@@ -58,7 +58,8 @@ class ArgumentHelper(dict):
             del self.params[name]
         elif name in self.flags:
             object.__setattr__(self, 'flags', [flag for flag in self.flags if flag != name])
-        raise KeyError("No such argument {}".format(name))
+        else:
+            raise KeyError("No such argument {}".format(name))
 
     @staticmethod
     def translate(flag) -> str:
@@ -90,7 +91,6 @@ def interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.BinaryIO,
     and also buffered in a ByteStream for later reading
     Returns (exit status, Stdout buffer, Stderr bufer)
     """
-    warnings.warn("Interactive command manager not recommended", stacklevel=2)
     infd = os.dup(sys.stdin.fileno())
     try:
         poll = select.poll()
@@ -99,25 +99,25 @@ def interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.BinaryIO,
         stdout = io.BytesIO()
         stderr = io.BytesIO()
         while not channel.exit_status_ready():
-            for fd, event in poll(0.5):
-                if fd == infd:
+            for fd, event in poll.poll(0.5):
+                if fd == infd and event == select.POLLIN or event == select.POLLPRI:
                     # Text available on python stdin
-                    stdin.write(os.read(infd, 4096))
+                    channel.send(os.read(infd, 4096))
             if channel.recv_ready():
                 content = channel.recv(4096)
-                sys.stdout.write(content)
+                sys.stdout.write(content.decode())
                 stdout.write(content)
-            if channel.recv__stderrready():
+            if channel.recv_stderr_ready():
                 content = channel.recv_stderr(4096)
-                sys.stderr.write(content)
+                sys.stderr.write(content.decode())
                 stderr.write(content)
         if channel.recv_ready():
             content = channel.recv(4096)
-            sys.stdout.write(content)
+            sys.stdout.write(content.decode())
             stdout.write(content)
-        if channel.recv__stderrready():
+        if channel.recv_stderr_ready():
             content = channel.recv_stderr(4096)
-            sys.stderr.write(content)
+            sys.stderr.write(content.decode())
             stderr.write(content)
         stdout.seek(0,0)
         stderr.seek(0,0)

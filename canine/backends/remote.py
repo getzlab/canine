@@ -1,0 +1,210 @@
+import typing
+import os
+import io
+import sys
+import subprocess
+from .base import AbstractSlurmBackend, AbstractTransport
+from ..utils import ArgumentHelper, interactive
+from agutil import StdOutAdapter
+import pandas as pd
+import paramiko
+
+class RemoteTransport(AbstractTransport):
+    """
+    Transport for working with remote files over ssh
+    """
+    def __init__(self, client: paramiko.SSHClient):
+        """
+        Initializes the transport from a given SSH client
+        """
+        self.client = client
+        self.session = None
+
+    def __enter__(self):
+        """
+        Starts a connection to the remote server
+        """
+        if self.client._transport is None:
+            raise paramiko.SSHException("Client is not connected")
+        self.session = self.client.open_sftp()
+        return self
+
+    def __exit__(self, *args):
+        """
+        Closes the connection to the remote server
+        """
+        self.session.close()
+        self.session = None
+
+    def open(self, filename: str, mode: str = 'r', bufsize: int = -1) -> typing.IO:
+        """
+        Returns a File-Like object open on the slurm cluster
+        """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
+        handle = self.session.open(filename, mode, bufsize)
+        handle.mode = mode
+        return handle
+
+    def listdir(self, path: str) -> typing.List[str]:
+        """
+        Lists the contents of the requested path
+        """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
+        return self.session.listdir(path)
+
+    def mkdir(self, path: str):
+        """
+        Creates the requested directory
+        """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
+        return self.session.mkdir(path)
+
+    def stat(self, path: str) -> typing.Any:
+        """
+        Returns stat information
+        """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
+        return self.session.stat(path)
+
+    def chmod(self, path: str, mode: int):
+        """
+        Change file permissions
+        """
+        self.session.chmod(path, mode)
+
+    def normpath(self, path: str) -> str:
+        """
+        Returns a normalized path relative to the transport
+        """
+        return self.session.normalize(path)
+
+    def remove(self, path: str):
+        """
+        Removes the file at the given path
+        """
+        self.session.remove(path)
+
+    def rmdir(self, path: str):
+        """
+        Removes the directory at the given path
+        """
+        self.session.rmdir(path)
+
+class RemoteSlurmBackend(AbstractSlurmBackend):
+    """
+    SLURM backend for interacting with a remote slurm node
+    """
+
+    def __init__(self, hostname: str, *args: typing.Any, **kwargs: typing.Any):
+        """
+        Initializes the backend.
+        No connection is established until the context is entered.
+        provided arguments and keyword arguments are passed to paramiko.SSHClient.Connect
+        """
+        self.hostname = hostname
+        self.__sshargs = args
+        self.__sshkwargs = kwargs
+        self.client = paramiko.SSHClient()
+        self.client.load_system_host_keys()
+
+    def load_config_args(self):
+        """
+        Parses the ssh config file and sets up this client's ssh arguments
+        as specified by the config file.
+        """
+        config_path = os.path.expanduser('~/.ssh/config')
+        config = paramiko.SSHConfig()
+        if os.path.isfile(config_path):
+            with open(config_path) as r:
+                config.parse(r)
+        config = config.lookup(self.hostname)
+        self.__sshargs = []
+        if 'hostname' in config:
+            self.hostname = config['hostname']
+        if 'port' in config:
+            self.__sshkwargs['port'] = config['port']
+        if 'user' in config:
+            self.__sshkwargs['username'] = config['user']
+        if 'identityfile' in config:
+            self.__sshkwargs['key_filename'] = os.path.expanduser(config['identityfile'][0])
+        if 'userknownhostsfile' in config:
+            self.client.load_host_keys(config['userknownhostsfile'])
+        if 'hostkeyalias' in config:
+            host_keys = self.client.get_host_keys()
+            host_keys[self.hostname] = host_keys[config['hostkeyalias']]
+
+    def _invoke(self, command: str) -> typing.Tuple[paramiko.ChannelFile, paramiko.ChannelFile, paramiko.ChannelFile]:
+        """
+        Raw handle to exec_command
+        """
+        if self.client._transport is None:
+            raise paramiko.SSHException("Client is not connected")
+        return self.client.exec_command(command)
+
+    def invoke(self, command: str) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
+        """
+        Invoke an arbitrary command in the slurm console
+        Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command)
+        """
+        raw_stdin, raw_stdout, raw_stderr = self._invoke(command)
+        stdout = io.BytesIO(raw_stdout.read())
+        stderr = io.BytesIO(raw_stderr.read())
+        return raw_stdout.channel.recv_exit_status(), stdout, stderr
+
+    def srun(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
+        """
+        Runs the given command interactively
+        The first argument MUST contain the entire command and options to run
+        Additional arguments and keyword arguments provided are passed as slurm arguments to srun
+        Returns a tuple containing (exit status, stdout buffer, stderr buffer)
+        """
+        command = 'srun {} -- {}'.format(
+            ArgumentHelper(*slurmopts, **slurmparams).commandline,
+            command
+        )
+        raw_stdin, raw_stdout, raw_stderr = self._invoke(command)
+        status, stdout, stderr = interactive(raw_stdout.channel)
+        if status != 0:
+            raise subprocess.CalledProcessError(status, command)
+        return status, stdout, stderr
+
+    def sbcast(self, localpath: str, remotepath: str, *slurmopts: str, **slurmparams: typing.Any):
+        """
+        Broadcasts the localpath (on the local filesystem)
+        to all compute nodes at remotepath
+        Additional arguments and keyword arguments provided are passed as slurm arguments to srun
+        """
+        command = 'sbcast {0} -- {1} {1}'.format(
+            ArgumentHelper(*slurmopts, **slurmparams).commandline,
+            remotepath
+        )
+        with self.transport() as transport:
+            transport.send(localpath, remotepath)
+            status, stdout, stderr = self.invoke(command)
+            if status != 0:
+                raise subprocess.CalledProcessError(status, command)
+
+    def __enter__(self):
+        """
+        Establishes a connection to the remote server
+        """
+        self.client.connect(self.hostname, *self.__sshargs, **self.__sshkwargs)
+        return self
+
+    def __exit__(self, *args):
+        """
+        Allows the Local backend to serve as a context manager
+        No action is taken
+        """
+        self.client.close()
+
+    def transport(self) -> RemoteTransport:
+        """
+        Return a Transport object suitable for moving files between the
+        SLURM cluster and the local filesystem
+        """
+        return RemoteTransport(self.client)

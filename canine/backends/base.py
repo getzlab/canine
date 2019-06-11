@@ -4,6 +4,7 @@ import re
 import shutil
 from contextlib import ExitStack
 from subprocess import CalledProcessError
+from uuid import uuid4 as uuid
 from ..utils import ArgumentHelper
 import pandas as pd
 
@@ -63,10 +64,10 @@ class AbstractTransport(abc.ABC):
         or the copy will not behave as expected
         """
         with ExitStack() as stack:
-            if isinstance(localfile, str):
-                localfile = stack.enter_context(open(localfile, 'rb'))
             if isinstance(remotefile, str):
-                remotefile = stack.enter_context(self.open(remotefile, 'wb' if 'b' in localfile.mode else 'w'))
+                remotefile = stack.enter_context(self.open(remotefile, 'rb'))
+            if isinstance(localfile, str):
+                localfile = stack.enter_context(open(localfile, 'wb' if 'b' in remotefile.mode else 'w'))
             shutil.copyfileobj(remotefile, localfile)
 
     @abc.abstractmethod
@@ -100,6 +101,33 @@ class AbstractTransport(abc.ABC):
         except FileNotFoundError:
             return False
 
+    @abc.abstractmethod
+    def chmod(self, path: str, mode: int):
+        """
+        Change file permissions
+        """
+        pass
+
+    @abc.abstractmethod
+    def normpath(self, path: str) -> str:
+        """
+        Returns a normalized path relative to the transport
+        """
+        pass
+
+    @abc.abstractmethod
+    def remove(self, path: str):
+        """
+        Removes the file at the given path
+        """
+        pass
+
+    @abc.abstractmethod
+    def rmdir(self, path: str):
+        """
+        Removes the directory at the given path
+        """
+        pass
 
 class AbstractSlurmBackend(abc.ABC):
     """
@@ -160,7 +188,6 @@ class AbstractSlurmBackend(abc.ABC):
             index_col=0
         )
 
-    @abc.abstractmethod
     def srun(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
         Runs the given command interactively
@@ -168,7 +195,14 @@ class AbstractSlurmBackend(abc.ABC):
         Additional arguments and keyword arguments provided are passed as slurm arguments to srun
         Returns a tuple containing (exit status, stdout buffer, stderr buffer)
         """
-        pass
+        command = 'srun {} -- {}'.format(
+            ArgumentHelper(*slurmopts, **slurmparams).commandline,
+            command
+        )
+        status, stdout, stderr = self.invoke(command)
+        if status != 0:
+            raise CalledProcessError(status, command)
+        return status, stdout, stderr
 
     def sbatch(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> str:
         """
@@ -237,3 +271,16 @@ class AbstractSlurmBackend(abc.ABC):
         SLURM cluster and the local filesystem
         """
         pass
+
+    def pack_batch_script(self, *commands: str):
+        """
+        writes the list of commands to a file and runs it
+        """
+        name = str(uuid())+'.sh'
+        with self.transport() as transport:
+            with transport.open(name, 'w') as w:
+                w.write('#!/bin/bash\n')
+                for command in commands:
+                    w.write(command.rstrip()+'\n')
+            transport.chmod(name, 0o775)
+        return name

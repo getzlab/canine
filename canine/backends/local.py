@@ -10,7 +10,7 @@ import pandas as pd
 
 class LocalTransport(AbstractTransport):
     """
-    Base class for file transport
+    Dummy file transport for working with the local filesystem
     """
     def __enter__(self):
         """
@@ -50,6 +50,30 @@ class LocalTransport(AbstractTransport):
         """
         return os.stat(path)
 
+    def chmod(self, path: str, mode: int):
+        """
+        Change file permissions
+        """
+        os.chmod(path, mode)
+
+    def normpath(self, path: str) -> str:
+        """
+        Returns a normalized path relative to the transport
+        """
+        return os.path.normpath(path)
+
+    def remove(self, path: str):
+        """
+        Removes the file at the given path
+        """
+        os.remove(path)
+
+    def rmdir(self, path: str):
+        """
+        Removes the directory at the given path
+        """
+        os.rmdir(path)
+
 class LocalSlurmBackend(AbstractSlurmBackend):
     """
     SLURM backend for interacting with a local slurm node
@@ -81,19 +105,6 @@ class LocalSlurmBackend(AbstractSlurmBackend):
             io.BytesIO(stdout.buffer),
             io.BytesIO(stderr.buffer)
         )
-
-    def srun(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
-        """
-        Runs the given command interactively
-        The first argument MUST contain the entire command and options to run
-        Additional arguments and keyword arguments provided are passed as slurm arguments to srun
-        Returns a tuple containing (exit status, stdout buffer, stderr buffer)
-        """
-        command = 'srun {} -- {}'.format(
-            ArgumentHelper(*slurmopts, **slurmparams).commandline,
-            command
-        )
-        return self.invoke(command)
 
     def __enter__(self):
         """
