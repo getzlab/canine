@@ -14,8 +14,10 @@ setup(
     long_description = "A dalmatian-based job manager to schedule tasks using SLURM",
     # long_description_content_type = 'text/markdown',
     install_requires = [
+        'paramiko==2.5.0'
     ],
     classifiers = [
+        "Development Status :: 1 - Planning",
         "Programming Language :: Python :: 3",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Bio-Informatics",
