@@ -2,6 +2,7 @@ import abc
 import typing
 import re
 import shutil
+import os
 import stat
 from contextlib import ExitStack
 from subprocess import CalledProcessError
@@ -138,23 +139,39 @@ class AbstractTransport(abc.ABC):
         """
         pass
 
+    @abc.abstractmethod
+    def mklink(self, src: str, dest: str):
+        """
+        Creates a symlink from dest->src
+        """
+        pass
+
     def isdir(self, path: str) -> bool:
         """
         Returns True if the requested path is a directory
         """
-        return stat.S_ISDIR(self.stat(path).st_mode)
+        try:
+            return stat.S_ISDIR(self.stat(path).st_mode)
+        except FileNotFoundError:
+            return False
 
     def isfile(self, path: str) -> bool:
         """
         Returns True if the requested path is a regular file
         """
-        return stat.S_ISREG(self.stat(path).st_mode)
+        try:
+            return stat.S_ISREG(self.stat(path).st_mode)
+        except FileNotFoundError:
+            return False
 
     def islink(self, path: str) -> bool:
         """
         Returns True if the requested path is a symlink
         """
-        return stat.S_ISLNK(self.stat(path).st_mode)
+        try:
+            return stat.S_ISLNK(self.stat(path).st_mode)
+        except FileNotFoundError:
+            return False
 
     def makedirs(self, path: str):
         """
@@ -167,7 +184,7 @@ class AbstractTransport(abc.ABC):
             self.makedirs(dirname)
         self.mkdir(path)
 
-    def walk(self, path: str) -> typing.Generator[typing.Tuple[str, typing.List[str], typing.list[str]]]:
+    def walk(self, path: str) -> typing.Generator[typing.Tuple[str, typing.List[str], typing.List[str]], None, None]:
         """
         Walk through a directory tree
         Each iteration yields a 3-tuple:

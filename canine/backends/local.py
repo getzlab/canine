@@ -74,6 +74,12 @@ class LocalTransport(AbstractTransport):
         """
         os.rmdir(path)
 
+    def mklink(self, src: str, dest: str):
+        """
+        Creates a symlink from dest->src
+        """
+        os.symlink(src, dest)
+
     def rename(self, src: str, dest: str):
         """
         Move the file or folder 'src' to 'dest'
@@ -81,7 +87,7 @@ class LocalTransport(AbstractTransport):
         """
         os.rename(src, dest)
 
-    def walk(self, path: str) -> typing.Generator[typing.Tuple[str, typing.List[str], typing.list[str]]]:
+    def walk(self, path: str) -> typing.Generator[typing.Tuple[str, typing.List[str], typing.List[str]], None, None]:
         """
         Walk through a directory tree
         Each iteration yields a 3-tuple:

@@ -1,8 +1,11 @@
 import os
 import sys
 import warnings
+import typing
+import fnmatch
 from uuid import uuid4
 from collections import namedtuple
+from contextlib import ExitStack
 from .backends import AbstractSlurmBackend, AbstractTransport
 from .utils import get_default_gcp_project
 
@@ -18,7 +21,7 @@ from .utils import get_default_gcp_project
 
 # $CANINE_ROOT: staging dir
 #   /common: common inputs
-#   /outputs: output dir
+#   /outputs: output dir (unused?)
 #       /{jobID}: job specific output
 #   /jobs/{jobID}: job staging dir
 #       setup.sh: setup script
@@ -37,8 +40,9 @@ class Localizer(object):
     Responsible for setting up staging directories and managing inputs and outputs
     NOT responsible for copying results to FireCloud (handled at the adapter layer)
     """
+    requester_pays = {}
 
-    def __init__(self, backend: AbstractSlurmBackend, localize_gs: bool = True, common: bool = True, staging_dir: path = None):
+    def __init__(self, backend: AbstractSlurmBackend, localize_gs: bool = True, common: bool = True, staging_dir: str = None):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
@@ -51,11 +55,13 @@ class Localizer(object):
         self.common_inputs = set()
         self.__sbcast = False
         if staging_dir == 'SBCAST':
+            # FIXME: This doesn't actually do anything yet
+            # If sbcast is true, then localization needs to use backend.sbcast to move files to the remote system
+            # Not sure at all how delocalization would work
             self.__sbcast = True
             staging_dir = None
         self.staging_dir = staging_dir if staging_dir is not None else str(uuid4())
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
-        self.requester_pays = {}
         self.env = {
             'CANINE_ROOT': self.staging_dir,
             'CANINE_COMMON': os.path.join(self.staging_dir, 'common'),
@@ -72,6 +78,7 @@ class Localizer(object):
             transport.mkdir(self.env['CANINE_COMMON'])
             transport.mkdir(self.env['CANINE_OUTPUT'])
             transport.mkdir(self.env['CANINE_JOBS'])
+        return self
 
     def __exit__(self, *args):
         """
@@ -104,10 +111,15 @@ class Localizer(object):
             overrides = {}
         with self.backend.transport() as transport:
             if self.common:
-                for varname, values in inputs.items():
-                    if len(values) > len(set(values.values())):
-                        self.common_inputs |= set(values.values())
-                    self.common_inputs |= {path for arg, path in values.items() if arg in overrides and overrides['arg'] == 'common'}
+                seen = set()
+                for jobId, values in inputs.items():
+                    for arg, path in values.items():
+                        if path in seen:
+                            self.common_inputs.add(path)
+                        if arg in overrides and overrides[arg] == 'common':
+                            self.common_inputs.add(path)
+                        seen.add(path)
+            print(self.common_inputs)
             common_dests = {}
             for path in self.common_inputs:
                 if path.startswith('gs://') and self.localize_gs:
@@ -161,7 +173,7 @@ class Localizer(object):
                             self.localize_file(transport, jobId, arg, value)
                         )
 
-    def localize_file(self, transport: AbstractTransport, jobId: int, name: str, value: str, delayed: bool = False) -> str:
+    def localize_file(self, transport: AbstractTransport, jobId: str, name: str, value: str, delayed: bool = False) -> str:
         """
         Localizes an individual file.
         Expects the caller to have initialized the transport and entered its context
@@ -186,9 +198,72 @@ class Localizer(object):
                     value,
                     filepath
                 ))
-            elif os.path.isfile(path):
+            elif os.path.isfile(value):
                 transport.send(
                     value,
                     filepath
                 )
         return filepath
+
+    def startup_hook(self, jobId: str) -> typing.Optional[str]:
+        """
+        Checks if the Localizer has any additional commands to add to this job's
+        startup script
+        Returns bash text or None
+        Mostly, this will correspond to final localization for input files
+        **WARNING** This function modifies Localizer.inputs
+        After calling it on a job, all of that job's inputs should have a localization type of None
+        """
+        raise NotImplementedError("TODO")
+
+    def environment(self, jobId: str) -> dict:
+        """
+        Produces a full dictionary of all environment variables for this job, which relate to the localizer
+        Orchestrator adds additional vars
+        """
+        raise NotImplementedError("TODO")
+
+    def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output', jobId: typing.Optional[str] = None, transport: typing.Optional[AbstractTransport] = None, delete: bool = True) -> typing.Dict[str typing.Dict[str, str]]:
+        """
+        Delocalizes the requested files from the given job (or all jobs)
+        Returns a dict {jobId: {output name: output path}}
+        """
+        with ExitStack() as stack:
+            if transport is None:
+                transport = stack.enter_context(self.backend.transport())
+            if jobId is None:
+                return {
+                    job: self.delocalize(patterns, output_dir, job, transport, delete)[job]
+                    for job in transport.listdir(self.env['CANINE_JOBS'])
+                }
+
+            else:
+                output_files = {}
+                start_dir = os.path.join(self.env['CANINE_JOBS'], jobId, 'workspace')
+                for dirpath, dirnames, filenames in transport.walk(start_dir):
+                    for name, pattern in patterns:
+                        for filename in filenames:
+                            fullname = os.path.join(dirpath, filename)
+                            if fnmatch.fnmatch(fullname, pattern) or fnmatch.fnmatch(os.path.relpath(fullname, start_dir), pattern):
+                                output_files[name] = self.delocalize_file(transport, jobId, name, fullname, output_dir)
+                                if delete:
+                                    if transport.isfile(fullname):
+                                        transport.remove(fullname)
+                return {jobId: output_files}
+
+    def delocalize_file(self, transport: AbstractTransport, jobId: str, name: str, fullname: str, output_dir: str) -> str:
+        """
+        Copies the remote output file back to the current filesystem
+        """
+        output_path = os.path.join(
+            output_dir,
+            jobId,
+            name,
+            os.path.basename(fullname)
+        )
+        os.makedirs(os.path.dirname(output_path))
+        transport.receive(
+            fullname,
+            output_path
+        )
+        return output_path

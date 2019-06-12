@@ -103,6 +103,14 @@ class RemoteTransport(AbstractTransport):
             raise paramiko.SSHException("Transport is not connected")
         self.session.rmdir(path)
 
+    def mklink(self, src: str, dest: str):
+        """
+        Creates a symlink from dest->src
+        """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
+        self.session.symlink(src, dest)
+
     def rename(self, src: str, dest: str):
         """
         Move the file or folder 'src' to 'dest'

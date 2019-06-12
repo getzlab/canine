@@ -16,11 +16,17 @@ controller or login node
 * `canine.backends.TransientGCPSlurmBackend`: If Canine needs to create a new SLURM
 cluster in Google, then delete it afterwards
 
+The backends provide the lowest level API. All backends implement at least the
+interface provided by `canine.backends.AbstractSlurmBackend`. You can use the backends
+to interact with a Slurm cluster. Each backend can also produce a Transport object,
+which implements `canine.backends.AbstractTransport`. Transports provide access
+to the Slurm cluster's filesystem
+
 ## Usage
 
 Canine operates by running jobs on a SLURM cluster. It is designed to take a bash
 or WDL script and schedule jobs using data from a Firecloud workspace or with manually
-provided inputs.
+provided inputs. API usage documented at the bottom of this section
 
 ### Configuration
 
