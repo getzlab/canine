@@ -29,7 +29,7 @@ setup(
         'agutil>=4.1.0'
     ],
     classifiers = [
-        "Development Status :: 1 - Planning",
+        "Development Status :: 3 - Alpha",
         "Programming Language :: Python :: 3",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Bio-Informatics",

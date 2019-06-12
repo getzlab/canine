@@ -103,12 +103,12 @@ class LocalSlurmBackend(AbstractSlurmBackend):
     SLURM backend for interacting with a local slurm node
     """
 
-    def invoke(self, command: str) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
+    def invoke(self, command: str, _display: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
         Invoke an arbitrary command in the slurm console
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command)
         """
-        stdout = StdOutAdapter(True)
+        stdout = StdOutAdapter(_display)
         stderr = StdOutAdapter(True)
         stdinFD = os.dup(sys.stdin.fileno())
         proc = subprocess.Popen(
@@ -129,6 +129,22 @@ class LocalSlurmBackend(AbstractSlurmBackend):
             io.BytesIO(stdout.buffer),
             io.BytesIO(stderr.buffer)
         )
+
+    def srun(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
+        """
+        Runs the given command interactively
+        The first argument MUST contain the entire command and options to run
+        Additional arguments and keyword arguments provided are passed as slurm arguments to srun
+        Returns a tuple containing (exit status, stdout buffer, stderr buffer)
+        """
+        command = 'srun {} -- {}'.format(
+            ArgumentHelper(*slurmopts, **slurmparams).commandline,
+            command
+        )
+        status, stdout, stderr = self.invoke(command, True)
+        if status != 0:
+            raise subprocess.CalledProcessError(status, command)
+        return status, stdout, stderr
 
     def __enter__(self):
         """

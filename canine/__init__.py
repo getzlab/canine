@@ -1,3 +1,2 @@
-from .orchestrator import Orchestrator
+from .orchestrator import Orchestrator, version as __version__
 from .localization import Localizer
-__version__ = '0.0.1'

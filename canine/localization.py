@@ -7,7 +7,7 @@ from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack
 from .backends import AbstractSlurmBackend, AbstractTransport
-from .utils import get_default_gcp_project
+from .utils import get_default_gcp_project, check_call
 
 # * `CANINE`: The current canine version
 # * `CANINE_BACKEND`: The name of the current backend type
@@ -96,9 +96,13 @@ class Localizer(object):
             path = path[5:]
         bucket = path.split('/')[0]
         if bucket not in self.requester_pays:
-            rc, sout, serr = self.backend.invoke('gsutil ls -Lb gs://{}'.format(bucket))
-            if rc == 0:
+            command = 'gsutil -u {} ls -Lb gs://{}'.format(get_default_gcp_project(), bucket)
+            try:
+                rc, sout, serr = self.backend.invoke(command)
+                check_call(command, rc, sout, serr)
                 self.requester_pays[bucket] = len([line for line in sout.readlines() if b'Requester Pays enabled:' in line and b'True' in line]) >= 1
+            except CalledProcessError:
+                pass
         return bucket in self.requester_pays and self.requester_pays[bucket]
 
     def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None):
@@ -124,11 +128,13 @@ class Localizer(object):
             for path in self.common_inputs:
                 if path.startswith('gs://') and self.localize_gs:
                     common_dests[path] = os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
-                    self.backend.invoke("gsutil {} cp {} {}".format(
+                    command = "gsutil {} cp {} {}".format(
                         '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(path) else '',
                         path,
                         common_dests[path]
-                    ))
+                    )
+                    rc, sout, serr = self.backend.invoke(command)
+                    check_call(command, rc, sout, serr)
                 elif os.path.isfile(path):
                     common_dests[path] = os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
                     transport.send(
@@ -193,11 +199,12 @@ class Localizer(object):
             filepath = '{}._alt{}'.format(root, ext)
         if not delayed:
             if self.localize_gs and value.startswith('gs://'):
-                self.backend.invoke("gsutil {} cp {} {}".format(
+                command = "gsutil {} cp {} {}".format(
                     '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(value) else '',
                     value,
                     filepath
-                ))
+                )
+                check_call(command, *self.backend.invoke(command))
             elif os.path.isfile(value):
                 transport.send(
                     value,

@@ -250,7 +250,7 @@ class AbstractSlurmBackend(abc.ABC):
             index_col=0
         )
         df.index = df.index.map(str)
-        return df
+        return df.loc[[idx for idx in df.index if not idx.startswith('---')]]
 
     def sinfo(self, *slurmopts: str, **slurmparams: typing.Any) -> pd.DataFrame:
         """

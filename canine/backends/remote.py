@@ -145,6 +145,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         """
         Parses the ssh config file and sets up this client's ssh arguments
         as specified by the config file.
+        Paramiko is too stupid to read ssh config so we have to write this function
         """
         config_path = os.path.expanduser('~/.ssh/config')
         config = paramiko.SSHConfig()
@@ -245,8 +246,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
 
     def __exit__(self, *args):
         """
-        Allows the Local backend to serve as a context manager
-        No action is taken
+        Closes the connection to the remote server
         """
         self.client.close()
 

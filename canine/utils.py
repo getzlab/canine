@@ -4,6 +4,8 @@ import sys
 import select
 import io
 import warnings
+import shlex
+from subprocess import CalledProcessError
 import google.auth
 import paramiko
 
@@ -75,7 +77,7 @@ class ArgumentHelper(dict):
             short_flags=''.join(flag for flag in self.flags if len(flag)==1),
             long_flags=''.join(' --{}'.format(self.translate(flag)) for flag in self.flags if len(flag) > 1),
             params=''.join(
-                ' --{}={}'.format(self.translate(key), value)
+                ' --{}={}'.format(self.translate(key), shlex.quote(value))
                 for key, value in self.params.items()
             )
         )
@@ -136,3 +138,15 @@ def get_default_gcp_project():
     if __DEFAULT_GCP_PROJECT__ is None:
         __DEFAULT_GCP_PROJECT__ = google.auth.default()[1]
     return __DEFAULT_GCP_PROJECT__
+
+def check_call(cmd:str, rc: int, stdout: typing.BinaryIO, stderr: typing.BinaryIO):
+    """
+    Checks that the rc is 0
+    If not, flush stdout and stderr streams and raise a CalledProcessError
+    """
+    if rc != 0:
+        sys.stdout.write(stdout.read().decode())
+        sys.stdout.flush()
+        sys.stderr.write(stderr.read().decode())
+        sys.stderr.flush()
+        raise CalledProcessError(rc, cmd)
