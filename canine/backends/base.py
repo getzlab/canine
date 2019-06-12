@@ -2,6 +2,7 @@ import abc
 import typing
 import re
 import shutil
+import stat
 from contextlib import ExitStack
 from subprocess import CalledProcessError
 from uuid import uuid4 as uuid
@@ -129,6 +130,63 @@ class AbstractTransport(abc.ABC):
         """
         pass
 
+    @abc.abstractmethod
+    def rename(self, src: str, dest: str):
+        """
+        Move the file or folder 'src' to 'dest'
+        Will overwrite dest if it exists
+        """
+        pass
+
+    def isdir(self, path: str) -> bool:
+        """
+        Returns True if the requested path is a directory
+        """
+        return stat.S_ISDIR(self.stat(path).st_mode)
+
+    def isfile(self, path: str) -> bool:
+        """
+        Returns True if the requested path is a regular file
+        """
+        return stat.S_ISREG(self.stat(path).st_mode)
+
+    def islink(self, path: str) -> bool:
+        """
+        Returns True if the requested path is a symlink
+        """
+        return stat.S_ISLNK(self.stat(path).st_mode)
+
+    def makedirs(self, path: str):
+        """
+        Recursively build the requested directory structure
+        """
+        if self.isdir(path):
+            return
+        dirname = os.path.dirname(path)
+        if not (dirname == '' or os.path.exists(dirname)):
+            self.makedirs(dirname)
+        self.mkdir(path)
+
+    def walk(self, path: str) -> typing.Generator[typing.Tuple[str, typing.List[str], typing.list[str]]]:
+        """
+        Walk through a directory tree
+        Each iteration yields a 3-tuple:
+        (dirpath, dirnames, filenames) ->
+        * dirpath: The current filepath relative to the starting path
+        * dirnames: The base names of all subdirectories in the current directory
+        * filenames: The base names of all files in the current directory
+        """
+        dirnames = []
+        filenames = []
+        for name in self.listdir(path):
+            if self.isdir(os.path.join(path, name)):
+                dirnames.append(name)
+            else:
+                filenames.append(name)
+        yield (path, dirnames, filenames)
+        for dirname in dirnames:
+            yield from self.walk(os.path.join(path, dirname))
+
 class AbstractSlurmBackend(abc.ABC):
     """
     Base class for a SLURM backend
@@ -152,10 +210,12 @@ class AbstractSlurmBackend(abc.ABC):
         status, stdout, stderr = self.invoke(command)
         if status != 0:
             raise CalledProcessError(status, command)
-        return pd.read_fwf(
+        df = pd.read_fwf(
             stdout,
             index_col=0
         )
+        df.index = df.index.map(str)
+        return df
 
 
     def sacct(self, *slurmopts: str, **slurmparams: typing.Any) -> pd.DataFrame:
@@ -168,10 +228,12 @@ class AbstractSlurmBackend(abc.ABC):
         status, stdout, stderr = self.invoke(command)
         if status != 0:
             raise CalledProcessError(status, command)
-        return pd.read_fwf(
+        df = pd.read_fwf(
             stdout,
             index_col=0
         )
+        df.index = df.index.map(str)
+        return df
 
     def sinfo(self, *slurmopts: str, **slurmparams: typing.Any) -> pd.DataFrame:
         """
@@ -183,10 +245,12 @@ class AbstractSlurmBackend(abc.ABC):
         status, stdout, stderr = self.invoke(command)
         if status != 0:
             raise CalledProcessError(status, command)
-        return pd.read_fwf(
+        df = pd.read_fwf(
             stdout,
             index_col=0
         )
+        df.index = df.index.map(str)
+        return df
 
     def srun(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
@@ -284,3 +348,20 @@ class AbstractSlurmBackend(abc.ABC):
                     w.write(command.rstrip()+'\n')
             transport.chmod(name, 0o775)
         return name
+
+    def wait_for_cluster_ready(self):
+        """
+        Blocks until the main partition is marked as up
+        """
+        df = self.sinfo()
+        default = [value for value in df.index if value.endswith('*')]
+        while len(default) == 0:
+            time.sleep(10)
+            df = self.sinfo()
+            default = [value for value in df.index if value.endswith('*')]
+        if len(default) != 1:
+            raise ValueError("Could not determine default partition from {}".format(df.index))
+        default = default[0]
+        while df.AVAIL[default] != 'up':
+            time.sleep(10)
+            df = self.sinfo()

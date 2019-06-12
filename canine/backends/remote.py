@@ -3,6 +3,7 @@ import os
 import io
 import sys
 import subprocess
+import warnings
 from .base import AbstractSlurmBackend, AbstractTransport
 from ..utils import ArgumentHelper, interactive
 from agutil import StdOutAdapter
@@ -74,25 +75,45 @@ class RemoteTransport(AbstractTransport):
         """
         Change file permissions
         """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
         self.session.chmod(path, mode)
 
     def normpath(self, path: str) -> str:
         """
         Returns a normalized path relative to the transport
         """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
         return self.session.normalize(path)
 
     def remove(self, path: str):
         """
         Removes the file at the given path
         """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
         self.session.remove(path)
 
     def rmdir(self, path: str):
         """
         Removes the directory at the given path
         """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
         self.session.rmdir(path)
+
+    def rename(self, src: str, dest: str):
+        """
+        Move the file or folder 'src' to 'dest'
+        Will overwrite dest if it exists
+        """
+        if self.session is None:
+            raise paramiko.SSHException("Transport is not connected")
+        try:
+            self.session.posix_rename(src, dest)
+        except IOError:
+            self.session.rename(src, dest)
 
 class RemoteSlurmBackend(AbstractSlurmBackend):
     """
@@ -106,6 +127,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         provided arguments and keyword arguments are passed to paramiko.SSHClient.Connect
         """
         self.hostname = hostname
+        self.__hostname = hostname
         self.__sshargs = args
         self.__sshkwargs = kwargs
         self.client = paramiko.SSHClient()
@@ -135,7 +157,12 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             self.client.load_host_keys(config['userknownhostsfile'])
         if 'hostkeyalias' in config:
             host_keys = self.client.get_host_keys()
-            host_keys[self.hostname] = host_keys[config['hostkeyalias']]
+            if config['hostkeyalias'] in host_keys:
+                host_keys[self.hostname] = host_keys[config['hostkeyalias']]
+            else:
+                warnings.warn("Requested HostKeyAlias not found. Switching to auto-add policy", stacklevel=2)
+                self.client.set_missing_host_key_policy(paramiko.client.AutoAddPolicy)
+
 
     def _invoke(self, command: str) -> typing.Tuple[paramiko.ChannelFile, paramiko.ChannelFile, paramiko.ChannelFile]:
         """
@@ -154,6 +181,19 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         stdout = io.BytesIO(raw_stdout.read())
         stderr = io.BytesIO(raw_stderr.read())
         return raw_stdout.channel.recv_exit_status(), stdout, stderr
+
+    def interactive_login(self) -> int:
+        """
+        Connects to the client interactively.
+        Stdin/out/err will be connected directly, and
+        Python will not have access to the streams
+        Returns ssh's exit status
+        """
+        return subprocess.call(
+            'ssh {}'.format(self.__hostname),
+            shell=True,
+            executable='/bin/bash'
+        )
 
     def srun(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """

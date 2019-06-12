@@ -1,0 +1,3 @@
+[submodule "canine/backends/slurm-gcp"]
+	path = canine/backends/slurm-gcp
+	url = git@github.com:SchedMD/slurm-gcp.git

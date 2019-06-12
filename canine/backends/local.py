@@ -74,6 +74,24 @@ class LocalTransport(AbstractTransport):
         """
         os.rmdir(path)
 
+    def rename(self, src: str, dest: str):
+        """
+        Move the file or folder 'src' to 'dest'
+        Will overwrite dest if it exists
+        """
+        os.rename(src, dest)
+
+    def walk(self, path: str) -> typing.Generator[typing.Tuple[str, typing.List[str], typing.list[str]]]:
+        """
+        Walk through a directory tree
+        Each iteration yields a 3-tuple:
+        (dirpath, dirnames, filenames) ->
+        * dirpath: The current filepath relative to the starting path
+        * dirnames: The base names of all subdirectories in the current directory
+        * filenames: The base names of all files in the current directory
+        """
+        yield from os.walk(path)
+
 class LocalSlurmBackend(AbstractSlurmBackend):
     """
     SLURM backend for interacting with a local slurm node

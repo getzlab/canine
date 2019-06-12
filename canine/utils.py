@@ -4,6 +4,7 @@ import sys
 import select
 import io
 import warnings
+import google.auth
 import paramiko
 
 class ArgumentHelper(dict):
@@ -124,3 +125,14 @@ def interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.BinaryIO,
         return channel.recv_exit_status(), stdout, stderr
     finally:
         os.close(infd)
+
+__DEFAULT_GCP_PROJECT__ = None
+
+def get_default_gcp_project():
+    """
+    Returns the currently configured default project
+    """
+    global __DEFAULT_GCP_PROJECT__
+    if __DEFAULT_GCP_PROJECT__ is None:
+        __DEFAULT_GCP_PROJECT__ = google.auth.default()[1]
+    return __DEFAULT_GCP_PROJECT__

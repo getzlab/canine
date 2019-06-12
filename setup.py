@@ -6,7 +6,15 @@ setup(
     version = __version__,
     packages = [
         'canine',
+        'canine.backends',
+        'canine.adapters'
     ],
+    package_data={
+        '':[
+            'backends/slurm-gcp/*',
+            'backends/slurm-gcp/scripts/*'
+        ],
+    },
     description = 'A dalmatian-based job manager to schedule tasks using SLURM',
     url = 'https://github.com/broadinstitute/canine',
     author = 'Aaron Graubert - Broad Institute - Cancer Genome Computational Analysis',
@@ -14,7 +22,11 @@ setup(
     long_description = "A dalmatian-based job manager to schedule tasks using SLURM",
     # long_description_content_type = 'text/markdown',
     install_requires = [
-        'paramiko==2.5.0'
+        'paramiko>=2.5.0',
+        'pandas>=0.24.1',
+        'google-auth>=1.6.3',
+        'PyYAML>=5.1',
+        'agutil>=4.1.0'
     ],
     classifiers = [
         "Development Status :: 1 - Planning",

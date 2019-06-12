@@ -1,9 +1,183 @@
-
+import getpass
+import tempfile
+import time
+import subprocess
+import shutil
+import os
 from .remote import RemoteSlurmBackend
+from ..utils import get_default_gcp_project
+import yaml
 
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
     Backend for transient slurm clusters which need to be deployed and configured
     on GCP before they're ready for use
     """
-    pass
+
+    def __init__(self, name='slurm-canine', *, max_node_count=10, compute_zone='us-central1-a', controller_type='n1-standard-16', login_type='n1-standard-1', worker_type='n1-highcpu-2', login_count=0, compute_disk_size=20, controller_disk_size=200, gpu_type=None, gpu_count=0):
+        super().__init__('{}-controller.{}.{}'.format(
+            name,
+            compute_zone,
+            get_default_gcp_project()
+        ))
+        self.config = {
+          "cluster_name": name,
+          "static_node_count": 0,
+          "max_node_count": max_node_count,
+          "zone": compute_zone,
+          "region": compute_zone[:-2],
+          "cidr": "10.10.0.0/16",
+          "controller_machine_type": controller_type,
+          "compute_machine_type": worker_type,
+          "compute_disk_type": "pd-standard",
+          "compute_disk_size_gb": compute_disk_size,
+          "controller_disk_type": "pd-ssd",
+          "controller_disk_size_gb": controller_disk_size,
+          "controller_secondary_disk": False,
+          "login_machine_type": login_type,
+          "login_node_count": login_count,
+          "login_disk_size_gb": 10,
+          "preemptible_bursting": True,
+          "private_google_access": False,
+          "vpc_net": "default",
+          "vpc_subnet": "default",
+          "default_users": getpass.getuser()
+        }
+
+        if gpu_type is not None and gpu_count > 0:
+            self.config['gpu_type'] = gpu_type
+            self.config['gpu_count'] = gpu_count
+
+        self.startup_script = """
+        sudo yum install -y yum-utils device-mapper-persistent-data lvm2 libcgroup libcgroup-tools htop gcc python-devel python-setuptools redhat-rpm-config
+        sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+        sudo yum install -y docker-ce
+        sudo groupadd docker
+        sudo usermod -aG docker {0}
+        sudo systemctl enable docker.service
+        sudo systemctl start docker.service
+        sudo chown root:docker /var/run/docker.sock
+        sudo bash -c "echo {0}$'\\t'ALL='(ALL:ALL)'$'\\t'ALL >> /etc/sudoers"
+        sudo sed -e 's/GRUB_CMDLINE_LINUX="\\?\\([^"]*\\)"\\?/GRUB_CMDLINE_LINUX="\\1 cgroup_enable=memory swapaccount=1"/' < /etc/default/grub > grub.tmp
+        sudo mv grub.tmp /etc/default/grub
+        sudo grub2-mkconfig -o /etc/grub2.cfg
+        yes | sudo pip uninstall crcmod
+        sudo pip install --no-cache-dir -U crcmod
+        """.format(
+            getpass.getuser(),
+        )
+
+        self.controller_script = """
+        sudo dd if=/dev/zero of=/swapfile count=4096 bs=1MiB
+        sudo chmod 700 /swapfile
+        sudo mkswap /swapfile
+        sudo swapon /swapfile
+        sudo yum install -y gcc python-devel python-setuptools redhat-rpm-config htop
+        yes | sudo pip uninstall crcmod
+        sudo pip install --no-cache-dir -U crcmod
+        """
+
+    def __enter__(self):
+        """
+        Create NFS server
+        Set up the NFS server and SLURM cluster
+        Use default VPC
+        """
+        # Idea: Allow the final deployment step to run in a Popen
+        # cluster.run then polls the object to make sure the deployment has finished
+        # allows copytree to begin while deployment still in progress
+
+        # User may also provide an NFS server IP
+
+        # 1) create NFS: (n1-highcpu-16 [16CPU, 14GB, 4GB SW], SSD w/ user GB)
+        # 2) SCP setup script to NFS
+        # 3) SSH into NFS, run script
+        with tempfile.TemporaryDirectory() as tempdir:
+            shutil.copytree(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    'slurm-gcp'
+                ),
+                tempdir+'/slurm'
+            )
+            with open(os.path.join(tempdir, 'slurm', 'scripts', 'custom-compute-install'), 'w') as w:
+                w.write(self.startup_script)
+            with open(os.path.join(tempdir, 'slurm', 'scripts', 'custom-controller-install'), 'w') as w:
+                w.write(self.controller_script)
+            with open(os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml'), 'w') as w:
+                yaml.dump(
+                    {
+                        "imports": [
+                          {
+                            "path": 'slurm.jinja'
+                          }
+                        ],
+                        "resources": [
+                          {
+                            "name": "slurm-cluster",
+                            "type": "slurm.jinja",
+                            "properties": self.config
+                          }
+                        ]
+                    },
+                    w
+                )
+            subprocess.check_call(
+                'gcloud deployment-manager deployments create {} --config {}'.format(
+                    self.config['cluster_name'],
+                    os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml')
+                ),
+                shell=True,
+                executable='/bin/bash'
+            )
+        subprocess.check_call(
+            'gcloud compute config-ssh',
+            shell=True
+        )
+        self.load_config_args()
+        super().__enter__()
+        print("Waiting for slurm to initialize")
+        rc, sout, serr = self.invoke("which sinfo")
+        while rc != 0:
+            time.sleep(10)
+            rc, sout, serr = self.invoke("which sinfo")
+        print("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
+        return self
+
+    def stop(self):
+        """
+        Kills the slurm cluster
+        """
+        subprocess.check_call(
+            'echo y | gcloud deployment-manager deployments delete {}'.format(
+                self.config['cluster_name']
+            ),
+            shell=True,
+            executable='/bin/bash'
+        )
+        subprocess.run(
+            "echo y | gcloud compute images delete $(gcloud compute images list --filter name:{}| awk 'NR>1 {{print $1}}')".format(
+                self.config['cluster_name']
+            ),
+            shell=True,
+            executable='/bin/bash'
+        )
+        subprocess.run(
+            "echo y | gcloud compute instances delete --zone {} $(gcloud compute instances list --filter name:{} | awk 'NR>1 {{print $1}}')".format(
+                self.config['zone'],
+                self.config['cluster_name']
+            ),
+            shell=True,
+            executable='/bin/bash'
+        )
+
+    def __exit__(self, *args):
+        """
+        kill NFS server
+        delete the deployment
+        """
+        subprocess.check_call(
+            'gcloud compute config-ssh --remove',
+            shell=True
+        )
+        self.stop()
