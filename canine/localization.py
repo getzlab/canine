@@ -223,7 +223,7 @@ class Localizer(object):
         """
         raise NotImplementedError("TODO")
 
-    def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output', jobId: typing.Optional[str] = None, transport: typing.Optional[AbstractTransport] = None, delete: bool = True) -> typing.Dict[str typing.Dict[str, str]]:
+    def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output', jobId: typing.Optional[str] = None, transport: typing.Optional[AbstractTransport] = None, delete: bool = True) -> typing.Dict[str, typing.Dict[str, str]]:
         """
         Delocalizes the requested files from the given job (or all jobs)
         Returns a dict {jobId: {output name: output path}}
