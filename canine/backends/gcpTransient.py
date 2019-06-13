@@ -1,12 +1,17 @@
 import getpass
 import tempfile
+import typing
 import time
 import subprocess
 import shutil
 import os
+import sys
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_project
+from ..utils import get_default_gcp_project, ArgumentHelper
 import yaml
+import pandas as pd
+
+SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
 
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
@@ -181,3 +186,24 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             shell=True
         )
         self.stop()
+
+    def sinfo(self, *slurmopts: str, **slurmparams: typing.Any) -> pd.DataFrame:
+        """
+        Shows the current cluster information
+        slurmopts and slurmparams are passed into an ArgumentHelper and unpacked
+        as command line arguments
+        """
+        command = 'sinfo'+ArgumentHelper(*slurmopts, **slurmparams).commandline
+        status, stdout, stderr = self.invoke(command)
+        if status != 0 and SLURM_PARTITION_RECON in stderr.read():
+            print("Transient controller timed out while checking partitions. Allowing one additional retry", file=sys.stderr)
+            time.sleep(60)
+            status, stdout, stderr = self.invoke(command)
+        stderr.seek(0,0)
+        check_call(command, status, stdout, stderr)
+        df = pd.read_fwf(
+            stdout,
+            index_col=0
+        )
+        df.index = df.index.map(str)
+        return df

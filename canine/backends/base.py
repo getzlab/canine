@@ -5,9 +5,8 @@ import shutil
 import os
 import stat
 from contextlib import ExitStack
-from subprocess import CalledProcessError
 from uuid import uuid4 as uuid
-from ..utils import ArgumentHelper
+from ..utils import ArgumentHelper, check_call
 import pandas as pd
 
 batch_job_pattern = re.compile(r'Submitted batch job (\d+)')
@@ -225,8 +224,7 @@ class AbstractSlurmBackend(abc.ABC):
         """
         command = 'squeue'+ArgumentHelper(*slurmopts, **slurmparams).commandline
         status, stdout, stderr = self.invoke(command)
-        if status != 0:
-            raise CalledProcessError(status, command)
+        check_call(command, status, stdout, stderr)
         df = pd.read_fwf(
             stdout,
             index_col=0
@@ -243,8 +241,7 @@ class AbstractSlurmBackend(abc.ABC):
         """
         command = 'sacct'+ArgumentHelper(*slurmopts, **slurmparams).commandline
         status, stdout, stderr = self.invoke(command)
-        if status != 0:
-            raise CalledProcessError(status, command)
+        check_call(command, status, stdout, stderr)
         df = pd.read_fwf(
             stdout,
             index_col=0
@@ -260,8 +257,7 @@ class AbstractSlurmBackend(abc.ABC):
         """
         command = 'sinfo'+ArgumentHelper(*slurmopts, **slurmparams).commandline
         status, stdout, stderr = self.invoke(command)
-        if status != 0:
-            raise CalledProcessError(status, command)
+        check_call(command, status, stdout, stderr)
         df = pd.read_fwf(
             stdout,
             index_col=0
@@ -281,8 +277,7 @@ class AbstractSlurmBackend(abc.ABC):
             command
         )
         status, stdout, stderr = self.invoke(command)
-        if status != 0:
-            raise CalledProcessError(status, command)
+        check_call(command, status, stdout, stderr)
         return status, stdout, stderr
 
     def sbatch(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> str:
@@ -297,8 +292,7 @@ class AbstractSlurmBackend(abc.ABC):
             command
         )
         status, stdout, stderr = self.invoke(command)
-        if status != 0:
-            raise CalledProcessError(status, command)
+        check_call(command, status, stdout, stderr)
         result = batch_job_pattern.search(stdout.read().decode())
         if result:
             return result.group(1)
@@ -316,8 +310,7 @@ class AbstractSlurmBackend(abc.ABC):
             jobID
         )
         status, stdout, stderr = self.invoke(command)
-        if status != 0:
-            raise CalledProcessError(status, command)
+        check_call(command, status, stdout, stderr)
 
 
     @abc.abstractmethod

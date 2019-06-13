@@ -74,10 +74,14 @@ class Localizer(object):
         Sets up staging directory for the job
         """
         with self.backend.transport() as transport:
-            transport.mkdir(self.env['CANINE_ROOT'])
-            transport.mkdir(self.env['CANINE_COMMON'])
-            transport.mkdir(self.env['CANINE_OUTPUT'])
-            transport.mkdir(self.env['CANINE_JOBS'])
+            if not transport.isdir(self.env['CANINE_ROOT']):
+                transport.mkdir(self.env['CANINE_ROOT'])
+            if not transport.isdir(self.env['CANINE_COMMON']):
+                transport.mkdir(self.env['CANINE_COMMON'])
+            if not transport.isdir(self.env['CANINE_OUTPUT']):
+                transport.mkdir(self.env['CANINE_OUTPUT'])
+            if not transport.isdir(self.env['CANINE_JOBS']):
+                transport.mkdir(self.env['CANINE_JOBS'])
         return self
 
     def __exit__(self, *args):
@@ -123,7 +127,6 @@ class Localizer(object):
                         if arg in overrides and overrides[arg] == 'common':
                             self.common_inputs.add(path)
                         seen.add(path)
-            print(self.common_inputs)
             common_dests = {}
             for path in self.common_inputs:
                 if path.startswith('gs://') and self.localize_gs:
@@ -144,6 +147,9 @@ class Localizer(object):
                 else:
                     print("Could not handle common file", path, file=sys.stderr)
             for jobId, data in inputs.items():
+                workspace_path = os.path.join(self.env['CANINE_JOBS'], str(jobId), 'workspace')
+                if not transport.isdir(workspace_path):
+                    transport.makedirs(workspace_path)
                 self.inputs[jobId] = {}
                 for arg, value in data.items():
                     mode = overrides[arg] if arg in overrides else False
@@ -248,7 +254,7 @@ class Localizer(object):
                 output_files = {}
                 start_dir = os.path.join(self.env['CANINE_JOBS'], jobId, 'workspace')
                 for dirpath, dirnames, filenames in transport.walk(start_dir):
-                    for name, pattern in patterns:
+                    for name, pattern in patterns.items():
                         for filename in filenames:
                             fullname = os.path.join(dirpath, filename)
                             if fnmatch.fnmatch(fullname, pattern) or fnmatch.fnmatch(os.path.relpath(fullname, start_dir), pattern):

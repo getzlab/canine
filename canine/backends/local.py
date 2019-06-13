@@ -4,7 +4,7 @@ import io
 import sys
 import subprocess
 from .base import AbstractSlurmBackend, AbstractTransport
-from ..utils import ArgumentHelper
+from ..utils import ArgumentHelper, check_call
 from agutil import StdOutAdapter
 import pandas as pd
 
@@ -142,8 +142,7 @@ class LocalSlurmBackend(AbstractSlurmBackend):
             command
         )
         status, stdout, stderr = self.invoke(command, True)
-        if status != 0:
-            raise subprocess.CalledProcessError(status, command)
+        check_call(command, status, stdout, stderr)
         return status, stdout, stderr
 
     def __enter__(self):

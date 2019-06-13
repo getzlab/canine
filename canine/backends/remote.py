@@ -217,8 +217,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         )
         raw_stdin, raw_stdout, raw_stderr = self._invoke(command)
         status, stdout, stderr = interactive(raw_stdout.channel)
-        if status != 0:
-            raise subprocess.CalledProcessError(status, command)
+        check_call(command, status, stdout, stderr)
         return status, stdout, stderr
 
     def sbcast(self, localpath: str, remotepath: str, *slurmopts: str, **slurmparams: typing.Any):
@@ -234,8 +233,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         with self.transport() as transport:
             transport.send(localpath, remotepath)
             status, stdout, stderr = self.invoke(command)
-            if status != 0:
-                raise subprocess.CalledProcessError(status, command)
+            check_call(command, status, stdout, stderr)
 
     def __enter__(self):
         """
