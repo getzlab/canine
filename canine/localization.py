@@ -3,6 +3,7 @@ import sys
 import warnings
 import typing
 import fnmatch
+import shlex
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack
@@ -42,7 +43,7 @@ class Localizer(object):
     """
     requester_pays = {}
 
-    def __init__(self, backend: AbstractSlurmBackend, localize_gs: bool = True, common: bool = True, staging_dir: str = None):
+    def __init__(self, backend: AbstractSlurmBackend, localize_gs: bool = True, common: bool = True, staging_dir: str = None, mount_path: str = None):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
@@ -61,6 +62,8 @@ class Localizer(object):
             self.__sbcast = True
             staging_dir = None
         self.staging_dir = staging_dir if staging_dir is not None else str(uuid4())
+        with self.backend.transport() as transport:
+            self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.env = {
             'CANINE_ROOT': self.staging_dir,
@@ -218,23 +221,105 @@ class Localizer(object):
                 )
         return filepath
 
-    def startup_hook(self, jobId: str) -> typing.Optional[str]:
-        """
-        Checks if the Localizer has any additional commands to add to this job's
-        startup script
-        Returns bash text or None
-        Mostly, this will correspond to final localization for input files
-        **WARNING** This function modifies Localizer.inputs
-        After calling it on a job, all of that job's inputs should have a localization type of None
-        """
-        raise NotImplementedError("TODO")
+    # def startup_hook(self, jobId: str) -> typing.Optional[str]:
+    #     """
+    #     Checks if the Localizer has any additional commands to add to this job's
+    #     startup script
+    #     Returns bash text or None
+    #     Mostly, this will correspond to final localization for input files
+    #     **WARNING** This function modifies Localizer.inputs
+    #     After calling it on a job, all of that job's inputs should have a localization type of None
+    #     """
+    #     raise NotImplementedError("TODO")
 
-    def environment(self, jobId: str) -> dict:
+    # def environment(self, jobId: str) -> dict:
+    #     """
+    #     Produces a full dictionary of all environment variables for this job, which relate to the localizer
+    #     Orchestrator adds additional vars
+    #     """
+    #     raise NotImplementedError("TODO")
+
+    def localize_job(self, jobId: str, setup_text: typing.Optional[str] = None, transport: typing.Optional[AbstractTransport] = None) -> str:
         """
-        Produces a full dictionary of all environment variables for this job, which relate to the localizer
-        Orchestrator adds additional vars
+        Does final localization of job script.
+        Used when finally prepping a job for dispatch
+        returns the path to the first script in the job's pipeline
         """
-        raise NotImplementedError("TODO")
+        self.__env = {**self.env}
+        self.env = {
+            'CANINE_ROOT': self.mount_path,
+            'CANINE_COMMON': os.path.join(self.mount_path, 'common'),
+            'CANINE_OUTPUT': os.path.join(self.mount_path, 'outputs'), #outputs/jobid/outputname/...files...
+            'CANINE_JOBS': os.path.join(self.mount_path, 'jobs'),
+        }
+
+        with ExitStack() as stack:
+            if transport is None:
+                transport = stack.enter_context(self.backend.transport())
+            job_vars = []
+            exports = []
+            extra_tasks = [
+                'cd $CANINE_JOB_INPUTS'
+            ]
+            for key, val in self.inputs[jobId].items():
+                if val.type == 'stream':
+                    job_vars.append(shlex.quote(key))
+                    dest = shlex.quote(self.localize_file(transport, jobId, key, val.path, True))
+                    extra_tasks += [
+                        'mkfifo {}'.format(dest),
+                        "gsutil {} cat {} > {} &".format(
+                            '-u {}'.format(shlex.quote(get_default_gcp_project())) if self.get_requester_pays(val.path) else '',
+                            shlex.quote(val.path),
+                            dest
+                        )
+                    ]
+                    exports.append('export {}="{}"'.format(
+                        key,
+                        dest
+                    ))
+                elif val.type == 'download':
+                    job_vars.append(shlex.quote(key))
+                    dest = shlex.quote(self.localize_file(transport, jobId, key, val.path, True))
+                    extra_tasks += [
+                        "gsutil {} cp {} {}".format(
+                            '-u {}'.format(shlex.quote(get_default_gcp_project())) if self.get_requester_pays(val.path) else '',
+                            shlex.quote(val.path),
+                            dest
+                        )
+                    ]
+                    exports.append('export {}="{}"'.format(
+                        key,
+                        dest
+                    ))
+                elif val.type is None:
+                    job_vars.append(shlex.quote(key))
+                    exports.append('export {}="{}"'.format(
+                        key,
+                        shlex.quote(val.path)
+                    ))
+                else:
+                    print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
+            script_path = os.path.join(self.env['CANINE_JOBS'], jobId, 'setup.sh')
+            script = '\n'.join(
+                line.rstrip()
+                for line in [
+                    '#!/bin/bash',
+                    'export CANINE_ROOT="{}"'.format(self.env['CANINE_ROOT']),
+                    'export CANINE_COMMON="{}"'.format(self.env['CANINE_COMMON']),
+                    'export CANINE_OUTPUT="{}"'.format(self.env['CANINE_OUTPUT']),
+                    'export CANINE_JOBS="{}"'.format(self.env['CANINE_JOBS']),
+                    'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
+                    'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(self.env['CANINE_JOBS'], jobId, 'inputs')),
+                    'export CANINE_JOB_ROOT="{}"'.format(os.path.join(self.env['CANINE_JOBS'], jobId, 'workspace')),
+                    'export CANINE_JOB_SETUP="{}"'.format(os.path.join(self.env['CANINE_JOBS'], jobId, 'setup.sh')),
+                    'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(self.env['CANINE_JOBS'], jobId, 'teardown.sh')),
+                ] + exports + extra_tasks
+            ) + '\ncd $CANINE_JOB_ROOT\n' + setup_text
+            with transport.open(script_path, 'w') as w:
+                w.write(script)
+            transport.chmod(script_path, 0o775)
+            self.env = {**self.__env}
+            return script_path
 
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output', jobId: typing.Optional[str] = None, transport: typing.Optional[AbstractTransport] = None, delete: bool = True) -> typing.Dict[str, typing.Dict[str, str]]:
         """

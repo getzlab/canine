@@ -1,1 +1,1 @@
-from .base import AbstractAdapter
+from .base import AbstractAdapter, ManualAdapter

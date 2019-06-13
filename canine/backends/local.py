@@ -60,7 +60,7 @@ class LocalTransport(AbstractTransport):
         """
         Returns a normalized path relative to the transport
         """
-        return os.path.normpath(path)
+        return os.path.abspath(os.path.normpath(path))
 
     def remove(self, path: str):
         """
