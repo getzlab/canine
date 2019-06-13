@@ -170,7 +170,7 @@ class Localizer(object):
                 for arg, value in data.items():
                     mode = overrides[arg] if arg in overrides else False
                     if mode is not False:
-                        if mode is 'stream':
+                        if mode == 'stream':
                             self.inputs[jobId][arg] = Localization('stream', value)
                         elif mode == 'localize':
                             self.inputs[jobId][arg] = Localization(
@@ -273,6 +273,8 @@ class Localizer(object):
                 'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
             ]
             for key, val in self.inputs[jobId].items():
+                import pdb; pdb.set_trace()
+
                 if val.type == 'stream':
                     job_vars.append(shlex.quote(key))
                     dest = shlex.quote(self.localize_file(transport, jobId, key, val.path, True))

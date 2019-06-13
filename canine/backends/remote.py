@@ -10,6 +10,21 @@ from agutil import StdOutAdapter
 import pandas as pd
 import paramiko
 
+class IgnoreKeyPolicy(paramiko.client.AutoAddPolicy):
+    """
+    Slight modification of paramiko.client.AutoAddPolicy
+    Doesn't save the new key to the file, but accepts it anyways
+    """
+
+    def missing_host_key(self, client, hostname, key):
+        client._host_keys.add(hostname, key.get_name(), key)
+        client._log(
+            10,
+            "Adding {} host key for {}: {}".format(
+                key.get_name(), hostname, hexlify(key.get_fingerprint())
+            ),
+        )
+
 class RemoteTransport(AbstractTransport):
     """
     Transport for working with remote files over ssh
@@ -170,7 +185,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
                 host_keys[self.hostname] = host_keys[config['hostkeyalias']]
             else:
                 warnings.warn("Requested HostKeyAlias not found. Switching to auto-add policy", stacklevel=2)
-                self.client.set_missing_host_key_policy(paramiko.client.AutoAddPolicy)
+                self.client.set_missing_host_key_policy(IgnoreKeyPolicy)
 
 
     def _invoke(self, command: str) -> typing.Tuple[paramiko.ChannelFile, paramiko.ChannelFile, paramiko.ChannelFile]:
