@@ -40,6 +40,8 @@ inputs: # Inputs to the script
   varname: # {--input varname:value1 --input varname:value2}
     - value1
     - value2
+resources: # slurm resources
+  varname: value {--resources varname:value}
 adapter: # Job input adapter configuration
   type: [One of: Manual (default), Firecloud] The adapter to map inputs into actual job inputs {--adapter type:value}
   # Other Keyword arguments to provide to adapter

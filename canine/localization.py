@@ -65,11 +65,21 @@ class Localizer(object):
         with self.backend.transport() as transport:
             self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
+
+        # Paths relative to staging dir on controller
         self.env = {
             'CANINE_ROOT': self.staging_dir,
             'CANINE_COMMON': os.path.join(self.staging_dir, 'common'),
             'CANINE_OUTPUT': os.path.join(self.staging_dir, 'outputs'), #outputs/jobid/outputname/...files...
             'CANINE_JOBS': os.path.join(self.staging_dir, 'jobs'),
+        }
+
+        # Paths relative to mount dir on worker
+        self.environment =  {
+            'CANINE_ROOT': self.mount_path,
+            'CANINE_COMMON': os.path.join(self.mount_path, 'common'),
+            'CANINE_OUTPUT': os.path.join(self.mount_path, 'outputs'),
+            'CANINE_JOBS': os.path.join(self.mount_path, 'jobs'),
         }
 
     def __enter__(self):
@@ -92,7 +102,9 @@ class Localizer(object):
         Assumes outputs have already been delocalized.
         Removes the staging directory
         """
-        self.backend.invoke('rm -rf {}'.format(self.env['CANINE_ROOT']))
+        if len([arg for arg in args if arg is not None]) == 0:
+            # Only clean if we are exiting the context cleanly
+            self.backend.invoke('rm -rf {}'.format(self.env['CANINE_ROOT']))
 
     def get_requester_pays(self, path: str) -> bool:
         """
@@ -120,12 +132,13 @@ class Localizer(object):
         """
         if overrides is None:
             overrides = {}
+        overrides = {k:v.lower() if isinstance(v, str) else None for k,v in overrides.items()}
         with self.backend.transport() as transport:
             if self.common:
                 seen = set()
                 for jobId, values in inputs.items():
                     for arg, path in values.items():
-                        if path in seen:
+                        if path in seen and (arg not in overrides or overrides[arg] == 'common'):
                             self.common_inputs.add(path)
                         if arg in overrides and overrides[arg] == 'common':
                             self.common_inputs.add(path)
@@ -133,19 +146,19 @@ class Localizer(object):
             common_dests = {}
             for path in self.common_inputs:
                 if path.startswith('gs://') and self.localize_gs:
-                    common_dests[path] = os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
+                    common_dests[path] = os.path.join(self.environment['CANINE_COMMON'], os.path.basename(path))
                     command = "gsutil {} cp {} {}".format(
                         '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(path) else '',
                         path,
-                        common_dests[path]
+                        os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
                     )
                     rc, sout, serr = self.backend.invoke(command)
                     check_call(command, rc, sout, serr)
                 elif os.path.isfile(path):
-                    common_dests[path] = os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
+                    common_dests[path] = os.path.join(self.environment['CANINE_COMMON'], os.path.basename(path))
                     transport.send(
                         path,
-                        common_dests[path]
+                        os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
                     )
                 else:
                     print("Could not handle common file", path, file=sys.stderr)
@@ -185,7 +198,11 @@ class Localizer(object):
                     else:
                         self.inputs[jobId][arg] = Localization(
                             None,
-                            self.localize_file(transport, jobId, arg, value)
+                            (
+                                self.localize_file(transport, jobId, arg, value)
+                                if os.path.isfile(value) or value.startswith('gs://')
+                                else value
+                            )
                         )
 
     def localize_file(self, transport: AbstractTransport, jobId: str, name: str, value: str, delayed: bool = False) -> str:
@@ -196,6 +213,7 @@ class Localizer(object):
         for files which are set to localize for each job
         If delayed is True, only a path will be produced, but no localization will occur
         """
+        # Relative to master node
         filepath = os.path.join(
             self.env['CANINE_JOBS'],
             str(jobId),
@@ -219,7 +237,13 @@ class Localizer(object):
                     value,
                     filepath
                 )
-        return filepath
+        # Relative to compute node
+        return os.path.join(
+            self.environment['CANINE_JOBS'],
+            str(jobId),
+            'inputs',
+            os.path.basename(value)
+        )
 
     # def startup_hook(self, jobId: str) -> typing.Optional[str]:
     #     """
@@ -232,34 +256,21 @@ class Localizer(object):
     #     """
     #     raise NotImplementedError("TODO")
 
-    # def environment(self, jobId: str) -> dict:
-    #     """
-    #     Produces a full dictionary of all environment variables for this job, which relate to the localizer
-    #     Orchestrator adds additional vars
-    #     """
-    #     raise NotImplementedError("TODO")
-
     def localize_job(self, jobId: str, setup_text: typing.Optional[str] = None, transport: typing.Optional[AbstractTransport] = None) -> str:
         """
         Does final localization of job script.
         Used when finally prepping a job for dispatch
         returns the path to the first script in the job's pipeline
         """
-        self.__env = {**self.env}
-        self.env = {
-            'CANINE_ROOT': self.mount_path,
-            'CANINE_COMMON': os.path.join(self.mount_path, 'common'),
-            'CANINE_OUTPUT': os.path.join(self.mount_path, 'outputs'), #outputs/jobid/outputname/...files...
-            'CANINE_JOBS': os.path.join(self.mount_path, 'jobs'),
-        }
-
+        if setup_text is None:
+            setup_text = ''
         with ExitStack() as stack:
             if transport is None:
                 transport = stack.enter_context(self.backend.transport())
             job_vars = []
             exports = []
             extra_tasks = [
-                'cd $CANINE_JOB_INPUTS'
+                'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
             ]
             for key, val in self.inputs[jobId].items():
                 if val.type == 'stream':
@@ -304,22 +315,17 @@ class Localizer(object):
                 line.rstrip()
                 for line in [
                     '#!/bin/bash',
-                    'export CANINE_ROOT="{}"'.format(self.env['CANINE_ROOT']),
-                    'export CANINE_COMMON="{}"'.format(self.env['CANINE_COMMON']),
-                    'export CANINE_OUTPUT="{}"'.format(self.env['CANINE_OUTPUT']),
-                    'export CANINE_JOBS="{}"'.format(self.env['CANINE_JOBS']),
                     'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
-                    'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(self.env['CANINE_JOBS'], jobId, 'inputs')),
-                    'export CANINE_JOB_ROOT="{}"'.format(os.path.join(self.env['CANINE_JOBS'], jobId, 'workspace')),
-                    'export CANINE_JOB_SETUP="{}"'.format(os.path.join(self.env['CANINE_JOBS'], jobId, 'setup.sh')),
-                    'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(self.env['CANINE_JOBS'], jobId, 'teardown.sh')),
+                    'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(self.environment['CANINE_JOBS'], jobId, 'inputs')),
+                    'export CANINE_JOB_ROOT="{}"'.format(os.path.join(self.environment['CANINE_JOBS'], jobId, 'workspace')),
+                    'export CANINE_JOB_SETUP="{}"'.format(os.path.join(self.environment['CANINE_JOBS'], jobId, 'setup.sh')),
+                    'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(self.environment['CANINE_JOBS'], jobId, 'teardown.sh')),
                 ] + exports + extra_tasks
             ) + '\ncd $CANINE_JOB_ROOT\n' + setup_text
             with transport.open(script_path, 'w') as w:
                 w.write(script)
             transport.chmod(script_path, 0o775)
-            self.env = {**self.__env}
-            return script_path
+            return  os.path.join(self.environment['CANINE_JOBS'], jobId, 'setup.sh')
 
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output', jobId: typing.Optional[str] = None, transport: typing.Optional[AbstractTransport] = None, delete: bool = True) -> typing.Dict[str, typing.Dict[str, str]]:
         """

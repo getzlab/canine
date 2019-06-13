@@ -1,0 +1,27 @@
+name: RNA-SeQC
+script:
+  - sudo docker run --rm -v $CANINE_ROOT:$CANINE_ROOT $CANINE_JOB_ROOT:/output gcr.io/broad-cga-aarong-gtex/rnaseqc rnaseqc $genes_gtf $bam_file output --coverage -vv
+  - tar -czf output.tar.gz *.bam
+resources:
+  cpus-per-task: 1
+inputs:
+  genes_gtf: gs://cga-aarong-resources/references/gencode.v19.genes.v7.patched_contigs.gtf
+  bam_file:
+    - gs://cga-aarong-resources/test_data/canine/rnaseqc/chr1.bam
+    - gs://cga-aarong-resources/test_data/canine/rnaseqc/downsampled.bam
+    - gs://cga-aarong-resources/test_data/canine/rnaseqc/single_pair.bam
+adapter:
+  type: Manual
+backend:
+  type: TransientGCP
+  name: slurm-canine-example
+  controller_type: n1-standard-2
+  worker_type: n1-standard-1
+  controller_disk_size: 50
+localization:
+  overrides:
+    bam_file: Stream
+outputs:
+  stdout: stdout
+  stderr: stderr
+  rnaseqc-results: output.tar.gz

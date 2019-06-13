@@ -5,7 +5,7 @@ import sys
 import subprocess
 import warnings
 from .base import AbstractSlurmBackend, AbstractTransport
-from ..utils import ArgumentHelper, interactive
+from ..utils import ArgumentHelper, interactive, check_call
 from agutil import StdOutAdapter
 import pandas as pd
 import paramiko

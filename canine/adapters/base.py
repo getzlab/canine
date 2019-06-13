@@ -58,6 +58,7 @@ class ManualAdapter(AbstractAdapter):
         keys = sorted(inputs)
         input_lengths = {
             key: len(val) if isinstance(val, list) else 1
+            for key, val in inputs.items()
         }
         if self.product:
             self._job_length = reduce(lambda x,y: x*y, input_lengths.values(), 1)
@@ -74,10 +75,10 @@ class ManualAdapter(AbstractAdapter):
                         raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
                 elif 1 != l != self._job_length:
                     raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
-            generator = zip(
+            generator = zip(*[
                 inputs[key] if isinstance(inputs[key], list) else repeat(inputs[key])
                 for key in keys
-            )
+            ])
         self.__spec = {
             str(i): {
                 key: str(val)

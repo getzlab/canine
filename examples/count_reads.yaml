@@ -1,0 +1,45 @@
+name: Count Reads
+script:
+  - ln -s $bam bam
+  - ~/samtools index -@ $SLURM_CPUS_PER_TASK bam
+  - ~/samtools view -@ $SLURM_CPUS_PER_TASK bam $chrom -c > $chrom.counts.txt
+resources:
+  cpus-per-task: 1
+inputs:
+  bam: gs://cga-aarong-resources/test_data/canine.bam
+  chrom:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+    - 6
+    - 7
+    - 8
+    - 9
+    - 10
+    - 11
+    - 12
+    - 13
+    - 14
+    - 15
+    - 16
+    - 17
+    - 18
+    - 19
+    - 20
+    - 21
+    - X
+    - Y
+adapter:
+  type: Manual
+backend:
+  type: TransientGCP
+  name: slurm-canine-example
+  controller_type: n1-standard-2
+  worker_type: n1-standard-1
+  controller_disk_size: 50
+outputs:
+  stdout: stdout
+  stderr: stderr
+  counts: "*.counts.txt"

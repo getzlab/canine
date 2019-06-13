@@ -3,6 +3,7 @@ import typing
 import re
 import shutil
 import os
+import time
 import stat
 from contextlib import ExitStack
 from uuid import uuid4 as uuid
@@ -176,7 +177,7 @@ class AbstractTransport(abc.ABC):
         """
         Recursively build the requested directory structure
         """
-        if self.isdir(path):
+        if path == '' or self.isdir(path):
             return
         dirname = os.path.dirname(path)
         if not (dirname == '' or os.path.exists(dirname)):
@@ -346,18 +347,21 @@ class AbstractSlurmBackend(abc.ABC):
         """
         pass
 
-    def pack_batch_script(self, *commands: str):
+    def pack_batch_script(self, *commands: str, script_path: str = None):
         """
         writes the list of commands to a file and runs it
+        Script_path may be the path to where the script should be written or None
         """
-        name = str(uuid())+'.sh'
+        if script_path is None:
+            script_path = str(uuid())+'.sh'
         with self.transport() as transport:
-            with transport.open(name, 'w') as w:
+            transport.makedirs(os.path.dirname(script_path))
+            with transport.open(script_path, 'w') as w:
                 w.write('#!/bin/bash\n')
                 for command in commands:
                     w.write(command.rstrip()+'\n')
-            transport.chmod(name, 0o775)
-        return name
+            transport.chmod(script_path, 0o775)
+        return script_path
 
     def wait_for_cluster_ready(self):
         """
@@ -369,9 +373,6 @@ class AbstractSlurmBackend(abc.ABC):
             time.sleep(10)
             df = self.sinfo()
             default = [value for value in df.index if value.endswith('*')]
-        if len(default) != 1:
-            raise ValueError("Could not determine default partition from {}".format(df.index))
-        default = default[0]
-        while df.AVAIL[default] != 'up':
+        while (df.AVAIL[default] != 'up').all():
             time.sleep(10)
             df = self.sinfo()

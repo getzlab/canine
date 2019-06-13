@@ -1,0 +1,24 @@
+name: Canine Example
+script:
+  - hostname
+  - date
+  - echo Hello, World!
+inputs:
+  jobIndex:
+    - 1
+    - 2
+    - 3
+    - 4
+    - 5
+adapter:
+  type: Manual
+  product: false
+backend:
+  type: TransientGCP
+  name: slurm-canine-example
+  controller_type: n1-standard-2
+  worker_type: n1-standard-1
+  controller_disk_size: 50
+outputs:
+  stdout: stdout
+  stderr: stderr

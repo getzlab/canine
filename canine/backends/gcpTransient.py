@@ -7,11 +7,13 @@ import shutil
 import os
 import sys
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_project, ArgumentHelper
+from ..utils import get_default_gcp_project, ArgumentHelper, check_call
 import yaml
 import pandas as pd
 
 SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
+
+# FIXME: allow custom startup and controller scripty bois
 
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
