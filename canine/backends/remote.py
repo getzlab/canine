@@ -4,6 +4,7 @@ import io
 import sys
 import subprocess
 import warnings
+import binascii
 from .base import AbstractSlurmBackend, AbstractTransport
 from ..utils import ArgumentHelper, interactive, check_call
 from agutil import StdOutAdapter
@@ -21,7 +22,7 @@ class IgnoreKeyPolicy(paramiko.client.AutoAddPolicy):
         client._log(
             10,
             "Adding {} host key for {}: {}".format(
-                key.get_name(), hostname, hexlify(key.get_fingerprint())
+                key.get_name(), hostname, binascii.hexlify(key.get_fingerprint())
             ),
         )
 

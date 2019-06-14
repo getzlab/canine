@@ -182,7 +182,7 @@ class Orchestrator(object):
                     time.sleep(30)
                     acct = self.backend.sacct()
                     for jid in [*waiting_jobs]:
-                        if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING'}:
+                        if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                             job = jid.split('_')[1]
                             print("Delocalizing task",job, "with status", acct['State'][jid])
                             outputs.update(localizer.delocalize(self.raw_outputs, jobId=job))

@@ -273,8 +273,6 @@ class Localizer(object):
                 'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
             ]
             for key, val in self.inputs[jobId].items():
-                import pdb; pdb.set_trace()
-
                 if val.type == 'stream':
                     job_vars.append(shlex.quote(key))
                     dest = shlex.quote(self.localize_file(transport, jobId, key, val.path, True))

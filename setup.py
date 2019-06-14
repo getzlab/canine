@@ -1,9 +1,13 @@
 from setuptools import setup
-from canine import __version__
+import re
+import os
+
+with open(os.path.join(os.path.dirname(__file__), 'canine', 'orchestrator.py')) as r:
+    version = re.search(r'version = \'(\d+\.\d+\.\d+[-_a-zA-Z0-9]*)\'', r.read()).group(1)
 
 setup(
     name = 'canine',
-    version = __version__,
+    version = version,
     packages = [
         'canine',
         'canine.backends',

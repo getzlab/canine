@@ -148,6 +148,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         while rc != 0:
             time.sleep(10)
             rc, sout, serr = self.invoke("which sinfo")
+        time.sleep(60)
         print("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
         return self
 
