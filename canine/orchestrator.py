@@ -1,6 +1,7 @@
 import typing
 import os
 import time
+import sys
 import warnings
 from .adapters import AbstractAdapter, ManualAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend
@@ -137,6 +138,8 @@ class Orchestrator(object):
                     job_spec,
                     self.localizer_overrides
                 )
+                print("Requester pays:", localizer.requester_pays)
+                input()
                 print("Preparing pipeline script")
                 env = localizer.environment
                 root_dir = localizer.mount_path
@@ -167,42 +170,32 @@ class Orchestrator(object):
                 print("Submitting batch job")
                 batch_id = self.backend.sbatch(
                     entrypoint_path,
+                    'requeue',
                     array="0-{}".format(len(job_spec)-1),
                     output="{}/%a/workspace/stdout".format(env['CANINE_JOBS']),
                     error="{}/%a/workspace/stderr".format(env['CANINE_JOBS']),
                     **self.resources
                 )
                 print("Batch id:", batch_id)
-                waiting_jobs = {
-                    '{}_{}'.format(batch_id, i)
-                    for i in range(len(job_spec))
-                }
-                outputs = {}
-                while len(waiting_jobs):
-                    time.sleep(30)
-                    acct = self.backend.sacct()
-                    for jid in [*waiting_jobs]:
-                        if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
-                            job = jid.split('_')[1]
-                            print("Delocalizing task",job, "with status", acct['State'][jid])
-                            outputs.update(localizer.delocalize(self.raw_outputs, jobId=job))
-                            waiting_jobs.remove(jid)
+                try:
+                    waiting_jobs = {
+                        '{}_{}'.format(batch_id, i)
+                        for i in range(len(job_spec))
+                    }
+                    outputs = {}
+                    while len(waiting_jobs):
+                        time.sleep(30)
+                        acct = self.backend.sacct()
+                        for jid in [*waiting_jobs]:
+                            if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
+                                job = jid.split('_')[1]
+                                print("Delocalizing task",job, "with status", acct['State'][jid])
+                                outputs.update(localizer.delocalize(self.raw_outputs, jobId=job))
+                                waiting_jobs.remove(jid)
+                except:
+                    print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
+                    self.backend.scancel(batch_id)
+                    raise
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
             return batch_id, job_spec, self.backend.sacct()
-
-
-
-# Pipeline will look something like this
-# config = parse_config()
-# with SlurmBackend(**args) as backend:
-#     with Localizer(backend, **args) as localizer:
-#         localizer.localize(config.inputs(), config.overrides())
-#         for job in config.jobs():
-#             job.startup_script = CanineCoreStartup(job.id) + localizer.startup_hook(job.id)
-#             job.main_script = wrap_script(config.script(), localizer.environment(job.id))
-#         backend.sbatch(wrapped_script(), task_array=config.jobs(), **args)
-#         for job in config.jobs():
-#             wait_for_job_complete(backend, job)
-#         outputs = localizer.delocalize()
-#     adapter.handle_outputs(outputs)

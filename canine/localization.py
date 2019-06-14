@@ -4,6 +4,7 @@ import warnings
 import typing
 import fnmatch
 import shlex
+from subprocess import CalledProcessError
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack
@@ -111,15 +112,15 @@ class Localizer(object):
         Returns True if the requested gs:// object or bucket resides in a
         requester pays bucket
         """
+        # FIXME: this sucks
         if path.startswith('gs://'):
             path = path[5:]
         bucket = path.split('/')[0]
         if bucket not in self.requester_pays:
-            command = 'gsutil -u {} ls -Lb gs://{}'.format(get_default_gcp_project(), bucket)
+            command = 'gsutil ls gs://{}'.format(path)
             try:
                 rc, sout, serr = self.backend.invoke(command)
-                check_call(command, rc, sout, serr)
-                self.requester_pays[bucket] = len([line for line in sout.readlines() if b'Requester Pays enabled:' in line and b'True' in line]) >= 1
+                self.requester_pays[bucket] = len([line for line in serr.readlines() if b'requester pays bucket but no user project provided' in line]) >= 1
             except CalledProcessError:
                 pass
         return bucket in self.requester_pays and self.requester_pays[bucket]
@@ -187,7 +188,8 @@ class Localizer(object):
                             else:
                                 self.inputs[jobId][arg] = Localization(
                                     'download',
-                                    self.localize_file(transport, jobId, arg, value, True)
+                                    #self.localize_file(transport, jobId, arg, value, True)
+                                    value
                                 )
                         elif mode is None:
                             self.inputs[jobId][arg] = Localization(None, value)
