@@ -19,12 +19,6 @@ class IgnoreKeyPolicy(paramiko.client.AutoAddPolicy):
 
     def missing_host_key(self, client, hostname, key):
         client._host_keys.add(hostname, key.get_name(), key)
-        client._log(
-            10,
-            "Adding {} host key for {}: {}".format(
-                key.get_name(), hostname, binascii.hexlify(key.get_fingerprint())
-            ),
-        )
 
 class RemoteTransport(AbstractTransport):
     """

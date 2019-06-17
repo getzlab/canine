@@ -76,7 +76,7 @@ class ManualAdapter(AbstractAdapter):
                 elif 1 != l != self._job_length:
                     raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
             generator = zip(*[
-                inputs[key] if isinstance(inputs[key], list) else repeat(inputs[key])
+                inputs[key] if isinstance(inputs[key], list) else repeat(inputs[key], self._job_length)
                 for key in keys
             ])
         self.__spec = {

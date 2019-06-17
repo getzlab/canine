@@ -41,6 +41,4 @@ backend:
   worker_type: n1-standard-1
   controller_disk_size: 50
 outputs:
-  stdout: stdout
-  stderr: stderr
   counts: "*.counts.txt"

@@ -19,6 +19,3 @@ backend:
   controller_type: n1-standard-2
   worker_type: n1-standard-1
   controller_disk_size: 50
-outputs:
-  stdout: stdout
-  stderr: stderr

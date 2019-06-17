@@ -2,6 +2,7 @@
 For argument parsing and CLI interface
 """
 import argparse
+import sys
 from . import Orchestrator
 import yaml
 
@@ -191,6 +192,8 @@ def main():
             }
     if args.export is not None:
         yaml.dump(conf, args.export)
+    if not len(conf):
+        sys.exit("Empty pipeline config")
     Orchestrator(conf).run_pipeline(args.dry_run)
 
 if __name__ == '__main__':

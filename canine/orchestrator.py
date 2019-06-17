@@ -91,8 +91,9 @@ class Orchestrator(object):
         if 'script' not in config:
             raise KeyError("Config missing required key 'script'")
         self.script = config['script']
-        if isinstance(self.script, str) and not os.path.isfile(self.script):
-            raise FileNotFoundError(self.script)
+        if isinstance(self.script, str):
+            if not os.path.isfile(self.script):
+                raise FileNotFoundError(self.script)
         elif not isinstance(self.script, list):
             raise TypeError("script must be a path to a bash script or a list of bash commands")
         self.raw_inputs = Orchestrator.stringify(config['inputs']) if 'inputs' in config else {}
@@ -110,11 +111,15 @@ class Orchestrator(object):
         self.localizer_args = config['localization'] if 'localization' in config else {}
         self.localizer_overrides = {}
         if 'overrides' in self.localizer_args:
-            self.localizer_overrides = {**self.localizer_args['overrides'], **{'stdout': 'stdout', 'stderr': 'stderr'}}
+            self.localizer_overrides = {**self.localizer_args['overrides']}
             del self.localizer_args['overrides']
         self.raw_outputs = Orchestrator.stringify(config['outputs']) if 'outputs' in config else {}
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
+        if 'stdout' not in self.raw_outputs:
+            self.raw_outputs['stdout'] = 'stdout'
+        if 'stderr' not in self.raw_outputs:
+            self.raw_outputs['stderr'] = 'stderr'
 
     def run_pipeline(self, dry_run: bool = False) -> typing.Tuple[str, dict, dict, pd.DataFrame]:
         """
