@@ -351,7 +351,10 @@ class Localizer(object):
                         for filename in filenames:
                             fullname = os.path.join(dirpath, filename)
                             if fnmatch.fnmatch(fullname, pattern) or fnmatch.fnmatch(os.path.relpath(fullname, start_dir), pattern):
-                                output_files[name] = self.delocalize_file(transport, jobId, name, fullname, output_dir)
+                                if name not in output_files:
+                                    output_files[name] = [self.delocalize_file(transport, jobId, name, fullname, output_dir)]
+                                else:
+                                    output_files[name].append(self.delocalize_file(transport, jobId, name, fullname, output_dir))
                                 if delete:
                                     if transport.isfile(fullname):
                                         transport.remove(fullname)

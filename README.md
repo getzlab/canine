@@ -31,6 +31,7 @@ provided inputs. API usage documented at the bottom of this section
 ### Configuration
 
 Canine uses a YAML file to specify the job configuration.
+See `pipeline_options.md` for a detailed description of pipeline configuration
 
 ```yaml
 name: (str, optional) The name for this job {--name}
@@ -52,7 +53,7 @@ adapter: # Job input adapter configuration
   entityType: [One of: sample, pair, participant, *_set] The entity type to use {--adapter entityType:type}
   entityName: (str) The entity to use {--adapter entityName:name}
   entityExpression: (str, optional) The expression to map the input entity to multiple sub-entities {--adapter entityExpression:expr}
-  write-to-workspace: (bool, default True) If outputs should be written back to the workspace {--adapter write-to-workspace:value}
+  write_to_workspace: (bool, default True) If outputs should be written back to the workspace {--adapter write-to-workspace:value}
 backend: # SLURM backend configuration
   type: [One of: Local (default), Remote, TransientGCP] The backend to use when interfacing with SLURM {--backend type:value}
   # Other keyword arguments to provide to the backend for initialization
@@ -60,8 +61,8 @@ backend: # SLURM backend configuration
 localization: # Localization options
   localizeGS: (bool, default True) Enables automatic localization of string inputs which start with "gs://" {--localization localizeGS:value}
   common: (bool, default True) Files (gs:// or otherwise) which are shared by multiple tasks will be downloaded only once {--localization common:value}
-  staging-dir: (str, default tempdir) Directory in which files for this job should be staged. For Remote backends, this should be set within the NFS share. If no NFS share exists, set this to "SBCAST" {--localization staging-dir:path}
-  mount-path: (str, default null) Path within compute nodes where the staging dir can be found {--localization mount-path:path}
+  staging_dir: (str, default tempdir) Directory in which files for this job should be staged. For Remote backends, this should be set within the NFS share. If no NFS share exists, set this to "SBCAST" {--localization staging-dir:path}
+  mount_path: (str, default null) Path within compute nodes where the staging dir can be found {--localization mount-path:path}
   overrides: # Override localization handling for specific inputs
     varname: [One of: Stream, Localize, Common, Delayed, null] Localization handling {--localization overrides:varname:mode}
     # Stream: The input variable will be streamed to a FIFO pipe which is passed to the job

@@ -1,18 +1,11 @@
 import typing
+import json
+import os
+import warnings
+import pandas as pd
+import numpy as np
 from .base import AbstractAdapter
 import dalmatian
-#
-# adapter: # Job input adapter configuration
-#   type: [One of: Manual (default), Firecloud] The adapter to map inputs into actual job inputs {--adapter type:value}
-#   # Other Keyword arguments to provide to adapter
-#   # Manual Args:
-#   product: (bool, default false) Whether adapter should take the product of all inputs rather than iterating {--adapter product:value}
-#   # FireCloud Args:
-#   workspace: (namespace)/(workspace) {--adapter workspace:ws/ns}
-#   entityType: [One of: sample, pair, participant, *_set] The entity type to use {--adapter entityType:type}
-#   entityName: (str) The entity to use {--adapter entityName:name}
-#   entityExpression: (str, optional) The expression to map the input entity to multiple sub-entities {--adapter entityExpression:expr}
-#   write-to-workspace: (bool, default True) If outputs should be written back to the workspace {--adapter write-to-workspace:value}
 
 class FirecloudAdapter(AbstractAdapter):
     """
@@ -20,7 +13,7 @@ class FirecloudAdapter(AbstractAdapter):
     Parses inputs as firecloud expression bois
     if enabled, job outputs will be written back to workspace
     """
-    def __init__(self, workspace: str, entityType: str, entityName: str, entityExpression: typing.Optional[str] = None):
+    def __init__(self, workspace: str, entityType: str, entityName: str, entityExpression: typing.Optional[str] = None, write_to_workspace: bool = True):
         """
         Initializes the adapter
         Must provide workspace and entity information
@@ -39,6 +32,9 @@ class FirecloudAdapter(AbstractAdapter):
                 entityName,
                 workspace
             ))
+        self._entityType = entityType
+        self._entityName = entityName
+        self._entityExpression = entityExpression
         self.evaluator = dalmatian.Evaluator(ws.entity_types)
         for etype in ws.entity_types:
             self.evaluator.add_entities(etype, self.workspace._get_entities_internal(etype))
@@ -49,6 +45,31 @@ class FirecloudAdapter(AbstractAdapter):
         else:
             self.entities = [entityName]
             self.etype = entityType
+        self.write_to_workspace = write_to_workspace
+        self.__spec = None
+        print("initialized fc adapter in workspace", self.workspace)
+        print(len(self.entities), "of type", self.etype)
+
+    def evaluate(self, etype: str, entity: str, expr: str) -> str:
+        """
+        Evaluates and unpacks the results of a firecloud expression to a single value
+        Raises appropriate exceptions otherwise
+        """
+        results = [
+            item for item in self.evaluator(etype, entity, expr)
+            if isinstance(item, str) or not np.isnan(item)
+        ]
+
+        if len(results) == 1:
+            return results[0]
+        elif len(results) == 0:
+            return None
+        else:
+            raise ValueError("Expression '{}' on {} {} returned more than one result".format(
+                expr,
+                etype,
+                entity
+            ))
 
     def parse_inputs(self, inputs: typing.Dict[str, typing.Union[typing.Any, typing.List[typing.Any]]]) -> typing.Dict[str, typing.Dict[str, str]]:
         """
@@ -61,18 +82,72 @@ class FirecloudAdapter(AbstractAdapter):
         #   gs:// -> raw
         #   else: warn, but assume raw
         # if array input: fail (can't map array expr to entity expr)
+        self.__spec = {str(i):{} for i in range(len(self.entities))}
+        for name, expr in inputs.items():
+            if isinstance(expr, list):
+                raise TypeError("Firecloud adapter cannot handle array-type inputs")
+            elif expr.startswith('this.') or expr.startswith('workspace.'):
+                for i, entity in enumerate(self.entities):
+                    self.__spec[i][name] = self.evaluate(self.etype, entity, expr)
+            else:
+                if isinstance(expr, str) and not expr.startswith('gs://'):
+                    warnings.warn("Assuming expression is not a Firecloud expression", stacklevel=2)
+                for i, entity in enumerate(self.entities):
+                    self.__spec[i][name] = expr
+        print("parsed", self.__spec['0'])
+        self.workspace.hound.write_log_entry(
+            'job',
+            'Canine launching new job with input configuration: {}; Results will{} be written back to workspace'.format(
+                json.dumps({
+                    entity:cfg for entity, (i, cfg) in zip(self.entities, self.__spec)
+                }),
+                '' if self.write_to_workspace else ' not'
+            ),
+            entities=[
+                '{}/{}'.format(self.etype, entity)
+                for entity in self.entities
+            ]
+        )
 
     def parse_outputs(self, outputs: typing.Dict[str, typing.Dict[str, typing.List[str]]]):
         """
         Takes a dictionary of job outputs
         {jobId: {outputName: [output paths]}}
-        And handles the post-processing
+        If write_to_workspace is enabled, output files will be written back to firecloud
         """
-        pass
+        if self.write_to_workspace:
+            with self.workspace.hound.with_reason('Uploading results from Canine job'):
+                outputDf = pd.DataFrame.from_dict(
+                    {
+                        jobId: {
+                            outputName: [outputFile for outputFile in outputFiles if os.path.exists(outputFile)]
+                            for outputName, outputFiles in jobOutput.items()
+                        }
+                        for jobId, jobOutput in outputs.items()
+                    },
+                    orient='index'
+                ).set_index(
+                    pd.index(
+                        [self.entities[int(i)] for i in outputs],
+                        name='{}_id'.format(self.etype)
+                    )
+                ).applymap(
+                    lambda cell: cell if (not isinstance(cell, list)) or len(cell) > 1 else (
+                        cell[0] if len(cell) == 1 else np.nan
+                    )
+                )
+                self.workspace.sync()
+                self.workspace.update_entity_attributes(
+                    self.etype,
+                    outputDf
+                )
 
     @property
     def spec(self) -> typing.Dict[str, typing.Dict[str, str]]:
         """
         The most recent job specification
         """
-        pass
+        return {
+            jobId: {**spec}
+            for jobId, spec in self.__spec.items()
+        }

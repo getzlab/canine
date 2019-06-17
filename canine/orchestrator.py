@@ -3,7 +3,7 @@ import os
 import time
 import sys
 import warnings
-from .adapters import AbstractAdapter, ManualAdapter
+from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend
 from .localization import Localizer
 import yaml
@@ -11,7 +11,8 @@ import pandas as pd
 version = '0.0.1'
 
 ADAPTERS = {
-    'Manual': ManualAdapter
+    'Manual': ManualAdapter,
+    'Firecloud': FirecloudAdapter
 }
 
 BACKENDS = {
@@ -109,13 +110,13 @@ class Orchestrator(object):
         self.localizer_args = config['localization'] if 'localization' in config else {}
         self.localizer_overrides = {}
         if 'overrides' in self.localizer_args:
-            self.localizer_overrides = {**self.localizer_args['overrides']}
+            self.localizer_overrides = {**self.localizer_args['overrides'], **{'stdout': 'stdout', 'stderr': 'stderr'}}
             del self.localizer_args['overrides']
         self.raw_outputs = Orchestrator.stringify(config['outputs']) if 'outputs' in config else {}
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
 
-    def run_pipeline(self) -> typing.Tuple[str, dict, pd.DataFrame]:
+    def run_pipeline(self) -> typing.Tuple[str, dict, dict, pd.DataFrame]:
         """
         Runs the configured pipeline
         Returns a 4-tuple:
@@ -138,8 +139,6 @@ class Orchestrator(object):
                     job_spec,
                     self.localizer_overrides
                 )
-                print("Requester pays:", localizer.requester_pays)
-                input()
                 print("Preparing pipeline script")
                 env = localizer.environment
                 root_dir = localizer.mount_path
@@ -165,6 +164,8 @@ class Orchestrator(object):
                     print("Preparing job environments...")
                     for job in job_spec:
                         localizer.localize_job(job, transport=transport)
+                print("Requester pays:", localizer.requester_pays)
+                input()
                 print("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
                 print("Submitting batch job")
@@ -186,16 +187,28 @@ class Orchestrator(object):
                     while len(waiting_jobs):
                         time.sleep(30)
                         acct = self.backend.sacct()
+                        completed_jobs = []
                         for jid in [*waiting_jobs]:
                             if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                                 job = jid.split('_')[1]
                                 print("Delocalizing task",job, "with status", acct['State'][jid])
-                                outputs.update(localizer.delocalize(self.raw_outputs, jobId=job))
-                                waiting_jobs.remove(jid)
+                                # outputs.update(localizer.delocalize(self.raw_outputs, jobId=job))
+                                # waiting_jobs.remove(jid)
+                                completed_jobs.append((job, jid))
+                        if len(completed_jobs):
+                            with self.backend.transport() as transport:
+                                for job, jid in completed_jobs:
+                                    waiting_jobs.remove(jid)
+                                    outputs.update(localizer.delocalize(
+                                        self.raw_outputs,
+                                        jobId=job,
+                                        transport=transport
+                                    ))
+
                 except:
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
                     raise
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
-            return batch_id, job_spec, self.backend.sacct()
+            return batch_id, job_spec, outputs, self.backend.sacct()
