@@ -116,7 +116,7 @@ class Orchestrator(object):
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
 
-    def run_pipeline(self) -> typing.Tuple[str, dict, dict, pd.DataFrame]:
+    def run_pipeline(self, dry_run: bool = False) -> typing.Tuple[str, dict, dict, pd.DataFrame]:
         """
         Runs the configured pipeline
         Returns a 4-tuple:
@@ -164,8 +164,9 @@ class Orchestrator(object):
                     print("Preparing job environments...")
                     for job in job_spec:
                         localizer.localize_job(job, transport=transport)
-                print("Requester pays:", localizer.requester_pays)
-                input()
+                if dry_run:
+                    localizer.clean_on_exit = False
+                    return job_spec
                 print("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
                 print("Submitting batch job")

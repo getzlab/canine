@@ -19,6 +19,9 @@ setup(
             'backends/slurm-gcp/scripts/*'
         ],
     },
+    entry_points={
+        'console_scripts':['canine = canine.__main__:main']
+    },
     description = 'A dalmatian-based job manager to schedule tasks using SLURM',
     url = 'https://github.com/broadinstitute/canine',
     author = 'Aaron Graubert - Broad Institute - Cancer Genome Computational Analysis',

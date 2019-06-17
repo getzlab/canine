@@ -35,8 +35,8 @@ class FirecloudAdapter(AbstractAdapter):
         self._entityType = entityType
         self._entityName = entityName
         self._entityExpression = entityExpression
-        self.evaluator = dalmatian.Evaluator(ws.entity_types)
-        for etype in ws.entity_types:
+        self.evaluator = dalmatian.Evaluator(self.workspace.entity_types)
+        for etype in self.workspace.entity_types:
             self.evaluator.add_entities(etype, self.workspace._get_entities_internal(etype))
         self.evaluator.add_attributes(self.workspace.attributes)
         if entityExpression is not None:
@@ -88,18 +88,18 @@ class FirecloudAdapter(AbstractAdapter):
                 raise TypeError("Firecloud adapter cannot handle array-type inputs")
             elif expr.startswith('this.') or expr.startswith('workspace.'):
                 for i, entity in enumerate(self.entities):
-                    self.__spec[i][name] = self.evaluate(self.etype, entity, expr)
+                    self.__spec[str(i)][name] = self.evaluate(self.etype, entity, expr)
             else:
                 if isinstance(expr, str) and not expr.startswith('gs://'):
                     warnings.warn("Assuming expression is not a Firecloud expression", stacklevel=2)
                 for i, entity in enumerate(self.entities):
-                    self.__spec[i][name] = expr
-        print("parsed", self.__spec['0'])
+                    self.__spec[str(i)][name] = expr
+        print("parsed", len(self.spec), self.__spec['0'])
         self.workspace.hound.write_log_entry(
             'job',
             'Canine launching new job with input configuration: {}; Results will{} be written back to workspace'.format(
                 json.dumps({
-                    entity:cfg for entity, (i, cfg) in zip(self.entities, self.__spec)
+                    entity:cfg for entity, (i, cfg) in zip(self.entities, self.__spec.items())
                 }),
                 '' if self.write_to_workspace else ' not'
             ),
@@ -108,6 +108,7 @@ class FirecloudAdapter(AbstractAdapter):
                 for entity in self.entities
             ]
         )
+        return self.spec
 
     def parse_outputs(self, outputs: typing.Dict[str, typing.Dict[str, typing.List[str]]]):
         """
@@ -127,13 +128,13 @@ class FirecloudAdapter(AbstractAdapter):
                     },
                     orient='index'
                 ).set_index(
-                    pd.index(
+                    pd.Index(
                         [self.entities[int(i)] for i in outputs],
                         name='{}_id'.format(self.etype)
                     )
                 ).applymap(
-                    lambda cell: cell if (not isinstance(cell, list)) or len(cell) > 1 else (
-                        cell[0] if len(cell) == 1 else np.nan
+                    lambda cell: cell if not isinstance(cell, list) else (
+                        cell[0] if len(cell) > 0 else np.nan
                     )
                 )
                 self.workspace.sync()

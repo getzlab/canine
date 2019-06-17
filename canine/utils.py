@@ -25,6 +25,10 @@ class ArgumentHelper(dict):
         object.__setattr__(self, 'defaults', {})
         object.__setattr__(self, 'flags', [item for item in flags])
         object.__setattr__(self, 'params', {k:v for k,v in params.items()})
+        for key, val in [*self.params.items()]:
+            if val is True:
+                self.flags.append(key)
+                del self.params[key]
 
     def __repr__(self) -> str:
         return '<ArgumentHelper{}>'.format(

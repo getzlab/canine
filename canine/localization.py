@@ -66,6 +66,7 @@ class Localizer(object):
         with self.backend.transport() as transport:
             self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
+        self.clean_on_exit = True
 
         # Paths relative to staging dir on controller
         self.env = {
@@ -103,7 +104,7 @@ class Localizer(object):
         Assumes outputs have already been delocalized.
         Removes the staging directory
         """
-        if len([arg for arg in args if arg is not None]) == 0:
+        if self.clean_on_exit and len([arg for arg in args if arg is not None]) == 0:
             # Only clean if we are exiting the context cleanly
             self.backend.invoke('rm -rf {}'.format(self.env['CANINE_ROOT']))
 

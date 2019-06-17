@@ -22,6 +22,9 @@ localization:
   overrides:
     bam_file: Stream
 outputs:
-  stdout: stdout
-  stderr: stderr
-  rnaseqc-results: output.tar.gz
+  rnaseqc_coverage: *.coverage.tsv
+  rnaseqc_exon_reads: *.exon_reads.gct
+  rnaseqc_gene_fragments: *.gene_fragments.gct
+  rnaseqc_gene_reads: *.gene_reads.gct
+  rnaseqc_gene_tpm: *.gene_tpm.gct
+  rnaseqc_metrics: *.metrics.tsv
