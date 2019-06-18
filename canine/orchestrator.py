@@ -158,6 +158,7 @@ class Orchestrator(object):
                 with self.backend.transport() as transport:
                     if isinstance(self.script, str):
                         transport.send(self.script, pipeline_path)
+                        transport.chmod(pipeline_path, 0o775)
                     with transport.open(entrypoint_path, 'w') as w:
                         w.write(ENTRYPOINT.format(
                             backend=self._backend_type,

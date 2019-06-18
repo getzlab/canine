@@ -1,6 +1,8 @@
 """
 For argument parsing and CLI interface
 """
+import logging
+logging.basicConfig(level=logging.WARNING)
 import argparse
 import sys
 from . import Orchestrator
@@ -132,7 +134,6 @@ def main():
             **{key: val for key, val in args.resources}
         }
     if len(args.adapter) > 0:
-        print(args.adapter)
         if 'adapter' not in conf:
             conf['adapter'] = {}
         conf['adapter'] = {

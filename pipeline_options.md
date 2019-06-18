@@ -227,6 +227,8 @@ to use for the compute nodes (default: n1-highcpu-2)
 * `gpu_type`: The [type of GPU](https://cloud.google.com/compute/pricing#gpus) to
 attach to compute nodes (default: No gpus)
 * `gpu_count`: The number of gpus to attach to each compute node (default: No gpus)
+* `controller_script`: Additional commands to run during setup of the SLURM controller node
+* `compute_script`: Additional commands to run during setup of the SLURM compute node image
 
 **Note:** The controller node will also act as an NFS server which shares the `/home`
 and `/apps` directories with the compute nodes. For this reason, the controller is
@@ -296,6 +298,10 @@ Here is a list of the different override types, and their function:
 be streamed into the job via a named pipe. The input's environment variable will
 point to the pipe. This only works for `gs://` files, and will override default
 common and localizeGS behavior (file will always be streamed to job-specific input directory)
+**Warning:** Streams are included as part of a job's resource allocation. Having too
+many streamed files may adversely affect job performance as gsutil competes with
+the main job script. If you stream more than ~3 files per job, consider increasing
+`resources.cpus-per-task`
 * `Localize`: Force the input to be localized. This will override default
 common and localizeGS behavior (file will always be localized to job-specific input directory).
 If the input is neither a `gs://` path nor valid local filepath, an exception will be raised
@@ -305,12 +311,25 @@ job's script. This only works for `gs://` files, and will override default
 common and localizeGS behavior (file will always be localized to job-specific input directory)
 * `Common`: Forces the input to be localized to the common directory. This will
 override default common behavior (the file will always be localized to the `$CANINE_COMMON` directory),
-but does not override localizeGS settings (will raise an error if localizeGS is disabled for `gs://` files)
+but does not override localizeGS settings (will ignore and handle as a raw string if localizeGS is disabled for `gs://` files)
 * `null`: Forces the input to be treated as a plain string. No handling whatsoever
 will be applied to the input.
 
+#### Google Cloud Storage
+
+Localization uses credentials on the remote server to localize `gs://` files.
+Files localized during job setup (default, `Common`, `Localize`) will use the credentials
+of the SLURM node your backend is connected to. However, `Stream` and `Delayed`
+files are handled as part of a job's script and will use credentials of the compute
+node
+
 Here is an example configuration for localization:
 ```yaml
+inputs: # from example above
+  reference_file: gs://references/my_file
+  main_file:
+    - input1
+    - input2
 localization:
   localizeGS: true
   common: true

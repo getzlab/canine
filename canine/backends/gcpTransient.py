@@ -21,7 +21,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
     on GCP before they're ready for use
     """
 
-    def __init__(self, name='slurm-canine', *, max_node_count=10, compute_zone='us-central1-a', controller_type='n1-standard-16', login_type='n1-standard-1', worker_type='n1-highcpu-2', login_count=0, compute_disk_size=20, controller_disk_size=200, gpu_type=None, gpu_count=0):
+    def __init__(self, name='slurm-canine', *, max_node_count=10, compute_zone='us-central1-a', controller_type='n1-standard-16', login_type='n1-standard-1', worker_type='n1-highcpu-2', login_count=0, compute_disk_size=20, controller_disk_size=200, gpu_type=None, gpu_count=0, compute_script="", controller_script=""):
         super().__init__('{}-controller.{}.{}'.format(
             name,
             compute_zone,
@@ -30,19 +30,19 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         self.config = {
           "cluster_name": name,
           "static_node_count": 0,
-          "max_node_count": max_node_count,
+          "max_node_count": int(max_node_count),
           "zone": compute_zone,
           "region": compute_zone[:-2],
           "cidr": "10.10.0.0/16",
           "controller_machine_type": controller_type,
           "compute_machine_type": worker_type,
           "compute_disk_type": "pd-standard",
-          "compute_disk_size_gb": compute_disk_size,
+          "compute_disk_size_gb": int(compute_disk_size),
           "controller_disk_type": "pd-ssd",
-          "controller_disk_size_gb": controller_disk_size,
+          "controller_disk_size_gb": int(controller_disk_size),
           "controller_secondary_disk": False,
           "login_machine_type": login_type,
-          "login_node_count": login_count,
+          "login_node_count": int(login_count),
           "login_disk_size_gb": 10,
           "preemptible_bursting": True,
           "private_google_access": False,
@@ -70,8 +70,10 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo grub2-mkconfig -o /etc/grub2.cfg
         yes | sudo pip uninstall crcmod
         sudo pip install --no-cache-dir -U crcmod
+        {1}
         """.format(
             getpass.getuser(),
+            compute_script
         )
 
         self.controller_script = """
@@ -82,7 +84,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo yum install -y gcc python-devel python-setuptools redhat-rpm-config htop
         yes | sudo pip uninstall crcmod
         sudo pip install --no-cache-dir -U crcmod
-        """
+        {0}
+        """.format(controller_script)
 
     def __enter__(self):
         """
@@ -99,63 +102,71 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         # 1) create NFS: (n1-highcpu-16 [16CPU, 14GB, 4GB SW], SSD w/ user GB)
         # 2) SCP setup script to NFS
         # 3) SSH into NFS, run script
-        with tempfile.TemporaryDirectory() as tempdir:
-            shutil.copytree(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    'slurm-gcp'
-                ),
-                tempdir+'/slurm'
-            )
-            with open(os.path.join(tempdir, 'slurm', 'scripts', 'custom-compute-install'), 'w') as w:
-                w.write(self.startup_script)
-            with open(os.path.join(tempdir, 'slurm', 'scripts', 'custom-controller-install'), 'w') as w:
-                w.write(self.controller_script)
-            with open(os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml'), 'w') as w:
-                yaml.dump(
-                    {
-                        "imports": [
-                          {
-                            "path": 'slurm.jinja'
-                          }
-                        ],
-                        "resources": [
-                          {
-                            "name": "slurm-cluster",
-                            "type": "slurm.jinja",
-                            "properties": self.config
-                          }
-                        ]
-                    },
-                    w
+        try:
+            with tempfile.TemporaryDirectory() as tempdir:
+                shutil.copytree(
+                    os.path.join(
+                        os.path.dirname(__file__),
+                        'slurm-gcp'
+                    ),
+                    tempdir+'/slurm'
+                )
+                with open(os.path.join(tempdir, 'slurm', 'scripts', 'custom-compute-install'), 'w') as w:
+                    w.write(self.startup_script)
+                with open(os.path.join(tempdir, 'slurm', 'scripts', 'custom-controller-install'), 'w') as w:
+                    w.write(self.controller_script)
+                with open(os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml'), 'w') as w:
+                    yaml.dump(
+                        {
+                            "imports": [
+                              {
+                                "path": 'slurm.jinja'
+                              }
+                            ],
+                            "resources": [
+                              {
+                                "name": "slurm-cluster",
+                                "type": "slurm.jinja",
+                                "properties": self.config
+                              }
+                            ]
+                        },
+                        w
+                    )
+                subprocess.check_call(
+                    'gcloud deployment-manager deployments create {} --config {}'.format(
+                        self.config['cluster_name'],
+                        os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml')
+                    ),
+                    shell=True,
+                    executable='/bin/bash'
                 )
             subprocess.check_call(
-                'gcloud deployment-manager deployments create {} --config {}'.format(
-                    self.config['cluster_name'],
-                    os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml')
-                ),
-                shell=True,
-                executable='/bin/bash'
+                'gcloud compute config-ssh',
+                shell=True
             )
-        subprocess.check_call(
-            'gcloud compute config-ssh',
-            shell=True
-        )
-        self.load_config_args()
-        super().__enter__()
-        print("Waiting for slurm to initialize")
-        rc, sout, serr = self.invoke("which sinfo")
-        while rc != 0:
-            time.sleep(10)
+            self.load_config_args()
+            super().__enter__()
+            print("Waiting for slurm to initialize")
             rc, sout, serr = self.invoke("which sinfo")
-        time.sleep(60)
-        print("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
-        return self
+            while rc != 0:
+                time.sleep(10)
+                rc, sout, serr = self.invoke("which sinfo")
+            time.sleep(60)
+            print("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
+            return self
+        except:
+            self.stop()
+            raise
 
     def stop(self):
         """
         Kills the slurm cluster
         """
+        subprocess.check_call(
+            'gcloud compute config-ssh --remove',
+            shell=True
+        )
         subprocess.check_call(
             'echo y | gcloud deployment-manager deployments delete {}'.format(
                 self.config['cluster_name']
@@ -184,10 +195,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         kill NFS server
         delete the deployment
         """
-        subprocess.check_call(
-            'gcloud compute config-ssh --remove',
-            shell=True
-        )
+        super().__exit__()
         self.stop()
 
     def sinfo(self, *slurmopts: str, **slurmparams: typing.Any) -> pd.DataFrame:

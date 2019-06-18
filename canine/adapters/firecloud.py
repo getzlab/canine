@@ -94,7 +94,6 @@ class FirecloudAdapter(AbstractAdapter):
                     warnings.warn("Assuming expression is not a Firecloud expression", stacklevel=2)
                 for i, entity in enumerate(self.entities):
                     self.__spec[str(i)][name] = expr
-        print("parsed", len(self.spec), self.__spec['0'])
         self.workspace.hound.write_log_entry(
             'job',
             'Canine launching new job with input configuration: {}; Results will{} be written back to workspace'.format(
@@ -123,6 +122,7 @@ class FirecloudAdapter(AbstractAdapter):
                         jobId: {
                             outputName: [outputFile for outputFile in outputFiles if os.path.exists(outputFile)]
                             for outputName, outputFiles in jobOutput.items()
+                            if outputName not in {'stdout', 'stderr'}
                         }
                         for jobId, jobOutput in outputs.items()
                     },

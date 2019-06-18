@@ -7,7 +7,7 @@ import shlex
 from subprocess import CalledProcessError
 from uuid import uuid4
 from collections import namedtuple
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from .backends import AbstractSlurmBackend, AbstractTransport
 from .utils import get_default_gcp_project, check_call
 
@@ -348,6 +348,7 @@ class Localizer(object):
                 output_files = {}
                 start_dir = os.path.join(self.env['CANINE_JOBS'], jobId, 'workspace')
                 for dirpath, dirnames, filenames in transport.walk(start_dir):
+                    matched = set()
                     for name, pattern in patterns.items():
                         for filename in filenames:
                             fullname = os.path.join(dirpath, filename)
@@ -356,9 +357,11 @@ class Localizer(object):
                                     output_files[name] = [self.delocalize_file(transport, jobId, name, fullname, output_dir)]
                                 else:
                                     output_files[name].append(self.delocalize_file(transport, jobId, name, fullname, output_dir))
-                                if delete:
-                                    if transport.isfile(fullname):
-                                        transport.remove(fullname)
+                                matched.add(fullname)
+                    if delete:
+                        for fullname in matched:
+                            if transport.isfile(fullname):
+                                transport.remove(fullname)
                 return {jobId: output_files}
 
     def delocalize_file(self, transport: AbstractTransport, jobId: str, name: str, fullname: str, output_dir: str) -> str:
@@ -371,7 +374,8 @@ class Localizer(object):
             name,
             os.path.basename(fullname)
         )
-        os.makedirs(os.path.dirname(output_path))
+        if not os.path.isdir(os.path.dirname(output_path)):
+            os.makedirs(os.path.dirname(output_path))
         transport.receive(
             fullname,
             output_path
