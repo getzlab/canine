@@ -8,10 +8,12 @@ import os
 import sys
 from .remote import RemoteSlurmBackend
 from ..utils import get_default_gcp_project, ArgumentHelper, check_call
+# import paramiko
 import yaml
 import pandas as pd
 
 SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
+PARAMIKO_PEM_KEY = os.path.expanduser('~/.ssh/canine_pem_key')
 
 # FIXME: allow custom startup and controller scripty bois
 
@@ -141,11 +143,24 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                     shell=True,
                     executable='/bin/bash'
                 )
+            if self.ssh_agent() is None:
+                print("Could not boot ssh agent. Authentication may fail on OpenSSH-based platforms", file=sys.stderr)
             subprocess.check_call(
                 'gcloud compute config-ssh',
                 shell=True
             )
+            subprocess.check_call(
+                'ssh-add ~/.ssh/google_compute_engine',
+                shell=True,
+                executable='/bin/bash'
+            )
+            subprocess.check_call(
+                'touch ~/.ssh/google_compute_known_hosts',
+                shell=True,
+                executable='/bin/bash'
+            )
             self.load_config_args()
+            time.sleep(30) # Key propagation time
             super().__enter__()
             print("Waiting for slurm to initialize")
             rc, sout, serr = self.invoke("which sinfo")
@@ -218,3 +233,63 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         )
         df.index = df.index.map(str)
         return df
+
+
+# ====
+# Old code to get around openssh issues. May be needed in future if ssh-agent trick doesn't work
+# @staticmethod
+# def get_paramiko_acceptable_key():
+#     """
+#     Because, openssh keys are not accepted by paramiko,
+#     but for some reason, it's the default format on OSx.
+#     Returns the filename of a paramiko-accepted 2048-bit rsa key
+#     You'll need to copy it over yourself or add it to os-login
+#     """
+#     if not os.path.isdir(os.path.dirname(PARAMIKO_PEM_KEY)):
+#         os.path.makedirs(os.path.dirname(PARAMIKO_PEM_KEY))
+#     if not (os.path.isfile(PARAMIKO_PEM_KEY) and os.path.isfile(PARAMIKO_PEM_KEY+'.pub')):
+#         print("Generating new ssh keypair for canine/paramiko")
+#         try:
+#             subprocess.check_call(
+#                 "ssh-keygen -t rsa -b 2048 -f {} -N '' -m PEM".format(PARAMIKO_PEM_KEY),
+#                 shell=True
+#             )
+#         except CalledProcessError:
+#             # probably fine. On non-openssh implementations "-m PEM" is not
+#             # a valid argument. Try anyways
+#             subprocess.check_call(
+#                 "ssh-keygen -t rsa -b 2048 -f {} -N ''".format(PARAMIKO_PEM_KEY),
+#                 shell=True
+#             )
+#     # Double-check that the key is acceptable
+#     paramiko.RSAKey.from_private_key_file(PARAMIKO_PEM_KEY)
+#     return PARAMIKO_PEM_KEY
+# subprocess.check_call(
+#     'gcloud compute --project {} ssh --zone {} {}-controller -- bash -c \'"if [[ ! -d .ssh ]]; then mkdir .ssh; fi"\''.format(
+#         get_default_gcp_project(),
+#         self.config['zone'],
+#         self.config['cluster_name']
+#     ),
+#     shell=True,
+#     executable='/bin/bash'
+# )
+# subprocess.check_call(
+#     'gcloud compute --project {} ssh --zone {} {}-controller -- bash -c \'"cat - >> .ssh/authorized_keys"\' < {}.pub'.format(
+#         get_default_gcp_project(),
+#         self.config['zone'],
+#         self.config['cluster_name'],
+#         self.get_paramiko_acceptable_key()
+#     ),
+#     shell=True,
+#     executable='/bin/bash'
+# )
+# subprocess.check_call(
+#     'gcloud compute --project {} ssh --zone {} {}-controller -- bash -c \'"chmod 600 .ssh/authorized_keys"\''.format(
+#         get_default_gcp_project(),
+#         self.config['zone'],
+#         self.config['cluster_name']
+#     ),
+#     shell=True,
+#     executable='/bin/bash'
+# )
+# self._RemoteSlurmBackend__sshkwargs['key_filename'] = self.get_paramiko_acceptable_key()

@@ -1,5 +1,6 @@
 import typing
 import os
+import re
 import io
 import sys
 import subprocess
@@ -10,6 +11,11 @@ from ..utils import ArgumentHelper, interactive, check_call
 from agutil import StdOutAdapter
 import pandas as pd
 import paramiko
+
+import logging
+logging.getLogger('paramiko').setLevel(logging.WARNING)
+
+SSH_AGENT_PATTERN = re.compile(r'SSH_AUTH_SOCK=(.+); export SSH_AUTH_SOCK')
 
 class IgnoreKeyPolicy(paramiko.client.AutoAddPolicy):
     """
@@ -138,7 +144,27 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
     SLURM backend for interacting with a remote slurm node
     """
 
-    def __init__(self, hostname: str, *args: typing.Any, **kwargs: typing.Any):
+    @staticmethod
+    def ssh_agent() -> typing.Optional[str]:
+        """
+        Ensures proper environment variables are set for the ssh agent
+        Returns the current value of SSH_AUTH_SOCK or None, if the agent could
+        not be located/started
+        """
+        if 'SSH_AUTH_SOCK' not in os.environ:
+            proc = subprocess.run(
+                'ssh-agent',
+                shell=True,
+                stdout=subprocess.PIPE
+            )
+            match = SSH_AGENT_PATTERN.search(proc.stdout.decode())
+            if match:
+                os.environ['SSH_AUTH_SOCK'] = match.group(1)
+                return os.environ['SSH_AUTH_SOCK']
+            return None
+        return os.environ['SSH_AUTH_SOCK']
+
+    def __init__(self, hostname: str, **kwargs: typing.Any):
         """
         Initializes the backend.
         No connection is established until the context is entered.
@@ -146,8 +172,14 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         """
         self.hostname = hostname
         self.__hostname = hostname
-        self.__sshargs = args
-        self.__sshkwargs = kwargs
+        self.__sshkwargs = {
+            **{
+                'timeout': 30,
+                'banner_timeout': 30,
+                'auth_timeout': 60
+            },
+            **kwargs
+        }
         self.client = paramiko.SSHClient()
         self.client.load_system_host_keys()
 
@@ -163,7 +195,6 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             with open(config_path) as r:
                 config.parse(r)
         config = config.lookup(self.hostname)
-        self.__sshargs = []
         if 'hostname' in config:
             self.hostname = config['hostname']
         if 'port' in config:
@@ -249,7 +280,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         """
         Establishes a connection to the remote server
         """
-        self.client.connect(self.hostname, *self.__sshargs, **self.__sshkwargs)
+        self.client.connect(self.hostname, **self.__sshkwargs)
         return self
 
     def __exit__(self, *args):

@@ -129,9 +129,7 @@ class Orchestrator(object):
         * The input job specification
         * The sacct dataframe after all jobs completed
         """
-        print("Raw inputs:", self.raw_inputs)
         job_spec = self.adapter.parse_inputs(self.raw_inputs)
-        print("Job spec:", job_spec)
         print("Preparing pipeline of", len(job_spec), "jobs")
         print("Connecting to backend...")
         if isinstance(self.backend, RemoteSlurmBackend):

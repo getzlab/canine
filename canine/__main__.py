@@ -1,8 +1,6 @@
 """
 For argument parsing and CLI interface
 """
-import logging
-logging.basicConfig(level=logging.WARNING)
 import argparse
 import sys
 from . import Orchestrator
