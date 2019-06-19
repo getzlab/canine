@@ -1,0 +1,195 @@
+
+<!DOCTYPE html>
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <meta charset="utf-8" />
+    <title>canine &#8212; Canine  documentation</title>
+    <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
+    <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
+    <script type="text/javascript" id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
+    <script type="text/javascript" src="../_static/jquery.js"></script>
+    <script type="text/javascript" src="../_static/underscore.js"></script>
+    <script type="text/javascript" src="../_static/doctools.js"></script>
+    <script type="text/javascript" src="../_static/language_data.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="canine.adapters" href="adapters.html" />
+    <link rel="prev" title="Welcome to Canine’s documentation!" href="../index.html" />
+   
+  <link rel="stylesheet" href="../_static/custom.css" type="text/css" />
+  
+  
+  <meta name="viewport" content="width=device-width, initial-scale=0.9, maximum-scale=0.9" />
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <div class="section" id="canine">
+<h1>canine<a class="headerlink" href="#canine" title="Permalink to this headline">¶</a></h1>
+<p>A dalmatian-based job manager to schedule tasks using SLURM</p>
+<span class="target" id="module-canine"></span><dl class="class">
+<dt id="canine.Localizer">
+<em class="property">class </em><code class="sig-prename descclassname">canine.</code><code class="sig-name descname">Localizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">localize_gs: bool = True</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.Localizer" title="Permalink to this definition">¶</a></dt>
+<dd><p>Class for handling file localization and delocalization
+Responsible for setting up staging directories and managing inputs and outputs
+NOT responsible for copying results to FireCloud (handled at the adapter layer)</p>
+<dl class="method">
+<dt id="canine.Localizer.delocalize">
+<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output', jobId: Optional[str] = None, transport: Optional[canine.backends.base.AbstractTransport] = None, delete: bool = True</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.Localizer.delocalize" title="Permalink to this definition">¶</a></dt>
+<dd><p>Delocalizes the requested files from the given job (or all jobs)
+Returns a dict {jobId: {output name: output path}}</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.Localizer.delocalize_file">
+<code class="sig-name descname">delocalize_file</code><span class="sig-paren">(</span><em class="sig-param">transport: canine.backends.base.AbstractTransport</em>, <em class="sig-param">jobId: str</em>, <em class="sig-param">name: str</em>, <em class="sig-param">fullname: str</em>, <em class="sig-param">output_dir: str</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.Localizer.delocalize_file" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copies the remote output file back to the current filesystem</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.Localizer.get_requester_pays">
+<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.Localizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the requested gs:// object or bucket resides in a
+requester pays bucket</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.Localizer.localize">
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.Localizer.localize" title="Permalink to this definition">¶</a></dt>
+<dd><p>Localizes all input files
+Inputs: {jobID: {inputName: inputValue}}
+Overrides: {inputName: handling}</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.Localizer.localize_file">
+<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">transport: canine.backends.base.AbstractTransport</em>, <em class="sig-param">jobId: str</em>, <em class="sig-param">name: str</em>, <em class="sig-param">value: str</em>, <em class="sig-param">delayed: bool = False</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.Localizer.localize_file" title="Permalink to this definition">¶</a></dt>
+<dd><p>Localizes an individual file.
+Expects the caller to have initialized the transport and entered its context
+Common and stream handling are taken care of externally. This function only runs
+for files which are set to localize for each job
+If delayed is True, only a path will be produced, but no localization will occur</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.Localizer.localize_job">
+<code class="sig-name descname">localize_job</code><span class="sig-paren">(</span><em class="sig-param">jobId: str</em>, <em class="sig-param">setup_text: Optional[str] = None</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.Localizer.localize_job" title="Permalink to this definition">¶</a></dt>
+<dd><p>Does final localization of job script.
+Used when finally prepping a job for dispatch
+returns the path to the first script in the job’s pipeline</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="canine.Orchestrator">
+<em class="property">class </em><code class="sig-prename descclassname">canine.</code><code class="sig-name descname">Orchestrator</code><span class="sig-paren">(</span><em class="sig-param">config: Union[str, Dict[str, Any]]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.Orchestrator" title="Permalink to this definition">¶</a></dt>
+<dd><p>Main class
+Parses a configuration object, initializes, runs, and cleans up a Canine Pipeline</p>
+<dl class="method">
+<dt id="canine.Orchestrator.fill_config">
+<em class="property">static </em><code class="sig-name descname">fill_config</code><span class="sig-paren">(</span><em class="sig-param">cfg: Union[str, Dict[str, Any]]</em><span class="sig-paren">)</span> &#x2192; Dict[str, Any]<a class="headerlink" href="#canine.Orchestrator.fill_config" title="Permalink to this definition">¶</a></dt>
+<dd><p>Loads the given config object (or reads from the given filepath)
+Applies Canine defaults, then returns the final config dictionary</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.Orchestrator.run_pipeline">
+<code class="sig-name descname">run_pipeline</code><span class="sig-paren">(</span><em class="sig-param">dry_run: bool = False</em><span class="sig-paren">)</span> &#x2192; Tuple[str, dict, dict, pandas.core.frame.DataFrame]<a class="headerlink" href="#canine.Orchestrator.run_pipeline" title="Permalink to this definition">¶</a></dt>
+<dd><p>Runs the configured pipeline
+Returns a 4-tuple:
+* The batch job id
+* The input job specification
+* The sacct dataframe after all jobs completed</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.Orchestrator.stringify">
+<em class="property">static </em><code class="sig-name descname">stringify</code><span class="sig-paren">(</span><em class="sig-param">obj: Any</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.Orchestrator.stringify" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recurses through the dictionary, converting objects to strings</p>
+</dd></dl>
+
+</dd></dl>
+
+</div>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="main navigation">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Canine</a></h1>
+
+
+
+
+
+
+
+
+<h3>Navigation</h3>
+<p class="caption"><span class="caption-text">Contents</span></p>
+<ul class="current">
+<li class="toctree-l1 current"><a class="current reference internal" href="#">canine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="adapters.html">canine.adapters</a></li>
+<li class="toctree-l1"><a class="reference internal" href="backends.html">canine.backends</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="../index.html" title="previous chapter">Welcome to Canine’s documentation!</a></li>
+      <li>Next: <a href="adapters.html" title="next chapter">canine.adapters</a></li>
+  </ul></li>
+</ul>
+</div>
+<div id="searchbox" style="display: none" role="search">
+  <h3 id="searchlabel">Quick search</h3>
+    <div class="searchformwrapper">
+    <form class="search" action="../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" />
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</div>
+<script type="text/javascript">$('#searchbox').show(0);</script>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &copy;2019, Aaron graubert.
+      
+      |
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 2.1.1</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/canine/index.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>
