@@ -19,7 +19,7 @@ help:
 %: Makefile
 	@$(SPHINXBUILD) -M $@ "$(SOURCEDIR)" "$(BUILDDIR)" $(SPHINXOPTS) $(O)
 
-gh-pages: html
+gh-pages: pre-clean html
 	mv _build/html/* ..
 	rm -rf _build
 
