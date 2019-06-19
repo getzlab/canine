@@ -154,7 +154,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 shell=True
             )
             subprocess.check_call(
-                'gcloud compute os-login ssh-keys add ~/.ssh/google_compute_engine.pub',
+                'gcloud compute os-login ssh-keys add --key-file ~/.ssh/google_compute_engine.pub >/dev/null',
                 shell=True
             )
             self.load_config_args()
