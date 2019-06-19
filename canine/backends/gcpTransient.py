@@ -143,16 +143,9 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                     shell=True,
                     executable='/bin/bash'
                 )
-            if self.ssh_agent() is None:
-                print("Could not boot ssh agent. Authentication may fail on OpenSSH-based platforms", file=sys.stderr)
             subprocess.check_call(
                 'gcloud compute config-ssh',
                 shell=True
-            )
-            subprocess.check_call(
-                'ssh-add ~/.ssh/google_compute_engine',
-                shell=True,
-                executable='/bin/bash'
             )
             subprocess.check_call(
                 'touch ~/.ssh/google_compute_known_hosts',
