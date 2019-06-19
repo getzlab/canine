@@ -4,6 +4,7 @@ For argument parsing and CLI interface
 import argparse
 import sys
 from . import Orchestrator
+from .backends import TransientGCPSlurmBackend
 import yaml
 
 def ConfType(nfields, nMax=None):
@@ -24,6 +25,81 @@ def ConfType(nfields, nMax=None):
         return args
 
     return parse_arg
+
+def boot_transient():
+    parser = argparse.ArgumentParser(
+        'canine-transient',
+        description="Boots a transient slurm cluster"
+    )
+    parser.add_argument(
+        'name',
+        help="Name of the cluster"
+    )
+    parser.add_argument(
+        '-n', '--node-count',
+        type=int,
+        help="Max number of compute nodes in the cluster",
+        default=10
+    )
+    parser.add_argument(
+        '-z', '--zone',
+        help="GCP Compute zone in which to create the cluster",
+        default='us-central1-a'
+    )
+    parser.add_argument(
+        '-c', '--controller-type',
+        help="Instance type for controller node",
+        default="n1-standard-16"
+    )
+    parser.add_argument(
+        '-w', '--worker-type',
+        help="Instance type for compute node",
+        default="n1-highcpu-2"
+    )
+    parser.add_argument(
+        '-s', '--controller-disk-size',
+        type=int,
+        help="Size of the controller's disk in GB",
+        default=200
+    )
+    parser.add_argument(
+        '-d', '--worker-disk-size',
+        type=int,
+        help="Size of the compute node disk in GB",
+        default=20
+    )
+    parser.add_argument(
+        '-t', '--gpu-type',
+        help="Type of GPU to attach to compute nodes",
+        default=None
+    )
+    parser.add_argument(
+        '-g', '--gpu-count',
+        type=int,
+        help="Number of GPUs to attach to compute nodes",
+        default=0
+    )
+    args = parser.parse_args()
+    with TransientGCPSlurmBackend(
+        name=args.name,
+        max_node_count=args.node_count,
+        compute_zone=args.zone,
+        controller_type=args.controller_type,
+        worker_type=args.worker_type,
+        compute_disk_size=args.worker_disk_size,
+        controller_disk_size=args.controller_disk_size,
+        gpu_type=args.gpu_type,
+        gpu_coumt=args.gpu_count
+    ) as slurm:
+        print("=====================")
+        print("Slurm cluster started")
+        print("SSH using", slurm._RemoteSlurmBackend__hostname)
+        print("=====================")
+        try:
+            while True:
+                input("Press Ctrl+C to kill the slurm cluster")
+        except KeyboardInterrupt:
+            pass # silence keyboard interrupt
 
 def main():
     parser = argparse.ArgumentParser(

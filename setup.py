@@ -23,7 +23,10 @@ setup(
         ],
     },
     entry_points={
-        'console_scripts':['canine = canine.__main__:main']
+        'console_scripts':[
+            'canine = canine.__main__:main',
+            'canine-transient = canine.__main__:boot_transient'
+        ]
     },
     description = 'A dalmatian-based job manager to schedule tasks using SLURM',
     url = 'https://github.com/broadinstitute/canine',
