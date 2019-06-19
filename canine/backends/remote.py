@@ -61,6 +61,7 @@ class RemoteTransport(AbstractTransport):
             raise paramiko.SSHException("Transport is not connected")
         handle = self.session.open(filename, mode, bufsize)
         handle.mode = mode
+        handle.name = filename
         return handle
 
     def listdir(self, path: str) -> typing.List[str]:

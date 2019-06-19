@@ -196,7 +196,7 @@ class Orchestrator(object):
                         for jid in [*waiting_jobs]:
                             if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                                 job = jid.split('_')[1]
-                                print("Delocalizing task",job, "with status", acct['State'][jid])
+                                print("Delocalizing task",job, "with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                                 # outputs.update(localizer.delocalize(self.raw_outputs, jobId=job))
                                 # waiting_jobs.remove(jid)
                                 completed_jobs.append((job, jid))

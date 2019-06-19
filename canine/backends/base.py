@@ -57,6 +57,7 @@ class AbstractTransport(abc.ABC):
             if isinstance(remotefile, str):
                 remotefile = stack.enter_context(self.open(remotefile, 'wb' if 'b' in localfile.mode else 'w'))
             shutil.copyfileobj(localfile, remotefile)
+            self.chmod(remotefile.name, os.stat(localfile.name).st_mode)
 
     def receive(self, remotefile: typing.Union[str, typing.IO], localfile: typing.Union[str, typing.IO]):
         """
@@ -71,6 +72,7 @@ class AbstractTransport(abc.ABC):
             if isinstance(localfile, str):
                 localfile = stack.enter_context(open(localfile, 'wb' if 'b' in remotefile.mode else 'w'))
             shutil.copyfileobj(remotefile, localfile)
+            os.chmod(localfile.name, self.stat(remotefile.name).st_mode)
 
     @abc.abstractmethod
     def listdir(self, path: str) -> typing.List[str]:
@@ -203,6 +205,39 @@ class AbstractTransport(abc.ABC):
         yield (path, dirnames, filenames)
         for dirname in dirnames:
             yield from self.walk(os.path.join(path, dirname))
+
+    def sendtree(self, src: str, dest: str):
+        """
+        Copy the full local file tree src to the remote path dest
+        """
+        if not self.exists(dest):
+            self.makedirs(dest)
+        for path, dirnames, filenames in os.walk(src):
+            rpath = os.path.join(
+                dest,
+                os.path.relpath(path, src)
+            )
+            if not self.exists(rpath):
+                self.mkdir(rpath)
+            for f in filenames:
+                self.send(os.path.join(path, f), os.path.join(rpath, f))
+
+
+    def receivetree(self, src: str, dest: str):
+        """
+        Copy the full remote file tree src to the local path dest
+        """
+        if not os.path.exists(dest):
+            os.makedirs(dest)
+        for path, dirnames, filenames in self.walk(src):
+            lpath = os.path.join(
+                dest,
+                os.path.relpath(path, src)
+            )
+            if not os.path.exists(lpath):
+                os.mkdir(lpath)
+            for f in filenames:
+                self.receive(os.path.join(path, f), os.path.join(lpath, f))
 
 class AbstractSlurmBackend(abc.ABC):
     """
