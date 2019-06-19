@@ -89,6 +89,12 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         {0}
         """.format(controller_script)
 
+        subprocess.check_call(
+            'touch ~/.ssh/google_compute_known_hosts',
+            shell=True,
+            executable='/bin/bash'
+        )
+
     def __enter__(self):
         """
         Create NFS server
@@ -148,9 +154,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 shell=True
             )
             subprocess.check_call(
-                'touch ~/.ssh/google_compute_known_hosts',
-                shell=True,
-                executable='/bin/bash'
+                'gcloud compute os-login ssh-keys add ~/.ssh/google_compute_engine.pub',
+                shell=True
             )
             self.load_config_args()
             time.sleep(30) # Key propagation time

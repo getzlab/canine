@@ -89,7 +89,7 @@ def boot_transient():
         compute_disk_size=args.worker_disk_size,
         controller_disk_size=args.controller_disk_size,
         gpu_type=args.gpu_type,
-        gpu_coumt=args.gpu_count
+        gpu_count=args.gpu_count
     ) as slurm:
         print("=====================")
         print("Slurm cluster started")
