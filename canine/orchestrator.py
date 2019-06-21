@@ -8,11 +8,13 @@ from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBacken
 from .localization import Localizer
 import yaml
 import pandas as pd
+from agutil import status_bar
 version = '0.0.1'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
-    'Firecloud': FirecloudAdapter
+    'Firecloud': FirecloudAdapter,
+    'Terra': FirecloudAdapter
 }
 
 BACKENDS = {
@@ -166,7 +168,7 @@ class Orchestrator(object):
                         ))
                     transport.chmod(entrypoint_path, 0o775)
                     print("Preparing job environments...")
-                    for job in job_spec:
+                    for job in status_bar.iter(job_spec):
                         localizer.localize_job(job, transport=transport)
                 if dry_run:
                     localizer.clean_on_exit = False
@@ -202,7 +204,7 @@ class Orchestrator(object):
                                 completed_jobs.append((job, jid))
                         if len(completed_jobs):
                             with self.backend.transport() as transport:
-                                for job, jid in completed_jobs:
+                                for job, jid in status_bar.iter(completed_jobs):
                                     waiting_jobs.remove(jid)
                                     outputs.update(localizer.delocalize(
                                         self.raw_outputs,
