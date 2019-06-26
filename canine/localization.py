@@ -149,7 +149,7 @@ class Localizer(object):
             for path in self.common_inputs:
                 if path.startswith('gs://') and self.localize_gs:
                     common_dests[path] = os.path.join(self.environment['CANINE_COMMON'], os.path.basename(path))
-                    command = "gsutil {} cp {} {}".format(
+                    command = "gsutil {} -o GSUtil:check_hashes=if_fast_else_skip cp {} {}".format(
                         '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(path) else '',
                         path,
                         os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
@@ -229,7 +229,7 @@ class Localizer(object):
             filepath = '{}._alt{}'.format(root, ext)
         if not delayed:
             if self.localize_gs and value.startswith('gs://'):
-                command = "gsutil {} cp {} {}".format(
+                command = "gsutil {} -o GSUtil:check_hashes=if_fast_else_skip cp {} {}".format(
                     '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(value) else '',
                     value,
                     filepath
@@ -295,7 +295,7 @@ class Localizer(object):
                     job_vars.append(shlex.quote(key))
                     dest = shlex.quote(self.localize_file(transport, jobId, key, val.path, True))
                     extra_tasks += [
-                        "gsutil {} cp {} {}".format(
+                        "gsutil {} -o GSUtil:check_hashes=if_fast_else_skip cp {} {}".format(
                             '-u {}'.format(shlex.quote(get_default_gcp_project())) if self.get_requester_pays(val.path) else '',
                             shlex.quote(val.path),
                             dest

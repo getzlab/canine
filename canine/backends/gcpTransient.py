@@ -14,6 +14,22 @@ import pandas as pd
 
 SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
 PARAMIKO_PEM_KEY = os.path.expanduser('~/.ssh/canine_pem_key')
+GPU_SCRIPT = ' && '.join([
+    'sudo yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r)',
+    'wget http://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
+    'sudo yum install -y cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
+    'sudo yum -y updateinfo',
+    'sudo yum install -y cuda',
+    'wget http://developer.download.nvidia.com/compute/machine-learning/repos/rhel7/x86_64/nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
+    'sudo yum install -y nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
+    'sudo yum -y updateinfo',
+    'sudo yum install -y cuda-10-0 libcudnn7 libcudnn7-devel',
+    'sudo yum -y updateinfo',
+    'sudo yum install -y libnvinfer5',
+    'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.repo | sudo tee /etc/yum.repos.d/nvidia-docker.repo',
+    'sudo yum -y updateinfo',
+    'sudo yum install -y nvidia-docker2'
+])
 
 # FIXME: allow custom startup and controller scripty bois
 
@@ -47,7 +63,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "login_node_count": int(login_count),
           "login_disk_size_gb": 10,
           "preemptible_bursting": True,
-          "private_google_access": False,
+          "private_google_access": True,
           "vpc_net": "default",
           "vpc_subnet": "default",
           "default_users": getpass.getuser()
@@ -58,7 +74,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             self.config['gpu_count'] = gpu_count
 
         self.startup_script = """
-        sudo yum install -y yum-utils device-mapper-persistent-data lvm2 libcgroup libcgroup-tools htop gcc python-devel python-setuptools redhat-rpm-config
+        sudo yum install -y yum-utils device-mapper-persistent-data lvm2 libcgroup libcgroup-tools htop gcc python-devel python-setuptools redhat-rpm-config wget
         sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
         sudo yum install -y docker-ce
         sudo groupadd docker
@@ -70,11 +86,15 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo sed -e 's/GRUB_CMDLINE_LINUX="\\?\\([^"]*\\)"\\?/GRUB_CMDLINE_LINUX="\\1 cgroup_enable=memory swapaccount=1"/' < /etc/default/grub > grub.tmp
         sudo mv grub.tmp /etc/default/grub
         sudo grub2-mkconfig -o /etc/grub2.cfg
-        yes | sudo pip uninstall crcmod
+        curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+        sudo python get-pip.py
+        sudo pip uninstall -y crcmod
         sudo pip install --no-cache-dir -U crcmod
         {1}
+        {2}
         """.format(
             getpass.getuser(),
+            GPU_SCRIPT if self.config['gpu_count'] > 0 else '',
             compute_script
         )
 
@@ -84,7 +104,9 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo mkswap /swapfile
         sudo swapon /swapfile
         sudo yum install -y gcc python-devel python-setuptools redhat-rpm-config htop
-        yes | sudo pip uninstall crcmod
+        curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
+        sudo python get-pip.py
+        sudo pip uninstall -y crcmod
         sudo pip install --no-cache-dir -U crcmod
         {0}
         """.format(controller_script)
