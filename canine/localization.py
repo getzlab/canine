@@ -4,6 +4,7 @@ import warnings
 import typing
 import fnmatch
 import shlex
+import tempfile
 from subprocess import CalledProcessError
 from uuid import uuid4
 from collections import namedtuple
@@ -44,15 +45,16 @@ class Localizer(object):
     """
     requester_pays = {}
 
-    def __init__(self, backend: AbstractSlurmBackend, localize_gs: bool = True, common: bool = True, staging_dir: str = None, mount_path: str = None):
+    def __init__(self, backend: AbstractSlurmBackend, common: bool = True, staging_dir: str = None, mount_path: str = None, localize_gs: bool = None):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
         the localizer's entire life cycle.
         If staging_dir is not provided, a random directory is chosen
         """
+        if localize_gs is not None:
+            warnings.warn("localize_gs option removed and ignored. Use overrides to explicitly control this behavior")
         self.backend = backend
-        self.localize_gs = localize_gs
         self.common = common
         self.common_inputs = set()
         self.__sbcast = False
@@ -381,3 +383,215 @@ class Localizer(object):
             output_path
         )
         return output_path
+
+# Keep localizer, but abstract the actual work interface to strategy objects
+# Localizer holds multiple strategies which respond to it's decisions to localize an input
+# strategies take raw input, mount and staging paths, and override settings and decide if they need to respond
+# File strategy: Decides where to stage files during localization. Either stages live
+
+# Stage locally, remote gsutil, transfer bucket: build staging dir here relative to local root
+#   bucket broadcast to controller, then execute gsutil batch request. Bucket broadcast output files back here
+# stage locally, remote gsutil, copytree: Same as above but use send/recievetree to
+#   move the staging and output dirs
+# stage locally, local gsutil, transfer bucket: same as first strategy, but
+#   gsutil copy files to the local staging dir, as part of prep, and do not include
+#   in finalization actions
+# stage locally, local gsutil, copytree: same as above strategy, but inputs and
+#   outputs are transfered using send/recieve tree
+# stage remotely, remote gsutil, transfer bucket: Build staging dir remotely, copying
+#   files over transport as needed. Batch gsutil requests until finalization step
+#   Use bucket broadcast to return final outputs
+# stage remotely, remote gsutil, copytree: same as above, but use recievetree to
+#   return final outputs
+
+import abc
+
+class AbstractLocalizer(abc.ABC):
+    """
+    Base class for localization.
+    """
+    requester_pays = {}
+
+    def __init__(self, backend: AbstractSlurmBackend, strategy: str = "batched", transfer_bucket: typing.Optional[str] = None, common: bool = True, staging_dir: str = None, mount_path: str = None, localize_gs: bool = None):
+        """
+        Initializes the Localizer using the given transport.
+        Localizer assumes that the SLURMBackend is connected and functional during
+        the localizer's entire life cycle.
+        If staging_dir is not provided, a random directory is chosen
+        """
+        if localize_gs is not None:
+            warnings.warn("localize_gs option removed and ignored. Use overrides to explicitly control this behavior")
+        self.transfer_bucket = transfer_bucket
+        self.strategy = strategy.lower()
+        self.backend = backend
+        self.common = common
+        self.common_inputs = set()
+        self.__sbcast = False
+        if staging_dir == 'SBCAST':
+            # FIXME: This doesn't actually do anything yet
+            # If sbcast is true, then localization needs to use backend.sbcast to move files to the remote system
+            # Not sure at all how delocalization would work
+            self.__sbcast = True
+            staging_dir = None
+        self.staging_dir = staging_dir if staging_dir is not None else str(uuid4())
+        self._local_dir = None if self.strategy == 'remote' else tempfile.TemporaryDirectory()
+        self.local_dir = None if self.strategy == 'remote' else self._local_dir.name
+        with self.backend.transport() as transport:
+            self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
+        self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
+        self.clean_on_exit = True
+
+    def get_requester_pays(self, path: str) -> bool:
+        """
+        Returns True if the requested gs:// object or bucket resides in a
+        requester pays bucket
+        """
+        if path.startswith('gs://'):
+            path = path[5:]
+        bucket = path.split('/')[0]
+        if bucket not in self.requester_pays:
+            command = 'gsutil ls gs://{}'.format(path)
+            try:
+                rc, sout, serr = self.backend.invoke(command)
+                self.requester_pays[bucket] = len([line for line in serr.readlines() if b'requester pays bucket but no user project provided' in line]) >= 1
+            except CalledProcessError:
+                pass
+        return bucket in self.requester_pays and self.requester_pays[bucket]
+
+    def environment(self, location: str) -> typing.Dict[str, str]:
+        """
+        Returns environment variables relative to the given location.
+        Location must be one of {"local", "controller", "compute"}
+        """
+        if location not in {"local", "controller", "compute"}:
+            raise ValueError('location must be one of {"local", "controller", "compute"}')
+        if location == 'local':
+            return {
+                'CANINE_ROOT': self.local_dir,
+                'CANINE_COMMON': os.path.join(self.local_dir, 'common'),
+                'CANINE_OUTPUT': os.path.join(self.local_dir, 'outputs'), #outputs/jobid/outputname/...files...
+                'CANINE_JOBS': os.path.join(self.local_dir, 'jobs'),
+            }
+        elif location == "controller":
+            return {
+                'CANINE_ROOT': self.staging_dir,
+                'CANINE_COMMON': os.path.join(self.staging_dir, 'common'),
+                'CANINE_OUTPUT': os.path.join(self.staging_dir, 'outputs'), #outputs/jobid/outputname/...files...
+                'CANINE_JOBS': os.path.join(self.staging_dir, 'jobs'),
+            }
+        elif location == "compute":
+            return {
+                'CANINE_ROOT': self.mount_path,
+                'CANINE_COMMON': os.path.join(self.mount_path, 'common'),
+                'CANINE_OUTPUT': os.path.join(self.mount_path, 'outputs'),
+                'CANINE_JOBS': os.path.join(self.mount_path, 'jobs'),
+            }
+
+    def gs_copy(self, src, dest):
+        command = "gsutil {} cp {} {}".format(
+            '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(path) else '',
+            path,
+            os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
+        )
+        rc, sout, serr = self.backend.invoke(command)
+        check_call(command, rc, sout, serr)
+
+    def localize_file(self, src, dest):
+        transport.send(
+            path,
+            os.path.join(self.env['CANINE_COMMON'], os.path.basename(path))
+        )
+
+    def reserve_path(self, jobId, argname, path):
+        pass
+
+    def stage_dir(self, path):
+        if not transport.isdir(workspace_path):
+            transport.makedirs(workspace_path)
+
+    def stage_tree(self):
+        pass
+
+    @abc.abstractmethod
+    def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None):
+        """
+        3 phase task:
+        1) Pre-scan inputs to determine proper localization strategy for all inputs
+        2) Begin localizing job inputs. For each job, check the predetermined strategy
+        and set up the job's setup and teardown scripts
+        3) Finally, finalize the localization. This may include broadcasting the
+        staging directory or copying a batch of gsutil files
+        """
+        if overrides is None:
+            overrides = {}
+        overrides = {k:v.lower() if isinstance(v, str) else None for k,v in overrides.items()}
+        with self.backend.transport() as transport:
+            if self.common:
+                seen = set()
+                for jobId, values in inputs.items():
+                    for arg, path in values.items():
+                        if path in seen and (arg not in overrides or overrides[arg] == 'common'):
+                            self.common_inputs.add(path)
+                        if arg in overrides and overrides[arg] == 'common':
+                            self.common_inputs.add(path)
+                        seen.add(path)
+            common_dests = {}
+            for path in self.common_inputs:
+                if path.startswith('gs://'):
+                    common_dests[path] = os.path.join(self.environment('compute')['CANINE_COMMON'], os.path.basename(path))
+                    self.gs_copy(path, os.path.join(self.environment('controller')['CANINE_COMMON'], os.path.basename(path)))
+                elif os.path.isfile(path):
+                    common_dests[path] = os.path.join(self.environment('compute')['CANINE_COMMON'], os.path.basename(path))
+                    self.localize_file(
+                        path,
+                        os.path.join(self.environment('controller')['CANINE_COMMON'], os.path.basename(path))
+                    )
+                else:
+                    print("Could not handle common file", path, file=sys.stderr)
+            for jobId, data in inputs.items():
+                workspace_path = os.path.join(self.environment('controller')['CANINE_JOBS'], str(jobId), 'workspace')
+                self.stage_dir(workspace_path)
+                self.inputs[jobId] = {}
+                for arg, value in data.items():
+                    mode = overrides[arg] if arg in overrides else False
+                    if mode is not False:
+                        if mode == 'stream':
+                            self.inputs[jobId][arg] = Localization('stream', value)
+                        elif mode == 'localize':
+                            self.inputs[jobId][arg] = Localization(
+                                None,
+                                self.reserve_path(jobId, arg, value)
+                            )
+                        elif mode == 'delayed':
+                            if not value.startswith('gs://'):
+                                print("Ignoring 'delayed' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
+                                self.inputs[jobId][arg] = Localization(
+                                    None,
+                                    self.reserve_path(jobId, arg, value)
+                                )
+                            else:
+                                self.inputs[jobId][arg] = Localization(
+                                    'download',
+                                    value
+                                )
+                        elif mode is None:
+                            self.inputs[jobId][arg] = Localization(None, value)
+                    elif value in common_dests:
+                        # common override already handled
+                        # No localization needed, already copied
+                        self.inputs[jobId][arg] = Localization(None, common_dests[value])
+                    else:
+                        self.inputs[jobId][arg] = Localization(
+                            None,
+                            (
+                                self.reserve_path(jobId, arg, value)
+                                if os.path.isfile(value) or value.startswith('gs://')
+                                else value
+                            )
+                        )
+
+    @abc.abstractmethod
+    def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output') -> typing.Dict[str, typing.Dict[str, str]]:
+        """
+        Delocalizes output from all jobs
+        """

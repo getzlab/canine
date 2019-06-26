@@ -59,7 +59,6 @@ backend: # SLURM backend configuration
   # Other keyword arguments to provide to the backend for initialization
   argname: argvalue {--backend argname:argvalue}
 localization: # Localization options
-  localizeGS: (bool, default True) Enables automatic localization of string inputs which start with "gs://" {--localization localizeGS:value}
   common: (bool, default True) Files (gs:// or otherwise) which are shared by multiple tasks will be downloaded only once {--localization common:value}
   staging_dir: (str, default tempdir) Directory in which files for this job should be staged. For Remote backends, this should be set within the NFS share. If no NFS share exists, set this to "SBCAST" {--localization staging-dir:path}
   mount_path: (str, default null) Path within compute nodes where the staging dir can be found {--localization mount-path:path}
