@@ -63,6 +63,8 @@ class RemoteTransport(AbstractTransport):
         handle = self.session.open(filename, mode, bufsize)
         handle.mode = mode
         handle.name = filename
+        if 'w' in mode:
+            handle.set_pipelined(True)
         return handle
 
     def listdir(self, path: str) -> typing.List[str]:
