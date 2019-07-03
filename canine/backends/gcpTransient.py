@@ -23,15 +23,11 @@ GPU_SCRIPT = ' && '.join([
     'wget http://developer.download.nvidia.com/compute/machine-learning/repos/rhel7/x86_64/nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
     'sudo yum install -y nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
     'sudo yum -y updateinfo',
-    'sudo yum install -y cuda-10-0 libcudnn7 libcudnn7-devel',
-    'sudo yum -y updateinfo',
-    'sudo yum install -y libnvinfer5',
+    'sudo yum install -y cuda-10-0 libcudnn7 libcudnn7-devel libnvinfer5',
     'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.repo | sudo tee /etc/yum.repos.d/nvidia-docker.repo',
     'sudo yum -y updateinfo',
     'sudo yum install -y nvidia-docker2'
 ])
-
-# FIXME: allow custom startup and controller scripty bois
 
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
