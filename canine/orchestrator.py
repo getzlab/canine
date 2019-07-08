@@ -9,7 +9,7 @@ from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, R
 import yaml
 import pandas as pd
 from agutil import status_bar
-version = '0.0.1'
+version = '0.0.2'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -192,6 +192,7 @@ class Orchestrator(object):
                 batch_id = self.backend.sbatch(
                     entrypoint_path,
                     'requeue',
+                    job_name=self.name,
                     array="0-{}".format(len(job_spec)-1),
                     output="{}/%a/workspace/stdout".format(env['CANINE_JOBS']),
                     error="{}/%a/workspace/stderr".format(env['CANINE_JOBS']),
