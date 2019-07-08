@@ -10,9 +10,6 @@ inputs:
     - 3
     - 4
     - 5
-adapter:
-  type: Manual
-  product: false
 backend:
   type: TransientGCP
   name: slurm-canine-example

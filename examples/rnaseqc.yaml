@@ -11,8 +11,6 @@ inputs:
     - gs://cga-aarong-resources/test_data/canine/rnaseqc/chr1.bam
     - gs://cga-aarong-resources/test_data/canine/rnaseqc/downsampled.bam
     - gs://cga-aarong-resources/test_data/canine/rnaseqc/single_pair.bam
-adapter:
-  type: Manual
 backend:
   type: TransientGCP
   name: slurm-canine-example

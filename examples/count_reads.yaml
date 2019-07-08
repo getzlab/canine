@@ -32,8 +32,6 @@ inputs:
     - 21
     - X
     - Y
-adapter:
-  type: Manual
 backend:
   type: TransientGCP
   name: slurm-canine-example
