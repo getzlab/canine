@@ -349,7 +349,6 @@ class AbstractLocalizer(abc.ABC):
         """
         Delocalizes output from all jobs
         """
-        print("DEBUG: Delocalizing outputs")
         self.receivetree(
             self.environment('controller')['CANINE_OUTPUT'],
             output_dir,

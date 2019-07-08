@@ -105,7 +105,16 @@ class RemoteTransport(AbstractTransport):
         """
         if self.session is None:
             raise paramiko.SSHException("Transport is not connected")
-        return self.session.normalize(path)
+        try:
+            return self.session.normalize(path)
+        except FileNotFoundError:
+            if path.startswith('/'):
+                return path # Absolute
+            # Relative
+            return os.path.join(
+                self.session.normalize('.'),
+                path
+            )
 
     def remove(self, path: str):
         """

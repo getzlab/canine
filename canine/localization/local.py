@@ -49,13 +49,14 @@ class BatchedLocalizer(AbstractLocalizer):
                 'remote'
             ))
         elif os.path.exists(src):
+            src = os.path.abspath(src)
             if not os.path.isdir(os.path.dirname(dest.localpath)):
                 os.makedirs(os.path.dirname(dest.localpath))
             if os.path.isfile(src):
                 os.symlink(src, dest.localpath)
             else:
                 subprocess.check_call(['touch', '{}/.dir'.format(src)])
-                self.queued_batch.append((src, dest))
+                self.queued_batch.append((src, os.path.join(dest.controllerpath, os.path.basename(src))))
 
     def __enter__(self):
         """
@@ -81,7 +82,6 @@ class BatchedLocalizer(AbstractLocalizer):
             overrides = {}
         overrides = {k:v.lower() if isinstance(v, str) else None for k,v in overrides.items()}
         with self.backend.transport() as transport:
-            print("DEBUG: Scanning for common inputs")
             if self.common:
                 seen = set()
                 for jobId, values in inputs.items():
@@ -92,10 +92,9 @@ class BatchedLocalizer(AbstractLocalizer):
                             self.common_inputs.add(path)
                         seen.add(path)
             common_dests = {}
-            print("DEBUG: Localizing common inputs")
             for path in self.common_inputs:
                 if path.startswith('gs://') or os.path.exists(path):
-                    common_dests[path] = self.reserve_path('common', os.path.basename(path))
+                    common_dests[path] = self.reserve_path('common', os.path.basename(os.path.abspath(path)))
                     self.localize_file(path, common_dests[path])
                 else:
                     print("Could not handle common file", path, file=sys.stderr)
@@ -106,7 +105,6 @@ class BatchedLocalizer(AbstractLocalizer):
                 ))
                 # workspace_path = os.path.join(self.environment('controller')['CANINE_JOBS'], str(jobId), 'workspace')
                 # self.stage_dir(workspace_path)
-                print("DEBUG: Localizing job", jobId)
                 self.inputs[jobId] = {}
                 for arg, value in data.items():
                     mode = overrides[arg] if arg in overrides else False
@@ -116,7 +114,7 @@ class BatchedLocalizer(AbstractLocalizer):
                                 print("Ignoring 'stream' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
                                 self.inputs[jobId][arg] = Localization(
                                     None,
-                                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(value))
+                                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                                 )
                                 self.localize_file(
                                     value,
@@ -130,7 +128,7 @@ class BatchedLocalizer(AbstractLocalizer):
                         elif mode == 'localize':
                             self.inputs[jobId][arg] = Localization(
                                 None,
-                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(value))
+                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                             )
                             self.localize_file(
                                 value,
@@ -141,7 +139,7 @@ class BatchedLocalizer(AbstractLocalizer):
                                 print("Ignoring 'delayed' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
                                 self.inputs[jobId][arg] = Localization(
                                     None,
-                                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(value))
+                                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                                 )
                                 self.localize_file(
                                     value,
@@ -162,7 +160,7 @@ class BatchedLocalizer(AbstractLocalizer):
                         self.inputs[jobId][arg] = Localization(None, common_dests[value])
                     else:
                         if os.path.exists(value) or value.startswith('gs://'):
-                            remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(value))
+                            remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                             self.localize_file(value, remote_path)
                             value = remote_path
                         self.inputs[jobId][arg] = Localization(
@@ -171,7 +169,6 @@ class BatchedLocalizer(AbstractLocalizer):
                             # or an unchanged string if not handled
                             value
                         )
-                print("DEBUG: Inputs prepared. Generating job startup")
                 # Now localize job setup and teardown scripts
                 setup_text = ''
                 job_vars = []
@@ -182,7 +179,7 @@ class BatchedLocalizer(AbstractLocalizer):
                 for key, val in self.inputs[jobId].items():
                     if val.type == 'stream':
                         job_vars.append(shlex.quote(key))
-                        dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(val.path))
+                        dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                         extra_tasks += [
                             'mkfifo {}'.format(dest.computepath),
                             "gsutil {} cat {} > {} &".format(
@@ -197,7 +194,7 @@ class BatchedLocalizer(AbstractLocalizer):
                         ))
                     elif val.type == 'download':
                         job_vars.append(shlex.quote(key))
-                        dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(val.path))
+                        dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                         extra_tasks += [
                             "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                                 '-u {}'.format(shlex.quote(get_default_gcp_project())) if self.get_requester_pays(val.path) else '',
@@ -259,7 +256,6 @@ class BatchedLocalizer(AbstractLocalizer):
                 ),
                 os.path.join(self.environment('local')['CANINE_ROOT'], 'delocalization.py')
             )
-            print("DEBUG: Done. Transmitting tree")
             self.sendtree(
                 self.local_dir,
                 self.staging_dir,
@@ -276,11 +272,10 @@ class BatchedLocalizer(AbstractLocalizer):
                     transport.makedirs(os.path.join(self.environment('controller')['CANINE_JOBS'], jobId, 'inputs'))
             if not transport.isdir(self.environment('controller')['CANINE_OUTPUT']):
                 transport.mkdir(self.environment('controller')['CANINE_OUTPUT'])
-            print("DEBUG: Copying queued files")
             for src, dest, context in self.queued_gs:
                 self.gs_copy(src, dest, context)
             for src, dest in self.queued_batch:
-                self.sendtree(src, dest)
+                self.sendtree(src, os.path.dirname(dest))
             return transport.normpath(self.staging_dir)
 
 class LocalLocalizer(BatchedLocalizer):
@@ -310,10 +305,11 @@ class LocalLocalizer(BatchedLocalizer):
                 'local'
             )
         elif os.path.exists(src):
+            src = os.path.abspath(src)
             if not os.path.isdir(os.path.dirname(dest.localpath)):
                 os.makedirs(os.path.dirname(dest.localpath))
             if os.path.isfile(src):
                 os.symlink(src, dest.localpath)
             else:
                 subprocess.check_call(['touch', '{}/.dir'.format(src)])
-                self.queued_batch.append((src, dest))
+                self.queued_batch.append((src, os.path.join(dest.controllerpath, os.path.basename(src))))

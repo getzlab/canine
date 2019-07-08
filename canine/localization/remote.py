@@ -69,7 +69,6 @@ class RemoteLocalizer(AbstractLocalizer):
             overrides = {}
         overrides = {k:v.lower() if isinstance(v, str) else None for k,v in overrides.items()}
         with self.backend.transport() as transport:
-            print("DEBUG: Scanning for common inputs")
             if self.common:
                 seen = set()
                 for jobId, values in inputs.items():
@@ -80,10 +79,9 @@ class RemoteLocalizer(AbstractLocalizer):
                             self.common_inputs.add(path)
                         seen.add(path)
             common_dests = {}
-            print("DEBUG: Localizing common inputs")
             for path in self.common_inputs:
                 if path.startswith('gs://') or os.path.exists(path):
-                    common_dests[path] = self.reserve_path('common', os.path.basename(path))
+                    common_dests[path] = self.reserve_path('common', os.path.basename(os.path.abspath(path)))
                     self.localize_file(path, common_dests[path], transport=transport)
                 else:
                     print("Could not handle common file", path, file=sys.stderr)
@@ -94,7 +92,6 @@ class RemoteLocalizer(AbstractLocalizer):
                         jobId
                     )
                 )
-                print("DEBUG: Localizing job", jobId)
                 self.inputs[jobId] = {}
                 for arg, value in data.items():
                     mode = overrides[arg] if arg in overrides else False
@@ -104,7 +101,7 @@ class RemoteLocalizer(AbstractLocalizer):
                                 print("Ignoring 'stream' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
                                 self.inputs[jobId][arg] = Localization(
                                     None,
-                                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(value))
+                                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                                 )
                                 self.localize_file(
                                     value,
@@ -119,7 +116,7 @@ class RemoteLocalizer(AbstractLocalizer):
                         elif mode == 'localize':
                             self.inputs[jobId][arg] = Localization(
                                 None,
-                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(value))
+                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                             )
                             self.localize_file(
                                 value,
@@ -131,7 +128,7 @@ class RemoteLocalizer(AbstractLocalizer):
                                 print("Ignoring 'delayed' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
                                 self.inputs[jobId][arg] = Localization(
                                     None,
-                                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(value))
+                                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                                 )
                                 self.localize_file(
                                     value,
@@ -153,7 +150,7 @@ class RemoteLocalizer(AbstractLocalizer):
                         self.inputs[jobId][arg] = Localization(None, common_dests[value])
                     else:
                         if os.path.exists(value) or value.startswith('gs://'):
-                            remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(value))
+                            remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                             self.localize_file(value, remote_path, transport=transport)
                             value = remote_path
                         self.inputs[jobId][arg] = Localization(
@@ -162,7 +159,6 @@ class RemoteLocalizer(AbstractLocalizer):
                             # or an unchanged string if not handled
                             value
                         )
-                print("DEBUG: Inputs prepared. Generating job startup")
                 # Now localize job setup and teardown scripts
                 setup_text = ''
                 job_vars = []
