@@ -31,8 +31,6 @@ GPU_SCRIPT = ' && '.join([
     'sudo yum install -y nvidia-docker2'
 ])
 
-# FIXME: allow custom startup and controller scripty bois
-
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
     Backend for transient slurm clusters which need to be deployed and configured
@@ -66,7 +64,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "private_google_access": True,
           "vpc_net": "default",
           "vpc_subnet": "default",
-          "default_users": getpass.getuser()
+          "default_users": getpass.getuser(),
+          'gpu_count': 0
         }
 
         if gpu_type is not None and gpu_count > 0:

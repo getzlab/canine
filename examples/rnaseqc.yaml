@@ -4,6 +4,7 @@ script:
   - tar -czf output.tar.gz *.bam*
 resources:
   cpus-per-task: 1
+  mem-per-cpu: 3072
 inputs:
   genes_gtf: gs://cga-aarong-resources/references/gencode.v19.genes.v7.patched_contigs.gtf
   bam_file:

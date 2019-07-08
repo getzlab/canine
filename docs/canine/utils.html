@@ -1,0 +1,219 @@
+
+<!DOCTYPE html>
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <meta charset="utf-8" />
+    <title>canine.utils &#8212; Canine  documentation</title>
+    <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
+    <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
+    <script type="text/javascript" id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
+    <script type="text/javascript" src="../_static/jquery.js"></script>
+    <script type="text/javascript" src="../_static/underscore.js"></script>
+    <script type="text/javascript" src="../_static/doctools.js"></script>
+    <script type="text/javascript" src="../_static/language_data.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="prev" title="canine.localization" href="localization.html" />
+   
+  <link rel="stylesheet" href="../_static/custom.css" type="text/css" />
+  
+  
+  <meta name="viewport" content="width=device-width, initial-scale=0.9, maximum-scale=0.9" />
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <div class="section" id="canine-utils">
+<h1>canine.utils<a class="headerlink" href="#canine-utils" title="Permalink to this headline">¶</a></h1>
+<p>Utility code for canine</p>
+<span class="target" id="module-canine.utils"></span><dl class="class">
+<dt id="canine.utils.ArgumentHelper">
+<em class="property">class </em><code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">ArgumentHelper</code><span class="sig-paren">(</span><em class="sig-param">*flags</em>, <em class="sig-param">**params</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper" title="Permalink to this definition">¶</a></dt>
+<dd><p>Helper class for setting arguments to slurm commands
+Used only to handle keyword arguments to console commands
+Should not be responsible for positionals</p>
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.clear">
+<code class="sig-name descname">clear</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; None.  Remove all items from D.<a class="headerlink" href="#canine.utils.ArgumentHelper.clear" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.commandline">
+<em class="property">property </em><code class="sig-name descname">commandline</code><a class="headerlink" href="#canine.utils.ArgumentHelper.commandline" title="Permalink to this definition">¶</a></dt>
+<dd><p>Expands the arguments to command line form</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.copy">
+<code class="sig-name descname">copy</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; a shallow copy of D<a class="headerlink" href="#canine.utils.ArgumentHelper.copy" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.fromkeys">
+<code class="sig-name descname">fromkeys</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.fromkeys" title="Permalink to this definition">¶</a></dt>
+<dd><p>Create a new dictionary with keys from iterable and values set to value.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.get">
+<code class="sig-name descname">get</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.get" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return the value for key if key is in the dictionary, else default.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.items">
+<code class="sig-name descname">items</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; a set-like object providing a view on D's items<a class="headerlink" href="#canine.utils.ArgumentHelper.items" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.keys">
+<code class="sig-name descname">keys</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; a set-like object providing a view on D's keys<a class="headerlink" href="#canine.utils.ArgumentHelper.keys" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.pop">
+<code class="sig-name descname">pop</code><span class="sig-paren">(</span><em class="sig-param">k</em><span class="optional">[</span>, <em class="sig-param">d</em><span class="optional">]</span><span class="sig-paren">)</span> &#x2192; v, remove specified key and return the corresponding value.<a class="headerlink" href="#canine.utils.ArgumentHelper.pop" title="Permalink to this definition">¶</a></dt>
+<dd><p>If key is not found, d is returned if given, otherwise KeyError is raised</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.popitem">
+<code class="sig-name descname">popitem</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; (k, v), remove and return some (key, value) pair as a<a class="headerlink" href="#canine.utils.ArgumentHelper.popitem" title="Permalink to this definition">¶</a></dt>
+<dd><p>2-tuple; but raise KeyError if D is empty.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.setdefault">
+<code class="sig-name descname">setdefault</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.setdefault" title="Permalink to this definition">¶</a></dt>
+<dd><p>Insert key with a value of default if key is not in the dictionary.</p>
+<p>Return the value for key if key is in the dictionary, else default.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.translate">
+<em class="property">static </em><code class="sig-name descname">translate</code><span class="sig-paren">(</span><em class="sig-param">flag</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.utils.ArgumentHelper.translate" title="Permalink to this definition">¶</a></dt>
+<dd><p>Converts acceptable python strings to command line args</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.update">
+<code class="sig-name descname">update</code><span class="sig-paren">(</span><span class="optional">[</span><em class="sig-param">E</em>, <span class="optional">]</span><em class="sig-param">**F</em><span class="sig-paren">)</span> &#x2192; None.  Update D from dict/iterable E and F.<a class="headerlink" href="#canine.utils.ArgumentHelper.update" title="Permalink to this definition">¶</a></dt>
+<dd><p>If E is present and has a .keys() method, then does:  for k in E: D[k] = E[k]
+If E is present and lacks a .keys() method, then does:  for k, v in E: D[k] = v
+In either case, this is followed by: for k in F:  D[k] = F[k]</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.ArgumentHelper.values">
+<code class="sig-name descname">values</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; an object providing a view on D's values<a class="headerlink" href="#canine.utils.ArgumentHelper.values" title="Permalink to this definition">¶</a></dt>
+<dd></dd></dl>
+
+</dd></dl>
+
+<dl class="function">
+<dt id="canine.utils.check_call">
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">check_call</code><span class="sig-paren">(</span><em class="sig-param">cmd: str</em>, <em class="sig-param">rc: int</em>, <em class="sig-param">stdout: BinaryIO</em>, <em class="sig-param">stderr: BinaryIO</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.check_call" title="Permalink to this definition">¶</a></dt>
+<dd><p>Checks that the rc is 0
+If not, flush stdout and stderr streams and raise a CalledProcessError</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="canine.utils.get_default_gcp_project">
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">get_default_gcp_project</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.get_default_gcp_project" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the currently configured default project</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="canine.utils.interactive">
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">interactive</code><span class="sig-paren">(</span><em class="sig-param">channel: paramiko.channel.Channel</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.utils.interactive" title="Permalink to this definition">¶</a></dt>
+<dd><p>Manages an interactive command
+Takes in a paramiko.Channel shared by stdin, stdout, stderr of a currently running command
+The current interpreter stdin is duplicated and written to the command’s stdin
+The command’s stdout and stderr are written to the interpreter’s stdout and stderr
+and also buffered in a ByteStream for later reading
+Returns (exit status, Stdout buffer, Stderr bufer)</p>
+</dd></dl>
+
+</div>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="main navigation">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Canine</a></h1>
+
+
+
+
+
+
+
+
+<h3>Navigation</h3>
+<p class="caption"><span class="caption-text">Contents</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="index.html">canine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="adapters.html">canine.adapters</a></li>
+<li class="toctree-l1"><a class="reference internal" href="backends.html">canine.backends</a></li>
+<li class="toctree-l1"><a class="reference internal" href="localization.html">canine.localization</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">canine.utils</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="localization.html" title="previous chapter">canine.localization</a></li>
+  </ul></li>
+</ul>
+</div>
+<div id="searchbox" style="display: none" role="search">
+  <h3 id="searchlabel">Quick search</h3>
+    <div class="searchformwrapper">
+    <form class="search" action="../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" />
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</div>
+<script type="text/javascript">$('#searchbox').show(0);</script>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &copy;2019, Aaron graubert.
+      
+      |
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 2.1.1</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/canine/utils.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>

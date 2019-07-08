@@ -169,6 +169,11 @@ Here is the equivalent command line option:
 --backend type:Local
 ```
 
+**Warning:** Do not specify `localization.transfer_bucket` when using a `LocalSlurmBackend`.
+This may result in redundant gsutil file transfers. Without a transfer bucket defined,
+a `LocalSlurmBackend` will use file copies and symlinks to stage inputs, even though
+a message about "SFTP" is displayed
+
 ### Remote backend
 
 This backend is used to SSH to a SLURM controller or login node and dispatch jobs
