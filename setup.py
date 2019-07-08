@@ -14,7 +14,8 @@ setup(
     packages = [
         'canine',
         'canine.backends',
-        'canine.adapters'
+        'canine.adapters',
+        'canine.localization'
     ],
     package_data={
         '':[

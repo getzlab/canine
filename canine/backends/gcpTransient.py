@@ -62,7 +62,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "private_google_access": True,
           "vpc_net": "default",
           "vpc_subnet": "default",
-          "default_users": getpass.getuser()
+          "default_users": getpass.getuser(),
+          'gpu_count': 0
         }
 
         if gpu_type is not None and gpu_count > 0:

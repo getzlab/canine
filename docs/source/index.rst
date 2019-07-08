@@ -8,6 +8,8 @@ Welcome to Canine's documentation!
    canine/index
    canine/adapters
    canine/backends
+   canine/localization
+   canine/utils
 
 
 

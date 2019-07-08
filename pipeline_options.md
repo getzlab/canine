@@ -169,6 +169,11 @@ Here is the equivalent command line option:
 --backend type:Local
 ```
 
+**Warning:** Do not specify `localization.transfer_bucket` when using a `LocalSlurmBackend`.
+This may result in redundant gsutil file transfers. Without a transfer bucket defined,
+a `LocalSlurmBackend` will use file copies and symlinks to stage inputs, even though
+a message about "SFTP" is displayed
+
 ### Remote backend
 
 This backend is used to SSH to a SLURM controller or login node and dispatch jobs
@@ -257,8 +262,6 @@ The `localization` section (`--localization varname:value`) specifies options fo
 how input data is transferred and made available to the SLURM cluster. Here is a
 description of the options for Localization:
 
-* `localizeGS`: If True, inputs beginning with `gs://` are recognized as files in
-Google Storage and are localized accordingly (default: True)
 * `common`: If True, any input files which appear more than once anywhere in the
 job configuration will be localized once to a common directory instead of being
 localized multiple times into each job's input directories (default: True)
@@ -272,6 +275,17 @@ to use slurm's `sbcast` command to copy job inputs
 If the `staging_dir` can be found at the same path on both the controller and compute
 nodes, leave this blank (for instance if `/home` is mounted to `/home`, as on the TransientGCP backend).
 (default: Same as `staging_dir`)
+* `strategy`: The localization strategy to use. Options:
+    * `Batched` (default): Localization takes place on the local filesystem, then
+    is transferred to the remote cluster near the end of localization. Gsutil files
+    are localized on the remote system during this same finalization step.
+    * `Local`: Same as the default `Batched` strategy, except that Gsutil files
+    are localized to the local staging directory and transferred to the remote
+    cluster along with the rest of localization files
+    * `Remote`: Localization takes place entirely on the remote cluster
+
+**NOTE:** The old `localizeGS` option has been removed. From now on,
+if you do not wish to automatically localize `gs://` paths, use an appropriate override
 
 ### overrides
 
@@ -285,7 +299,7 @@ for any given input is as follows:
 * If the file appears multiple times in the job configuration and `localization.common`
 is enabled, the file will be localized to the `$CANINE_COMMON` directory instead
 of the job's input. Actual handling of the file follows the remaining rules:
-* If the file starts with `gs://` and `localization.localizeGS` is enabled, the file
+* If the file starts with `gs://`, the file
 will be treated as a Google Storage file and will be copied by invoking `gsutil cp`
 though the current backend
 * If the file is a valid file path on the local system, it will be copied using
@@ -297,21 +311,20 @@ Here is a list of the different override types, and their function:
 * `Stream`: Instead of copying the whole file to the remote system, the file will
 be streamed into the job via a named pipe. The input's environment variable will
 point to the pipe. This only works for `gs://` files, and will override default
-common and localizeGS behavior (file will always be streamed to job-specific input directory)
+common behavior (file will always be streamed to job-specific input directory)
 **Warning:** Streams are included as part of a job's resource allocation. Having too
 many streamed files may adversely affect job performance as gsutil competes with
 the main job script. If you stream more than ~3 files per job, consider increasing
 `resources.cpus-per-task`
 * `Localize`: Force the input to be localized. This will override default
-common and localizeGS behavior (file will always be localized to job-specific input directory).
+common behavior (file will always be localized to job-specific input directory).
 If the input is neither a `gs://` path nor valid local filepath, an exception will be raised
 * `Delayed`: Instead of copying the whole file during the setup phase (before any jobs
   are queued on the SLURM cluster), the file will be localized as part of each individual
 job's script. This only works for `gs://` files, and will override default
-common and localizeGS behavior (file will always be localized to job-specific input directory)
+common behavior (file will always be localized to job-specific input directory)
 * `Common`: Forces the input to be localized to the common directory. This will
-override default common behavior (the file will always be localized to the `$CANINE_COMMON` directory),
-but does not override localizeGS settings (will ignore and handle as a raw string if localizeGS is disabled for `gs://` files)
+override default common behavior (the file will always be localized to the `$CANINE_COMMON` directory)
 * `null`: Forces the input to be treated as a plain string. No handling whatsoever
 will be applied to the input.
 
@@ -331,7 +344,6 @@ inputs: # from example above
     - input1
     - input2
 localization:
-  localizeGS: true
   common: true
   staging_dir: ~/my-job
   overrides:
@@ -341,7 +353,7 @@ localization:
 
 Here is the equivalent command line options:
 ```
---localization localizeGS:True --localization common:True --localization staging_dir:'~/my-job' --localization overrides:reference_file:Common --localization overrides:main_file:Delayed
+--localization common:True --localization staging_dir:'~/my-job' --localization overrides:reference_file:Common --localization overrides:main_file:Delayed
 ```
 
 ## outputs

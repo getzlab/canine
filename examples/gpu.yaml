@@ -1,0 +1,21 @@
+name: GPU Test and example
+script:
+  - nvidia-smi
+inputs:
+  dummy-input: h
+resources:
+  cpus-per-task: 1
+  mem-per-cpu: 3072
+  gres: "gpu:1"
+backend:
+  type: TransientGCP
+  name: canine-gpu
+  compute_zone: us-central1-a
+  controller_type: n1-standard-1
+  worker_type: n1-standard-1
+  compute_disk_size: 30
+  gpu_type: nvidia-tesla-p4
+  gpu_count: 1
+localization:
+  overrides:
+    dummy-input: null

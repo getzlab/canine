@@ -5,7 +5,7 @@ import sys
 import warnings
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend
-from .localization import Localizer
+from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer
 import yaml
 import pandas as pd
 from agutil import status_bar
@@ -23,6 +23,12 @@ BACKENDS = {
     'TransientGCP': TransientGCPSlurmBackend
 }
 
+LOCALIZERS = {
+    'Batched': BatchedLocalizer,
+    'Local': LocalLocalizer,
+    'Remote': RemoteLocalizer
+}
+
 ENTRYPOINT = """#!/bin/bash
 export CANINE="{version}"
 export CANINE_BACKEND="{{backend}}"
@@ -33,6 +39,7 @@ export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 {{pipeline_script}}
+source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
 """.format(version=version)
 
 class Orchestrator(object):
@@ -75,6 +82,9 @@ class Orchestrator(object):
             'backend': {
                 'type': 'Local'
             },
+            'localization': {
+                'strategy': 'Batched'
+            }
         }
         for key, value in DEFAULTS.items():
             if key not in cfg:
@@ -111,6 +121,10 @@ class Orchestrator(object):
         self._backend_type=backend['type']
         self.backend: AbstractSlurmBackend = BACKENDS[backend['type']](**{arg:val for arg,val in backend.items() if arg != 'type'})
         self.localizer_args = config['localization'] if 'localization' in config else {}
+        if self.localizer_args['strategy'] not in LOCALIZERS:
+            raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
+        self._localizer_type = LOCALIZERS[self.localizer_args['strategy']]
+        self.localizer_args = {key:val for key,val in self.localizer_args.items() if key != 'strategy'}
         self.localizer_overrides = {}
         if 'overrides' in self.localizer_args:
             self.localizer_overrides = {**self.localizer_args['overrides']}
@@ -138,15 +152,16 @@ class Orchestrator(object):
             self.backend.load_config_args()
         with self.backend:
             print("Initializing pipeline workspace")
-            with Localizer(self.backend, **self.localizer_args) as localizer:
+            with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 print("Localizing inputs...")
                 localizer.localize(
                     job_spec,
+                    self.raw_outputs,
                     self.localizer_overrides
                 )
                 print("Preparing pipeline script")
-                env = localizer.environment
-                root_dir = localizer.mount_path
+                env = localizer.environment('compute')
+                root_dir = env['CANINE_ROOT']
                 entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')
                 if isinstance(self.script, str):
                     pipeline_path = os.path.join(root_dir, os.path.basename(self.script))
@@ -167,9 +182,7 @@ class Orchestrator(object):
                             **env
                         ))
                     transport.chmod(entrypoint_path, 0o775)
-                    print("Preparing job environments...")
-                    for job in status_bar.iter(job_spec):
-                        localizer.localize_job(job, transport=transport)
+                    transport.chmod(pipeline_path, 0o775)
                 if dry_run:
                     localizer.clean_on_exit = False
                     return job_spec
@@ -185,6 +198,7 @@ class Orchestrator(object):
                     **self.resources
                 )
                 print("Batch id:", batch_id)
+                completed_jobs = []
                 try:
                     waiting_jobs = {
                         '{}_{}'.format(batch_id, i)
@@ -194,28 +208,22 @@ class Orchestrator(object):
                     while len(waiting_jobs):
                         time.sleep(30)
                         acct = self.backend.sacct()
-                        completed_jobs = []
                         for jid in [*waiting_jobs]:
                             if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                                 job = jid.split('_')[1]
-                                print("Delocalizing task",job, "with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
+                                print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                                 # outputs.update(localizer.delocalize(self.raw_outputs, jobId=job))
                                 # waiting_jobs.remove(jid)
                                 completed_jobs.append((job, jid))
-                        if len(completed_jobs):
-                            with self.backend.transport() as transport:
-                                for job, jid in status_bar.iter(completed_jobs):
-                                    waiting_jobs.remove(jid)
-                                    outputs.update(localizer.delocalize(
-                                        self.raw_outputs,
-                                        jobId=job,
-                                        transport=transport
-                                    ))
-
+                                waiting_jobs.remove(jid)
                 except:
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
                     raise
+                finally:
+                    if len(completed_jobs):
+                        print("Delocalizing outputs")
+                        outputs = localizer.delocalize(self.raw_outputs)
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
             return batch_id, job_spec, outputs, self.backend.sacct()

@@ -1,0 +1,395 @@
+
+<!DOCTYPE html>
+
+<html xmlns="http://www.w3.org/1999/xhtml">
+  <head>
+    <meta charset="utf-8" />
+    <title>canine.localization &#8212; Canine  documentation</title>
+    <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
+    <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
+    <script type="text/javascript" id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
+    <script type="text/javascript" src="../_static/jquery.js"></script>
+    <script type="text/javascript" src="../_static/underscore.js"></script>
+    <script type="text/javascript" src="../_static/doctools.js"></script>
+    <script type="text/javascript" src="../_static/language_data.js"></script>
+    <link rel="index" title="Index" href="../genindex.html" />
+    <link rel="search" title="Search" href="../search.html" />
+    <link rel="next" title="canine.utils" href="utils.html" />
+    <link rel="prev" title="canine.backends" href="backends.html" />
+   
+  <link rel="stylesheet" href="../_static/custom.css" type="text/css" />
+  
+  
+  <meta name="viewport" content="width=device-width, initial-scale=0.9, maximum-scale=0.9" />
+
+  </head><body>
+  
+
+    <div class="document">
+      <div class="documentwrapper">
+        <div class="bodywrapper">
+          
+
+          <div class="body" role="main">
+            
+  <div class="section" id="canine-localization">
+<h1>canine.localization<a class="headerlink" href="#canine-localization" title="Permalink to this headline">¶</a></h1>
+<p>Contains code to stage job inputs on the slurm cluster and transfer job outputs back</p>
+<span class="target" id="module-canine.localization"></span><dl class="class">
+<dt id="canine.localization.BatchedLocalizer">
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">BatchedLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">strategy: str = 'batched'</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">localize_gs: bool = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer" title="Permalink to this definition">¶</a></dt>
+<dd><p>Default localization strategy:
+Constructs the canine staging directory locally.
+Local inputs are symlinked into the staging directory.
+gs:// inputs are queued for later
+After staging, the directory is copied to the slurm controller
+(If a transfer bucket is provided, a more efficient copy is used)
+After all jobs have finished, the output directory is copied back here</p>
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.delocalize">
+<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.BatchedLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
+<dd><p>Delocalizes output from all jobs</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.environment">
+<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.environment" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns environment variables relative to the given location.
+Location must be one of {“local”, “controller”, “compute”}</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.get_requester_pays">
+<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.BatchedLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the requested gs:// object or bucket resides in a
+requester pays bucket</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.gs_copy">
+<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copy a google storage (gs://) object
+context must be one of {‘local’, ‘remote’}, which specifies
+where the command should be run
+When uploading to gs://, the destination gs:// directory does not have to exist
+When downloading from gs:// the destination parent directory must exist</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.gs_dircp">
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<dd><p>gs_copy for directories
+context must be one of {‘local’, ‘remote’}, which specifies
+where the command should be run
+When uploading to gs://, the destination gs:// director does not have to exist
+When downloading from gs:// the destination directory does not have to exist,
+but its parent does</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.localize">
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.BatchedLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<dd><p>3 phase task:
+1) Pre-scan inputs to determine proper localization strategy for all inputs
+2) Begin localizing job inputs. For each job, check the predetermined strategy
+and set up the job’s setup and teardown scripts
+3) Finally, finalize the localization. This may include broadcasting the
+staging directory or copying a batch of gsutil files
+Returns the remote staging directory, which is now ready for final startup</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.localize_file">
+<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: canine.localization.base.PathType</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
+<dd><p>Localizes the given file.
+gs:// files are queued for later transfer
+local files are symlinked to the staging directory</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.receivetree">
+<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Transfers the given remote folder to the given local destination.
+Source must be a remote folder, and dest must not exist</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.reserve_path">
+<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.BatchedLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
+<dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
+Returns a PathType object which can be used to view the path relative to
+local, compute, or controller contexts</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.sendtree">
+<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Transfers the given local folder to the given remote destination.
+Source must be a local folder, and destination must not exist</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="canine.localization.LocalLocalizer">
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">LocalLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">strategy: str = 'batched'</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">localize_gs: bool = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer" title="Permalink to this definition">¶</a></dt>
+<dd><p>Similar to BatchedLocalizer:
+Constructs the canine staging directory locally.
+Local inputs are symlinked into the staging directory.
+After staging, the directory is copied to the slurm controller
+(If a transfer bucket is provided, a more efficient copy is used)
+After all jobs have finished, the output directory is copied back here</p>
+<p>EXCEPT:
+Unlike BatchedLocalizer, gs:// files are copied into the local staging directory
+prior to it being copied to the slurm node. This is less efficient (as it
+increases the size of the staging transfer) but utilizes local gsutil credentials</p>
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.delocalize">
+<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.LocalLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
+<dd><p>Delocalizes output from all jobs</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.environment">
+<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.environment" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns environment variables relative to the given location.
+Location must be one of {“local”, “controller”, “compute”}</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.get_requester_pays">
+<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.LocalLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the requested gs:// object or bucket resides in a
+requester pays bucket</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.gs_copy">
+<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copy a google storage (gs://) object
+context must be one of {‘local’, ‘remote’}, which specifies
+where the command should be run
+When uploading to gs://, the destination gs:// directory does not have to exist
+When downloading from gs:// the destination parent directory must exist</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.gs_dircp">
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<dd><p>gs_copy for directories
+context must be one of {‘local’, ‘remote’}, which specifies
+where the command should be run
+When uploading to gs://, the destination gs:// director does not have to exist
+When downloading from gs:// the destination directory does not have to exist,
+but its parent does</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.localize">
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.LocalLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<dd><p>3 phase task:
+1) Pre-scan inputs to determine proper localization strategy for all inputs
+2) Begin localizing job inputs. For each job, check the predetermined strategy
+and set up the job’s setup and teardown scripts
+3) Finally, finalize the localization. This may include broadcasting the
+staging directory or copying a batch of gsutil files
+Returns the remote staging directory, which is now ready for final startup</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.localize_file">
+<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: canine.localization.base.PathType</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
+<dd><p>Localizes the given file.
+gs:// files are queued for later transfer
+local files are symlinked to the staging directory</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.receivetree">
+<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Transfers the given remote folder to the given local destination.
+Source must be a remote folder, and dest must not exist</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.reserve_path">
+<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.LocalLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
+<dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
+Returns a PathType object which can be used to view the path relative to
+local, compute, or controller contexts</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.sendtree">
+<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Transfers the given local folder to the given remote destination.
+Source must be a local folder, and destination must not exist</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="canine.localization.RemoteLocalizer">
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">RemoteLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">strategy: str = 'batched'</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">localize_gs: bool = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer" title="Permalink to this definition">¶</a></dt>
+<dd><p>Remote Only strategy:
+Staging dir is created remotely and files are copied in</p>
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.delocalize">
+<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.RemoteLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
+<dd><p>Delocalizes output from all jobs</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.environment">
+<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.environment" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns environment variables relative to the given location.
+Location must be one of {“local”, “controller”, “compute”}</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.get_requester_pays">
+<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.RemoteLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the requested gs:// object or bucket resides in a
+requester pays bucket</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.gs_copy">
+<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copy a google storage (gs://) object
+context must be one of {‘local’, ‘remote’}, which specifies
+where the command should be run
+When uploading to gs://, the destination gs:// directory does not have to exist
+When downloading from gs:// the destination parent directory must exist</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.gs_dircp">
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<dd><p>gs_copy for directories
+context must be one of {‘local’, ‘remote’}, which specifies
+where the command should be run
+When uploading to gs://, the destination gs:// director does not have to exist
+When downloading from gs:// the destination directory does not have to exist,
+but its parent does</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.localize">
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.RemoteLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<dd><p>3 phase task:
+1) Pre-scan inputs to determine proper localization strategy for all inputs
+2) Begin localizing job inputs. For each job, check the predetermined strategy
+and set up the job’s setup and teardown scripts
+3) Finally, finalize the localization. This may include broadcasting the
+staging directory or copying a batch of gsutil files
+Returns the remote staging directory, which is now ready for final startup</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.localize_file">
+<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: canine.localization.base.PathType</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
+<dd><p>Localizes the given file.
+All files are immediately transferred</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.receivetree">
+<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Transfers the given remote folder to the given local destination.
+Source must be a remote folder, and dest must not exist</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.reserve_path">
+<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.RemoteLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
+<dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
+Returns a PathType object which can be used to view the path relative to
+local, compute, or controller contexts</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.sendtree">
+<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Transfers the given local folder to the given remote destination.
+Source must be a local folder, and destination must not exist</p>
+</dd></dl>
+
+</dd></dl>
+
+</div>
+
+
+          </div>
+          
+        </div>
+      </div>
+      <div class="sphinxsidebar" role="navigation" aria-label="main navigation">
+        <div class="sphinxsidebarwrapper">
+<h1 class="logo"><a href="../index.html">Canine</a></h1>
+
+
+
+
+
+
+
+
+<h3>Navigation</h3>
+<p class="caption"><span class="caption-text">Contents</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="index.html">canine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="adapters.html">canine.adapters</a></li>
+<li class="toctree-l1"><a class="reference internal" href="backends.html">canine.backends</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">canine.localization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="utils.html">canine.utils</a></li>
+</ul>
+
+<div class="relations">
+<h3>Related Topics</h3>
+<ul>
+  <li><a href="../index.html">Documentation overview</a><ul>
+      <li>Previous: <a href="backends.html" title="previous chapter">canine.backends</a></li>
+      <li>Next: <a href="utils.html" title="next chapter">canine.utils</a></li>
+  </ul></li>
+</ul>
+</div>
+<div id="searchbox" style="display: none" role="search">
+  <h3 id="searchlabel">Quick search</h3>
+    <div class="searchformwrapper">
+    <form class="search" action="../search.html" method="get">
+      <input type="text" name="q" aria-labelledby="searchlabel" />
+      <input type="submit" value="Go" />
+    </form>
+    </div>
+</div>
+<script type="text/javascript">$('#searchbox').show(0);</script>
+
+
+
+
+
+
+
+
+        </div>
+      </div>
+      <div class="clearer"></div>
+    </div>
+    <div class="footer">
+      &copy;2019, Aaron graubert.
+      
+      |
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 2.1.1</a>
+      &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
+      
+      |
+      <a href="../_sources/canine/localization.rst.txt"
+          rel="nofollow">Page source</a>
+    </div>
+
+    
+
+    
+  </body>
+</html>
