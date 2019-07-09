@@ -231,7 +231,9 @@ to use for the compute nodes (default: n1-highcpu-2)
 * `controller_disk_size`: The size of the controller node's disk, in gigabytes (default: 200)
 * `gpu_type`: The [type of GPU](https://cloud.google.com/compute/pricing#gpus) to
 attach to compute nodes (default: No gpus)
-* `gpu_count`: The number of gpus to attach to each compute node (default: No gpus)
+* `gpu_count`: The number of gpus to attach to each compute node (default: No gpus).
+If any gpus are attached, nvidia drivers and the nvidia docker runtime will be
+automatically installed on the compute nodes
 * `controller_script`: Additional commands to run during setup of the SLURM controller node
 * `compute_script`: Additional commands to run during setup of the SLURM compute node image
 

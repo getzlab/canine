@@ -114,12 +114,12 @@ class Orchestrator(object):
         if adapter['type'] not in ADAPTERS:
             raise ValueError("Unknown adapter type '{}'".format(adapter))
         self._adapter_type=adapter['type']
-        self.adapter: AbstractAdapter = ADAPTERS[adapter['type']](**{arg:val for arg,val in adapter.items() if arg != 'type'})
+        self.adapter = ADAPTERS[adapter['type']](**{arg:val for arg,val in adapter.items() if arg != 'type'})
         backend = config['backend']
         if backend['type'] not in BACKENDS:
             raise ValueError("Unknown backend type '{}'".format(backend))
         self._backend_type=backend['type']
-        self.backend: AbstractSlurmBackend = BACKENDS[backend['type']](**{arg:val for arg,val in backend.items() if arg != 'type'})
+        self.backend = BACKENDS[backend['type']](**{arg:val for arg,val in backend.items() if arg != 'type'})
         self.localizer_args = config['localization'] if 'localization' in config else {}
         if self.localizer_args['strategy'] not in LOCALIZERS:
             raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
