@@ -130,6 +130,11 @@ def main():
         default=None
     )
     parser.add_argument(
+        '--output-dir',
+        help="Output directory for canine pipeline. Defaults to 'canine_output'",
+        default=None
+    )
+    parser.add_argument(
         '-n', '--name',
         help="Name of the job",
         default=None
@@ -269,7 +274,10 @@ def main():
         yaml.dump(conf, args.export)
     if not len(conf):
         sys.exit("Empty pipeline config")
-    Orchestrator(conf).run_pipeline(args.dry_run)
+    kwargs = {'dry_run': args.dry_run}
+    if args.output_dir is not None:
+        kwargs['output_dir'] = args.output_dir
+    Orchestrator(conf).run_pipeline(**kwargs)
 
 if __name__ == '__main__':
     main()

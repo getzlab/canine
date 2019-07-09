@@ -9,7 +9,7 @@ from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, R
 import yaml
 import pandas as pd
 from agutil import status_bar
-version = '0.0.2'
+version = '0.1.0'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -137,7 +137,7 @@ class Orchestrator(object):
         if 'stderr' not in self.raw_outputs:
             self.raw_outputs['stderr'] = 'stderr'
 
-    def run_pipeline(self, dry_run: bool = False) -> typing.Tuple[str, dict, dict, pd.DataFrame]:
+    def run_pipeline(self, output_dir: str = 'canine_output', dry_run: bool = False) -> typing.Tuple[str, dict, dict, pd.DataFrame]:
         """
         Runs the configured pipeline
         Returns a 4-tuple:
@@ -224,7 +224,7 @@ class Orchestrator(object):
                 finally:
                     if len(completed_jobs):
                         print("Delocalizing outputs")
-                        outputs = localizer.delocalize(self.raw_outputs)
+                        outputs = localizer.delocalize(self.raw_outputs, output_dir)
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
             return batch_id, job_spec, outputs, self.backend.sacct()

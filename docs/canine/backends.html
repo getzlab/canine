@@ -44,9 +44,10 @@
 <dd><p>SLURM backend for interacting with a local slurm node</p>
 <dl class="method">
 <dt id="canine.backends.LocalSlurmBackend.invoke">
-<code class="sig-name descname">invoke</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">_display: bool = False</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.LocalSlurmBackend.invoke" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">invoke</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">interactive: bool = False</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.LocalSlurmBackend.invoke" title="Permalink to this definition">¶</a></dt>
 <dd><p>Invoke an arbitrary command in the slurm console
-Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command)</p>
+Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
+If interactive is True, stdin, stdout, and stderr should all be connected live to the user’s terminal.</p>
 </dd></dl>
 
 <dl class="method">
@@ -283,9 +284,10 @@ Returns ssh’s exit status</p>
 
 <dl class="method">
 <dt id="canine.backends.RemoteSlurmBackend.invoke">
-<code class="sig-name descname">invoke</code><span class="sig-paren">(</span><em class="sig-param">command: str</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.RemoteSlurmBackend.invoke" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">invoke</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">interactive: bool = False</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.RemoteSlurmBackend.invoke" title="Permalink to this definition">¶</a></dt>
 <dd><p>Invoke an arbitrary command in the slurm console
-Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command)</p>
+Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
+If interactive is True, stdin, stdout, and stderr should all be connected live to the user’s terminal</p>
 </dd></dl>
 
 <dl class="method">
@@ -547,9 +549,10 @@ Returns ssh’s exit status</p>
 
 <dl class="method">
 <dt id="canine.backends.TransientGCPSlurmBackend.invoke">
-<code class="sig-name descname">invoke</code><span class="sig-paren">(</span><em class="sig-param">command: str</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.TransientGCPSlurmBackend.invoke" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">invoke</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">interactive: bool = False</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.TransientGCPSlurmBackend.invoke" title="Permalink to this definition">¶</a></dt>
 <dd><p>Invoke an arbitrary command in the slurm console
-Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command)</p>
+Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
+If interactive is True, stdin, stdout, and stderr should all be connected live to the user’s terminal</p>
 </dd></dl>
 
 <dl class="method">

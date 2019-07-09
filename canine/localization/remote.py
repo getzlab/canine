@@ -6,6 +6,7 @@ from contextlib import ExitStack
 from .base import AbstractLocalizer, PathType, Localization
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project, check_call
+from agutil import status_bar
 
 class RemoteLocalizer(AbstractLocalizer):
     """
@@ -171,6 +172,7 @@ class RemoteLocalizer(AbstractLocalizer):
                         job_vars.append(shlex.quote(key))
                         dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(val.path))
                         extra_tasks += [
+                            'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
                             'mkfifo {}'.format(dest.computepath),
                             "gsutil {} cat {} > {} &".format(
                                 '-u {}'.format(shlex.quote(get_default_gcp_project())) if self.get_requester_pays(val.path) else '',
@@ -250,7 +252,8 @@ class RemoteLocalizer(AbstractLocalizer):
                 transport.mkdir(self.environment('controller')['CANINE_COMMON'])
             if not transport.isdir(self.environment('controller')['CANINE_JOBS']):
                 transport.mkdir(self.environment('controller')['CANINE_JOBS'])
-            for jobId in inputs:
+            print("Finalizing directory structure. This may take a while...")
+            for jobId in status_bar.iter(inputs):
                 if not transport.isdir(os.path.join(self.environment('controller')['CANINE_JOBS'], jobId, 'workspace')):
                     transport.makedirs(os.path.join(self.environment('controller')['CANINE_JOBS'], jobId, 'workspace'))
                 if not transport.isdir(os.path.join(self.environment('controller')['CANINE_JOBS'], jobId, 'inputs')):

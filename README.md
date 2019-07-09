@@ -4,29 +4,18 @@ A Dalmatian-based job manager to schedule tasks using SLURM
 
 ---
 
-## Backends
-
-Canine is designed to work with a variety of SLURM setups. The currently supported
-backends are:
-
-* `canine.backends.LocalSlurmBackend`: If Canine is currently running on a SLURM
-controller or login node
-* `canine.backends.RemoteSlurmBackend`: If Canine needs to SSH into an existing SLURM
-controller or login node
-* `canine.backends.TransientGCPSlurmBackend`: If Canine needs to create a new SLURM
-cluster in Google, then delete it afterwards
-
-The backends provide the lowest level API. All backends implement at least the
-interface provided by `canine.backends.AbstractSlurmBackend`. You can use the backends
-to interact with a Slurm cluster. Each backend can also produce a Transport object,
-which implements `canine.backends.AbstractTransport`. Transports provide access
-to the Slurm cluster's filesystem
-
 ## Usage
 
 Canine operates by running jobs on a SLURM cluster. It is designed to take a bash
 or WDL script and schedule jobs using data from a Firecloud workspace or with manually
-provided inputs. API usage documented at the bottom of this section
+provided inputs. API usage documented at the bottom of this section.
+
+Canine may be used in any of the following ways:
+* Running a pipeline yaml file (ie: `$ canine examples/example_pipeline.yaml`)
+* Running a pipeline defined on the commandline (ie: `$ canine --backend type:TransientGCP --backend name:my-cluster (etc...)`)
+* Building and running a pipeline in python (ie: `>>> canine.Orchestrator(pipeline_dict).run_pipeline()`)
+* Using the [Canine API](https://broadinstitute.github.io/canine/) to execute custom
+workflows in Slurm, which could not be configured as a pipeline object
 
 ### Configuration
 
@@ -62,6 +51,8 @@ localization: # Localization options
   common: (bool, default True) Files (gs:// or otherwise) which are shared by multiple tasks will be downloaded only once {--localization common:value}
   staging_dir: (str, default tempdir) Directory in which files for this job should be staged. For Remote backends, this should be set within the NFS share. If no NFS share exists, set this to "SBCAST" {--localization staging-dir:path}
   mount_path: (str, default null) Path within compute nodes where the staging dir can be found {--localization mount-path:path}
+  strategy: [One of: Batched, Local, Remote] Strategy for staging inputs {--localization strategy:mode}
+  transfer_bucket: (str, default null) Transfer directories via the given bucket instead of directly over SFTP. Bucket transfer generally faster
   overrides: # Override localization handling for specific inputs
     varname: [One of: Stream, Localize, Common, Delayed, null] Localization handling {--localization overrides:varname:mode}
     # Stream: The input variable will be streamed to a FIFO pipe which is passed to the job
@@ -74,34 +65,11 @@ outputs: # Required output files
   outputName: pattern {--output outputName:pattern}
 ```
 
-#### Manual Jobs
-
-In manual mode, the provided inputs are taken at face value. If any input is an
-array, the job will become a SLURM array job. In default iterating mode, all array
-inputs must be of equal length, and each task in the array will pop one set of arguments
-from the lists (the nth task runs using the nth value for each array input). In
-product mode, each task will run using a unique combination of arguments. In either
-mode, single-valued inputs are held constant. The SLURM batch job will run the script and all input "varnames"
-will be exported as environment variables to the job. All environment variables
-will have a single value, reflecting the input for that task in the array
-
-##### Delocalization
-
-In manual mode, after each job completes, any files which match any of the provided
-output patterns will be moved to an output directory on your local system
-
-#### Firecloud Jobs
-
-In Firecloud mode, the provided inputs are taken as expressions which need to be
-evaluated as inputs to the bash script. In this mode, the adapter arguments for
-entities are used to select one or mode entities to use for the job. Each entity
-will correspond to one task in the SLURM batch job array. For each entity, all
-of the inputs will be evaluated as firecloud expressions in the context of the entity
-
-##### Delocalization
-
-In Firecloud mode, after each job completes, any files which match any of the provided
-output patterns will be copied into firecloud, if `write-to-workspace` is enabled
+Canine is designed to support a large variety of Slurm setups, including creating
+a temporary Slurm cluster exclusively for itself. The options supported in pipelines
+should allow users to run Slurm jobs in most common setups. For more complicated
+workflows, you may need to use Canine's [Python API](https://broadinstitute.github.io/canine/)
+to gain more granular control.
 
 ---
 

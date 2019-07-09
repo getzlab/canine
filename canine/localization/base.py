@@ -7,6 +7,7 @@ import fnmatch
 import shlex
 import tempfile
 import subprocess
+import traceback
 import shutil
 from uuid import uuid4
 from collections import namedtuple
@@ -72,6 +73,9 @@ class AbstractLocalizer(abc.ABC):
         if bucket not in self.requester_pays:
             command = 'gsutil ls gs://{}'.format(path)
             try:
+                # We check on the remote host because scope differences may cause
+                # a requester pays bucket owned by this account to require -u on the controller
+                # better safe than sorry
                 rc, sout, serr = self.backend.invoke(command)
                 self.requester_pays[bucket] = len([line for line in serr.readlines() if b'requester pays bucket but no user project provided' in line]) >= 1
             except subprocess.CalledProcessError:
@@ -106,7 +110,7 @@ class AbstractLocalizer(abc.ABC):
                 'CANINE_OUTPUT': os.path.join(self.mount_path, 'outputs'),
                 'CANINE_JOBS': os.path.join(self.mount_path, 'jobs'),
             }
-    def gs_dircp(self, src: str, dest: str, context: str):
+    def gs_dircp(self, src: str, dest: str, context: str, transport: typing.Optional[AbstractTransport] = None):
         """
         gs_copy for directories
         context must be one of {'local', 'remote'}, which specifies
@@ -117,16 +121,43 @@ class AbstractLocalizer(abc.ABC):
         """
         assert context in {'local', 'remote'}
         gs_obj = src if src.startswith('gs://') else dest
+        if not dest.startswith('gs://'):
+            # Download
+            if context == 'remote':
+                with ExitStack() as stack:
+                    if transport is None:
+                        transport = stack.enter_context(self.backend.transport())
+                    if not transport.exists(dest):
+                        transport.makedirs(dest)
+            else:
+                if not os.path.exists(dest):
+                    os.makedirs(dest)
+        if not src.startswith('gs://'):
+            # Upload
+            # Fix empty dirs by touching a file
+            # Won't fix nested directory structure containing empty dirs,
+            # but it seems inefficient to walk and touch directories
+            if context == 'remote':
+                self.backend.invoke('touch {}/.canine_dir_marker'.format(src))
+            else:
+                subprocess.run(['touch', '{}/.canine_dir_marker'.format(src)])
         command = "gsutil -m -o GSUtil:parallel_composite_upload_threshold=150M {} cp -r {} {}".format(
             '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
         )
         if context == 'remote':
-            rc, sout, serr = self.backend.invoke(command)
+            # Invoke interactively
+            rc, sout, serr = self.backend.invoke(command, True)
             check_call(command, rc, sout, serr)
         else:
             subprocess.check_call(command, shell=True)
+        if not dest.startswith('gs://'):
+            # Clean up .dir file
+            if context == 'remote':
+                self.backend.invoke('rm -f {}/.canine_dir_marker'.format(src))
+            else:
+                subprocess.run(['rm', '-f', '{}/.canine_dir_marker'.format(src)])
 
     def gs_copy(self, src: str, dest: str, context: str):
         """
@@ -141,18 +172,19 @@ class AbstractLocalizer(abc.ABC):
         try:
             components = gs_obj[5:].split('/')
             bucket = _getblob_bucket(None, components[0], None)
-            blobs = [*{
+            blobs = {
                 blob.name
-                for page in bucket.list_blobs(prefix='/'.join(components), fields='items/name,nextPageToken').pages
+                for page in bucket.list_blobs(prefix='/'.join(components[1:]), fields='items/name,nextPageToken').pages
                 for blob in page
-            }]
-            if not (len(blobs) == 1 and blobs[0] == '/'.join(components)):
+            }
+            if len([blob for blob in blobs if blob == '/'.join(components[1:])]) == 0:
                 # This is a directory
-                self.gs_dircp(src, dest, context)
+                print("Copying directory:", gs_obj)
+                return self.gs_dircp(src, os.path.dirname(dest), context)
         except:
             # If there is an exception, or the above condition is false
             # Procede as a regular gs_copy
-            pass
+            traceback.print_exc()
 
         command = "gsutil -o GSUtil:parallel_composite_upload_threshold=150M {} cp {} {}".format(
             '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(gs_obj) else '',
@@ -160,7 +192,7 @@ class AbstractLocalizer(abc.ABC):
             dest
         )
         if context == 'remote':
-            rc, sout, serr = self.backend.invoke(command)
+            rc, sout, serr = self.backend.invoke(command, True)
             check_call(command, rc, sout, serr)
         else:
             subprocess.check_call(command, shell=True)
@@ -188,35 +220,17 @@ class AbstractLocalizer(abc.ABC):
                 self.gs_dircp(
                     src,
                     'gs://{}/{}'.format(self.transfer_bucket, path),
-                    'local'
+                    'local',
+                    transport=transport
                 )
-                # cmd = "gsutil -m -o GSUtil:parallel_composite_upload_threshold=150M {} cp -r {} gs://{}/{}".format(
-                #     '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(self.transfer_bucket) else '',
-                #     src,
-                #     self.transfer_bucket,
-                #     path
-                # )
-                # print(cmd)
-                # subprocess.check_call(
-                #     cmd,
-                #     shell=True
-                # )
                 if not transport.isdir(os.path.dirname(dest)):
                     transport.makedirs(os.path.dirname(dest))
                 self.gs_dircp(
                     'gs://{}/{}'.format(self.transfer_bucket, path),
                     os.path.dirname(dest),
-                    'remote'
+                    'remote',
+                    transport=transport
                 )
-                # cmd = "gsutil -m {} cp -r gs://{}/{} {}".format(
-                #     '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(self.transfer_bucket) else '',
-                #     self.transfer_bucket,
-                #     path,
-                #     os.path.dirname(dest)
-                # )
-                # print("Remote:", cmd)
-                # rc, sout, serr = self.backend.invoke(cmd)
-                # check_call(cmd, rc, sout, serr)
                 cmd = "gsutil -m {} rm -r gs://{}/{}".format(
                     '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
@@ -254,35 +268,17 @@ class AbstractLocalizer(abc.ABC):
                 self.gs_dircp(
                     src,
                     'gs://{}/{}'.format(self.transfer_bucket, path),
-                    'remote'
+                    'remote',
+                    transport=transport
                 )
-                # cmd = "gsutil -m -o GSUtil:parallel_composite_upload_threshold=150M {} cp -r {} gs://{}/{}".format(
-                #     '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(self.transfer_bucket) else '',
-                #     src,
-                #     self.transfer_bucket,
-                #     path,
-                # )
-                # print("Remote:", cmd)
-                # rc, sout, serr = self.backend.invoke(cmd)
-                # check_call(cmd, rc, sout, serr)
                 if not os.path.isdir(os.path.dirname(dest)):
                     os.makedirs(os.path.dirname(dest))
                 self.gs_dircp(
                     'gs://{}/{}'.format(self.transfer_bucket, path),
                     os.path.dirname(dest),
-                    'local'
+                    'local',
+                    transport=transport
                 )
-                # cmd = "gsutil -m {} cp -r gs://{}/{} {}".format(
-                #     '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(self.transfer_bucket) else '',
-                #     self.transfer_bucket,
-                #     path,
-                #     os.path.dirname(dest)
-                # )
-                # print(cmd)
-                # subprocess.check_call(
-                #     cmd,
-                #     shell=True
-                # )
                 cmd = "gsutil -m {} rm -r gs://{}/{}".format(
                     '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
@@ -356,8 +352,10 @@ class AbstractLocalizer(abc.ABC):
         )
         output_files = {}
         for jobId in os.listdir(output_dir):
-            output_files[jobId] = {}
             start_dir = os.path.join(output_dir, jobId)
+            if not os.path.isdir(start_dir):
+                continue
+            output_files[jobId] = {}
             for dirpath, dirnames, filenames in os.walk(start_dir):
                 for name, pattern in patterns.items():
                     for filename in filenames:

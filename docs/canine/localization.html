@@ -77,7 +77,7 @@ When downloading from gs:// the destination parent directory must exist</p>
 
 <dl class="method">
 <dt id="canine.localization.BatchedLocalizer.gs_dircp">
-<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
 <dd><p>gs_copy for directories
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run
@@ -175,7 +175,7 @@ When downloading from gs:// the destination parent directory must exist</p>
 
 <dl class="method">
 <dt id="canine.localization.LocalLocalizer.gs_dircp">
-<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
 <dd><p>gs_copy for directories
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run
@@ -265,7 +265,7 @@ When downloading from gs:// the destination parent directory must exist</p>
 
 <dl class="method">
 <dt id="canine.localization.RemoteLocalizer.gs_dircp">
-<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
 <dd><p>gs_copy for directories
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run

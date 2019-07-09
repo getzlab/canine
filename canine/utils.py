@@ -89,7 +89,7 @@ class ArgumentHelper(dict):
     def setdefaults(self, **kwargs: typing.Any):
         self.defaults.update(kwargs)
 
-def interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
+def make_interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
     """
     Manages an interactive command
     Takes in a paramiko.Channel shared by stdin, stdout, stderr of a currently running command
@@ -143,14 +143,16 @@ def get_default_gcp_project():
         __DEFAULT_GCP_PROJECT__ = google.auth.default()[1]
     return __DEFAULT_GCP_PROJECT__
 
-def check_call(cmd:str, rc: int, stdout: typing.BinaryIO, stderr: typing.BinaryIO):
+def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None, stderr: typing.Optional[typing.BinaryIO] = None):
     """
     Checks that the rc is 0
     If not, flush stdout and stderr streams and raise a CalledProcessError
     """
     if rc != 0:
-        sys.stdout.write(stdout.read().decode())
-        sys.stdout.flush()
-        sys.stderr.write(stderr.read().decode())
-        sys.stderr.flush()
+        if stdout is not None:
+            sys.stdout.write(stdout.read().decode())
+            sys.stdout.flush()
+        if stderr is not None:
+            sys.stderr.write(stderr.read().decode())
+            sys.stderr.flush()
         raise CalledProcessError(rc, cmd)

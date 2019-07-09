@@ -7,8 +7,9 @@ import subprocess
 import warnings
 import binascii
 import traceback
+import shlex
 from .base import AbstractSlurmBackend, AbstractTransport
-from ..utils import ArgumentHelper, interactive, check_call
+from ..utils import ArgumentHelper, make_interactive, check_call
 from agutil import StdOutAdapter
 import pandas as pd
 import paramiko
@@ -253,15 +254,22 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             raise paramiko.SSHException("Client is not connected")
         return self.client.exec_command(command)
 
-    def invoke(self, command: str) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
+    def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
         Invoke an arbitrary command in the slurm console
-        Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command)
+        Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
+        If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal
         """
         raw_stdin, raw_stdout, raw_stderr = self._invoke(command)
-        stdout = io.BytesIO(raw_stdout.read())
-        stderr = io.BytesIO(raw_stderr.read())
-        return raw_stdout.channel.recv_exit_status(), stdout, stderr
+        try:
+            if interactive:
+                return make_interactive(raw_stdout.channel)
+            stdout = io.BytesIO(raw_stdout.read())
+            stderr = io.BytesIO(raw_stderr.read())
+            return raw_stdout.channel.recv_exit_status(), stdout, stderr
+        except KeyboardInterrupt:
+            print("Warning: Command will continue running on remote server as Paramiko has no way to interrupt commands", file=sys.stderr)
+            raise
 
     def interactive_login(self) -> int:
         """
@@ -275,22 +283,6 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             shell=True,
             executable='/bin/bash'
         )
-
-    def srun(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
-        """
-        Runs the given command interactively
-        The first argument MUST contain the entire command and options to run
-        Additional arguments and keyword arguments provided are passed as slurm arguments to srun
-        Returns a tuple containing (exit status, stdout buffer, stderr buffer)
-        """
-        command = 'srun {} -- {}'.format(
-            ArgumentHelper(*slurmopts, **slurmparams).commandline,
-            command
-        )
-        raw_stdin, raw_stdout, raw_stderr = self._invoke(command)
-        status, stdout, stderr = interactive(raw_stdout.channel)
-        check_call(command, status, stdout, stderr)
-        return status, stdout, stderr
 
     def sbcast(self, localpath: str, remotepath: str, *slurmopts: str, **slurmparams: typing.Any):
         """

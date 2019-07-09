@@ -41,10 +41,11 @@ setup(
         'google-auth>=1.6.3',
         'PyYAML>=5.1',
         'agutil>=4.1.0',
+        'hound>=0.1.9',
         'firecloud-dalmatian>=0.0.11'
     ],
     classifiers = [
-        "Development Status :: 3 - Alpha",
+        "Development Status :: 4 - Beta",
         "Programming Language :: Python :: 3",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Bio-Informatics",

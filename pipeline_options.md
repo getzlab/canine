@@ -54,7 +54,7 @@ See more about file localization below
 
 ## resources
 
-The `resources` section (`--resources resourceName:value`) is used to specify command
+The `resources` section (`--resources resourceName:value`) is used to specify
 additional arguments to SLURM when launching the pipeline. Each _resourceName_ should
 refer to a specific commandline option to SBATCH. For a full list of acceptable options,
 see the [SBATCH](https://slurm.schedmd.com/sbatch.html) man pages. Each _resourceName_
@@ -240,6 +240,15 @@ and `/apps` directories with the compute nodes. For this reason, the controller 
 given a large disk (as most job data will reside there) and a powerful instance type
 (to avoid becoming a bottleneck to the compute nodes).
 
+**Note:** The TransientGCP backend is configured to schedule jobs as if each hyper-thread
+were an actual physical core. This allows applications to access all available vCPUs
+on the compute nodes. If your application does not support hyper-threading, this
+will cause massive overutilization of the CPUs. In this case, you must either
+adjust your `resources` to request _double_ the cpus that you will actually use
+or use your own slurm cluster (with the `Remote` or `Local` backends) and configure
+the nodes, and SelectTypeParameters such that multiple jobs cannot share the same
+core
+
 This backend can run without configuation, but here is an example:
 
 ```yaml
@@ -275,6 +284,26 @@ to use slurm's `sbcast` command to copy job inputs
 If the `staging_dir` can be found at the same path on both the controller and compute
 nodes, leave this blank (for instance if `/home` is mounted to `/home`, as on the TransientGCP backend).
 (default: Same as `staging_dir`)
+* `transfer_bucket`: A Google Cloud Storage bucket to use when executing batch directory
+transfers between the slurm cluster and the local filesystem. Providing a `transfer_bucket`
+_vastly_ improves file transfer performance when copying directories, however there
+are some considerations:
+    * **Do not** include `gs://` or any other path in the bucket. Transfers will
+    be executed through temporary directories which are cleaned up afterwards.
+    For example, if you want to transfer using `gs://my_bucket`, simply use the
+    bucket name: `my_bucket`
+    * **Do not** use a nearline or coldline bucket for transfers. You will incur
+    massive storage fees
+    * **Do not** use `transfer_bucket` with the `Local` backend. Doing so will
+    result in unecessary file transfers
+    * Using a transfer bucket does not preserve empty directories. To preserve
+    directory structure, either add an empty file to each directory and subdirectory
+    you wish to transfer, or do not set a `transfer_bucket`. The fallback SFTP system
+    is significantly slower, but will preserve directory structure
+    * Directories containing directory symlinks will not be preserved. It's okay
+    if the starting directory is a symlink but only file symlinks will be followed after that.
+    Do not set a `transfer_bucket` if you wish to preserve the **apparent** structure,
+    meaning all symlinks will be resolved during the transfer
 * `strategy`: The localization strategy to use. Options:
     * `Batched` (default): Localization takes place on the local filesystem, then
     is transferred to the remote cluster near the end of localization. Gsutil files
@@ -296,9 +325,9 @@ by specifying an override value for the input name (for instance, an input named
   would be overridden with `--localization overrides:foo:value`). The default handling
 for any given input is as follows:
 
-* If the file appears multiple times in the job configuration and `localization.common`
-is enabled, the file will be localized to the `$CANINE_COMMON` directory instead
-of the job's input. Actual handling of the file follows the remaining rules:
+* If the file appears as an input to multiple jobs (for instance, if it was a constant input)
+and `localization.common` is enabled, the file will be localized to the `$CANINE_COMMON`
+directory instead of the job's input. Actual handling of the file follows the remaining rules:
 * If the file starts with `gs://`, the file
 will be treated as a Google Storage file and will be copied by invoking `gsutil cp`
 though the current backend
@@ -314,7 +343,7 @@ point to the pipe. This only works for `gs://` files, and will override default
 common behavior (file will always be streamed to job-specific input directory)
 **Warning:** Streams are included as part of a job's resource allocation. Having too
 many streamed files may adversely affect job performance as gsutil competes with
-the main job script. If you stream more than ~3 files per job, consider increasing
+the main job script for the CPU. If you stream more than ~3 files per job, consider increasing
 `resources.cpus-per-task`
 * `Localize`: Force the input to be localized. This will override default
 common behavior (file will always be localized to job-specific input directory).
@@ -322,7 +351,10 @@ If the input is neither a `gs://` path nor valid local filepath, an exception wi
 * `Delayed`: Instead of copying the whole file during the setup phase (before any jobs
   are queued on the SLURM cluster), the file will be localized as part of each individual
 job's script. This only works for `gs://` files, and will override default
-common behavior (file will always be localized to job-specific input directory)
+common behavior (file will always be localized to job-specific input directory).
+The file will only be localized once. If the job is restarted (for instance, if the
+  node was preempted) the file will only be re-downloaded if the download did not
+  already finish
 * `Common`: Forces the input to be localized to the common directory. This will
 override default common behavior (the file will always be localized to the `$CANINE_COMMON` directory)
 * `null`: Forces the input to be treated as a plain string. No handling whatsoever
@@ -334,7 +366,8 @@ Localization uses credentials on the remote server to localize `gs://` files.
 Files localized during job setup (default, `Common`, `Localize`) will use the credentials
 of the SLURM node your backend is connected to. However, `Stream` and `Delayed`
 files are handled as part of a job's script and will use credentials of the compute
-node
+node. If you wish to use your current credentials to localize default, `Common`, and `Localize`
+files, set your localization strategy to `Local`
 
 Here is an example configuration for localization:
 ```yaml
