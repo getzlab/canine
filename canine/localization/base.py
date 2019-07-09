@@ -141,7 +141,7 @@ class AbstractLocalizer(abc.ABC):
                 self.backend.invoke('touch {}/.canine_dir_marker'.format(src))
             else:
                 subprocess.run(['touch', '{}/.canine_dir_marker'.format(src)])
-        command = "gsutil -m -o GSUtil:parallel_composite_upload_threshold=150M {} cp -r {} {}".format(
+        command = "gsutil -m -o GSUtil:check_hashes=if_fast_else_skip -o GSUtil:parallel_composite_upload_threshold=150M {} cp -r {} {}".format(
             '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
@@ -186,7 +186,7 @@ class AbstractLocalizer(abc.ABC):
             # Procede as a regular gs_copy
             traceback.print_exc()
 
-        command = "gsutil -o GSUtil:parallel_composite_upload_threshold=150M {} cp {} {}".format(
+        command = "gsutil -o GSUtil:check_hashes=if_fast_else_skip -o GSUtil:parallel_composite_upload_threshold=150M {} cp {} {}".format(
             '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
