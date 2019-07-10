@@ -39,7 +39,9 @@ export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 {{pipeline_script}}
+CANINE_JOB_RC=$?
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
+exit $CANINE_JOB_RC
 """.format(version=version)
 
 class Orchestrator(object):
@@ -154,11 +156,12 @@ class Orchestrator(object):
             print("Initializing pipeline workspace")
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 print("Localizing inputs...")
-                localizer.localize(
+                abs_staging_dir = localizer.localize(
                     job_spec,
                     self.raw_outputs,
                     self.localizer_overrides
                 )
+                print("Job staged on SLURM controller in:", abs_staging_dir)
                 print("Preparing pipeline script")
                 env = localizer.environment('compute')
                 root_dir = env['CANINE_ROOT']
