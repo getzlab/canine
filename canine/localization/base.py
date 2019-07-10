@@ -375,13 +375,14 @@ class AbstractLocalizer(abc.ABC):
             if not transport.isdir(controller_env['CANINE_JOBS']):
                 transport.mkdir(controller_env['CANINE_JOBS'])
             print("Finalizing directory structure. This may take a while...")
-            for jobId in status_bar.iter(jobs):
-                if not transport.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace')):
-                    transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'))
-                if not transport.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs')):
-                    transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'))
-            if not transport.isdir(controller_env['CANINE_OUTPUT']):
-                transport.mkdir(controller_env['CANINE_OUTPUT'])
+            if len(jobs):
+                for jobId in status_bar.iter(jobs):
+                    if not transport.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace')):
+                        transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'))
+                    if not transport.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs')):
+                        transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'))
+                if not transport.isdir(controller_env['CANINE_OUTPUT']):
+                    transport.mkdir(controller_env['CANINE_OUTPUT'])
             return transport.normpath(self.staging_dir)
 
     def prepare_job_inputs(self, jobId: str, job_inputs: typing.Dict[str, str], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None):
