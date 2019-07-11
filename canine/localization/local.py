@@ -25,14 +25,14 @@ class BatchedLocalizer(AbstractLocalizer):
     After all jobs have finished, the output directory is copied back here
     """
 
-    def __init__(self, backend: AbstractSlurmBackend, strategy: str = "batched", transfer_bucket: typing.Optional[str] = None, common: bool = True, staging_dir: str = None, mount_path: str = None, localize_gs: bool = None):
+    def __init__(self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None, common: bool = True, staging_dir: str = None, mount_path: str = None, localize_gs: bool = None):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
         the localizer's entire life cycle.
         If staging_dir is not provided, a random directory is chosen
         """
-        super().__init__(backend, strategy, transfer_bucket, common, staging_dir, mount_path, localize_gs)
+        super().__init__(backend, transfer_bucket, common, staging_dir, mount_path, localize_gs)
         self.queued_gs = [] # Queued gs:// -> remote staging transfers
         self.queued_batch = [] # Queued local -> remote directory transfers
 

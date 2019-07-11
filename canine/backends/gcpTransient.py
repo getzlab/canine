@@ -28,6 +28,13 @@ GPU_SCRIPT = ' && '.join([
     'sudo yum -y updateinfo',
     'sudo yum install -y nvidia-docker2'
 ])
+GPU_TYPES = {
+    'nvidia-tesla-k80',
+    'nvidia-tesla-p100',
+    'nvidia-tesla-v100',
+    'nvidia-tesla-p4',
+    'nvidia-tesla-t4'
+}
 
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
@@ -35,11 +42,18 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
     on GCP before they're ready for use
     """
 
-    def __init__(self, name='slurm-canine', *, max_node_count=10, compute_zone='us-central1-a', controller_type='n1-standard-16', login_type='n1-standard-1', worker_type='n1-highcpu-2', login_count=0, compute_disk_size=20, controller_disk_size=200, gpu_type=None, gpu_count=0, compute_script="", controller_script=""):
+    def __init__(
+        self, name: str = 'slurm-canine', *, max_node_count: int = 10, compute_zone: str = 'us-central1-a',
+        controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1',
+        worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
+        controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
+        compute_script: str = "", controller_script: str = "", project: typing.Optional[str]  = None
+    ):
+        self.project = project if project is not None else get_default_gcp_project()
         super().__init__('{}-controller.{}.{}'.format(
             name,
             compute_zone,
-            get_default_gcp_project()
+            self.project
         ))
         self.config = {
           "cluster_name": name,
@@ -67,6 +81,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         }
 
         if gpu_type is not None and gpu_count > 0:
+            if gpu_type not in GPU_TYPES:
+                raise ValueError("gpu_type must be one of {}".format(GPU_TYPES))
             self.config['gpu_type'] = gpu_type
             self.config['gpu_count'] = gpu_count
 
@@ -161,19 +177,23 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                         w
                     )
                 subprocess.check_call(
-                    'gcloud deployment-manager deployments create {} --config {}'.format(
+                    'gcloud deployment-manager deployments create {} --config {} --project {}'.format(
                         self.config['cluster_name'],
-                        os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml')
+                        os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml'),
+                        self.project
                     ),
                     shell=True,
                     executable='/bin/bash'
                 )
             subprocess.check_call(
-                'gcloud compute config-ssh',
+                'gcloud compute config-ssh --project {}'.format(self.project),
                 shell=True
             )
             subprocess.check_call(
-                'gcloud compute os-login ssh-keys add --key-file ~/.ssh/google_compute_engine.pub >/dev/null',
+                'gcloud compute os-login ssh-keys add --key-file '
+                '~/.ssh/google_compute_engine.pub --project {} >/dev/null'.format(
+                    self.project
+                ),
                 shell=True
             )
             self.load_config_args()
@@ -200,21 +220,26 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             shell=True
         )
         subprocess.check_call(
-            'echo y | gcloud deployment-manager deployments delete {}'.format(
+            'echo y | gcloud deployment-manager deployments delete {} --project {}'.format(
+                self.config['cluster_name'],
+                self.project
+            ),
+            shell=True,
+            executable='/bin/bash'
+        )
+        subprocess.run(
+            "echo y | gcloud compute images delete --project {} "
+            "$(gcloud compute images list --filter name:{}| awk 'NR>1 {{print $1}}')".format(
+                self.project,
                 self.config['cluster_name']
             ),
             shell=True,
             executable='/bin/bash'
         )
         subprocess.run(
-            "echo y | gcloud compute images delete $(gcloud compute images list --filter name:{}| awk 'NR>1 {{print $1}}')".format(
-                self.config['cluster_name']
-            ),
-            shell=True,
-            executable='/bin/bash'
-        )
-        subprocess.run(
-            "echo y | gcloud compute instances delete --zone {} $(gcloud compute instances list --filter name:{} | awk 'NR>1 {{print $1}}')".format(
+            "echo y | gcloud compute instances delete --project {} "
+            "--zone {} $(gcloud compute instances list --filter name:{} | awk 'NR>1 {{print $1}}')".format(
+                self.project,
                 self.config['zone'],
                 self.config['cluster_name']
             ),

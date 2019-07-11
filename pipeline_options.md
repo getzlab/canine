@@ -234,8 +234,20 @@ attach to compute nodes (default: No gpus)
 * `gpu_count`: The number of gpus to attach to each compute node (default: No gpus).
 If any gpus are attached, nvidia drivers and the nvidia docker runtime will be
 automatically installed on the compute nodes
+* `project` : The Google Cloud Project to use when creating the Slurm cluster
 * `controller_script`: Additional commands to run during setup of the SLURM controller node
 * `compute_script`: Additional commands to run during setup of the SLURM compute node image
+
+**Note:** By default, the Slurm cluster is created using your default Google Cloud
+Project. However, you can explicitly set a project with `project`,
+and that value will be used instead. You must have the following permissions on the
+project to use it for the TransientGCP backend:
+    * deploymentmanager.deployments.{create,get,stop,update,delete}
+    * compute.disks.{create,get,delete,use}
+    * compute.images.{create,delete,get}
+    * compute.instances.{create,delete,get,list,osAdminLogin,setMetadata,start,stop,suspend,update}
+    * compute.subnetworks.update
+    * compute.routers.{create,delete,get,use,update}
 
 **Note:** The controller node will also act as an NFS server which shares the `/home`
 and `/apps` directories with the compute nodes. For this reason, the controller is
@@ -286,6 +298,9 @@ to use slurm's `sbcast` command to copy job inputs
 If the `staging_dir` can be found at the same path on both the controller and compute
 nodes, leave this blank (for instance if `/home` is mounted to `/home`, as on the TransientGCP backend).
 (default: Same as `staging_dir`)
+* `project` : The Google Cloud Project to charge when interacting with requester pays buckets.
+If the `transfer_bucket` or any declared inputs are requester pays, this project will
+be billed for the charges
 * `transfer_bucket`: A Google Cloud Storage bucket to use when executing batch directory
 transfers between the slurm cluster and the local filesystem. Providing a `transfer_bucket`
 _vastly_ improves file transfer performance when copying directories, however there

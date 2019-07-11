@@ -9,7 +9,7 @@ from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, R
 import yaml
 import pandas as pd
 from agutil import status_bar
-version = '0.1.1'
+version = '0.1.2'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -216,13 +216,12 @@ class Orchestrator(object):
                             if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                                 job = jid.split('_')[1]
                                 print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
-                                # outputs.update(localizer.delocalize(self.raw_outputs, jobId=job))
-                                # waiting_jobs.remove(jid)
                                 completed_jobs.append((job, jid))
                                 waiting_jobs.remove(jid)
                 except:
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
+                    localizer.clean_on_exit = False
                     raise
                 finally:
                     if len(completed_jobs):

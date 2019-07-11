@@ -32,7 +32,7 @@ class AbstractLocalizer(abc.ABC):
     """
     requester_pays = {}
 
-    def __init__(self, backend: AbstractSlurmBackend, strategy: str = "batched", transfer_bucket: typing.Optional[str] = None, common: bool = True, staging_dir: str = None, mount_path: str = None, localize_gs: bool = None):
+    def __init__(self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None, common: bool = True, staging_dir: str = None, mount_path: str = None, localize_gs: bool = None, project : typing.Optional[str] = None):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
@@ -44,7 +44,6 @@ class AbstractLocalizer(abc.ABC):
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
             self.transfer_bucket = self.transfer_bucket[5:]
-        self.strategy = strategy.lower()
         self.backend = backend
         self.common = common
         self.common_inputs = set()
@@ -56,12 +55,13 @@ class AbstractLocalizer(abc.ABC):
             self.__sbcast = True
             staging_dir = None
         self.staging_dir = staging_dir if staging_dir is not None else str(uuid4())
-        self._local_dir = None if self.strategy == 'remote' else tempfile.TemporaryDirectory()
-        self.local_dir = None if self.strategy == 'remote' else self._local_dir.name
+        self._local_dir = tempfile.TemporaryDirectory()
+        self.local_dir = self._local_dir.name
         with self.backend.transport() as transport:
             self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
+        self.project = project if project is not None else get_default_gcp_project()
 
     def get_requester_pays(self, path: str) -> bool:
         """
@@ -153,7 +153,7 @@ class AbstractLocalizer(abc.ABC):
             else:
                 subprocess.run(['touch', '{}/.canine_dir_marker'.format(src)])
         command = "gsutil -m -o GSUtil:check_hashes=if_fast_else_skip -o GSUtil:parallel_composite_upload_threshold=150M {} cp -r {} {}".format(
-            '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(gs_obj) else '',
+            '-u {}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
         )
@@ -198,7 +198,7 @@ class AbstractLocalizer(abc.ABC):
             traceback.print_exc()
 
         command = "gsutil -o GSUtil:check_hashes=if_fast_else_skip -o GSUtil:parallel_composite_upload_threshold=150M {} cp {} {}".format(
-            '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(gs_obj) else '',
+            '-u {}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
         )
@@ -241,7 +241,7 @@ class AbstractLocalizer(abc.ABC):
                     transport=transport
                 )
                 cmd = "gsutil -m {} rm -r gs://{}/{}".format(
-                    '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(self.transfer_bucket) else '',
+                    '-u {}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
@@ -287,7 +287,7 @@ class AbstractLocalizer(abc.ABC):
                     transport=transport
                 )
                 cmd = "gsutil -m {} rm -r gs://{}/{}".format(
-                    '-u {}'.format(get_default_gcp_project()) if self.get_requester_pays(self.transfer_bucket) else '',
+                    '-u {}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
@@ -478,7 +478,7 @@ class AbstractLocalizer(abc.ABC):
                     'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
                     'mkfifo {}'.format(dest.computepath),
                     "gsutil {} cat {} > {} &".format(
-                        '-u {}'.format(shlex.quote(get_default_gcp_project())) if self.get_requester_pays(val.path) else '',
+                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
                         dest.computepath
                     )
@@ -492,7 +492,7 @@ class AbstractLocalizer(abc.ABC):
                 dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                 extra_tasks += [
                     "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
-                        '-u {}'.format(shlex.quote(get_default_gcp_project())) if self.get_requester_pays(val.path) else '',
+                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
                         dest.computepath
                     )
@@ -553,6 +553,12 @@ class AbstractLocalizer(abc.ABC):
         """
         if self._local_dir is not None:
             self._local_dir.cleanup()
+        if self.clean_on_exit:
+            try:
+                with self.backend.transport() as transport:
+                    transport.rmdir(self.staging_dir)
+            except:
+                pass
 
     @abc.abstractmethod
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
