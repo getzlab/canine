@@ -228,8 +228,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             executable='/bin/bash'
         )
         subprocess.run(
-            "echo y | gcloud compute images delete --project {} "
-            "$(gcloud compute images list --filter name:{}| awk 'NR>1 {{print $1}}')".format(
+            "echo y | gcloud compute images delete --project {0} "
+            "$(gcloud compute images list --project {0} --filter name:{1}| awk 'NR>1 {{print $1}}')".format(
                 self.project,
                 self.config['cluster_name']
             ),
@@ -237,8 +237,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             executable='/bin/bash'
         )
         subprocess.run(
-            "echo y | gcloud compute instances delete --project {} "
-            "--zone {} $(gcloud compute instances list --filter name:{} | awk 'NR>1 {{print $1}}')".format(
+            "echo y | gcloud compute instances delete --project {0} "
+            "--zone {1} $(gcloud compute instances list --project {0} --filter name:{2} | awk 'NR>1 {{print $1}}')".format(
                 self.project,
                 self.config['zone'],
                 self.config['cluster_name']
