@@ -63,6 +63,12 @@ def boot_transient():
         default=200
     )
     parser.add_argument(
+        '-k', '--secondary-disk-size',
+        type=int,
+        help="Size of the secondary disk",
+        default=0
+    )
+    parser.add_argument(
         '-d', '--worker-disk-size',
         type=int,
         help="Size of the compute node disk in GB",
@@ -88,6 +94,7 @@ def boot_transient():
         worker_type=args.worker_type,
         compute_disk_size=args.worker_disk_size,
         controller_disk_size=args.controller_disk_size,
+        secondary_disk_size=args.secondary_disk_size,
         gpu_type=args.gpu_type,
         gpu_count=args.gpu_count
     ) as slurm:

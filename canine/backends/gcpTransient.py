@@ -47,7 +47,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1',
         worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
-        compute_script: str = "", controller_script: str = "", project: typing.Optional[str]  = None
+        compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None
     ):
         self.project = project if project is not None else get_default_gcp_project()
         super().__init__('{}-controller.{}.{}'.format(
@@ -68,7 +68,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "compute_disk_size_gb": int(compute_disk_size),
           "controller_disk_type": "pd-ssd",
           "controller_disk_size_gb": int(controller_disk_size),
-          "controller_secondary_disk": False,
+          "controller_secondary_disk": secondary_disk_size > 0,
           "login_machine_type": login_type,
           "login_node_count": int(login_count),
           "login_disk_size_gb": 10,
@@ -85,6 +85,10 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 raise ValueError("gpu_type must be one of {}".format(GPU_TYPES))
             self.config['gpu_type'] = gpu_type
             self.config['gpu_count'] = gpu_count
+
+        if secondary_disk_size > 0:
+            self.config['controller_secondary_disk_type'] = 'pd-standard'
+            self.config['controller_secondary_disk_size_gb'] = secondary_disk_size
 
         self.startup_script = """
         sudo yum install -y yum-utils device-mapper-persistent-data lvm2 libcgroup libcgroup-tools htop gcc python-devel python-setuptools redhat-rpm-config wget
@@ -122,7 +126,11 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo pip uninstall -y crcmod
         sudo pip install --no-cache-dir -U crcmod
         {0}
-        """.format(controller_script)
+        {1}
+        """.format(
+            'sudo chmod a+w /mnt/disks/sec' if secondary_disk_size else '',
+            controller_script
+        )
 
         subprocess.check_call(
             'touch ~/.ssh/google_compute_known_hosts',

@@ -228,7 +228,10 @@ to use for the controller node (default: n1-standard-16)
 * `worker_type`: The [Compute Instance Type](https://cloud.google.com/compute/pricing#predefined)
 to use for the compute nodes (default: n1-highcpu-2)
 * `compute_disk_size`: The size of the disk for each compute node, in gigabytes (default: 20)
-* `controller_disk_size`: The size of the controller node's disk, in gigabytes (default: 200)
+* `controller_disk_size`: The size of the controller node's disk, in gigabytes (default: 200; Max: 2000)
+* `secondary_disk_size`: The of a secondary disk (default: 0; Max: 64000). If you
+use the secondary disk, it is mounted at `/mnt/disks/sec`. Make sure you set
+`localization.staging_dir` to be a path within this directory.
 * `gpu_type`: The [type of GPU](https://cloud.google.com/compute/pricing#gpus) to
 attach to compute nodes (default: No gpus)
 * `gpu_count`: The number of gpus to attach to each compute node (default: No gpus).
