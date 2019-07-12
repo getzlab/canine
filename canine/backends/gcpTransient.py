@@ -126,9 +126,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo pip uninstall -y crcmod
         sudo pip install --no-cache-dir -U crcmod
         {0}
-        {1}
         """.format(
-            'sudo chmod a+w /mnt/disks/sec' if secondary_disk_size else '',
             controller_script
         )
 
