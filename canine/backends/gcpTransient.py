@@ -270,9 +270,13 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         command = 'sinfo'+ArgumentHelper(*slurmopts, **slurmparams).commandline
         status, stdout, stderr = self.invoke(command)
         if status != 0 and SLURM_PARTITION_RECON in stderr.read():
-            print("Transient controller timed out while checking partitions. Allowing one additional retry", file=sys.stderr)
+            print("Transient controller timed out while checking partitions. Retrying...", file=sys.stderr)
             time.sleep(120)
             status, stdout, stderr = self.invoke(command)
+            if status != 0 and SLURM_PARTITION_RECON in stderr.read():
+                print("Transient controller timed out while checking partitions. Making one final retry", file=sys.stderr)
+                time.sleep(120)
+                status, stdout, stderr = self.invoke(command)
         stderr.seek(0,0)
         check_call(command, status, stdout, stderr)
         df = pd.read_fwf(
