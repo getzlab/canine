@@ -9,6 +9,7 @@ import tempfile
 import subprocess
 import traceback
 import shutil
+import crayons
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
@@ -234,12 +235,22 @@ class AbstractLocalizer(abc.ABC):
                 )
                 if not transport.isdir(os.path.dirname(dest)):
                     transport.makedirs(os.path.dirname(dest))
-                self.gs_dircp(
-                    'gs://{}/{}'.format(self.transfer_bucket, path),
-                    os.path.dirname(dest),
-                    'remote',
-                    transport=transport
-                )
+                try:
+                    self.gs_dircp(
+                        'gs://{}/{}'.format(self.transfer_bucket, path),
+                        os.path.dirname(dest),
+                        'remote',
+                        transport=transport
+                    )
+                except:
+                    print(
+                        crayons.red("ERROR:", bold=True),
+                        "Failed to download the data on the remote system."
+                        "Your files are still saved in",
+                        'gs://{}/{}'.format(self.transfer_bucket, path),
+                        file=sys.stderr
+                    )
+                    raise
                 cmd = "gsutil -m {} rm -r gs://{}/{}".format(
                     '-u {}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
@@ -280,12 +291,22 @@ class AbstractLocalizer(abc.ABC):
                 )
                 if not os.path.isdir(os.path.dirname(dest)):
                     os.makedirs(os.path.dirname(dest))
-                self.gs_dircp(
-                    'gs://{}/{}'.format(self.transfer_bucket, path),
-                    os.path.dirname(dest),
-                    'local',
-                    transport=transport
-                )
+                try:
+                    self.gs_dircp(
+                        'gs://{}/{}'.format(self.transfer_bucket, path),
+                        os.path.dirname(dest),
+                        'local',
+                        transport=transport
+                    )
+                except:
+                    print(
+                        crayons.red("ERROR:", bold=True),
+                        "Failed to download the data on the local system."
+                        "Your files are still saved in",
+                        'gs://{}/{}'.format(self.transfer_bucket, path),
+                        file=sys.stderr
+                    )
+                    raise
                 cmd = "gsutil -m {} rm -r gs://{}/{}".format(
                     '-u {}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,

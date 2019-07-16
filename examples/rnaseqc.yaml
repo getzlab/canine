@@ -17,8 +17,6 @@ backend:
   worker_type: n1-standard-1
   controller_disk_size: 50
 localization:
-  strategy: Batched
-  transfer_bucket: cga-aarong-resources
   overrides:
     bam_file: Stream
 outputs:
