@@ -1,6 +1,11 @@
 from setuptools import setup
 import re
 import os
+import sys
+
+ver_info = sys.version_info
+if ver_info < (3,5,4):
+    raise RuntimeError("canine requires at least python 3.5.4")
 
 with open(os.path.join(os.path.dirname(__file__), 'canine', 'orchestrator.py')) as r:
     version = re.search(r'version = \'(\d+\.\d+\.\d+[-_a-zA-Z0-9]*)\'', r.read()).group(1)
