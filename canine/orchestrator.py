@@ -9,7 +9,7 @@ from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, R
 import yaml
 import pandas as pd
 from agutil import status_bar
-version = '0.1.4'
+version = '0.2.0'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
