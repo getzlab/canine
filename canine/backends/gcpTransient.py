@@ -14,20 +14,20 @@ import pandas as pd
 
 SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
 PARAMIKO_PEM_KEY = os.path.expanduser('~/.ssh/canine_pem_key')
-GPU_SCRIPT = ' && '.join([
-    'sudo yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r)',
-    'wget http://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
-    'sudo yum install -y cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
-    'sudo yum -y updateinfo',
-    'sudo yum install -y cuda',
-    'wget http://developer.download.nvidia.com/compute/machine-learning/repos/rhel7/x86_64/nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
-    'sudo yum install -y nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
-    'sudo yum -y updateinfo',
-    'sudo yum install -y cuda-10-0 libcudnn7 libcudnn7-devel libnvinfer5',
-    'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.repo | sudo tee /etc/yum.repos.d/nvidia-docker.repo',
-    'sudo yum -y updateinfo',
-    'sudo yum install -y nvidia-docker2'
-])
+# GPU_SCRIPT = ' && '.join([
+#     'sudo yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r)',
+#     'wget http://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
+#     'sudo yum install -y cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
+#     'sudo yum -y updateinfo',
+#     'sudo yum install -y cuda',
+#     'wget http://developer.download.nvidia.com/compute/machine-learning/repos/rhel7/x86_64/nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
+#     'sudo yum install -y nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
+#     'sudo yum -y updateinfo',
+#     'sudo yum install -y cuda-10-0 libcudnn7 libcudnn7-devel libnvinfer5',
+#     'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.repo | sudo tee /etc/yum.repos.d/nvidia-docker.repo',
+#     'sudo yum -y updateinfo',
+#     'sudo yum install -y nvidia-docker2'
+# ])
 GPU_TYPES = {
     'nvidia-tesla-k80',
     'nvidia-tesla-p100',
@@ -77,7 +77,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "vpc_net": "default",
           "vpc_subnet": "default",
           "default_users": getpass.getuser(),
-          'gpu_count': 0
+          'gpu_count': 0,
+          'external_compute_ips': True
         }
 
         if gpu_type is not None and gpu_count > 0:
@@ -91,9 +92,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             self.config['controller_secondary_disk_size_gb'] = secondary_disk_size
 
         self.startup_script = """
-        sudo yum install -y yum-utils device-mapper-persistent-data lvm2 libcgroup libcgroup-tools htop gcc python-devel python-setuptools redhat-rpm-config wget
-        sudo yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
-        sudo yum install -y docker-ce
+        sudo apt-get install -y apt-utils lvm2 cgroup-bin cgroup-tools libcgroup-dev htop gcc python-dev python-setuptools wget docker.io
         sudo groupadd docker
         sudo usermod -aG docker {0}
         sudo systemctl enable docker.service
@@ -120,7 +119,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo chmod 700 /swapfile
         sudo mkswap /swapfile
         sudo swapon /swapfile
-        sudo yum install -y gcc python-devel python-setuptools redhat-rpm-config htop
+        sudo apt-get install -y gcc python-dev python-setuptools htop
         curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
         sudo python get-pip.py
         sudo pip uninstall -y crcmod
