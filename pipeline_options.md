@@ -213,7 +213,7 @@ Here is the equivalent command line options:
 
 ### TransientGCP backend
 
-This backend is used to create a new SLURM cluster on GCP, then shut it down after
+This backend is used to create a new Ubuntu 18.04 SLURM cluster on GCP, then shut it down after
 running the pipeline. It requires that you have the Google Cloud SDK installed.
 Depending on your cluster configuration, it may take up to 10 minutes before Canine
 begins localizing files to the server and another 10 before the cluster is ready

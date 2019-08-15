@@ -14,20 +14,24 @@ import pandas as pd
 
 SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
 PARAMIKO_PEM_KEY = os.path.expanduser('~/.ssh/canine_pem_key')
-# GPU_SCRIPT = ' && '.join([
-#     'sudo yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r)',
-#     'wget http://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
-#     'sudo yum install -y cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
-#     'sudo yum -y updateinfo',
-#     'sudo yum install -y cuda',
-#     'wget http://developer.download.nvidia.com/compute/machine-learning/repos/rhel7/x86_64/nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
-#     'sudo yum install -y nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
-#     'sudo yum -y updateinfo',
-#     'sudo yum install -y cuda-10-0 libcudnn7 libcudnn7-devel libnvinfer5',
-#     'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.repo | sudo tee /etc/yum.repos.d/nvidia-docker.repo',
-#     'sudo yum -y updateinfo',
-#     'sudo yum install -y nvidia-docker2'
-# ])
+GPU_SCRIPT = ' && '.join([
+    # 'sudo yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r)',
+    # 'wget http://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
+    # 'sudo yum install -y cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
+    # 'sudo yum -y updateinfo',
+    # 'sudo yum install -y cuda',
+    # 'wget http://developer.download.nvidia.com/compute/machine-learning/repos/rhel7/x86_64/nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
+    # 'sudo yum install -y nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
+    # 'sudo yum -y updateinfo',
+    # 'sudo yum install -y cuda-10-0 libcudnn7 libcudnn7-devel libnvinfer5',
+    # 'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.repo | sudo tee /etc/yum.repos.d/nvidia-docker.repo',
+    # 'sudo yum -y updateinfo',
+    # 'sudo yum install -y nvidia-docker2'
+    'curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -',
+    'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list',
+    'sudo apt-get update',
+    'sudo apt-get install -y nvidia-container-toolkit'
+])
 GPU_TYPES = {
     'nvidia-tesla-k80',
     'nvidia-tesla-p100',
@@ -95,10 +99,11 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo apt-get install -y apt-utils lvm2 cgroup-bin cgroup-tools libcgroup-dev htop gcc python-dev python-setuptools wget docker.io
         sudo groupadd docker
         sudo usermod -aG docker {0}
+        sudo usermod -aG sudo {0}
         sudo systemctl enable docker.service
         sudo systemctl start docker.service
         sudo chown root:docker /var/run/docker.sock
-        sudo bash -c "echo {0}$'\\t'ALL='(ALL:ALL)'$'\\t'ALL >> /etc/sudoers"
+        # sudo bash -c "echo {0}$'\\t'ALL='(ALL:ALL)'$'\\t'ALL >> /etc/sudoers"
         sudo sed -e 's/GRUB_CMDLINE_LINUX="\\?\\([^"]*\\)"\\?/GRUB_CMDLINE_LINUX="\\1 cgroup_enable=memory swapaccount=1"/' < /etc/default/grub > grub.tmp
         sudo mv grub.tmp /etc/default/grub
         sudo grub2-mkconfig -o /etc/grub2.cfg
@@ -234,7 +239,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         )
         subprocess.run(
             "echo y | gcloud compute images delete --project {0} "
-            "$(gcloud compute images list --project {0} --filter name:{1}| awk 'NR>1 {{print $1}}')".format(
+            "$(gcloud compute images list --project {0} --filter family:{1}-compute-image-family| awk 'NR>1 {{print $1}}')".format(
                 self.project,
                 self.config['cluster_name']
             ),
@@ -243,7 +248,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         )
         subprocess.run(
             "echo y | gcloud compute instances delete --project {0} "
-            "--zone {1} $(gcloud compute instances list --project {0} --filter name:{2} | awk 'NR>1 {{print $1}}')".format(
+            "--zone {1} $(gcloud compute instances list --project {0} --filter name:{2}-compute | awk 'NR>1 {{print $1}}')".format(
                 self.project,
                 self.config['zone'],
                 self.config['cluster_name']
