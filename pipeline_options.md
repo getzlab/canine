@@ -245,12 +245,12 @@ automatically installed on the compute nodes
 Project. However, you can explicitly set a project with `project`,
 and that value will be used instead. You must have the following permissions on the
 project to use it for the TransientGCP backend:
-    * deploymentmanager.deployments.{create,get,stop,update,delete}
-    * compute.disks.{create,get,delete,use}
-    * compute.images.{create,delete,get}
-    * compute.instances.{create,delete,get,list,osAdminLogin,setMetadata,start,stop,suspend,update}
-    * compute.subnetworks.update
-    * compute.routers.{create,delete,get,use,update}
+  * deploymentmanager.deployments.{create,get,stop,update,delete}
+  * compute.disks.{create,get,delete,use}
+  * compute.images.{create,delete,get}
+  * compute.instances.{create,delete,get,list,osAdminLogin,setMetadata,start,stop,suspend,update}
+  * compute.subnetworks.update
+  * compute.routers.{create,delete,get,use,update}
 
 **Note:** The controller node will also act as an NFS server which shares the `/home`
 and `/apps` directories with the compute nodes. For this reason, the controller is
