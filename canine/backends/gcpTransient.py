@@ -30,7 +30,7 @@ GPU_SCRIPT = ' && '.join([
     'curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -',
     'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list',
     'sudo apt-get update',
-    'sudo apt-get install -y nvidia-container-toolkit'
+    'sudo apt-get install -y nvidia-container-toolkit nvidia-docker2'
 ])
 GPU_TYPES = {
     'nvidia-tesla-k80',
@@ -82,7 +82,6 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "vpc_subnet": "default",
           "default_users": getpass.getuser(),
           'gpu_count': 0,
-          'external_compute_ips': True
         }
 
         if gpu_type is not None and gpu_count > 0:
@@ -103,7 +102,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo systemctl enable docker.service
         sudo systemctl start docker.service
         sudo chown root:docker /var/run/docker.sock
-        # sudo bash -c "echo {0}$'\\t'ALL='(ALL:ALL)'$'\\t'ALL >> /etc/sudoers"
+        # sudo bash -c "echo {0}$'\\t'ALL='(ALL:ALL)'$'\\t'NOPASSWD:$'\\t'ALL >> /etc/sudoers"
         sudo sed -e 's/GRUB_CMDLINE_LINUX="\\?\\([^"]*\\)"\\?/GRUB_CMDLINE_LINUX="\\1 cgroup_enable=memory swapaccount=1"/' < /etc/default/grub > grub.tmp
         sudo mv grub.tmp /etc/default/grub
         sudo grub2-mkconfig -o /etc/grub2.cfg

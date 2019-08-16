@@ -1,7 +1,7 @@
 name: GPU Test and example
 script:
   - nvidia-smi
-  - sudo docker run --rm --gpus all nvidia/cuda:10.0-base nvidia-smi
+  - sudo docker run --rm --runtime nvidia nvidia/cuda nvidia-smi
 inputs:
   dummy_input: h
 resources:

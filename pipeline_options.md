@@ -23,9 +23,17 @@ script:
   - tar czf output.tar.gz *.outputs*
 ```
 
-**NOTE:** When using docker, you **must** also use `sudo` if using the `TransientGCP`
-backend (below). Additionally, we recommend setting `-v $CANINE_ROOT:$CANINE_ROOT`
-in the docker command, as it will allow for job input filepaths (see below) to work
+### Docker notes
+* When using the `TransientGCP` backend, you **must** use `sudo` to use docker
+* When using the `TransientGCP` backend with GPUS, you will need to add the option
+`--runtime nvidia` option to enable access to the GPUS
+* We recommend setting `-v $CANINE_ROOT:$CANINE_ROOT` as this will mount the pipeline
+directory into the container. This allows for existing input variable filepaths to
+function correctly in the container
+* We recommend setting `--cpus $SLURM_CPUS_PER_TASK` and `--memory $(expr $SLURM_CPUS_PER_TASK '*' $SLURM_MEM_PER_CPU)MB`.
+While these settings are entirely optional, they enforce CPU and memory usage limits
+in the container, which can help avoid accidentally exceeding the resources provisioned
+for each job
 
 ## inputs
 

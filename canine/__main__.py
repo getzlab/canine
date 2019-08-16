@@ -21,7 +21,7 @@ def ConfType(nfields, nMax=None):
         if len(args) < nfields:
             raise argparse.ArgumentError(argument, "Not enough fields in argument (expected {}, got {})".format(nfields, len(args)))
         elif len(args) > nMax:
-            args = args[:nMax-1] + ':'.join(args[nMax-1:])
+            args = args[:nMax-1] + [':'.join(args[nMax-1:])]
         return args
 
     return parse_arg
