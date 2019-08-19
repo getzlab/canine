@@ -102,7 +102,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         sudo systemctl enable docker.service
         sudo systemctl start docker.service
         sudo chown root:docker /var/run/docker.sock
-        # sudo bash -c "echo {0}$'\\t'ALL='(ALL:ALL)'$'\\t'NOPASSWD:$'\\t'ALL >> /etc/sudoers"
+        sudo bash -c "echo {0}$'\\t'ALL='(ALL:ALL)'$'\\t'NOPASSWD:$'\\t'ALL >> /etc/sudoers"
         sudo sed -e 's/GRUB_CMDLINE_LINUX="\\?\\([^"]*\\)"\\?/GRUB_CMDLINE_LINUX="\\1 cgroup_enable=memory swapaccount=1"/' < /etc/default/grub > grub.tmp
         sudo mv grub.tmp /etc/default/grub
         sudo grub2-mkconfig -o /etc/grub2.cfg
