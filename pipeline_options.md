@@ -400,6 +400,7 @@ notes when using the NFS localizer:
 only passively over NFS
 * The `staging_dir` option refers to the path where canine should be staged **on the local system**.
 This path _must_ exist within the NFS share
+* `staging_dir` is a required option for the NFS strategy
 * The `mount_path` option refers to the path where the staging directory will be visible
 **on the remote systems**. The slurm controller and worker nodes must all use this path
 

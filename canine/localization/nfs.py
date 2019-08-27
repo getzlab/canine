@@ -1,14 +1,17 @@
 import typing
 import warnings
 import shutil
+import tempfile
 import os
+import shlex
 from .base import PathType, Localization
-from .local import LocalLocalizer
+from .local import BatchedLocalizer
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project
+from agutil import status_bar
 
 
-class NFSLocalizer(LocalLocalizer):
+class NFSLocalizer(BatchedLocalizer):
     """
     Similar to LocalLocalizer:
     Constructs the canine staging directory locally.
@@ -32,6 +35,8 @@ class NFSLocalizer(LocalLocalizer):
         Note: staging_dir refers to the directory on the LOCAL filesystem
         Note: mount_path refers to the mounted directory on the REMOTE filesystem (both the controller and worker nodes)
         """
+        if staging_dir is None:
+            raise TypeError("staging_dir is a required argument for NFSLocalizer")
         if transfer_bucket is not None:
             warnings.warn("transfer_bucket has no bearing on NFSLocalizer. It is kept purely for adherence to the API")
         self.backend = backend
@@ -74,7 +79,7 @@ class NFSLocalizer(LocalLocalizer):
             if os.path.isfile(src):
                 shutil.copyfile(src, dest.localpath)
             else:
-                shutil.copytree(src, os.path.join(dest.localpath, os.path.basename(src)))
+                shutil.copytree(src, dest.localpath)
 
     def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
         """
@@ -119,7 +124,7 @@ class NFSLocalizer(LocalLocalizer):
                 ),
                 os.path.join(self.environment('local')['CANINE_ROOT'], 'delocalization.py')
             )
-            return staging_dir
+            return self.finalize_staging_dir(inputs)
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str]:
         """
@@ -224,3 +229,25 @@ class NFSLocalizer(LocalLocalizer):
                             else:
                                 output_files[jobId][name].append(os.path.abspath(fullname))
         return output_files
+
+    def finalize_staging_dir(self, jobs: typing.Iterable[str], transport: typing.Optional[AbstractTransport] = None) -> str:
+        """
+        Finalizes the staging directory by building any missing directory trees
+        (such as those dropped during transfer for being empty).
+        Returns the absolute path of the remote staging directory on the controller node.
+        """
+        controller_env = self.environment('local')
+        if not os.path.isdir(controller_env['CANINE_COMMON']):
+            os.mkdir(controller_env['CANINE_COMMON'])
+        if not os.path.isdir(controller_env['CANINE_JOBS']):
+            os.mkdir(controller_env['CANINE_JOBS'])
+        print("Finalizing directory structure. This may take a while...")
+        if len(jobs):
+            for jobId in status_bar.iter(jobs):
+                if not os.path.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace')):
+                    os.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'))
+                if not os.path.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs')):
+                    os.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'))
+            if not os.path.isdir(controller_env['CANINE_OUTPUT']):
+                os.mkdir(controller_env['CANINE_OUTPUT'])
+        return self.staging_dir
