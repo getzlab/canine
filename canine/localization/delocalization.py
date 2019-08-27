@@ -9,7 +9,7 @@ This is not actually part of the canine package
 This is helper code which is run in the backend
 """
 
-def main(dest, jobId, patterns):
+def main(dest, jobId, patterns, copy):
     jobdir = os.path.join(dest, str(jobId))
     if not os.path.isdir(jobdir):
         os.makedirs(jobdir)
@@ -20,7 +20,10 @@ def main(dest, jobId, patterns):
                 if not os.path.isdir(os.path.dirname(dest)):
                     os.makedirs(os.path.dirname(dest))
                 if os.path.isfile(target):
-                    os.symlink(os.path.abspath(target), dest)
+                    if copy:
+                        shutil.copyfile(os.path.abspath(target), dest)
+                    else:
+                        os.symlink(os.path.abspath(target), dest)
                 else:
                     shutil.copytree(target, dest)
 
@@ -41,5 +44,10 @@ if __name__ == '__main__':
         help="Pattern name and pattern. in form '-p {name} {pattern}'",
         default=[]
     )
+    parser.add_argument(
+        '-c', '--copy',
+        action='store_true',
+        help="Copy outputs instead of symlinking"
+    )
     args = parser.parse_args()
-    main(args.dest, args.jobId, args.pattern)
+    main(args.dest, args.jobId, args.pattern, args.copy)

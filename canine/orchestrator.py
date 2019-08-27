@@ -5,7 +5,7 @@ import sys
 import warnings
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend
-from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer
+from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
 import yaml
 import pandas as pd
 from agutil import status_bar
@@ -26,7 +26,8 @@ BACKENDS = {
 LOCALIZERS = {
     'Batched': BatchedLocalizer,
     'Local': LocalLocalizer,
-    'Remote': RemoteLocalizer
+    'Remote': RemoteLocalizer,
+    'NFS': NFSLocalizer
 }
 
 ENTRYPOINT = """#!/bin/bash

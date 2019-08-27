@@ -1,7 +1,6 @@
 import abc
 import os
 import sys
-import warnings
 import typing
 import fnmatch
 import shlex
@@ -36,7 +35,7 @@ class AbstractLocalizer(abc.ABC):
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
         common: bool = True, staging_dir: str = None, mount_path: str = None,
-        localize_gs: bool = None, project: typing.Optional[str] = None,
+        project: typing.Optional[str] = None,
     ):
         """
         Initializes the Localizer using the given transport.
@@ -44,8 +43,6 @@ class AbstractLocalizer(abc.ABC):
         the localizer's entire life cycle.
         If staging_dir is not provided, a random directory is chosen
         """
-        if localize_gs is not None:
-            warnings.warn("localize_gs option removed and ignored. Use overrides to explicitly control this behavior")
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
             self.transfer_bucket = self.transfer_bucket[5:]
