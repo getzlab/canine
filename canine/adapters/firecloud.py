@@ -24,8 +24,6 @@ class FirecloudAdapter(AbstractAdapter):
         * Launch one job per entity, resolving input expressions for each one
         """
         self.workspace = dalmatian.WorkspaceManager(workspace)
-        self.workspace.populate_cache()
-        self.workspace.go_offline()
         if entityName not in self.workspace._get_entities_internal(entityType).index:
             raise NameError('No such {} "{}" in workspace {}'.format(
                 entityType,
@@ -35,10 +33,7 @@ class FirecloudAdapter(AbstractAdapter):
         self._entityType = entityType
         self._entityName = entityName
         self._entityExpression = entityExpression
-        self.evaluator = dalmatian.Evaluator(self.workspace.entity_types)
-        for etype in self.workspace.entity_types:
-            self.evaluator.add_entities(etype, self.workspace._get_entities_internal(etype))
-        self.evaluator.add_attributes(self.workspace.attributes)
+        self.evaluator = self.workspace.get_evaluator(False)
         if entityExpression is not None:
             self.entities = self.evaluator(entityType, entityName, entityExpression)
             self.etype = self.evaluator.determine_reference_type(entityType, self.entities, '')
@@ -47,7 +42,7 @@ class FirecloudAdapter(AbstractAdapter):
             self.etype = entityType
         self.write_to_workspace = write_to_workspace
         self.__spec = None
-        print("initialized fc adapter in workspace", self.workspace)
+        print("Initialized FireCloud adapter in workspace", self.workspace)
         print(len(self.entities), "of type", self.etype)
 
     def evaluate(self, etype: str, entity: str, expr: str) -> str:
@@ -137,7 +132,6 @@ class FirecloudAdapter(AbstractAdapter):
                         cell[0] if len(cell) > 0 else np.nan
                     )
                 )
-                self.workspace.sync()
                 self.workspace.update_entity_attributes(
                     self.etype,
                     outputDf

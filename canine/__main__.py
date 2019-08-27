@@ -3,7 +3,7 @@ For argument parsing and CLI interface
 """
 import argparse
 import sys
-from . import Orchestrator
+from . import Orchestrator, __version__
 from .backends import TransientGCPSlurmBackend
 import yaml
 
@@ -84,6 +84,12 @@ def boot_transient():
         type=int,
         help="Number of GPUs to attach to compute nodes",
         default=0
+    )
+    parser.add_argument(
+        '-v', '--version',
+        action='version',
+        version='canine '+__version__,
+        help="Display the current version and exit"
     )
     args = parser.parse_args()
     with TransientGCPSlurmBackend(
@@ -203,6 +209,12 @@ def main():
         type=ConfType(2),
         action='append',
         default=[]
+    )
+    parser.add_argument(
+        '-v', '--version',
+        action='version',
+        version='canine '+__version__,
+        help="Display the current version and exit"
     )
     args = parser.parse_args()
     conf = {}

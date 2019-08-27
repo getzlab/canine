@@ -46,8 +46,8 @@ setup(
         'google-auth>=1.6.3',
         'PyYAML>=5.1',
         'agutil>=4.1.0',
-        'hound>=0.1.9',
-        'firecloud-dalmatian>=0.0.11'
+        'hound>=0.2.0',
+        'firecloud-dalmatian>=0.0.17'
     ],
     classifiers = [
         "Development Status :: 4 - Beta",

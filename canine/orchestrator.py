@@ -9,7 +9,7 @@ from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, R
 import yaml
 import pandas as pd
 from agutil import status_bar
-version = '0.3.1'
+version = '0.3.2'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -213,7 +213,7 @@ class Orchestrator(object):
                     outputs = {}
                     while len(waiting_jobs):
                         time.sleep(30)
-                        acct = self.backend.sacct()
+                        acct = self.backend.sacct(job=batch_id)
                         for jid in [*waiting_jobs]:
                             if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                                 job = jid.split('_')[1]
@@ -231,4 +231,4 @@ class Orchestrator(object):
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
-            return batch_id, job_spec, outputs, self.backend.sacct()
+            return batch_id, job_spec, outputs, self.backend.sacct(job=batch_id)

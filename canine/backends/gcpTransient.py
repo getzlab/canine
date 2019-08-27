@@ -51,7 +51,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1',
         worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
-        compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None
+        compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
+        **kwargs : typing.Any
     ):
         self.project = project if project is not None else get_default_gcp_project()
         super().__init__('{}-controller.{}.{}'.format(
@@ -82,6 +83,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "vpc_subnet": "default",
           "default_users": getpass.getuser(),
           'gpu_count': 0,
+          **kwargs
         }
 
         if gpu_type is not None and gpu_count > 0:
@@ -229,7 +231,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             shell=True
         )
         subprocess.check_call(
-            'echo y | gcloud deployment-manager deployments delete {} --project {}'.format(
+            'gcloud deployment-manager deployments delete {} --project {} -q'.format(
                 self.config['cluster_name'],
                 self.project
             ),
@@ -237,7 +239,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             executable='/bin/bash'
         )
         subprocess.run(
-            "echo y | gcloud compute images delete --project {0} "
+            "gcloud compute images delete --project {0} --quiet "
             "$(gcloud compute images list --project {0} --filter family:{1}-compute-image-family| awk 'NR>1 {{print $1}}')".format(
                 self.project,
                 self.config['cluster_name']
@@ -246,7 +248,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             executable='/bin/bash'
         )
         subprocess.run(
-            "echo y | gcloud compute instances delete --project {0} "
+            "gcloud compute instances delete --project {0} --quiet "
             "--zone {1} $(gcloud compute instances list --project {0} --filter name:{2}-compute | awk 'NR>1 {{print $1}}')".format(
                 self.project,
                 self.config['zone'],

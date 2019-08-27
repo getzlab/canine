@@ -33,7 +33,11 @@ class AbstractLocalizer(abc.ABC):
     """
     requester_pays = {}
 
-    def __init__(self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None, common: bool = True, staging_dir: str = None, mount_path: str = None, localize_gs: bool = None, project : typing.Optional[str] = None):
+    def __init__(
+        self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
+        common: bool = True, staging_dir: str = None, mount_path: str = None,
+        localize_gs: bool = None, project: typing.Optional[str] = None,
+    ):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
@@ -60,6 +64,10 @@ class AbstractLocalizer(abc.ABC):
         self.local_dir = self._local_dir.name
         with self.backend.transport() as transport:
             self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
+            # if transport.isdir(self.staging_dir) and not force:
+            #     raise FileExistsError("{} already exists. Supply force=True to override".format(
+            #         self.staging_dir
+            #     ))
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
@@ -415,7 +423,11 @@ class AbstractLocalizer(abc.ABC):
             self.inputs[jobId] = {}
             for arg, value in job_inputs.items():
                 mode = overrides[arg] if arg in overrides else False
-                if mode is not False:
+                if value in common_dests or mode == 'common':
+                    # common override already handled
+                    # No localization needed, already copied
+                    self.inputs[jobId][arg] = Localization(None, common_dests[value])
+                elif mode is not False:
                     if mode == 'stream':
                         if not value.startswith('gs://'):
                             print("Ignoring 'stream' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
@@ -464,10 +476,6 @@ class AbstractLocalizer(abc.ABC):
                         # Do not reserve path here
                         # null override treats input as string
                         self.inputs[jobId][arg] = Localization(None, value)
-                elif value in common_dests:
-                    # common override already handled
-                    # No localization needed, already copied
-                    self.inputs[jobId][arg] = Localization(None, common_dests[value])
                 else:
                     if os.path.exists(value) or value.startswith('gs://'):
                         remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
