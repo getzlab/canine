@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import os
 import shlex
+import fnmatch
 from .base import PathType, Localization
 from .local import BatchedLocalizer
 from ..backends import AbstractSlurmBackend, AbstractTransport
@@ -212,22 +213,25 @@ class NFSLocalizer(BatchedLocalizer):
         """
         if output_dir is not None:
             warnings.warn("output_dir has no bearing on NFSLocalizer. outputs are available in {}/outputs".format(self.local_dir))
-        output_dir = self.local_dir
+        output_dir = os.path.join(self.local_dir, 'outputs')
         output_files = {}
         for jobId in os.listdir(output_dir):
             start_dir = os.path.join(output_dir, jobId)
             if not os.path.isdir(start_dir):
                 continue
             output_files[jobId] = {}
-            for dirpath, dirnames, filenames in os.walk(start_dir):
-                for name, pattern in patterns.items():
-                    for filename in filenames:
-                        fullname = os.path.join(dirpath, filename)
-                        if fnmatch.fnmatch(fullname, pattern) or fnmatch.fnmatch(os.path.relpath(fullname, start_dir), pattern):
-                            if name not in output_files[jobId]:
-                                output_files[jobId][name] = [os.path.abspath(fullname)]
+            for outputname in os.listdir(start_dir):
+                dirpath = os.path.join(start_dir, outputname)
+                if os.path.isdir(dirpath):
+                    if outputname not in patterns:
+                        warnings.warn("Detected output directory {} which was not declared".format(dirpath))
+                    for output in os.listdir(dirpath):
+                        fullname = os.path.join(dirpath, output)
+                        if fnmatch.fnmatch(fullname, pattern) or fnmatch.fnmatch(os.path.relpath(fullname, dirpath), pattern):
+                            if outputname not in output_files[jobId]:
+                                output_files[jobId][outputname] = [os.path.abspath(fullname)]
                             else:
-                                output_files[jobId][name].append(os.path.abspath(fullname))
+                                output_files[jobId][outputname].append(os.path.abspath(fullname))
         return output_files
 
     def finalize_staging_dir(self, jobs: typing.Iterable[str], transport: typing.Optional[AbstractTransport] = None) -> str:
