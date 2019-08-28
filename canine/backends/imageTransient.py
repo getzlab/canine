@@ -140,7 +140,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend):
             #
             # create worker nodes
 
+            # check which nodes already exist
+
             # TODO: support the other config flags
+            # TODO: check if any worker nodes already exist; skip them
             subprocess.check_call(
                 """gcloud compute instances create $(eval echo {worker_prefix}\{1..{tot_node_count}\})
                    --image {image} --machine-type {worker_type} --zone {compute_zone}
@@ -167,3 +170,22 @@ class TransientImageSlurmBackend(LocalSlurmBackend):
 
     def __exit__(self, *args):
         self.stop()
+
+    def stop(self):
+        try:
+            #
+            # shut down compute nodes
+
+            # XXX: hard vs. soft shutdown -- totally delete the nodes or not?
+
+            # XXX: if some of the nodes are already shut down, does this return a nonzero exit?
+            #      if so, we don't want to raise any exceptions.
+            subprocess.check_call(
+                """gcloud compute instances stop $(eval echo {worker_prefix}\{1..{tot_node_count}\})
+                   --zone {compute_zone} --quiet 
+                """.format(**self.config),
+                shell = True,
+                exceutable = '/bin/bash'
+            )
+        except:
+            raise
