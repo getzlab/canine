@@ -227,7 +227,7 @@ class NFSLocalizer(BatchedLocalizer):
                         warnings.warn("Detected output directory {} which was not declared".format(dirpath))
                     for output in os.listdir(dirpath):
                         fullname = os.path.join(dirpath, output)
-                        if fnmatch.fnmatch(fullname, pattern) or fnmatch.fnmatch(os.path.relpath(fullname, dirpath), pattern):
+                        if fnmatch.fnmatch(fullname, patterns[outputname]) or fnmatch.fnmatch(os.path.relpath(fullname, dirpath), patterns[outputname]):
                             if outputname not in output_files[jobId]:
                                 output_files[jobId][outputname] = [os.path.abspath(fullname)]
                             else:
