@@ -58,7 +58,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend):
     """
 
     def __init__(
-        self, image: str, worker_prefix: str = 'slurm-canine', tot_node_count: int = 50,
+        self, *, image: str, worker_prefix: str = 'slurm-canine', tot_node_count: int = 50,
         init_node_count: typing.Optional[int] = None, compute_zone: str = 'us-central1-a',
         worker_type: str = 'n1-highcpu-2', preemptible: bool = True,
         gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
@@ -120,7 +120,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend):
         }
 
         # since GCP cannot start nodes powered off, after starting all nodes,
-        # we will power down nodes # init_node_count + 1 ... tot_node_count
+        # we will power down nodes init_node_count + 1 ... tot_node_count
         self.config["init_node_count"] += 1
 
     def __enter__(self):
