@@ -146,9 +146,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "slurm_conf_path" : slurm_conf_path # TODO: there is a global slurm_conf_path now; use this
         }
 
-        # since GCP cannot start nodes powered off, after starting all nodes,
-        # we will power down nodes init_node_count + 1 ... tot_node_count
-        self.config["init_node_count"] += 1
+        # list of nodes under the purview of Canine
+        self.nodes = pd.Series()
+
 
     def __enter__(self):
         try:
@@ -206,15 +206,15 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                     print(instances.drop(columns = "selfLink").loc[zonemismatch_idx].to_string(index = False), file = sys.stderr)
                     print("This may result in degraded performance or egress charges.", file = sys.stderr)
 
-
-            workers_to_launch = nodenames.loc[~ex_idx]
+            self.nodes = nodenames.loc[~ex_idx]
 
             # TODO: support the other config flags
+            # TODO: use API to launch these
             subprocess.check_call(
                 """gcloud compute instances create {workers} 
                    --image {image} --machine-type {worker_type} --zone {compute_zone}
                    {compute_script} {compute_script_file} {preemptible}
-                """.format(**self.config, workers = " ".join(worker_to_launch.values)),
+                """.format(**self.config, workers = " ".join(self.nodes.values)),
                 shell = True,
                 exceutable = '/bin/bash'
             )
@@ -230,9 +230,11 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             )
 
             return self
-        except:
-            self.stop()
-            raise
+        except Exception as e:
+            print("ERROR: Could not initialize cluster; attempting to tear down.", file = sys.stderr)
+
+            self.stop() 
+            raise e
 
     def __exit__(self, *args):
         self.stop()
@@ -247,14 +249,18 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             # XXX: if some of the nodes are already shut down, does this return a nonzero exit?
             #      if so, we don't want to raise any exceptions.
             subprocess.check_call(
-                """gcloud compute instances stop $(eval echo {worker_prefix}\{1..{tot_node_count}\})
+                """gcloud compute instances stop {workers}
                    --zone {compute_zone} --quiet 
-                """.format(**self.config),
+                """.format(**self.config, workers = self.nodes.values),
                 shell = True,
                 exceutable = '/bin/bash'
             )
-        except:
-            raise
+        except Exception as e:
+            if self.nodes.shape[0] > 0:
+                print("ERROR: could not stop cluster nodes. Please ensure that the following nodes are halted:", file = sys.stderr)
+                print(self.nodes.to_string(index = False), file = sys.stderr)
+
+            raise e
 
     def list_instances(self):
         return list_instances(zone = self.config["compute_zone"], project = self.config["project"])
