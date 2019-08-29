@@ -8,8 +8,16 @@ from io import BytesIO
 import os
 import sys
 
+#
+# switch these lines appropriately when testing in an interactive session
+
 from .local import LocalSlurmBackend
+#from canine.backends.local import LocalSlurmBackend
+
 from ..utils import get_default_gcp_project, ArgumentHelper, check_call
+#from canine.utils import get_default_gcp_project, ArgumentHelper, check_call
+
+from IPython.core.debugger import set_trace
 import pandas as pd
 
 
