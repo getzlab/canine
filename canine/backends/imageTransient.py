@@ -141,9 +141,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 "--metadata startup-script={}".format(controller_script)
                 if controller_script else "",
             "secondary_disk_size" : secondary_disk_size,
-            "project" : project if project else "",
+            "project" : project if project else get_default_gcp_project(),
             "user" : user if user else os.getenv('USER'),
-            "slurm_conf_path" : slurm_conf_path
+            "slurm_conf_path" : slurm_conf_path # TODO: there is a global slurm_conf_path now; use this
         }
 
         # since GCP cannot start nodes powered off, after starting all nodes,
@@ -167,15 +167,54 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             #
             # create worker nodes
 
-            # check which nodes already exist
+            nodenames = pd.Series([
+                          self.config["worker_prefix"] + str(x) for x in
+                          range(1, self.config["tot_node_count"] + 1)
+                        ])
+
+            # first, check which worker nodes already exist; skip these
+            instances = self.list_instances_all_zones()
+
+            ex_idx = nodenames.isin(instances["name"])
+
+            set_trace()
+
+            if ex_idx.any():
+                ex_nodes = nodenames.loc[ex_idx]
+
+                print("WARNING: the following nodes already exist:\n - ", file = sys.stderr, end = "")
+                print("\n - ".join(ex_nodes), file = sys.stderr)
+                print("Assuming these are properly configured Slurm nodes.")
+
+                # also check if any instance types are incongruous with given definition
+                typemismatch_idx = (instances.loc[:, "machineType"] != self.config["worker_type"]) \
+                                   & instances["name"].isin(ex_nodes)
+
+                if typemismatch_idx.any():
+                    print("""ERROR: nodes that already exist do not match specified machine type ({worker_type}):""".format(**self.config), file = sys.stderr)
+                    print(instances.drop(columns = "selfLink").loc[typemismatch_idx].to_string(index = False), file = sys.stderr)
+                    print("This will result in Slurm bitmap corruption.", file = sys.stderr)
+
+                    raise RuntimeError('Preexisting cluster nodes do not match specified machine type for new nodes')
+
+                # finally, check if any nodes are already defined but present in other zones
+                zonemismatch_idx = (instances.loc[:, "zone"] != self.config["compute_zone"]) \
+                                   & instances["name"].isin(ex_nodes)
+
+                if zonemismatch_idx.any():
+                    print("WARNING: nodes that already exist do not match specified compute zone ({compute_zone}):".format(**self.config), file = sys.stderr)
+                    print(instances.drop(columns = "selfLink").loc[zonemismatch_idx].to_string(index = False), file = sys.stderr)
+                    print("This may result in degraded performance or egress charges.", file = sys.stderr)
+
+
+            workers_to_launch = nodenames.loc[~ex_idx]
 
             # TODO: support the other config flags
-            # TODO: check if any worker nodes already exist; skip them
             subprocess.check_call(
-                """gcloud compute instances create $(eval echo {worker_prefix}\{1..{tot_node_count}\})
+                """gcloud compute instances create {workers} 
                    --image {image} --machine-type {worker_type} --zone {compute_zone}
                    {compute_script} {compute_script_file} {preemptible}
-                """.format(**self.config),
+                """.format(**self.config, workers = " ".join(worker_to_launch.values)),
                 shell = True,
                 exceutable = '/bin/bash'
             )
