@@ -6,7 +6,9 @@ import subprocess
 import tempfile
 from io import BytesIO
 import os
-from .remote import RemoteSlurmBackend
+import sys
+
+from .local import LocalSlurmBackend
 from ..utils import get_default_gcp_project, ArgumentHelper, check_call
 import pandas as pd
 
@@ -45,7 +47,7 @@ def parse_machine_type(mtype: str, zone: str) -> typing.Tuple[int, int]:
     return (int(cores), int(mem))
 
 
-class TransientImageSlurmBackend(LocalSlurmBackend):
+class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
     """
     Backend for starting a Slurm cluster using a preconfigured GCP image.
     The image must meet the following requirements:
