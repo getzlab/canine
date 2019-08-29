@@ -18,8 +18,11 @@ from ..utils import get_default_gcp_project, ArgumentHelper, check_call
 #from canine.utils import get_default_gcp_project, ArgumentHelper, check_call
 
 from IPython.core.debugger import set_trace
+
+import googleapiclient.discovery as gd
 import pandas as pd
 
+gce = gd.build('compute', 'v1');
 
 @lru_cache(2)
 def get_machine_types(zone: str) -> pd.DataFrame:
@@ -54,6 +57,20 @@ def parse_machine_type(mtype: str, zone: str) -> typing.Tuple[int, int]:
     custom, cores, mem = mtype.split('-')
     return (int(cores), int(mem))
 
+
+def list_instances(zone: str, project: str) -> pd.DataFrame:
+    inst_dict = gce.instances().list(project = project, zone = zone).execute()
+
+    fnames = ['name', 'machineType', 'status', 'zone', 'selfLink'];
+
+    if "items" in inst_dict:
+        inst_DF = pd.DataFrame([[x[y] for y in fnames] for x in inst_dict['items']], columns = fnames)
+    else:
+        return pd.DataFrame()
+
+    # API returns selfLinks; parse these into something human-readable
+    return inst_DF.apply(lambda x : x.str.replace(r'.*/', '')
+                         if x.name in ["machineType", "zone"] else x)
 
 class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
     """
@@ -199,3 +216,17 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             )
         except:
             raise
+
+    def list_instances(self):
+        return list_instances(zone = self.config["compute_zone"], project = self.config["project"])
+
+    def list_instances_all_zones(self):
+        zone_dict = gce.zones().list(project = self.config["project"]).execute()
+
+        return pd.concat([
+          list_instances(zone = x["name"], project = self.config["project"])
+          for x in zone_dict["items"]
+        ], axis = 0).reset_index(drop = True)
+
+
+# }}}
