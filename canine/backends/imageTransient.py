@@ -94,7 +94,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         controller_script_file: typing.Optional[str] = None,
         controller_script: typing.Optional[str] = None,
         secondary_disk_size: int = 0, project: typing.Optional[str] = None, 
-        user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None
+        user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None,
+        delete_on_stop: bool = False
     ):
         #
         # validate inputs that will not be caught later on (e.g. by gcloud invocations)
@@ -143,12 +144,12 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "secondary_disk_size" : secondary_disk_size,
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else os.getenv('USER'),
-            "slurm_conf_path" : slurm_conf_path # TODO: there is a global slurm_conf_path now; use this
+            "slurm_conf_path" : slurm_conf_path, # TODO: there is a global slurm_conf_path now; use this
+            "delete_on_stop" : delete_on_stop
         }
 
         # list of nodes under the purview of Canine
         self.nodes = pd.Series()
-
 
     def __enter__(self):
         try:
@@ -206,6 +207,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
             self.nodes = nodenames.loc[~ex_idx]
 
+            # actually create the workers
+
             # TODO: support the other config flags
             # TODO: use API to launch these
             subprocess.check_call(
@@ -219,49 +222,40 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
             #
             # shut down nodes exceeding init_node_count
-            subprocess.check_call(
-                """gcloud compute instances stop $(eval echo {worker_prefix}\{{init_node_count}..{tot_node_count}\})
-                   --zone {compute_zone} --quiet 
-                """.format(**self.config),
-                shell = True,
-                exceutable = '/bin/bash'
-            )
+
+            for node in self.nodes.loc[(self.config["init_node_count"] + 1):]:
+                try:
+                    self._pzw(gce.instances().stop)(instance = node).execute()
+                except Exception as e:
+                    print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
+                    print(e) 
 
             return self
         except Exception as e:
             print("ERROR: Could not initialize cluster; attempting to tear down.", file = sys.stderr)
 
-            self.stop() 
+            self.stop()
             raise e
 
     def __exit__(self, *args):
         self.stop()
 
-    def stop(self):
-        try:
-            #
-            # shut down compute nodes
+    def stop(self, delete_on_stop = None):
+        if delete_on_stop is None:
+            delete_on_stop = self.config["delete_on_stop"] 
 
-            # XXX: hard vs. soft shutdown -- totally delete the nodes or not?
+        #
+        # delete compute nodes
 
-            # XXX: if some of the nodes are already shut down, does this return a nonzero exit?
-            #      if so, we don't want to raise any exceptions.
-            subprocess.check_call(
-                """gcloud compute instances stop {workers}
-                   --zone {compute_zone} --quiet 
-                """.format(**self.config, workers = self.nodes.values),
-                shell = True,
-                exceutable = '/bin/bash'
-            )
-        except Exception as e:
-            if self.nodes.shape[0] > 0:
-                print("ERROR: could not stop cluster nodes. Please ensure that the following nodes are halted:", file = sys.stderr)
-                print(self.nodes.to_string(index = False), file = sys.stderr)
-
-            raise e
-
-    def list_instances(self):
-        return list_instances(zone = self.config["compute_zone"], project = self.config["project"])
+        for node in self.nodes:
+            try:
+                if delete_on_stop:
+                    self._pzw(gce.instances().delete)(instance = node).execute()
+                else:
+                    self._pzw(gce.instances().stop)(instance = node).execute()
+            except Exception as e:
+                print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
+                print(e) 
 
     def list_instances_all_zones(self):
         zone_dict = gce.zones().list(project = self.config["project"]).execute()
@@ -270,6 +264,16 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
           list_instances(zone = x["name"], project = self.config["project"])
           for x in zone_dict["items"]
         ], axis = 0).reset_index(drop = True)
+
+    # a handy wrapper to automatically add this instance's project and zone to
+    # GCP API calls
+    # TODO: for bonus points, can we automatically apply this to all relevant
+    #       methods in a GCE class instance?
+    def _pzw(self, f):
+        def x(*args, **kwargs):
+            return f(project = self.config["project"], zone = self.config["compute_zone"], *args, **kwargs)
+
+        return x
 
 
 # }}}
