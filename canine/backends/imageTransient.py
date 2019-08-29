@@ -157,7 +157,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             subprocess.check_call(
                 """sudo -u {user} bash -c 'pgrep slurmctld || slurmctld -c -f {slurm_conf_path} &&
                    slurmctld reconfigure; pgrep munged || munged -f'
-                """.format(**self.config)
+                """.format(**self.config),
                 shell = True
             )
 
@@ -176,8 +176,6 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             instances = self.list_instances_all_zones()
 
             ex_idx = nodenames.isin(instances["name"])
-
-            set_trace()
 
             if ex_idx.any():
                 ex_nodes = nodenames.loc[ex_idx]
@@ -211,12 +209,12 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             # TODO: support the other config flags
             # TODO: use API to launch these
             subprocess.check_call(
-                """gcloud compute instances create {workers} 
-                   --image {image} --machine-type {worker_type} --zone {compute_zone}
+                """gcloud compute instances create {workers} \
+                   --image {image} --machine-type {worker_type} --zone {compute_zone} \
                    {compute_script} {compute_script_file} {preemptible}
                 """.format(**self.config, workers = " ".join(self.nodes.values)),
                 shell = True,
-                exceutable = '/bin/bash'
+                executable = '/bin/bash'
             )
 
             #
