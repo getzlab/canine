@@ -149,6 +149,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "delete_on_stop" : delete_on_stop
         }
 
+        # this backend resets itself on startup; no need for the orchestrator
+        # to do this.
+        self.hard_reset_on_orch_init = False
+
         # list of nodes under the purview of Canine
         self.nodes = pd.DataFrame()
 

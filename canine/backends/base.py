@@ -244,11 +244,13 @@ class AbstractSlurmBackend(abc.ABC):
     Base class for a SLURM backend
     """
 
-	def __init__(self, **kwargs):
+	def __init__(self, hard_reset_on_orch_init: bool = True, **kwargs):
 		"""
 		If an implementing class defines a constructor, it must take **kwargs.
 		"""
-		pass
+		
+		#:param bool hard_reset_on_orch_init: Whether this backend needs the orchestrator to hard reset it after initialization (True), or the backend resets itself (False)
+		self.hard_reset_on_orch_init = hard_reset_on_orch_init
 
     @abc.abstractmethod
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:

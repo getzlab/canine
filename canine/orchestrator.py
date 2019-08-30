@@ -195,7 +195,11 @@ class Orchestrator(object):
                     return job_spec
                 print("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
-                if self._slurmconf_path:
+
+                # perform hard reset of cluster; some backends do this own their
+                # own, in which case we skip.  we also can't do this if path to slurm.conf
+                # is unknown.
+                if self.backend.hard_reset_on_orch_init and self._slurmconf_path:
                     active_jobs = self.backend.squeue('all')
                     if len(active_jobs):
                         print("There are active jobs. Skipping slurmctld restart")
