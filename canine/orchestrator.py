@@ -118,12 +118,12 @@ class Orchestrator(object):
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
         adapter = config['adapter']
         if adapter['type'] not in ADAPTERS:
-            raise ValueError("Unknown adapter type '{}'".format(adapter))
+            raise ValueError("Unknown adapter type '{type}'".format(**adapter))
         self._adapter_type=adapter['type']
         self.adapter = ADAPTERS[adapter['type']](**{arg:val for arg,val in adapter.items() if arg != 'type'})
         backend = config['backend']
         if backend['type'] not in BACKENDS:
-            raise ValueError("Unknown backend type '{}'".format(backend))
+            raise ValueError("Unknown backend type '{type}'".format(**backend))
         self._backend_type = backend['type']
         self._slurmconf_path = backend['slurm_conf_path'] if 'slurm_conf_path' in backend else None
         self.backend = BACKENDS[backend['type']](**backend)
