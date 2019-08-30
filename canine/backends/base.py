@@ -412,11 +412,15 @@ class AbstractSlurmBackend(abc.ABC):
         Blocks until the main partition is marked as up
         """
         df = self.sinfo()
-        default = [value for value in df.index if value.endswith('*')]
+        default = df.index[df.index.str.contains(r"\*$")]
+
+        # wait for partition to appear
         while len(default) == 0:
             time.sleep(10)
             df = self.sinfo()
-            default = [value for value in df.index if value.endswith('*')]
-        while (df.AVAIL[default] != 'up').all():
+            default = df.index[df.index.str.contains(r"\*$")]
+
+        # wait for any node in the partition to be ready
+        while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle|completing|allocated\+?)$").any():
             time.sleep(10)
             df = self.sinfo()
