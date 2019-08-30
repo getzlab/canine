@@ -153,6 +153,10 @@ class Orchestrator(object):
         * The sacct dataframe after all jobs completed
         """
         job_spec = self.adapter.parse_inputs(self.raw_inputs)
+
+        if len(job_spec) == 0:
+            raise ValueError("You didn't specify any jobs!")
+
         print("Preparing pipeline of", len(job_spec), "jobs")
         print("Connecting to backend...")
         if isinstance(self.backend, RemoteSlurmBackend):
