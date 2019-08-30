@@ -96,7 +96,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         controller_script: typing.Optional[str] = None,
         secondary_disk_size: int = 0, project: typing.Optional[str] = None, 
         user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None,
-        delete_on_stop: bool = False
+        delete_on_stop: bool = False,
+        **kwargs
     ):
         #
         # validate inputs that will not be caught later on (e.g. by gcloud invocations)
