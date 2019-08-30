@@ -244,6 +244,12 @@ class AbstractSlurmBackend(abc.ABC):
     Base class for a SLURM backend
     """
 
+	def __init__(self, **kwargs):
+		"""
+		If an implementing class defines a constructor, it must take **kwargs.
+		"""
+		pass
+
     @abc.abstractmethod
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """

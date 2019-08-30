@@ -161,6 +161,16 @@ should be used to launch jobs. Backends are used to launch and monitor jobs, as 
 as to localize inputs and delocalize outputs. Below are the 3 types of Backends,
 and an example configuration for each
 
+### Global options
+
+This section lists backend options which can be applied to all backends
+* `type`: Specifies the backend type (`Local`, `Remote`, or `TransientGCP`)
+* `slurm_conf_path`: Specifies the path to the `slurm.conf` path. If provided,
+`slurmctld` will be halted and reconfigured using this path before the job is submitted.
+This is useful for `Local` and `Remote` backends to fix corrupted slurmctl.
+**Note:** This path must be valid within the slurm controller. It will not be localized
+from the current filesystem to the slurm controller
+
 ### Local (default) backend
 
 This backend is the default, and runs SLURM commands through the local system.

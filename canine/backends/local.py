@@ -105,7 +105,7 @@ class LocalSlurmBackend(AbstractSlurmBackend):
 
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
-        Invoke an arbitrary command in the slurm console
+        Invoke an arbitrary command on the Slurm controller node
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
         If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal.
         """

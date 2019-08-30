@@ -3,9 +3,12 @@ import os
 import time
 import sys
 import warnings
+import traceback
+from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer
+from .utils import check_call
 import yaml
 import pandas as pd
 from agutil import status_bar
@@ -120,8 +123,9 @@ class Orchestrator(object):
         backend = config['backend']
         if backend['type'] not in BACKENDS:
             raise ValueError("Unknown backend type '{}'".format(backend))
-        self._backend_type=backend['type']
-        self.backend = BACKENDS[backend['type']](**{arg:val for arg,val in backend.items() if arg != 'type'})
+        self._backend_type = backend['type']
+        self._slurmconf_path = backend['slurm_conf_path'] if 'slurm_conf_path' in backend else None
+        self.backend = BACKENDS[backend['type']](**backend)
         self.localizer_args = config['localization'] if 'localization' in config else {}
         if self.localizer_args['strategy'] not in LOCALIZERS:
             raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
@@ -191,6 +195,33 @@ class Orchestrator(object):
                     return job_spec
                 print("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
+                if self._slurmconf_path:
+                    active_jobs = self.backend.squeue('all')
+                    if len(active_jobs):
+                        print("There are active jobs. Skipping slurmctld restart")
+                    else:
+                        try:
+                            print("Stopping slurmctld")
+                            rc, stdout, stderr = self.backend.invoke(
+                                'sudo pkill slurmctld',
+                                True
+                            )
+                            check_call('sudo pkill slurmctld', rc, stdout, stderr)
+                            print("Loading configurations", self._slurmconf_path)
+                            rc, stdout, stderr = self.backend.invoke(
+                                'sudo slurmctld -c -f {}'.format(self._slurmconf_path),
+                                True
+                            )
+                            check_call('sudo slurmctld -c -f {}'.format(self._slurmconf_path), rc, stdout, stderr)
+                            print("Restarting slurmctl")
+                            rc, stdout, stderr = self.backend.invoke(
+                                'sudo slurmctld reconfigure',
+                                True
+                            )
+                            check_call('sudo slurmctld reconfigure', rc, stdout, stderr)
+                        except CalledProcessError:
+                            traceback.print_exc()
+                            print("Slurmctld restart failed")
                 print("Submitting batch job")
                 batch_id = self.backend.sbatch(
                     entrypoint_path,
