@@ -1,7 +1,6 @@
 import abc
 import os
 import sys
-import warnings
 import typing
 import fnmatch
 import shlex
@@ -36,7 +35,7 @@ class AbstractLocalizer(abc.ABC):
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
         common: bool = True, staging_dir: str = None, mount_path: str = None,
-        localize_gs: bool = None, project: typing.Optional[str] = None,
+        project: typing.Optional[str] = None,
     ):
         """
         Initializes the Localizer using the given transport.
@@ -44,8 +43,6 @@ class AbstractLocalizer(abc.ABC):
         the localizer's entire life cycle.
         If staging_dir is not provided, a random directory is chosen
         """
-        if localize_gs is not None:
-            warnings.warn("localize_gs option removed and ignored. Use overrides to explicitly control this behavior")
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
             self.transfer_bucket = self.transfer_bucket[5:]
@@ -356,15 +353,18 @@ class AbstractLocalizer(abc.ABC):
             if not os.path.isdir(start_dir):
                 continue
             output_files[jobId] = {}
-            for dirpath, dirnames, filenames in os.walk(start_dir):
-                for name, pattern in patterns.items():
-                    for filename in filenames:
-                        fullname = os.path.join(dirpath, filename)
-                        if fnmatch.fnmatch(fullname, pattern) or fnmatch.fnmatch(os.path.relpath(fullname, start_dir), pattern):
-                            if name not in output_files[jobId]:
-                                output_files[jobId][name] = [os.path.abspath(fullname)]
+            for outputname in os.listdir(start_dir):
+                dirpath = os.path.join(start_dir, outputname)
+                if os.path.isdir(dirpath):
+                    if outputname not in patterns:
+                        warnings.warn("Detected output directory {} which was not declared".format(dirpath))
+                    for output in os.listdir(dirpath):
+                        fullname = os.path.join(dirpath, output)
+                        if fnmatch.fnmatch(fullname, patterns[outputname]) or fnmatch.fnmatch(os.path.relpath(fullname, dirpath), patterns[outputname]):
+                            if outputname not in output_files[jobId]:
+                                output_files[jobId][outputname] = [os.path.abspath(fullname)]
                             else:
-                                output_files[jobId][name].append(os.path.abspath(fullname))
+                                output_files[jobId][outputname].append(os.path.abspath(fullname))
         return output_files
 
     def pick_common_inputs(self, inputs: typing.Dict[str, typing.Dict[str, str]], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None) -> typing.Dict[str, str]:

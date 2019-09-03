@@ -1,11 +1,13 @@
 from .base import AbstractLocalizer
 from .local import BatchedLocalizer, LocalLocalizer
 from .remote import RemoteLocalizer
+from .nfs import NFSLocalizer
 
 __all__ = [
     'BatchedLocalizer',
     'LocalLocalizer',
-    'RemoteLocalizer'
+    'RemoteLocalizer',
+    'NFSLocalizer'
 ]
 
 # * `CANINE`: The current canine version

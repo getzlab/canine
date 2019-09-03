@@ -29,7 +29,8 @@ BACKENDS = {
 LOCALIZERS = {
     'Batched': BatchedLocalizer,
     'Local': LocalLocalizer,
-    'Remote': RemoteLocalizer
+    'Remote': RemoteLocalizer,
+    'NFS': NFSLocalizer
 }
 
 ENTRYPOINT = """#!/bin/bash
