@@ -313,16 +313,18 @@ dynamically spins up nodes from this image.
 
 This backend assumes:
 * As with the local backend, the current node is a valid Slurm controller, i.e.:
-    * slurmctld, munged, and slurmdbd run properly (note that these do not need
+    * `slurmctld`, `munged`, and `slurmdbd` run properly (note that these do not need
       to already be running when invoking Canine with this backend; they will
       be started automatically as needed.)
     * Accounting is enabled (i.e., `sacct` can list completed jobs)
-    * The default Slurm partition is compatible with any nodes that get spun up,
-      i.e., their machine type matches that which is defined in `slurm.conf`
+* The default Slurm partition is compatible with any nodes that get spun up:
+    * Worker node names must match names specified in a partition defined in `slurm.conf`
+    * Worker node types must be consistent with node definitions in `slurm.conf`
 * The image provided has a valid Slurm installation, compatible with that of the
   controller node (e.g., same version, same plugins, etc.)
 * Slurm configuration files are present at a path accessible by all nodes (e.g.,
   an NFS server, or mirrored across all nodes)
+* If GPUs are added, drivers must already be installed
 
 Configuration options are similar to those of the TransientGCP backend; the following
 options are identical:

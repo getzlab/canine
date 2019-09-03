@@ -44,14 +44,19 @@ def list_instances(zone: str, project: str) -> pd.DataFrame:
 
 class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
     """
-    Backend for starting a Slurm cluster using a preconfigured GCP image.
+    Backend for starting a Slurm cluster using a preconfigured GCE image.
     The image must meet the following requirements:
-    * Slurm is installed and configured (compute node configuration not necessary)
-    * Worker node names must match names specified in a partition defined in slurm.conf
-    * Worker node types must be consistent with node definitions in slurm.conf
+    * The current node is a valid Slurm controller, i.e.:
+        * `slurmctld`, `munged`, and `slurmdbd` run properly (note that these do not need
+          to already be running when invoking Canine with this backend; they will
+          be started automatically as needed.)
+        * Accounting is enabled (i.e., `sacct` can list completed jobs)
+    * The default Slurm partition is compatible with any nodes that get spun up:
+        * Worker node names must match names specified in a partition defined in `slurm.conf`
+        * Worker node types must be consistent with node definitions in `slurm.conf`
+    * The image provided has a valid Slurm installation, compatible with that of the
+      controller node (e.g., same version, same plugins, etc.)
     * If GPUs are added, drivers must already be installed
-    * An external NFS server must be present, /etc/fstab must be set up on the
-      image to mount the server, and /etc/exports must allow mounting of the nodes
     """
 
     def __init__(
@@ -267,6 +272,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         self.stop()
 
     def stop(self, delete_on_stop = None):
+        """
+        Delete or stop (default) compute instances
+        """
         if delete_on_stop is None:
             delete_on_stop = self.config["delete_on_stop"] 
 
@@ -284,6 +292,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 print(e) 
 
     def list_instances_all_zones(self):
+        """
+        List all instances across all zones in `self.config["project"]`
+        """
         zone_dict = gce.zones().list(project = self.config["project"]).execute()
 
         return pd.concat([
