@@ -24,41 +24,10 @@ import pandas as pd
 
 gce = gd.build('compute', 'v1');
 
-@lru_cache(2)
-def get_machine_types(zone: str) -> pd.DataFrame:
-    """
-    Returns a dataframe of defined machine types in the given zone
-    """
-    cmd = "gcloud compute machine-types list --zones {}".format(zone)
-    proc = subprocess.run(
-        cmd,
-        shell=True,
-        stdout=subprocess.PIPE
-    )
-    stdout = BytesIO(proc.stdout)
-    check_call(cmd, proc.returncode, stdout, None)
-    df = pd.read_fwf(
-        stdout,
-        index_col=0
-    )
-    df['MEMORY'] = [int(x*1024) for x in df['MEMORY_GB']]
-    return df[['CPUS', 'MEMORY']]
-
-
-def parse_machine_type(mtype: str, zone: str) -> typing.Tuple[int, int]:
-    """
-    Parses a google machine type name and returns a tuple of cpu count, memory (mb)
-    """
-    mtypes = get_machine_types(zone)
-    if mtype in mtypes.index:
-        return (mtypes['CPUS'][mtype], mtypes['MEMORY'][mtype])
-    if mtype.endswith('-ext'):
-        mtype = mtype[:-4] # Drop -ext suffix
-    custom, cores, mem = mtype.split('-')
-    return (int(cores), int(mem))
-
-
 def list_instances(zone: str, project: str) -> pd.DataFrame:
+    """
+    List all instances in a given zone and project
+    """
     inst_dict = gce.instances().list(project = project, zone = zone).execute()
 
     fnames = ['name', 'machineType', 'status', 'zone', 'selfLink', 'tags'];
