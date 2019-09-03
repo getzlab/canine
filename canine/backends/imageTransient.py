@@ -145,7 +145,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 if controller_script else "",
             "secondary_disk_size" : secondary_disk_size,
             "project" : project if project else get_default_gcp_project(),
-            "user" : user if user else os.getenv('USER'),
+            "user" : user if user else "root",
             "slurm_conf_path" : slurm_conf_path,
             "delete_on_stop" : delete_on_stop
         }
