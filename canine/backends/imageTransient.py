@@ -165,18 +165,26 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             #
             # check if Slurm is already running locally; start (with hard reset) if not
 
+            print("Checking for running Slurm controller ... ", end = "", flush = True)
+
             subprocess.check_call(
                 """sudo -E -u {user} bash -c 'pgrep slurmctld || slurmctld -c -f {slurm_conf_path} &&
                    slurmctld reconfigure; pgrep slurmdbd || slurmdbd; pgrep munged || munged -f'
                 """.format(**self.config),
-                shell = True
+                shell = True,
+                stdout = subprocess.DEVNULL
             )
 
             # ensure all started successfully
-            subprocess.check_call("pgrep slurmctld && pgrep slurmdbd && pgrep munged", shell = True)
+            subprocess.check_call("pgrep slurmctld && pgrep slurmdbd && pgrep munged", shell = True,
+                                  stdout = subprocess.DEVNULL)
+
+            print("done", flush = True)
 
             #
             # create/start worker nodes
+
+            print("Checking for preexisting cluster nodes ... ", end = "", flush = True)
 
             nodenames = pd.DataFrame(index = [
                           self.config["worker_prefix"] + str(x) for x in
@@ -194,6 +202,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
             instances = instances.merge(nodenames, left_on = "name", right_index = True,
                           how = "right")
+
+            print("done", flush = True)
 
             # handle nodes that will not be created
             if (nodenames["is_ex_node"] | nodenames["is_k9_node"]).any():
@@ -237,14 +247,19 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             # TODO: use API to launch these
 
             if ~self.nodes["is_k9_node"].any():
+                nodes_to_start = self.nodes.index[~self.nodes["is_k9_node"]].values
+
+                print("Creating {0:d} worker nodes ... ".format(nodes_to_start.shape[0]),
+                      end = "", flush = True)
                 subprocess.check_call(
                     """gcloud compute instances create {workers} \
                        --image {image} --machine-type {worker_type} --zone {compute_zone} \
                        {compute_script} {compute_script_file} {preemptible} \
                        --tags caninetransientimage
-                    """.format(**self.config, workers = " ".join(self.nodes.index[~self.nodes["is_k9_node"]].values)),
+                    """.format(**self.config, workers = " ".join(nodes_to_start)),
                     shell = True
                 )
+                print("done", flush = True)
 
             # start nodes previously created by Canine
 
@@ -253,11 +268,14 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
             # TODO: use API to start these
             if instances_to_start.shape[0] > 0:
+                print("Starting {0:d} preexisting worker nodes ... ".format(instances_to_start.shape[0]),
+                      end = "", flush = True)
                 subprocess.check_call(
                     """gcloud compute instances start {workers} --zone {compute_zone} \
                     """.format(**self.config, workers = " ".join(instances_to_start.values)),
                     shell = True
                 )
+                print("done", flush = True)
 
             #
             # shut down nodes exceeding init_node_count
