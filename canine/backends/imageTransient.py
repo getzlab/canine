@@ -1,23 +1,12 @@
 # vim: set expandtab:
 
 import typing
-from functools import lru_cache
 import subprocess
-import tempfile
-from io import BytesIO
 import os
 import sys
 
-#
-# switch these lines appropriately when testing in an interactive session
-
 from .local import LocalSlurmBackend
-#from canine.backends.local import LocalSlurmBackend
-
-from ..utils import get_default_gcp_project, ArgumentHelper, check_call
-#from canine.utils import get_default_gcp_project, ArgumentHelper, check_call
-
-from IPython.core.debugger import set_trace
+from ..utils import get_default_gcp_project
 
 import googleapiclient.discovery as gd
 import pandas as pd
