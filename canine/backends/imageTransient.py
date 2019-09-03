@@ -181,7 +181,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
                 # ERROR if any instance types (Canine or external) are incongruous
                 # with given definition
-                typemismatch_idx = (instances.loc[:, "machineType"] != self.config["worker_type"])
+                typemismatch_idx = ~instances.loc[:, "machineType"].isna() & \
+                                   (instances.loc[:, "machineType"] != self.config["worker_type"])
 
                 if typemismatch_idx.any():
                     print("ERROR: nodes that already exist do not match specified machine type ({worker_type}):".format(**self.config), file = sys.stderr)
@@ -193,7 +194,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
                 # WARN if any nodes (Canine or external) are already defined but
                 # present in other zones
-                zonemismatch_idx = (instances.loc[:, "zone"] != self.config["compute_zone"])
+                zonemismatch_idx = ~instances.loc[:, "zone"].isna() & \
+                                   (instances.loc[:, "zone"] != self.config["compute_zone"])
 
                 if zonemismatch_idx.any():
                     print("WARNING: nodes that already exist do not match specified compute zone ({compute_zone}):".format(**self.config), file = sys.stderr)
