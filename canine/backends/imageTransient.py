@@ -157,19 +157,23 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         # list of nodes under the purview of Canine
         self.nodes = pd.DataFrame()
 
+        # export slurm_conf_path to environment
+        os.environ['SLURM_CONF'] = self.config["slurm_conf_path"]
+
     def __enter__(self):
         try:
             #
             # check if Slurm is already running locally; start (with hard reset) if not
+
             subprocess.check_call(
-                """sudo -u {user} bash -c 'pgrep slurmctld || slurmctld -c -f {slurm_conf_path} &&
-                   slurmctld reconfigure; pgrep munged || munged -f'
+                """sudo -E -u {user} bash -c 'pgrep slurmctld || slurmctld -c -f {slurm_conf_path} &&
+                   slurmctld reconfigure; pgrep slurmdbd || slurmdbd; pgrep munged || munged -f'
                 """.format(**self.config),
                 shell = True
             )
 
-            # ensure both started successfully
-            subprocess.check_call("pgrep slurmctld && pgrep munged", shell = True)
+            # ensure all started successfully
+            subprocess.check_call("pgrep slurmctld && pgrep slurmdbd && pgrep munged", shell = True)
 
             #
             # create/start worker nodes
