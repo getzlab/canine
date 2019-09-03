@@ -419,6 +419,8 @@ class AbstractLocalizer(abc.ABC):
         Prepares job-specific inputs.
         Fills self.inputs[jobId] with Localization objects for each input
         """
+        if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
+            overrides['CANINE_JOB_ALIAS'] = None
         with self.transport_context(transport) as transport:
             self.inputs[jobId] = {}
             for arg, value in job_inputs.items():

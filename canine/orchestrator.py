@@ -196,7 +196,7 @@ class Orchestrator(object):
                     return job_spec
                 print("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
-                if self._slurmconf_path:
+                if self._slurmconf_path is not None:
                     active_jobs = self.backend.squeue('all')
                     if len(active_jobs):
                         print("There are active jobs. Skipping slurmctld restart")
