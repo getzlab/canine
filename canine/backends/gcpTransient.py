@@ -48,7 +48,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
 
     def __init__(
         self, name: str = 'slurm-canine', *, max_node_count: int = 10, compute_zone: str = 'us-central1-a',
-        controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1',
+        controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1', preemptible: bool = True
         worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
@@ -77,7 +77,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "login_machine_type": login_type,
           "login_node_count": int(login_count),
           "login_disk_size_gb": 10,
-          "preemptible_bursting": True,
+          "preemptible_bursting": preemptible,
           "private_google_access": True,
           "vpc_net": "default",
           "vpc_subnet": "default",

@@ -15,6 +15,6 @@ __all__ = [
     'LocalTransport',
     'RemoteSlurmBackend',
     'RemoteTransport',
-    'TransientGCPSlurmBackend'
+    'TransientGCPSlurmBackend',
     'TransientImageSlurmBackend'
 ]

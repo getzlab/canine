@@ -55,9 +55,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script_file: typing.Optional[str] = None,
         compute_script: typing.Optional[str] = None,
-        controller_script_file: typing.Optional[str] = None,
-        controller_script: typing.Optional[str] = None,
-        secondary_disk_size: int = 0, project: typing.Optional[str] = None, 
+        project: typing.Optional[str] = None,
         user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None,
         delete_on_stop: bool = False,
         **kwargs
@@ -76,9 +74,6 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
         if compute_script_file is not None and compute_script is not None:
             raise ValueError("Cannot simultaneously specifiy compute_script_file and compute_script.")
-
-        if controller_script_file is not None and controller_script is not None:
-            raise ValueError("Cannot simultaneously specifiy controller_script_file and controller_script.")
 
         if slurm_conf_path is None:
             raise ValueError("Currently, path to slurm.conf must be explicitly specified.")
@@ -100,13 +95,6 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "compute_script" :
                 "--metadata startup-script={}".format(compute_script)
                 if compute_script else "",
-            "controller_script_file" : 
-                "--metadata-from-file startup-script={}".format(controller_script_file)
-                if controller_script_file else "",
-            "controller_script" :
-                "--metadata startup-script={}".format(controller_script)
-                if controller_script else "",
-            "secondary_disk_size" : secondary_disk_size,
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else "root",
             "slurm_conf_path" : slurm_conf_path,
@@ -250,7 +238,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                     self._pzw(gce.instances().stop)(instance = node).execute()
                 except Exception as e:
                     print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
-                    print(e) 
+                    print(e)
 
             return self
         except Exception as e:
@@ -267,7 +255,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         Delete or stop (default) compute instances
         """
         if delete_on_stop is None:
-            delete_on_stop = self.config["delete_on_stop"] 
+            delete_on_stop = self.config["delete_on_stop"]
 
         #
         # stop or delete compute nodes
@@ -280,7 +268,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                     self._pzw(gce.instances().stop)(instance = node).execute()
             except Exception as e:
                 print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
-                print(e) 
+                print(e)
 
     def list_instances_all_zones(self):
         """
