@@ -7,7 +7,7 @@ import traceback
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
-from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer
+from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
 from .utils import check_call
 import yaml
 import pandas as pd
@@ -30,7 +30,8 @@ BACKENDS = {
 LOCALIZERS = {
     'Batched': BatchedLocalizer,
     'Local': LocalLocalizer,
-    'Remote': RemoteLocalizer
+    'Remote': RemoteLocalizer,
+    'NFS': NFSLocalizer
 }
 
 ENTRYPOINT = """#!/bin/bash

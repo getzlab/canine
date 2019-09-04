@@ -165,7 +165,8 @@ and an example configuration for each
 
 This section lists backend options which can be applied to all backends
 * `type`: Specifies the backend type (`Local`, `Remote`, or `TransientGCP`)
-* `slurm_conf_path`: Specifies the path to the `slurm.conf` path. If provided,
+* `slurm_conf_path`: Specifies the path to the `slurm.conf` path.
+* `hard_reset_on_orch_init`: If this is `True` and `slurm_conf_path` is provided,
 `slurmctld` will be halted and reconfigured using this path before the job is submitted.
 This is useful for `Local` and `Remote` backends to fix corrupted slurmctl.
 **Note:** This path must be valid within the slurm controller. It will not be localized
@@ -308,7 +309,7 @@ Here is the equivalent command line options:
 ### TransientImage backend (alpha)
 
 This backend is similar to LocalBackend, but it does not assume that the Slurm
-cluster is already running. Rather, it takes a user-provided GCE image and 
+cluster is already running. Rather, it takes a user-provided GCE image and
 dynamically spins up nodes from this image.
 
 This backend assumes:
@@ -424,6 +425,8 @@ are some considerations:
     are localized to the local staging directory and transferred to the remote
     cluster along with the rest of localization files
     * `Remote`: Localization takes place entirely on the remote cluster
+    * `NFS`: Localization takes place entirely local, and assumes that an NFS share
+    will ensure the data is localized/delocalized. See `NFS` section below
 
 **NOTE:** The old `localizeGS` option has been removed. From now on,
 if you do not wish to automatically localize `gs://` paths, use an appropriate override
@@ -472,7 +475,21 @@ override default common behavior (the file will always be localized to the `$CAN
 * `null`: Forces the input to be treated as a plain string. No handling whatsoever
 will be applied to the input.
 
-#### Google Cloud Storage
+### NFS Localizer
+
+This localizer assumes that both the current system, the slurm controller, and slurm
+compute nodes are all linked by at least one common NFS share. Please read the following
+notes when using the NFS localizer:
+
+* The `transfer_bucket` option has no effect. Data is never actively transferred,
+only passively over NFS
+* The `staging_dir` option refers to the path where canine should be staged **on the local system**.
+This path _must_ exist within the NFS share
+* `staging_dir` is a required option for the NFS strategy
+* The `mount_path` option refers to the path where the staging directory will be visible
+**on the remote systems**. The slurm controller and worker nodes must all use this path
+
+### Google Cloud Storage
 
 Localization uses credentials on the remote server to localize `gs://` files.
 Files localized during job setup (default, `Common`, `Localize`) will use the credentials
