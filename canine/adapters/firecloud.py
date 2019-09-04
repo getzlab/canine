@@ -13,7 +13,11 @@ class FirecloudAdapter(AbstractAdapter):
     Parses inputs as firecloud expression bois
     if enabled, job outputs will be written back to workspace
     """
-    def __init__(self, workspace: str, entityType: str, entityName: str, entityExpression: typing.Optional[str] = None, write_to_workspace: bool = True):
+    def __init__(
+        self, workspace: str, entityType: str, entityName: str,
+        entityExpression: typing.Optional[str] = None, write_to_workspace: bool = True,
+        alias: typing.Union[None, str, typing.List[str]] = None,
+    ):
         """
         Initializes the adapter
         Must provide workspace and entity information
@@ -22,7 +26,11 @@ class FirecloudAdapter(AbstractAdapter):
         If an expression is provided:
         * Assume multiple entities (entity type will be auto-detected)
         * Launch one job per entity, resolving input expressions for each one
+        If alias is provided, it is used to specify custom job aliases.
+        alias may be a list of strings (an alias for each job) or a single string
+        (the input variable to use as the alias)
         """
+        super().__init__(alias=alias)
         self.workspace = dalmatian.WorkspaceManager(workspace)
         if entityName not in self.workspace._get_entities_internal(entityType).index:
             raise NameError('No such {} "{}" in workspace {}'.format(
@@ -42,8 +50,6 @@ class FirecloudAdapter(AbstractAdapter):
             self.etype = entityType
         self.write_to_workspace = write_to_workspace
         self.__spec = None
-        print("Initialized FireCloud adapter in workspace", self.workspace)
-        print(len(self.entities), "of type", self.etype)
 
     def evaluate(self, etype: str, entity: str, expr: str) -> str:
         """
@@ -102,6 +108,21 @@ class FirecloudAdapter(AbstractAdapter):
                 for entity in self.entities
             ]
         )
+        if self.alias is not None:
+            if isinstance(self.alias, list):
+                assert len(self.alias) == len(self.entities), "Number of job aliases does not match number of jobs"
+                for i, alias in enumerate(self.alias):
+                    self.__spec[str(i)]['CANINE_JOB_ALIAS'] = alias
+            elif isinstance(self.alias, str):
+                assert self.alias in inputs, "User provided alias variable not provided in inputs"
+                self.__spec[str(i)]['CANINE_JOB_ALIAS'] = self.__spec[str(i)][self.alias]
+            else:
+                raise TypeError("alias must be a string of list of strings")
+        else:
+            for i, entity in enumerate(self.entities):
+                self.__spec[str(i)]['CANINE_JOB_ALIAS'] = entity
+        if len({job['CANINE_JOB_ALIAS'] for job in self.__spec.values()}) != len(self.__spec):
+            raise ValueError("Job aliases are not unique")
         return self.spec
 
     def parse_outputs(self, outputs: typing.Dict[str, typing.Dict[str, typing.List[str]]]):

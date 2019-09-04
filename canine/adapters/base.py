@@ -8,6 +8,16 @@ class AbstractAdapter(abc.ABC):
     Base class for pipeline input adapters
     """
 
+    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None):
+        """
+        Initializes the adapter.
+        If alias is provided, it is used to specify custom job aliases.
+        alias may be a list of strings (an alias for each job) or a single string
+        (the input variable to use as the alias)
+        """
+        self.alias = alias
+
+
     @abc.abstractmethod
     def parse_inputs(self, inputs: typing.Dict[str, typing.Union[typing.Any, typing.List[typing.Any]]]) -> typing.Dict[str, typing.Dict[str, str]]:
         """
@@ -40,11 +50,15 @@ class ManualAdapter(AbstractAdapter):
     Does pretty much nothing, except maybe combining arguments
     """
 
-    def __init__(self, product: bool = False):
+    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, product: bool = False):
         """
         Initializes the adapter
-        If product is True, array arguments will be combined, instead of co-iterated
+        If product is True, array arguments will be combined, instead of co-iterated.
+        If alias is provided, it is used to specify custom job aliases.
+        alias may be a list of strings (an alias for each job) or a single string
+        (the input variable to use as the alias)
         """
+        super().__init__(alias=alias)
         self.product = product
         self.__spec = None
         self._job_length = 0
@@ -87,6 +101,18 @@ class ManualAdapter(AbstractAdapter):
             for i, job in enumerate(generator)
         }
         assert len(self.__spec) == self._job_length, "Failed to predict input length"
+        if self.alias is not None:
+            if isinstance(self.alias, list):
+                assert len(self.alias) == self._job_length, "Number of job aliases does not match number of jobs"
+                for i, alias in enumerate(self.alias):
+                    self.__spec[str(i)]['CANINE_JOB_ALIAS'] = alias
+            elif isinstance(self.alias, str):
+                assert self.alias in inputs, "User provided alias variable not provided in inputs"
+                self.__spec[str(i)]['CANINE_JOB_ALIAS'] = self.__spec[str(i)][self.alias]
+            else:
+                raise TypeError("alias must be a string of list of strings")
+            if len({job['CANINE_JOB_ALIAS'] for job in self.__spec.values()}) != len(self.__spec):
+                raise ValueError("Job aliases are not unique")
         return self.spec
 
     @property

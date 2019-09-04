@@ -274,4 +274,18 @@ class Orchestrator(object):
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
-            return batch_id, job_spec, outputs, self.backend.sacct(job=batch_id)
+            acct = self.backend.sacct(job=batch_id)
+            return pd.DataFrame(
+                data={
+                    job_id: {
+                        'slurm_state': acct['State'][batch_id+'_'+job_id],
+                        'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
+                        **job_spec[job_id],
+                        **{
+                            key: val[0] if isinstance(val, list) and len(val) == 1 else val
+                            for key, val in outputs[job_id].items()
+                        }
+                    }
+                    for job_id in job_spec
+                }
+            ).T.set_index(pd.Index([*job_spec], name='job_id'))

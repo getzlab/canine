@@ -23,6 +23,10 @@ script:
   - tar czf output.tar.gz *.outputs*
 ```
 
+**Note:** This is a regular bash script, which means that if one command fails,
+bash will continue to the next line. If you wish for the script to fail as soon
+as one command fails, add `set -eo pipefail` as your first command
+
 ### Docker notes
 * When using the `TransientGCP` backend, you **must** use `sudo` to use docker
 * When using the `TransientGCP` backend with GPUS, you will need to add the option
