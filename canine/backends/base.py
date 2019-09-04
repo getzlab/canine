@@ -248,7 +248,7 @@ class AbstractSlurmBackend(abc.ABC):
         """
         If an implementing class defines a constructor, it must take **kwargs.
         """
-        
+
         #:param bool hard_reset_on_orch_init: Whether this backend needs the orchestrator to hard reset it after initialization (True), or the backend resets itself (False)
         self.hard_reset_on_orch_init = hard_reset_on_orch_init
 
@@ -421,6 +421,6 @@ class AbstractSlurmBackend(abc.ABC):
             default = df.index[df.index.str.contains(r"\*$")]
 
         # wait for any node in the partition to be ready
-        while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle|completing|allocated\+?)$").any():
+        while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle~?|completing|allocated\+?)$").any():
             time.sleep(10)
             df = self.sinfo()
