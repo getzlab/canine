@@ -244,6 +244,14 @@ class AbstractSlurmBackend(abc.ABC):
     Base class for a SLURM backend
     """
 
+    def __init__(self, hard_reset_on_orch_init: bool = True, **kwargs):
+        """
+        If an implementing class defines a constructor, it must take **kwargs.
+        """
+        
+        #:param bool hard_reset_on_orch_init: Whether this backend needs the orchestrator to hard reset it after initialization (True), or the backend resets itself (False)
+        self.hard_reset_on_orch_init = hard_reset_on_orch_init
+
     @abc.abstractmethod
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
@@ -404,11 +412,15 @@ class AbstractSlurmBackend(abc.ABC):
         Blocks until the main partition is marked as up
         """
         df = self.sinfo()
-        default = [value for value in df.index if value.endswith('*')]
+        default = df.index[df.index.str.contains(r"\*$")]
+
+        # wait for partition to appear
         while len(default) == 0:
             time.sleep(10)
             df = self.sinfo()
-            default = [value for value in df.index if value.endswith('*')]
-        while (df.AVAIL[default] != 'up').all():
+            default = df.index[df.index.str.contains(r"\*$")]
+
+        # wait for any node in the partition to be ready
+        while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle|completing|allocated\+?)$").any():
             time.sleep(10)
             df = self.sinfo()

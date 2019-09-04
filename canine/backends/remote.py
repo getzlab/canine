@@ -192,12 +192,13 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             executable='/bin/bash'
         )
 
-    def __init__(self, hostname: str, **kwargs: typing.Any):
+    def __init__(self, hostname: str, hard_reset_on_orch_init: bool = True, **kwargs: typing.Any):
         """
         Initializes the backend.
         No connection is established until the context is entered.
         provided arguments and keyword arguments are passed to paramiko.SSHClient.Connect
         """
+        super().__init__(hard_reset_on_orch_init=hard_reset_on_orch_init)
         self.hostname = hostname
         self.__hostname = hostname
         self.__sshkwargs = {

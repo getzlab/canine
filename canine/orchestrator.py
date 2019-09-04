@@ -6,8 +6,8 @@ import warnings
 import traceback
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
-from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend
-from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer
+from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
+from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
 from .utils import check_call
 import yaml
 import pandas as pd
@@ -23,7 +23,8 @@ ADAPTERS = {
 BACKENDS = {
     'Local': LocalSlurmBackend,
     'Remote': RemoteSlurmBackend,
-    'TransientGCP': TransientGCPSlurmBackend
+    'TransientGCP': TransientGCPSlurmBackend,
+    'TransientImage': TransientImageSlurmBackend
 }
 
 LOCALIZERS = {
@@ -118,15 +119,15 @@ class Orchestrator(object):
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
         adapter = config['adapter']
         if adapter['type'] not in ADAPTERS:
-            raise ValueError("Unknown adapter type '{}'".format(adapter))
+            raise ValueError("Unknown adapter type '{type}'".format(**adapter))
         self._adapter_type=adapter['type']
         self.adapter = ADAPTERS[adapter['type']](**{arg:val for arg,val in adapter.items() if arg != 'type'})
         backend = config['backend']
         if backend['type'] not in BACKENDS:
-            raise ValueError("Unknown backend type '{}'".format(backend))
+            raise ValueError("Unknown backend type '{type}'".format(**backend))
         self._backend_type = backend['type']
         self._slurmconf_path = backend['slurm_conf_path'] if 'slurm_conf_path' in backend else None
-        self.backend = BACKENDS[backend['type']](**{arg:val for arg,val in backend.items() if arg not in {'type', 'slurm_conf_path'}})
+        self.backend = BACKENDS[backend['type']](**backend)
         self.localizer_args = config['localization'] if 'localization' in config else {}
         if self.localizer_args['strategy'] not in LOCALIZERS:
             raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
@@ -153,6 +154,10 @@ class Orchestrator(object):
         * The sacct dataframe after all jobs completed
         """
         job_spec = self.adapter.parse_inputs(self.raw_inputs)
+
+        if len(job_spec) == 0:
+            raise ValueError("You didn't specify any jobs!")
+
         print("Preparing pipeline of", len(job_spec), "jobs")
         print("Connecting to backend...")
         if isinstance(self.backend, RemoteSlurmBackend):
@@ -196,7 +201,11 @@ class Orchestrator(object):
                     return job_spec
                 print("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
-                if self._slurmconf_path:
+
+                # perform hard reset of cluster; some backends do this own their
+                # own, in which case we skip.  we also can't do this if path to slurm.conf
+                # is unknown.
+                if self.backend.hard_reset_on_orch_init and self._slurmconf_path:
                     active_jobs = self.backend.squeue('all')
                     if len(active_jobs):
                         print("There are active jobs. Skipping slurmctld restart")

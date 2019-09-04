@@ -165,7 +165,8 @@ and an example configuration for each
 
 This section lists backend options which can be applied to all backends
 * `type`: Specifies the backend type (`Local`, `Remote`, or `TransientGCP`)
-* `slurm_conf_path`: Specifies the path to the `slurm.conf` path. If provided,
+* `slurm_conf_path`: Specifies the path to the `slurm.conf` path.
+* `hard_reset_on_orch_init`: If this is `True` and `slurm_conf_path` is provided,
 `slurmctld` will be halted and reconfigured using this path before the job is submitted.
 This is useful for `Local` and `Remote` backends to fix corrupted slurmctl.
 **Note:** This path must be valid within the slurm controller. It will not be localized
@@ -174,8 +175,13 @@ from the current filesystem to the slurm controller
 ### Local (default) backend
 
 This backend is the default, and runs SLURM commands through the local system.
-This only works if your computer is a SLURM node. This is the default, so no
-configuration is required, but here is an example of how to explicitly set the backend:
+This only works if your computer is a validly configured SLURM controller node, i.e.:
+
+* slurmctld, munged, and slurmdbd run properly
+* Accounting is enabled (i.e., `sacct` can list completed jobs)
+
+This is the default, so no configuration is required, but here is an example of
+how to explicitly set the backend:
 
 ```yaml
 backend:
@@ -298,6 +304,75 @@ backend:
 Here is the equivalent command line options:
 ```
 --backend type:TransientGCP --backend name:slurm-canine-example --backend controller_type:n1-standard-2 --backend worker_type:n1-standard-1 --backend controller_disk_size:50
+```
+
+### TransientImage backend (alpha)
+
+This backend is similar to LocalBackend, but it does not assume that the Slurm
+cluster is already running. Rather, it takes a user-provided GCE image and
+dynamically spins up nodes from this image.
+
+This backend assumes:
+* As with the local backend, the current node is a valid Slurm controller, i.e.:
+    * `slurmctld`, `munged`, and `slurmdbd` run properly (note that these do not need
+      to already be running when invoking Canine with this backend; they will
+      be started automatically as needed.)
+    * Accounting is enabled (i.e., `sacct` can list completed jobs)
+* The default Slurm partition is compatible with any nodes that get spun up:
+    * Worker node names must match names specified in a partition defined in `slurm.conf`
+    * Worker node types must be consistent with node definitions in `slurm.conf`
+* The image provided has a valid Slurm installation, compatible with that of the
+  controller node (e.g., same version, same plugins, etc.)
+* Slurm configuration files are present at a path accessible by all nodes (e.g.,
+  an NFS server, or mirrored across all nodes)
+* If GPUs are added, drivers must already be installed
+
+Configuration options are similar to those of the TransientGCP backend; the following
+options are identical:
+
+* `compute_zone`: The [Compute Zone](https://cloud.google.com/compute/docs/regions-zones/)
+in which to create resources (default: us-central1-a)
+* `worker_type`: The [Compute Instance Type](https://cloud.google.com/compute/pricing#predefined)
+to use for the compute nodes (default: n1-highcpu-2). **This must match the node specification
+defined in `slurm.conf`.**
+* `secondary_disk_size`: The of a secondary disk (default: 0; Max: 64000). If you
+use the secondary disk, it is mounted at `/mnt/disks/sec`. Make sure you set
+`localization.staging_dir` to be a path within this directory. (**not yet implemented
+in alpha release**)
+* `gpu_type`: The [type of GPU](https://cloud.google.com/compute/pricing#gpus) to
+attach to compute nodes (default: No gpus) (**not yet implemented in alpha release**)
+* `gpu_count`: The number of gpus to attach to each compute node (default: No gpus).
+If any gpus are attached, nvidia drivers and the nvidia docker runtime will be
+automatically installed on the compute nodes (**not yet implemented in alpha release**)
+* `project` : The Google Cloud Project to use when creating the Slurm cluster.
+(default: current working project)
+* `controller_script`: Additional commands to run during setup of the SLURM controller node
+(**not yet implemented in alpha release**)
+* `compute_script`: Additional commands to run during setup of the SLURM compute node image
+
+The following options are unique to the TransientImage backend:
+
+* `image`: Name of GCE image to instantiate worker nodes with. Must exist in
+current project. **Mandatory.**
+* `slurm_conf_path`: Path to `slurm.conf`. Must be exist on both controller
+node and all worker nodes. **Mandatory.**
+* `worker_prefix`: Prefix for node names (e.g., slurm_canine1 ... slurm_canine50).
+(default: slurm_canine). **Must match the partition specification in `slurm.conf`.**
+* `tot_node_count`: Total number of nodes to create. (default: 50)
+* `init_node_count`: Initial number of nodes to start. (default: `tot_node_count`)
+* `preemptible`: Whether the nodes to create are
+[preemptible](https://cloud.google.com/preemptible-vms/). (default: True)
+* `user`: User under which Slurm controller is launched. (default: root)
+* `delete_on_stop`: Whether to delete worker nodes entirely after Canine exist,
+or just shut them down. (default: False)
+
+Here is an example minimal configuration file:
+
+```yaml
+backend:
+  type: TransientImage
+  image: my_cluster_image
+  slurm_conf_path: /nfs/slurm/conf/slurm.conf
 ```
 
 ## localization
