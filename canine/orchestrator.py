@@ -153,6 +153,8 @@ class Orchestrator(object):
         * The input job specification
         * The sacct dataframe after all jobs completed
         """
+        if isinstance(self.backend, LocalSlurmBackend) and os.path.exists(output_dir):
+            raise FileExistsError("Output directory {} already exists".format(output_dir))
         job_spec = self.adapter.parse_inputs(self.raw_inputs)
 
         if len(job_spec) == 0:
