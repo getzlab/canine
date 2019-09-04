@@ -14,9 +14,9 @@ class FirecloudAdapter(AbstractAdapter):
     if enabled, job outputs will be written back to workspace
     """
     def __init__(
-        self, alias: typing.Union[None, str, typing.List[str]] = None,
-        workspace: str, entityType: str, entityName: str,
-        entityExpression: typing.Optional[str] = None, write_to_workspace: bool = True
+        self, workspace: str, entityType: str, entityName: str,
+        entityExpression: typing.Optional[str] = None, write_to_workspace: bool = True,
+        alias: typing.Union[None, str, typing.List[str]] = None,
     ):
         """
         Initializes the adapter

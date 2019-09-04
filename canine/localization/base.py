@@ -559,7 +559,7 @@ class AbstractLocalizer(abc.ABC):
                 'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3}; else python {0} {1} {2} {3}; fi'.format(
                     os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     compute_env['CANINE_OUTPUT'],
-                    jobId if 'CANINE_JOB_ALIAS' not in self.inputs[jobId] else self.inputs[jobId]['CANINE_JOB_ALIAS'],
+                    jobId,
                     ' '.join(
                         '-p {} {}'.format(name, shlex.quote(pattern))
                         for name, pattern in patterns.items()
