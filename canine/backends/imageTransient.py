@@ -211,17 +211,17 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             # TODO: support the other config flags
             # TODO: use API to launch these
 
-            if ~self.nodes["is_k9_node"].any():
-                nodes_to_start = self.nodes.index[~self.nodes["is_k9_node"]].values
+            if (~self.nodes["is_k9_node"]).any():
+                nodes_to_create = self.nodes.index[~self.nodes["is_k9_node"]].values
 
-                print("Creating {0:d} worker nodes ... ".format(nodes_to_start.shape[0]),
+                print("Creating {0:d} worker nodes ... ".format(nodes_to_create.shape[0]),
                       end = "", flush = True)
                 subprocess.check_call(
                     """gcloud compute instances create {workers} \
                        --image {image} --machine-type {worker_type} --zone {compute_zone} \
                        {compute_script} {compute_script_file} {preemptible} \
                        --tags caninetransientimage
-                    """.format(**self.config, workers = " ".join(nodes_to_start)),
+                    """.format(**self.config, workers = " ".join(nodes_to_create)),
                     shell = True
                 )
                 print("done", flush = True)
