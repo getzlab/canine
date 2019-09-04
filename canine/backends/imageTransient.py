@@ -11,7 +11,7 @@ from ..utils import get_default_gcp_project
 import googleapiclient.discovery as gd
 import pandas as pd
 
-gce = gd.build('compute', 'v1');
+gce = gd.build('compute', 'v1')
 
 def list_instances(zone: str, project: str) -> pd.DataFrame:
     """
@@ -19,7 +19,7 @@ def list_instances(zone: str, project: str) -> pd.DataFrame:
     """
     inst_dict = gce.instances().list(project = project, zone = zone).execute()
 
-    fnames = ['name', 'machineType', 'status', 'zone', 'selfLink', 'tags'];
+    fnames = ['name', 'machineType', 'status', 'zone', 'selfLink', 'tags']
 
     if "items" in inst_dict:
         inst_DF = pd.DataFrame([[x[y] for y in fnames] for x in inst_dict['items']], columns = fnames)
