@@ -83,6 +83,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "vpc_subnet": "default",
           "default_users": getpass.getuser(),
           'gpu_count': 0,
+          'slurm_version': '19.05-latest',
           **kwargs
         }
 

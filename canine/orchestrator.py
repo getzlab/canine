@@ -126,8 +126,9 @@ class Orchestrator(object):
         if backend['type'] not in BACKENDS:
             raise ValueError("Unknown backend type '{type}'".format(**backend))
         self._backend_type = backend['type']
+        del backend['type']
         self._slurmconf_path = backend['slurm_conf_path'] if 'slurm_conf_path' in backend else None
-        self.backend = BACKENDS[backend['type']](**backend)
+        self.backend = BACKENDS[self._backend_type](**backend)
         self.localizer_args = config['localization'] if 'localization' in config else {}
         if self.localizer_args['strategy'] not in LOCALIZERS:
             raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
