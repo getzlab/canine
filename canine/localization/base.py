@@ -535,7 +535,7 @@ class AbstractLocalizer(abc.ABC):
                 ))
             elif val.type is None:
                 job_vars.append(shlex.quote(key))
-                exports.append('export {}="{}"'.format(
+                exports.append('export {}={}'.format(
                     key,
                     shlex.quote(val.path.computepath if isinstance(val.path, PathType) else val.path)
                 ))

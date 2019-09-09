@@ -12,7 +12,7 @@ from .utils import check_call
 import yaml
 import pandas as pd
 from agutil import status_bar
-version = '0.4.0'
+version = '0.4.1'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
