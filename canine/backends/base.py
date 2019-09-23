@@ -391,7 +391,7 @@ class AbstractSlurmBackend(abc.ABC):
         """
         pass
 
-    def pack_batch_script(self, *commands: str, script_path: str = None):
+    def pack_batch_script(self, *commands: str, script_path: typing.Optional[str] = None):
         """
         writes the list of commands to a file and runs it
         Script_path may be the path to where the script should be written or None
@@ -424,3 +424,15 @@ class AbstractSlurmBackend(abc.ABC):
         while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle~?|completing|allocated\+?)$").any():
             time.sleep(10)
             df = self.sinfo()
+
+    def estimate_cost(self, clock_uptime: typing.Optional[float] = None, node_uptime: typing.Optional[float] = None, job_cpu_time: typing.Optional[typing.Dict[str, float]] = None) -> typing.Tuple[float, typing.Optional[typing.Dict[str, float]]]:
+        """
+        Returns a cost estimate for the cluster, based on any cost information available
+        to the backend. May provide total node uptime (for cluster cost estimate)
+        and/or cpu_time for each job to get job specific cost estimates.
+        Clock uptime may be provided and is useful if the cluster has an inherrant
+        overhead for uptime (ie: controller nodes).
+        Note: Job cost estimates may not sum up to the total cluster cost if the
+        cluster was not at full utilization.
+        """
+        return 0, None

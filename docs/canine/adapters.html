@@ -37,7 +37,7 @@
 <p>Contains code to parse canine input/output configuration</p>
 <span class="target" id="module-canine.adapters"></span><dl class="class">
 <dt id="canine.adapters.ManualAdapter">
-<em class="property">class </em><code class="sig-prename descclassname">canine.adapters.</code><code class="sig-name descname">ManualAdapter</code><span class="sig-paren">(</span><em class="sig-param">product: bool = False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.adapters.ManualAdapter" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.adapters.</code><code class="sig-name descname">ManualAdapter</code><span class="sig-paren">(</span><em class="sig-param">alias: Union[None</em>, <em class="sig-param">str</em>, <em class="sig-param">List[str]] = None</em>, <em class="sig-param">product: bool = False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.adapters.ManualAdapter" title="Permalink to this definition">¶</a></dt>
 <dd><p>Handles manual argument formatting
 Does pretty much nothing, except maybe combining arguments</p>
 <dl class="method">
@@ -66,7 +66,7 @@ Does nothing. Manual Adapter has no output handling</p>
 
 <dl class="class">
 <dt id="canine.adapters.FirecloudAdapter">
-<em class="property">class </em><code class="sig-prename descclassname">canine.adapters.</code><code class="sig-name descname">FirecloudAdapter</code><span class="sig-paren">(</span><em class="sig-param">workspace: str</em>, <em class="sig-param">entityType: str</em>, <em class="sig-param">entityName: str</em>, <em class="sig-param">entityExpression: Optional[str] = None</em>, <em class="sig-param">write_to_workspace: bool = True</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.adapters.FirecloudAdapter" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.adapters.</code><code class="sig-name descname">FirecloudAdapter</code><span class="sig-paren">(</span><em class="sig-param">workspace: str</em>, <em class="sig-param">entityType: str</em>, <em class="sig-param">entityName: str</em>, <em class="sig-param">entityExpression: Optional[str] = None</em>, <em class="sig-param">write_to_workspace: bool = True</em>, <em class="sig-param">alias: Union[None</em>, <em class="sig-param">str</em>, <em class="sig-param">List[str]] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.adapters.FirecloudAdapter" title="Permalink to this definition">¶</a></dt>
 <dd><p>Job input adapter
 Parses inputs as firecloud expression bois
 if enabled, job outputs will be written back to workspace</p>

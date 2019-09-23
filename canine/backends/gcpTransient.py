@@ -7,7 +7,7 @@ import shutil
 import os
 import sys
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_project, ArgumentHelper, check_call
+from ..utils import get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost
 # import paramiko
 import yaml
 import pandas as pd
@@ -309,62 +309,60 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             time.sleep(10)
             df = self.sinfo()
 
-
-# ====
-# Old code to get around openssh issues. May be needed in future if ssh-agent trick doesn't work
-# @staticmethod
-# def get_paramiko_acceptable_key():
-#     """
-#     Because, openssh keys are not accepted by paramiko,
-#     but for some reason, it's the default format on OSx.
-#     Returns the filename of a paramiko-accepted 2048-bit rsa key
-#     You'll need to copy it over yourself or add it to os-login
-#     """
-#     if not os.path.isdir(os.path.dirname(PARAMIKO_PEM_KEY)):
-#         os.path.makedirs(os.path.dirname(PARAMIKO_PEM_KEY))
-#     if not (os.path.isfile(PARAMIKO_PEM_KEY) and os.path.isfile(PARAMIKO_PEM_KEY+'.pub')):
-#         print("Generating new ssh keypair for canine/paramiko")
-#         try:
-#             subprocess.check_call(
-#                 "ssh-keygen -t rsa -b 2048 -f {} -N '' -m PEM".format(PARAMIKO_PEM_KEY),
-#                 shell=True
-#             )
-#         except CalledProcessError:
-#             # probably fine. On non-openssh implementations "-m PEM" is not
-#             # a valid argument. Try anyways
-#             subprocess.check_call(
-#                 "ssh-keygen -t rsa -b 2048 -f {} -N ''".format(PARAMIKO_PEM_KEY),
-#                 shell=True
-#             )
-#     # Double-check that the key is acceptable
-#     paramiko.RSAKey.from_private_key_file(PARAMIKO_PEM_KEY)
-#     return PARAMIKO_PEM_KEY
-# subprocess.check_call(
-#     'gcloud compute --project {} ssh --zone {} {}-controller -- bash -c \'"if [[ ! -d .ssh ]]; then mkdir .ssh; fi"\''.format(
-#         get_default_gcp_project(),
-#         self.config['zone'],
-#         self.config['cluster_name']
-#     ),
-#     shell=True,
-#     executable='/bin/bash'
-# )
-# subprocess.check_call(
-#     'gcloud compute --project {} ssh --zone {} {}-controller -- bash -c \'"cat - >> .ssh/authorized_keys"\' < {}.pub'.format(
-#         get_default_gcp_project(),
-#         self.config['zone'],
-#         self.config['cluster_name'],
-#         self.get_paramiko_acceptable_key()
-#     ),
-#     shell=True,
-#     executable='/bin/bash'
-# )
-# subprocess.check_call(
-#     'gcloud compute --project {} ssh --zone {} {}-controller -- bash -c \'"chmod 600 .ssh/authorized_keys"\''.format(
-#         get_default_gcp_project(),
-#         self.config['zone'],
-#         self.config['cluster_name']
-#     ),
-#     shell=True,
-#     executable='/bin/bash'
-# )
-# self._RemoteSlurmBackend__sshkwargs['key_filename'] = self.get_paramiko_acceptable_key()
+    def estimate_cost(self, clock_uptime: typing.Optional[float] = None, node_uptime: typing.Optional[float] = None, job_cpu_time: typing.Optional[typing.Dict[str, float]] = None) -> typing.Tuple[float, typing.Optional[typing.Dict[str, float]]]:
+        """
+        Returns a cost estimate for the cluster, based on any cost information available
+        to the backend. May provide total node uptime (for cluster cost estimate)
+        and/or cpu_time for each job to get job specific cost estimates.
+        Clock uptime may be provided and is useful if the cluster has an inherrant
+        overhead for uptime (ie: controller nodes).
+        Note: Job cost estimates may not sum up to the total cluster cost if the
+        cluster was not at full utilization.
+        """
+        cluster_cost = 0
+        worker_cpu_cost = 0
+        job_cost = None
+        if node_uptime is not None:
+            worker_info = {
+                'mtype': self.config['compute_machine_type'],
+                'preemptible': self.config['preemptible_bursting']
+            }
+            if self.config['compute_disk_type'] == 'pd-ssd':
+                worker_info['ssd_size'] = self.config['compute_disk_size_gb']
+            else:
+                worker_info['hdd_size'] = self.config['compute_disk_size_gb']
+            if 'gpu_type' in self.config and 'gpu_count' in self.config and self.config['gpu_count'] > 0:
+                worker_info['gpu_type'] = self.config['gpu_type']
+                worker_info['gpu_count'] = self.config['gpu_count']
+            worker_hourly_cost = gcp_hourly_cost(**worker_info)
+            cluster_cost += node_uptime * worker_hourly_cost
+            mtype_prefix = self.config['compute_machine_type'][:3]
+            if mtype_prefix in {'f1-', 'g1-'}:
+                ncpus = 1
+            elif mtype_prefix == 'cus': # n1-custom-X
+                ncpus = int(self.config['compute_machine_type'].split('-')[1])
+            else:
+                ncpus = int(self.config['compute_machine_type'].split('-')[2])
+            # Approximates the cost burden / CPU hour of the VM
+            worker_cpu_cost = worker_hourly_cost / ncpus
+        if clock_uptime is not None:
+            controller_info = {
+                'mtype': self.config['controller_machine_type'],
+                'preemptible': False,
+            }
+            if self.config['controller_disk_type'] == 'pd-ssd':
+                controller_info['ssd_size'] = self.config['controller_disk_size_gb']
+            else:
+                controller_info['hdd_size'] = self.config['controller_disk_size_gb']
+            if 'controller_secondary_disk_size_gb' in self.config:
+                if 'hdd_size' in controller_info:
+                    controller_info['hdd_size'] += self.config['controller_secondary_disk_size_gb']
+                elif self.config['controller_secondary_disk_size_gb'] > 0:
+                    controller_info['hdd_size'] = self.config['controller_secondary_disk_size_gb']
+            cluster_cost += clock_uptime * gcp_hourly_cost(**controller_info)
+        if job_cpu_time is not None:
+            job_cost = {
+                job_id: worker_cpu_cost * cpu_time
+                for job_id, cpu_time in job_cpu_time.items()
+            }
+        return cluster_cost, job_cost

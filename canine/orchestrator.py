@@ -12,7 +12,7 @@ from .utils import check_call
 import yaml
 import pandas as pd
 from agutil import status_bar
-version = '0.4.1'
+version = '0.4.2'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -165,6 +165,7 @@ class Orchestrator(object):
         print("Connecting to backend...")
         if isinstance(self.backend, RemoteSlurmBackend):
             self.backend.load_config_args()
+        start_time = time.monotonic()
         with self.backend:
             print("Initializing pipeline workspace")
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
@@ -249,6 +250,9 @@ class Orchestrator(object):
                 )
                 print("Batch id:", batch_id)
                 completed_jobs = []
+                cpu_time = {}
+                uptime = {}
+                prev_acct = None
                 try:
                     waiting_jobs = {
                         '{}_{}'.format(batch_id, i)
@@ -257,13 +261,26 @@ class Orchestrator(object):
                     outputs = {}
                     while len(waiting_jobs):
                         time.sleep(30)
-                        acct = self.backend.sacct(job=batch_id)
+                        acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
                         for jid in [*waiting_jobs]:
-                            if jid in acct.index and acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
-                                job = jid.split('_')[1]
-                                print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
-                                completed_jobs.append((job, jid))
-                                waiting_jobs.remove(jid)
+                            if jid in acct.index:
+                                if prev_acct is not None and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
+                                    # Job has restarted since last update:
+                                    if jid in cpu_time:
+                                        cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
+                                    else:
+                                        cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
+                                if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
+                                    job = jid.split('_')[1]
+                                    print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
+                                    completed_jobs.append((job, jid))
+                                    waiting_jobs.remove(jid)
+                        for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
+                            if node in uptime:
+                                uptime[node] += 1
+                            else:
+                                uptime[node] = 1
+                        prev_acct = acct
                 except:
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
@@ -276,17 +293,32 @@ class Orchestrator(object):
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
             acct = self.backend.sacct(job=batch_id)
-            return pd.DataFrame(
-                data={
-                    job_id: {
-                        'slurm_state': acct['State'][batch_id+'_'+job_id],
-                        'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
-                        **job_spec[job_id],
-                        **{
-                            key: val[0] if isinstance(val, list) and len(val) == 1 else val
-                            for key, val in outputs[job_id].items()
-                        }
+        runtime = time.monotonic() - start_time
+        df = pd.DataFrame(
+            data={
+                job_id: {
+                    'slurm_state': acct['State'][batch_id+'_'+job_id],
+                    'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
+                    'cpu_hours': (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
+                        cpu_time[batch_id+'_'+job_id] if batch_id+'_'+job_id in cpu_time else 0
+                    ))/3600,
+                    **job_spec[job_id],
+                    **{
+                        key: val[0] if isinstance(val, list) and len(val) == 1 else val
+                        for key, val in outputs[job_id].items()
                     }
-                    for job_id in job_spec
                 }
-            ).T.set_index(pd.Index([*job_spec], name='job_id'))
+                for job_id in job_spec
+            }
+        ).T.set_index(pd.Index([*job_spec], name='job_id')).astype({'cpu_seconds': int})
+        try:
+            print("Estimated total cluster cost:", self.backend.estimate_cost(
+                runtime/3600,
+                node_uptime=sum(uptime.values())/120
+            ))
+            job_cost = self.backend.estimate_cost(job_cpu_time=df['cpu_hours'].to_dict())
+            df['est_cost'] = [job_cost[batch_id+'_'+job_id] for job_id in df.index]
+        except:
+            traceback.print_exc()
+        finally:
+            return df

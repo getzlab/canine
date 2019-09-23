@@ -6,7 +6,7 @@ import os
 import sys
 
 from .local import LocalSlurmBackend
-from ..utils import get_default_gcp_project
+from ..utils import get_default_gcp_project, gcp_hourly_cost
 
 import googleapiclient.discovery as gd
 import pandas as pd
@@ -290,6 +290,46 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             return f(project = self.config["project"], zone = self.config["compute_zone"], *args, **kwargs)
 
         return x
+
+    def estimate_cost(self, clock_uptime: typing.Optional[float] = None, node_uptime: typing.Optional[float] = None, job_cpu_time: typing.Optional[typing.Dict[str, float]] = None) -> typing.Tuple[float, typing.Optional[typing.Dict[str, float]]]:
+        """
+        Returns a cost estimate for the cluster, based on any cost information available
+        to the backend. May provide total node uptime (for cluster cost estimate)
+        and/or cpu_time for each job to get job specific cost estimates.
+        Clock uptime may be provided and is useful if the cluster has an inherrant
+        overhead for uptime (ie: controller nodes).
+        Note: Job cost estimates may not sum up to the total cluster cost if the
+        cluster was not at full utilization.
+        """
+        cluster_cost = 0
+        worker_cpu_cost = 0
+        job_cost = None
+        if node_uptime is not None:
+            worker_info = {
+                'mtype': self.config['worker_type'],
+                'preemptible': bool(self.config['preemptible'])
+            }
+            if 'gpu_type' in self.config and 'gpu_count' in self.config and self.config['gpu_count'] > 0:
+                worker_info['gpu_type'] = self.config['gpu_type']
+                worker_info['gpu_count'] = self.config['gpu_count']
+            worker_hourly_cost = gcp_hourly_cost(**worker_info)
+            cluster_cost = node_uptime * worker_hourly_cost
+            mtype_prefix = self.config['worker_type'][:3]
+            if mtype_prefix in {'f1-', 'g1-'}:
+                ncpus = 1
+            elif mtype_prefix == 'cus': # n1-custom-X
+                ncpus = int(self.config['worker_type'].split('-')[1])
+            else:
+                ncpus = int(self.config['worker_type'].split('-')[2])
+            # Approximates the cost burden / CPU hour of the VM
+            worker_cpu_cost = worker_hourly_cost / ncpus
+        if job_cpu_time is not None:
+            job_cost = {
+                job_id: worker_cpu_cost * cpu_time
+                for job_id, cpu_time in job_cpu_time.items()
+            }
+        return cluster_cost, job_cost
+
 
 
 # }}}

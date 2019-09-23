@@ -4,6 +4,8 @@ import sys
 import select
 import io
 import warnings
+from collections import namedtuple
+import functools
 import shlex
 from subprocess import CalledProcessError
 import google.auth
@@ -156,3 +158,107 @@ def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None
             sys.stderr.write(stderr.read().decode())
             sys.stderr.flush()
         raise CalledProcessError(rc, cmd)
+
+predefined_mtypes = {
+    # cost / CPU in each of the predefined tracks
+    'n1-standard': (0.0475, 0.01),
+    'n1-highmem': (0.0592, 0.0125),
+    'n1-highcpu': (0.03545, 0.0075),
+    'n2-standard': (0.4855, 0.01175),
+    'n2-highmem': (0.0655, 0.01585),
+    'n2-highcpu': (0.03585, 0.00865),
+    'm1-ultramem': (0.1575975, 0.0332775),
+    'm2-ultramem': (0.2028173077, 0), # no preemptible version
+    'c2-standard': (0.0522, 0.012625)
+}
+
+CustomPricing = namedtuple('CustomPricing', [
+    'cpu_cost',
+    'mem_cost',
+    'ext_cost',
+    'preempt_cpu_cost',
+    'preempt_mem_cost',
+    'preempt_ext_cost'
+])
+
+custom_mtypes = {
+    # cost / CPU, extended memory cost, preemptible cpu, preemptible extended memory
+    'n1-custom': CustomPricing(
+        0.033174, 0.004446, 0.00955,
+        0.00698, 0.00094, 0.002014 #extends > 6.5gb/core
+    ),
+    'n2-custom': CustomPricing(
+        0.033174, 0.004446, 0.00955,
+        0.00802, 0.00108, 0.002310 # extends > 7gb/core
+    )
+}
+
+fixed_cost = {
+    # For fixed machine types, direct mapping of cost
+    'm1-megamem-96': (10.6740, 2.26),
+    'f1-micro': (0.0076, 0.0035),
+    'g1-small': (0.0257, 0.007)
+}
+
+gpu_pricing = {
+    'nvidia-tesla-t4': (0.95, 0.29),
+    'nvidia-tesla-p4': (0.60, 0.216),
+    'nvidia-tesla-v100': (2.48, 0.74),
+    'nvidia-tesla-p100': (1.46, 0.43),
+    'nvidia-tesla-k80': (0.45, 0.135)
+}
+
+@functools.lru_cache()
+def _get_mtype_cost(mtype: str) -> typing.Tuple[float, float]:
+    """
+    Returns the hourly cost of a google VM based on machine type.
+    Returns a tuple of (non-preemptible cost, preemptible cost)
+    """
+    if mtype in fixed_cost:
+        return fixed_cost[mtype]
+    components = mtype.split('-')
+    if len(components) < 3:
+        raise ValueError("mtype {} not in expected format".format(mtype))
+    track = '{}-{}'.format(components[0], components[1])
+    if 'custom' in mtype:
+        # (n1-|n2-)?custom-(\d+)-(\d+)(-ext)?
+        if components[0] == 'custom':
+            components = ['n1'] + components
+        if len(components) not in {4, 5}:
+            raise ValueError("Custom mtype {} not in expected format".format(mtype))
+        cores = int(components[2])
+        mem = int(components[3]) / 1024
+        if track == 'n1-custom':
+            reg_mem = min(mem, cores * 6.5)
+        else:
+            reg_mem = min(mem, cores * 8)
+        ext_mem = mem - reg_mem
+        price_model = custom_mtypes[track]
+        return (
+            (price_model.cpu_cost * cores) + (price_model.mem_cost * reg_mem) + (price_model.ext_cost * ext_mem),
+            (price_model.preempt_cpu_cost * cores) + (price_model.preempt_mem_cost * reg_mem) + (price_model.preempt_ext_cost * ext_mem)
+        )
+    if track not in predefined_mtypes:
+        raise ValueError("mtype family {} not defined".format(track))
+    cores = int(components[2])
+    return (
+        predefined_mtypes[track][0] * cores,
+        predefined_mtypes[track][1] * cores
+    )
+
+def gcp_hourly_cost(mtype: str, preemptible: bool = False, ssd_size: int = 0, hdd_size: int = 0, gpu_type: typing.Optional[str] = None, gpu_count: int = 0) -> float:
+    """
+    Gets the hourly cost of a GCP VM based on its machine type and disk size.
+    Does not include any sustained usage discounts. Actual pricing may vary based
+    on compute region
+    """
+    mtype_cost, preemptible_cost = _get_mtype_cost(mtype)
+    return (
+        (preemptible_cost if preemptible else mtype_cost) +
+        (0.00023287671232876715 * ssd_size) +
+        (0.00005479452055 * hdd_size) +
+        (
+            0 if gpu_type is None or gpu_count < 1
+            else (gpu_pricing[gpu_type][1 if preemptible else 0] * gpu_count)
+        )
+    )

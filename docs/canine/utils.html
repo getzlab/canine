@@ -118,11 +118,73 @@ In either case, this is followed by: for k in F:  D[k] = F[k]</p>
 
 </dd></dl>
 
+<dl class="class">
+<dt id="canine.utils.CustomPricing">
+<em class="property">class </em><code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">CustomPricing</code><span class="sig-paren">(</span><em class="sig-param">cpu_cost</em>, <em class="sig-param">mem_cost</em>, <em class="sig-param">ext_cost</em>, <em class="sig-param">preempt_cpu_cost</em>, <em class="sig-param">preempt_mem_cost</em>, <em class="sig-param">preempt_ext_cost</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="method">
+<dt id="canine.utils.CustomPricing.count">
+<code class="sig-name descname">count</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing.count" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return number of occurrences of value.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.CustomPricing.cpu_cost">
+<em class="property">property </em><code class="sig-name descname">cpu_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.cpu_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Alias for field number 0</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.CustomPricing.ext_cost">
+<em class="property">property </em><code class="sig-name descname">ext_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.ext_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Alias for field number 2</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.CustomPricing.index">
+<code class="sig-name descname">index</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing.index" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return first index of value.</p>
+<p>Raises ValueError if the value is not present.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.CustomPricing.mem_cost">
+<em class="property">property </em><code class="sig-name descname">mem_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.mem_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Alias for field number 1</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.CustomPricing.preempt_cpu_cost">
+<em class="property">property </em><code class="sig-name descname">preempt_cpu_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_cpu_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Alias for field number 3</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.CustomPricing.preempt_ext_cost">
+<em class="property">property </em><code class="sig-name descname">preempt_ext_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_ext_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Alias for field number 5</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.utils.CustomPricing.preempt_mem_cost">
+<em class="property">property </em><code class="sig-name descname">preempt_mem_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_mem_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Alias for field number 4</p>
+</dd></dl>
+
+</dd></dl>
+
 <dl class="function">
 <dt id="canine.utils.check_call">
 <code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">check_call</code><span class="sig-paren">(</span><em class="sig-param">cmd: str</em>, <em class="sig-param">rc: int</em>, <em class="sig-param">stdout: Optional[BinaryIO] = None</em>, <em class="sig-param">stderr: Optional[BinaryIO] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.check_call" title="Permalink to this definition">¶</a></dt>
 <dd><p>Checks that the rc is 0
 If not, flush stdout and stderr streams and raise a CalledProcessError</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="canine.utils.gcp_hourly_cost">
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">gcp_hourly_cost</code><span class="sig-paren">(</span><em class="sig-param">mtype: str</em>, <em class="sig-param">preemptible: bool = False</em>, <em class="sig-param">ssd_size: int = 0</em>, <em class="sig-param">hdd_size: int = 0</em>, <em class="sig-param">gpu_type: Optional[str] = None</em>, <em class="sig-param">gpu_count: int = 0</em><span class="sig-paren">)</span> &#x2192; float<a class="headerlink" href="#canine.utils.gcp_hourly_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Gets the hourly cost of a GCP VM based on its machine type and disk size.
+Does not include any sustained usage discounts. Actual pricing may vary based
+on compute region</p>
 </dd></dl>
 
 <dl class="function">
