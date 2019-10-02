@@ -77,8 +77,8 @@ class ManualAdapter(AbstractAdapter):
         if self.product:
             self._job_length = reduce(lambda x,y: x*y, input_lengths.values(), 1)
             generator = product(
-                inputs[key] if isinstance(inputs[key], list) else (inputs[key],)
-                for key in keys
+                *[inputs[key] if isinstance(inputs[key], list) else (inputs[key],)
+                for key in keys]
             )
         else:
             for key, l in input_lengths.items():
