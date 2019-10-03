@@ -175,16 +175,19 @@ class AbstractTransport(abc.ABC):
         except FileNotFoundError:
             return False
 
-    def makedirs(self, path: str):
+    def makedirs(self, path: str, exist_okay: bool = False):
         """
         Recursively build the requested directory structure
         """
         if path == '' or self.isdir(path):
             return
         dirname = os.path.dirname(path)
-        if not (dirname == '' or os.path.exists(dirname)):
+        if not (dirname == '' or self.exists(dirname)):
             self.makedirs(dirname)
-        self.mkdir(path)
+        if not self.exists(path):
+            self.mkdir(path)
+        elif not exist_okay:
+            raise FileExistsError(path)
 
     def walk(self, path: str) -> typing.Generator[typing.Tuple[str, typing.List[str], typing.List[str]], None, None]:
         """

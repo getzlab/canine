@@ -249,9 +249,9 @@ class NFSLocalizer(BatchedLocalizer):
         if len(jobs):
             for jobId in status_bar.iter(jobs):
                 if not os.path.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace')):
-                    os.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'))
+                    os.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'), exist_okay=True)
                 if not os.path.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs')):
-                    os.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'))
+                    os.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'), exist_okay=True)
             if not os.path.isdir(controller_env['CANINE_OUTPUT']):
                 os.mkdir(controller_env['CANINE_OUTPUT'])
         return self.staging_dir

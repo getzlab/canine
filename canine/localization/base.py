@@ -408,9 +408,9 @@ class AbstractLocalizer(abc.ABC):
             if len(jobs):
                 for jobId in status_bar.iter(jobs):
                     if not transport.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace')):
-                        transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'))
+                        transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'), exist_okay=True)
                     if not transport.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs')):
-                        transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'))
+                        transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'), exist_okay=True)
                 if not transport.isdir(controller_env['CANINE_OUTPUT']):
                     transport.mkdir(controller_env['CANINE_OUTPUT'])
             return transport.normpath(self.staging_dir)
