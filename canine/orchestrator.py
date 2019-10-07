@@ -142,17 +142,14 @@ class Orchestrator(object):
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
         if 'stdout' not in self.raw_outputs:
-            self.raw_outputs['stdout'] = 'stdout'
+            self.raw_outputs['stdout'] = '../stdout'
         if 'stderr' not in self.raw_outputs:
-            self.raw_outputs['stderr'] = 'stderr'
+            self.raw_outputs['stderr'] = '../stderr'
 
-    def run_pipeline(self, output_dir: str = 'canine_output', dry_run: bool = False) -> typing.Tuple[str, dict, dict, pd.DataFrame]:
+    def run_pipeline(self, output_dir: str = 'canine_output', dry_run: bool = False) -> pd.DataFrame:
         """
         Runs the configured pipeline
-        Returns a 4-tuple:
-        * The batch job id
-        * The input job specification
-        * The sacct dataframe after all jobs completed
+        Returns a pandas DataFrame containing job inputs, outputs, and runtime information
         """
         if isinstance(self.backend, LocalSlurmBackend) and os.path.exists(output_dir):
             raise FileExistsError("Output directory {} already exists".format(output_dir))
@@ -160,6 +157,8 @@ class Orchestrator(object):
 
         if len(job_spec) == 0:
             raise ValueError("You didn't specify any jobs!")
+        elif len(job_spec) > 4000000:
+            raise ValueError("Cannot exceede 4000000 jobs in one pipeline")
 
         print("Preparing pipeline of", len(job_spec), "jobs")
         print("Connecting to backend...")
@@ -243,8 +242,8 @@ class Orchestrator(object):
                         'requeue': True,
                         'job_name': self.name,
                         'array': "0-{}".format(len(job_spec)-1),
-                        'output': "{}/%a/workspace/stdout".format(env['CANINE_JOBS']),
-                        'error': "{}/%a/workspace/stderr".format(env['CANINE_JOBS']),
+                        'output': "{}/%a/stdout".format(env['CANINE_JOBS']),
+                        'error': "{}/%a/stderr".format(env['CANINE_JOBS']),
                         **self.resources
                     }
                 )
@@ -264,7 +263,7 @@ class Orchestrator(object):
                         acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
                         for jid in [*waiting_jobs]:
                             if jid in acct.index:
-                                if prev_acct is not None and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
+                                if prev_acct is not None and jid in prev_acct.index and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
                                     # Job has restarted since last update:
                                     if jid in cpu_time:
                                         cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
@@ -280,7 +279,13 @@ class Orchestrator(object):
                                 uptime[node] += 1
                             else:
                                 uptime[node] = 1
-                        prev_acct = acct
+                        if prev_acct is None:
+                            prev_acct = acct
+                        else:
+                            prev_acct = pd.concat([
+                                acct,
+                                prev_acct.loc[[idx for idx in prev_acct.index if idx not in acct.index]]
+                            ])
                 except:
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
@@ -310,14 +315,14 @@ class Orchestrator(object):
                 }
                 for job_id in job_spec
             }
-        ).T.set_index(pd.Index([*job_spec], name='job_id')).astype({'cpu_seconds': int})
+        ).T.set_index(pd.Index([*job_spec], name='job_id')).astype({'cpu_hours': int})
         try:
             print("Estimated total cluster cost:", self.backend.estimate_cost(
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
             ))
-            job_cost = self.backend.estimate_cost(job_cpu_time=df['cpu_hours'].to_dict())
-            df['est_cost'] = [job_cost[batch_id+'_'+job_id] for job_id in df.index]
+            job_cost = self.backend.estimate_cost(job_cpu_time=df['cpu_hours'].to_dict())[1]
+            df['est_cost'] = [job_cost[job_id] for job_id in df.index]
         except:
             traceback.print_exc()
         finally:

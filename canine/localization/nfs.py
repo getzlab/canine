@@ -186,6 +186,8 @@ class NFSLocalizer(BatchedLocalizer):
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
+                'mkdir -p $CANINE_JOB_INPUTS',
+                'mkdir -p $CANINE_JOB_ROOT',
             ] + exports + extra_tasks
         ) + '\ncd $CANINE_JOB_ROOT\n'
         teardown_script = '\n'.join(
@@ -193,6 +195,7 @@ class NFSLocalizer(BatchedLocalizer):
             for line in [
                 '#!/bin/bash',
                 'if [[ -d {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
+                # 'mv ../stderr ../stdout .',
                 'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} -c {3}; else python {0} {1} {2} -c {3}; fi'.format(
                     os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     compute_env['CANINE_OUTPUT'],
@@ -245,13 +248,6 @@ class NFSLocalizer(BatchedLocalizer):
             os.mkdir(controller_env['CANINE_COMMON'])
         if not os.path.isdir(controller_env['CANINE_JOBS']):
             os.mkdir(controller_env['CANINE_JOBS'])
-        print("Finalizing directory structure. This may take a while...")
-        if len(jobs):
-            for jobId in status_bar.iter(jobs):
-                if not os.path.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace')):
-                    os.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'), exist_okay=True)
-                if not os.path.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs')):
-                    os.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'), exist_okay=True)
-            if not os.path.isdir(controller_env['CANINE_OUTPUT']):
-                os.mkdir(controller_env['CANINE_OUTPUT'])
+        if len(jobs) and not os.path.isdir(controller_env['CANINE_OUTPUT']):
+            os.mkdir(controller_env['CANINE_OUTPUT'])
         return self.staging_dir

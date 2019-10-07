@@ -404,15 +404,8 @@ class AbstractLocalizer(abc.ABC):
                 transport.mkdir(controller_env['CANINE_COMMON'])
             if not transport.isdir(controller_env['CANINE_JOBS']):
                 transport.mkdir(controller_env['CANINE_JOBS'])
-            print("Finalizing directory structure. This may take a while...")
-            if len(jobs):
-                for jobId in status_bar.iter(jobs):
-                    if not transport.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace')):
-                        transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'workspace'), exist_okay=True)
-                    if not transport.isdir(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs')):
-                        transport.makedirs(os.path.join(controller_env['CANINE_JOBS'], jobId, 'inputs'), exist_okay=True)
-                if not transport.isdir(controller_env['CANINE_OUTPUT']):
-                    transport.mkdir(controller_env['CANINE_OUTPUT'])
+            if len(jobs) and not transport.isdir(controller_env['CANINE_OUTPUT']):
+                transport.mkdir(controller_env['CANINE_OUTPUT'])
             return transport.normpath(self.staging_dir)
 
     def prepare_job_inputs(self, jobId: str, job_inputs: typing.Dict[str, str], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None):
@@ -550,6 +543,8 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
+                'mkdir -p $CANINE_JOB_INPUTS',
+                'mkdir -p $CANINE_JOB_ROOT',
             ] + exports + extra_tasks
         ) + '\ncd $CANINE_JOB_ROOT\n'
         teardown_script = '\n'.join(
@@ -557,6 +552,7 @@ class AbstractLocalizer(abc.ABC):
             for line in [
                 '#!/bin/bash',
                 'if [[ -d {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
+                # 'mv ../stderr ../stdout .',
                 'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3}; else python {0} {1} {2} {3}; fi'.format(
                     os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     compute_env['CANINE_OUTPUT'],
