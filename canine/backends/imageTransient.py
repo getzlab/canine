@@ -57,7 +57,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         compute_script: typing.Optional[str] = None,
         project: typing.Optional[str] = None,
         user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None,
-        delete_on_stop: bool = False,
+        action_on_stop: str = "stop",
         **kwargs
     ):
         #
@@ -98,7 +98,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else "root",
             "slurm_conf_path" : slurm_conf_path,
-            "delete_on_stop" : delete_on_stop
+            "action_on_stop" : action_on_stop
         }
 
         # this backend resets itself on startup; no need for the orchestrator
@@ -250,21 +250,25 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
     def __exit__(self, *args):
         self.stop()
 
-    def stop(self, delete_on_stop = None):
+    def stop(self, action_on_stop = None):
         """
         Delete or stop (default) compute instances
         """
-        if delete_on_stop is None:
-            delete_on_stop = self.config["delete_on_stop"]
+        if action_on_stop is None:
+            action_on_stop = self.config["action_on_stop"]
 
         #
-        # stop or delete compute nodes
+        # stop, delete, or leave running compute nodes
 
         for node in self.nodes.index:
             try:
-                if delete_on_stop:
+                if action_on_stop == "delete":
                     self._pzw(gce.instances().delete)(instance = node).execute()
+                elif action_on_stop == "run":
+                    # leave it running
+                    pass
                 else:
+                    # default behavior is to shut down
                     self._pzw(gce.instances().stop)(instance = node).execute()
             except Exception as e:
                 print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
