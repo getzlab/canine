@@ -31,7 +31,8 @@ setup(
     entry_points={
         'console_scripts':[
             'canine = canine.__main__:main',
-            'canine-transient = canine.__main__:boot_transient'
+            'canine-transient = canine.__main__:boot_transient',
+            'canine-xargs = canine.__main__:xargs'
         ]
     },
     description = 'A dalmatian-based job manager to schedule tasks using SLURM',

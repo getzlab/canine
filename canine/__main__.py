@@ -3,8 +3,10 @@ For argument parsing and CLI interface
 """
 import argparse
 import sys
+import os
 from . import Orchestrator, __version__
 from .backends import TransientGCPSlurmBackend
+from .xargs import Xargs
 import yaml
 
 def ConfType(nfields, nMax=None):
@@ -113,6 +115,98 @@ def boot_transient():
                 input("Press Ctrl+C to kill the slurm cluster")
         except KeyboardInterrupt:
             pass # silence keyboard interrupt
+
+def xargs():
+    parser = argparse.ArgumentParser(
+        'canine-xargs',
+        description="An xargs-like canine interface for local slurm clusters",
+        epilog="Use the replacement character (default '@') to substitute in arguments."
+        " By default, each line from stdin is substituted into the replacement character."
+        " If the replacement character appears multiple times, one line is used to fill each occurrence, "
+        " and stdin is expected to contain a multiple of the number of replacement characters"
+    )
+    parser.add_argument(
+        '-n', '--name',
+        help="Name of the job",
+        default=None
+    )
+    parser.add_argument(
+        '-s', '--replacement-string',
+        help="Replacement string (default: @). ALL occurrences of this string in the command string"
+        " will be replaced with the next argument read from stdin. Stdin is expected to contain"
+        " a number of lines equal to an integer multiple of the number of occurrences of this string"
+    )
+    parser.add_argument(
+        '-e', '--allow-empty',
+        action='store_true',
+        help="By default, empty lines in stdin are ignored. With this option, they"
+        " will be parsed into the input configuration as an empty string"
+    )
+    parser.add_argument(
+        '-r', '--resources',
+        help="SLURM arguments. Must specify in the form argName:argValue. --resources"
+        " may be specified as many times as necessary, and a specific argName may also"
+        " be repeated. Specify slurm arguments without leading dashes, but otherwise"
+        " exactly as they'd appear on the command line. For slurm options"
+        " which take no arguments, set --resources argName:true",
+        type=ConfType(2),
+        action='append',
+        default=[]
+    )
+    parser.add_argument(
+        '-b', '--backend',
+        help="Backend configuration. Must specify in the form optionName:optionValue."
+        " --backend may be provided as many times as necessary",
+        type=ConfType(2),
+        action='append',
+        default=[]
+    )
+    parser.add_argument(
+        '-d', '--working-directory',
+        help="Set the working directory of the launched jobs. Defaults to current directory",
+        default=os.getcwd()
+    )
+    parser.add_argument(
+        '-v', '--version',
+        action='version',
+        version='canine '+__version__,
+        help="Display the current version and exit"
+    )
+    parser.add_argument(
+        'command',
+        help="The command to execute. Must contain at least one occurrence of the replacement string",
+        nargs=argparse.REMAINDER
+    )
+    args = parser.parse_args()
+    backend = {key: val for key, val in args.backend}
+    resources = {key: val for key, val in args.resources}
+    if len(args.command) < 1:
+        sys.exit("Empty command string")
+    cmd = ' '.join(args.command)
+    if args.replacement_string not in cmd:
+        sys.exit("Replacement string '{}' not present in command".format(args.replacement_string))
+    inputs = {
+        'canine_arg{}'.format(i): []
+        for i in range(cmd.count(args.replacement_string))
+    }
+    line_cnt = 0
+    for line in sys.stdin:
+        if len(line.rstrip()) or args.allow_empty:
+            inputs['canine_arg{}'.format(line_cnt)].append(line.strip())
+            line_cnt += 1
+    if line_cnt % cmd.count(args.replacement_string) != 0:
+        sys.exit("Unexpected EOF: stdin did not contain enough input. {} lines read, {} parallel commands parsed".format(
+            line_cnt,
+            line_cnt/cmd.count(args.replacement_string)
+        ))
+    for i in range(cmd.count(args.replacement_string)):
+        cmd = cmd.replace(
+            args.replacement_string,
+            'canine_arg{}'.format(i),
+            1
+        )
+    Xargs(cmd, inputs, backend, args.name, args.working_directory, resources).run_pipeline()
+
 
 def main():
     parser = argparse.ArgumentParser(

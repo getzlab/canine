@@ -10,6 +10,7 @@ Welcome to Canine's documentation!
    canine/backends
    canine/localization
    canine/utils
+   canine/xargs
 
 
 

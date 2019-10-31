@@ -4,7 +4,7 @@
 <html xmlns="http://www.w3.org/1999/xhtml">
   <head>
     <meta charset="utf-8" />
-    <title>canine &#8212; Canine  documentation</title>
+    <title>canine.xargs &#8212; Canine  documentation</title>
     <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
     <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
     <script type="text/javascript" id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
@@ -14,8 +14,7 @@
     <script type="text/javascript" src="../_static/language_data.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
-    <link rel="next" title="canine.adapters" href="adapters.html" />
-    <link rel="prev" title="Welcome to Canine’s documentation!" href="../index.html" />
+    <link rel="prev" title="canine.utils" href="utils.html" />
    
   <link rel="stylesheet" href="../_static/custom.css" type="text/css" />
   
@@ -32,31 +31,34 @@
 
           <div class="body" role="main">
             
-  <div class="section" id="canine">
-<h1>canine<a class="headerlink" href="#canine" title="Permalink to this headline">¶</a></h1>
-<p>A dalmatian-based job manager to schedule tasks using SLURM</p>
-<span class="target" id="module-canine"></span><dl class="class">
-<dt id="canine.Orchestrator">
-<em class="property">class </em><code class="sig-prename descclassname">canine.</code><code class="sig-name descname">Orchestrator</code><span class="sig-paren">(</span><em class="sig-param">config: Union[str, Dict[str, Any]]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.Orchestrator" title="Permalink to this definition">¶</a></dt>
-<dd><p>Main class
-Parses a configuration object, initializes, runs, and cleans up a Canine Pipeline</p>
+  <div class="section" id="canine-xargs">
+<h1>canine.xargs<a class="headerlink" href="#canine-xargs" title="Permalink to this headline">¶</a></h1>
+<p>Contains code to run the xargs orchestrator</p>
+<span class="target" id="module-canine.xargs"></span><dl class="class">
+<dt id="canine.xargs.Xargs">
+<em class="property">class </em><code class="sig-prename descclassname">canine.xargs.</code><code class="sig-name descname">Xargs</code><span class="sig-paren">(</span><em class="sig-param">command: str, inputs: Dict[str, Any], backend: Union[canine.backends.base.AbstractSlurmBackend, Dict[str, Any]], name: Optional[str] = None, cwd: Optional[str] = None, resources: Optional[Dict[str, Any]] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.xargs.Xargs" title="Permalink to this definition">¶</a></dt>
+<dd><p>Simplified Orchestrator
+Built to work on a local slurm cluster.
+No localization is performed. Job-specific commands are dumped to a staging
+directory, and jobs are dispatched. Outputs are not gathered or delocalized,
+and the only cleanup performed removes the temporary staging dir</p>
 <dl class="method">
-<dt id="canine.Orchestrator.fill_config">
-<em class="property">static </em><code class="sig-name descname">fill_config</code><span class="sig-paren">(</span><em class="sig-param">cfg: Union[str, Dict[str, Any]]</em><span class="sig-paren">)</span> &#x2192; Dict[str, Any]<a class="headerlink" href="#canine.Orchestrator.fill_config" title="Permalink to this definition">¶</a></dt>
+<dt id="canine.xargs.Xargs.fill_config">
+<em class="property">static </em><code class="sig-name descname">fill_config</code><span class="sig-paren">(</span><em class="sig-param">cfg: Union[str, Dict[str, Any]]</em><span class="sig-paren">)</span> &#x2192; Dict[str, Any]<a class="headerlink" href="#canine.xargs.Xargs.fill_config" title="Permalink to this definition">¶</a></dt>
 <dd><p>Loads the given config object (or reads from the given filepath)
 Applies Canine defaults, then returns the final config dictionary</p>
 </dd></dl>
 
 <dl class="method">
-<dt id="canine.Orchestrator.run_pipeline">
-<code class="sig-name descname">run_pipeline</code><span class="sig-paren">(</span><em class="sig-param">output_dir: str = 'canine_output'</em>, <em class="sig-param">dry_run: bool = False</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.Orchestrator.run_pipeline" title="Permalink to this definition">¶</a></dt>
+<dt id="canine.xargs.Xargs.run_pipeline">
+<code class="sig-name descname">run_pipeline</code><span class="sig-paren">(</span><em class="sig-param">dry_run: bool = False</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.xargs.Xargs.run_pipeline" title="Permalink to this definition">¶</a></dt>
 <dd><p>Runs the configured pipeline
 Returns a pandas DataFrame containing job inputs, outputs, and runtime information</p>
 </dd></dl>
 
 <dl class="method">
-<dt id="canine.Orchestrator.stringify">
-<em class="property">static </em><code class="sig-name descname">stringify</code><span class="sig-paren">(</span><em class="sig-param">obj: Any</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.Orchestrator.stringify" title="Permalink to this definition">¶</a></dt>
+<dt id="canine.xargs.Xargs.stringify">
+<em class="property">static </em><code class="sig-name descname">stringify</code><span class="sig-paren">(</span><em class="sig-param">obj: Any</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.xargs.Xargs.stringify" title="Permalink to this definition">¶</a></dt>
 <dd><p>Recurses through the dictionary, converting objects to strings</p>
 </dd></dl>
 
@@ -83,20 +85,19 @@ Returns a pandas DataFrame containing job inputs, outputs, and runtime informati
 <h3>Navigation</h3>
 <p class="caption"><span class="caption-text">Contents</span></p>
 <ul class="current">
-<li class="toctree-l1 current"><a class="current reference internal" href="#">canine</a></li>
+<li class="toctree-l1"><a class="reference internal" href="index.html">canine</a></li>
 <li class="toctree-l1"><a class="reference internal" href="adapters.html">canine.adapters</a></li>
 <li class="toctree-l1"><a class="reference internal" href="backends.html">canine.backends</a></li>
 <li class="toctree-l1"><a class="reference internal" href="localization.html">canine.localization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="utils.html">canine.utils</a></li>
-<li class="toctree-l1"><a class="reference internal" href="xargs.html">canine.xargs</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">canine.xargs</a></li>
 </ul>
 
 <div class="relations">
 <h3>Related Topics</h3>
 <ul>
   <li><a href="../index.html">Documentation overview</a><ul>
-      <li>Previous: <a href="../index.html" title="previous chapter">Welcome to Canine’s documentation!</a></li>
-      <li>Next: <a href="adapters.html" title="next chapter">canine.adapters</a></li>
+      <li>Previous: <a href="utils.html" title="previous chapter">canine.utils</a></li>
   </ul></li>
 </ul>
 </div>
@@ -130,7 +131,7 @@ Returns a pandas DataFrame containing job inputs, outputs, and runtime informati
       &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
       
       |
-      <a href="../_sources/canine/index.rst.txt"
+      <a href="../_sources/canine/xargs.rst.txt"
           rel="nofollow">Page source</a>
     </div>
 
