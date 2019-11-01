@@ -56,7 +56,7 @@ class Xargs(Orchestrator):
                     # By creating a local tempdir
                     # but using the backend to write the script
                     # we ensure that this is a local-based backend
-                    backend.pack_batch_script(
+                    self.backend.pack_batch_script(
                         *(
                             'export {}={}'.format(
                                 argname,
@@ -71,7 +71,7 @@ class Xargs(Orchestrator):
                     )
                 print("Job staged on SLURM controller in:", tempdir)
                 print("Preparing pipeline script")
-                backend.pack_batch_script(
+                self.backend.pack_batch_script(
                     'export CANINE={}'.format(version),
                     'export CANINE_BACKEND='.format(type(self.backend)),
                     'export CANINE_ADAPTER=Xargs',
@@ -128,8 +128,8 @@ class Xargs(Orchestrator):
                         'requeue': True,
                         'job_name': self.name,
                         'array': "0-{}".format(self.n_jobs-1),
-                        'output': "{}/%a.stdout".format('~' if self.cwd is None else self.cwd),
-                        'error': "{}/%a.stderr".format('~' if self.cwd is None else self.cwd),
+                        'output': "{}/%A.%a.stdout".format('~' if self.cwd is None else self.cwd),
+                        'error': "{}/%A.%a.stderr".format('~' if self.cwd is None else self.cwd),
                         **self.resources
                     }
                 )
@@ -143,7 +143,6 @@ class Xargs(Orchestrator):
                         '{}_{}'.format(batch_id, i)
                         for i in range(self.n_jobs)
                     }
-                    outputs = {}
                     while len(waiting_jobs):
                         time.sleep(30)
                         acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
@@ -176,10 +175,6 @@ class Xargs(Orchestrator):
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
                     raise
-                finally:
-                    if len(completed_jobs):
-                        print("Delocalizing outputs")
-                        outputs = localizer.delocalize(self.raw_outputs, output_dir)
         runtime = time.monotonic() - start_time
         job_spec = {
             str(i): {
@@ -205,9 +200,9 @@ class Xargs(Orchestrator):
             print("Estimated total cluster cost:", self.backend.estimate_cost(
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
-            ))
+            )[0])
             job_cost = self.backend.estimate_cost(job_cpu_time=df['cpu_hours'].to_dict())[1]
-            df['est_cost'] = [job_cost[job_id] for job_id in df.index]
+            df['est_cost'] = [job_cost[job_id] for job_id in df.index] if job_cost is not None else [0] * len(df)
         except:
             traceback.print_exc()
         finally:

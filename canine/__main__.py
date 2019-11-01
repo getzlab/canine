@@ -134,7 +134,8 @@ def xargs():
         '-s', '--replacement-string',
         help="Replacement string (default: @). ALL occurrences of this string in the command string"
         " will be replaced with the next argument read from stdin. Stdin is expected to contain"
-        " a number of lines equal to an integer multiple of the number of occurrences of this string"
+        " a number of lines equal to an integer multiple of the number of occurrences of this string",
+        default='@'
     )
     parser.add_argument(
         '-e', '--allow-empty',
@@ -178,7 +179,10 @@ def xargs():
         nargs=argparse.REMAINDER
     )
     args = parser.parse_args()
-    backend = {key: val for key, val in args.backend}
+    backend = {
+        'type': 'Local',
+        **{key: val for key, val in args.backend}
+    }
     resources = {key: val for key, val in args.resources}
     if len(args.command) < 1:
         sys.exit("Empty command string")
@@ -192,7 +196,7 @@ def xargs():
     line_cnt = 0
     for line in sys.stdin:
         if len(line.rstrip()) or args.allow_empty:
-            inputs['canine_arg{}'.format(line_cnt)].append(line.strip())
+            inputs['canine_arg{}'.format(line_cnt % len(inputs))].append(line.strip())
             line_cnt += 1
     if line_cnt % cmd.count(args.replacement_string) != 0:
         sys.exit("Unexpected EOF: stdin did not contain enough input. {} lines read, {} parallel commands parsed".format(
