@@ -74,13 +74,10 @@ class NFSLocalizer(BatchedLocalizer):
                 'local'
             )
         elif os.path.exists(src):
-            src = os.path.abspath(src)
             if not os.path.isdir(os.path.dirname(dest.localpath)):
                 os.makedirs(os.path.dirname(dest.localpath))
-            if os.path.isfile(src):
-                shutil.copyfile(src, dest.localpath)
-            else:
-                shutil.copytree(src, dest.localpath)
+
+            os.symlink(os.path.abspath(src), dest.localpath)
 
     def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
         """
