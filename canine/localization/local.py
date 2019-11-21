@@ -28,7 +28,7 @@ class BatchedLocalizer(AbstractLocalizer):
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
         common: bool = True, staging_dir: str = None, mount_path: str = None,
-        project : typing.Optional[str] = None
+        project : typing.Optional[str] = None, **kwargs
     ):
 
         """
