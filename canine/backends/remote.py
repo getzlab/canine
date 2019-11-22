@@ -207,8 +207,12 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
                 'banner_timeout': 30,
                 'auth_timeout': 60
             },
-            **kwargs
+            **{
+                key:val for key,val in kwargs.items()
+                if key != 'type'
+            }
         }
+        self._force_rekey = True
         self.client = paramiko.SSHClient()
         self.client.load_system_host_keys()
 
@@ -253,7 +257,16 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         """
         if self.client._transport is None:
             raise paramiko.SSHException("Client is not connected")
-        return self.client.exec_command(command)
+        try:
+            return self.client.exec_command(command)
+        except paramiko.ssh_exception.SSHException as e:
+            if e.args == ('Key-exchange timed out waiting for key negotiation',):
+                print("Rekey timeout. Restarting client. Open transports may be interrupted")
+                self.__exit__()
+                self.__enter__()
+                return self.client.exec_command(command)
+            else:
+                raise
 
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
@@ -300,8 +313,6 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             status, stdout, stderr = self.invoke(command)
             check_call(command, status, stdout, stderr)
 
-
-
     def disable_paramiko_rekey(self):
         """
         Disables the re-key feature of SSH2.
@@ -321,13 +332,13 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             return False
 
         self.client.get_transport().packetizer.need_rekey = need_rekey
+        self._force_rekey = False
 
     def __enter__(self):
         """
         Establishes a connection to the remote server
         """
         self.client.connect(self.hostname, **self.__sshkwargs)
-        # self.client.get_transport().packetizer.REKEY_BYTES = 1024
         return self
 
     def __exit__(self, *args):
