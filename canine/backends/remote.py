@@ -300,11 +300,34 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             status, stdout, stderr = self.invoke(command)
             check_call(command, status, stdout, stderr)
 
+
+
+    def disable_paramiko_rekey(self):
+        """
+        Disables the re-key feature of SSH2.
+        Paramiko's implementation deadlocks during rekey (see paramiko #822).
+        """
+        warnings.warn(
+            "User disabled paramiko rekey. An attacker may be able to read data in the SSH channel",
+            stacklevel=2
+        )
+        __NEED_REKEY__ = self.client.get_transport().packetizer.need_rekey
+        def need_rekey(*args, **kwargs):
+            if __NEED_REKEY__(*args, **kwargs):
+                warnings.warn(
+                    "Supressing rekey request from paramiko to avoid deadlock. Current SSH channel should be considered insecure",
+                    stacklevel=2
+                )
+            return False
+
+        self.client.get_transport().packetizer.need_rekey = need_rekey
+
     def __enter__(self):
         """
         Establishes a connection to the remote server
         """
         self.client.connect(self.hostname, **self.__sshkwargs)
+        # self.client.get_transport().packetizer.REKEY_BYTES = 1024
         return self
 
     def __exit__(self, *args):
