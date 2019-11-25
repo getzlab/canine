@@ -228,17 +228,7 @@ class Orchestrator(object):
                 #
                 # submit job
                 print("Submitting batch job")
-                batch_id = self.backend.sbatch(
-                    entrypoint_path,
-                    **{
-                        'requeue': True,
-                        'job_name': self.name,
-                        'array': "0-{}".format(len(self.job_spec)-1),
-                        'output': "{}/%a/stdout".format(localizer.environment('compute')['CANINE_JOBS']),
-                        'error': "{}/%a/stderr".format(localizer.environment('compute')['CANINE_JOBS']),
-                        **self.resources
-                    }
-                )
+                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('compute'))
                 print("Batch id:", batch_id)
 
                 #
@@ -375,3 +365,18 @@ class Orchestrator(object):
         ).T.set_index(pd.Index([*self.job_spec], name='job_id')).astype({'cpu_hours': int})
 
         return df
+
+    def submit_batch_job(self, entrypoint_path, compute_env):
+        batch_id = self.backend.sbatch(
+            entrypoint_path,
+            **{
+                'requeue': True,
+                'job_name': self.name,
+                'array': "0-{}".format(len(self.job_spec)-1),
+                'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
+                'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
+                **self.resources
+            }
+        )
+
+        return batch_id
