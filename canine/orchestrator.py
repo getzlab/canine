@@ -107,6 +107,9 @@ class Orchestrator(object):
         """
         config = Orchestrator.fill_config(config)
         self.name = config['name']
+
+        #
+        # script
         if 'script' not in config:
             raise KeyError("Config missing required key 'script'")
         self.script = config['script']
@@ -115,19 +118,31 @@ class Orchestrator(object):
                 raise FileNotFoundError(self.script)
         elif not isinstance(self.script, list):
             raise TypeError("script must be a path to a bash script or a list of bash commands")
+
+        #
+        # inputs/resources
         self.raw_inputs = Orchestrator.stringify(config['inputs']) if 'inputs' in config else {}
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
+
+        #
+        # adapter
         adapter = config['adapter']
         if adapter['type'] not in ADAPTERS:
             raise ValueError("Unknown adapter type '{type}'".format(**adapter))
         self._adapter_type=adapter['type']
         self.adapter = ADAPTERS[adapter['type']](**{arg:val for arg,val in adapter.items() if arg != 'type'})
+
+        #
+        # backend
         backend = config['backend']
         if backend['type'] not in BACKENDS:
             raise ValueError("Unknown backend type '{type}'".format(**backend))
         self._backend_type = backend['type']
         self._slurmconf_path = backend['slurm_conf_path'] if 'slurm_conf_path' in backend else None
         self.backend = BACKENDS[self._backend_type](**backend)
+
+        #
+        # localizer
         self.localizer_args = config['localization'] if 'localization' in config else {}
         if self.localizer_args['strategy'] not in LOCALIZERS:
             raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
@@ -135,6 +150,9 @@ class Orchestrator(object):
         self.localizer_overrides = {}
         if 'overrides' in self.localizer_args:
             self.localizer_overrides = {**self.localizer_args['overrides']}
+
+        #
+        # outputs
         self.raw_outputs = Orchestrator.stringify(config['outputs']) if 'outputs' in config else {}
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
