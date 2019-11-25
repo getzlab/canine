@@ -366,7 +366,7 @@ class Orchestrator(object):
 
         return df
 
-    def submit_batch_job(self, entrypoint_path, compute_env):
+    def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}):
         batch_id = self.backend.sbatch(
             entrypoint_path,
             **{
@@ -375,7 +375,8 @@ class Orchestrator(object):
                 'array': "0-{}".format(len(self.job_spec)-1),
                 'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
                 'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
-                **self.resources
+                **self.resources,
+                **Orchestrator.stringify(extra_sbatch_args)
             }
         )
 
