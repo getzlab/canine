@@ -329,6 +329,12 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
                     "Supressing rekey request from paramiko to avoid deadlock. Current SSH channel should be considered insecure",
                     stacklevel=2
                 )
+                packetizer = self.client.get_transport().packetizer
+                packetizer._Packetizer__need_rekey = False
+                packetizer._Packetizer__received_bytes = 0
+                packetizer._Packetizer__received_packets = 0
+                packetizer._Packetizer__received_bytes_overflow = 0
+                packetizer._Packetizer__received_packets_overflow = 0
             return False
 
         self.client.get_transport().packetizer.need_rekey = need_rekey
