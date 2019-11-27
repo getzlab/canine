@@ -277,21 +277,20 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
                 raise
 
     def early_rekey(self):
-        packetizer = self.client.get_transport().packetizer
-        bytes_count = packetizer._Packetizer__received_bytes / packetizer.REKEY_BYTES
-        packets_count = packetizer._Packetizer__received_packets / packetizer.REKEY_PACKETS
-        if packets_count >= 0.8 or bytes_count >= 0.8:
-            reinit = []
-            for t in self.__transports:
-                if t.session is not None:
-                    t.__exit__()
-                    reinit.append(t)
-            self.__exit__()
-            self.__enter__()
-            for t in reinit:
-                t.__enter__()
-        bytes_count = packetizer._Packetizer__received_bytes / packetizer.REKEY_BYTES
-        packets_count = packetizer._Packetizer__received_packets / packetizer.REKEY_PACKETS
+        if self._force_rekey:
+            packetizer = self.client.get_transport().packetizer
+            bytes_count = packetizer._Packetizer__received_bytes / packetizer.REKEY_BYTES
+            packets_count = packetizer._Packetizer__received_packets / packetizer.REKEY_PACKETS
+            if packets_count >= 0.8 or bytes_count >= 0.8:
+                reinit = []
+                for t in self.__transports:
+                    if t.session is not None:
+                        t.__exit__()
+                        reinit.append(t)
+                self.__exit__()
+                self.__enter__()
+                for t in reinit:
+                    t.__enter__()
 
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
