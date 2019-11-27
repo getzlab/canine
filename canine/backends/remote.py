@@ -247,21 +247,23 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             except:
                 warnings.warn("Unable to add specified key file to ssh agent. Mojave users may be unable to authenticate")
 
-    def _invoke(self, command: str) -> typing.Tuple[paramiko.ChannelFile, paramiko.ChannelFile, paramiko.ChannelFile]:
+    def _invoke(self, command: str, pty: typing.Optional[bool] = False) -> typing.Tuple[paramiko.ChannelFile, paramiko.ChannelFile, paramiko.ChannelFile]:
         """
         Raw handle to exec_command
         """
         if self.client._transport is None:
             raise paramiko.SSHException("Client is not connected")
-        return self.client.exec_command(command)
+        return self.client.exec_command(command, get_pty=pty)
 
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
         Invoke an arbitrary command in the slurm console
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
-        If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal
+        If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal.
+        NOTE: For interactive commands, we recommend you prefix your command with 'stty -echo &&' to disable echoing your input on stdout.
+        EX: backend.invoke('stty -echo && python', True) would invoke an interactive python session without your input also appearing in stdout
         """
-        raw_stdin, raw_stdout, raw_stderr = self._invoke(command)
+        raw_stdin, raw_stdout, raw_stderr = self._invoke(command, pty=interactive)
         try:
             if interactive:
                 return make_interactive(raw_stdout.channel)
