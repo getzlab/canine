@@ -215,6 +215,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         self._force_rekey = True
         self.client = paramiko.SSHClient()
         self.client.load_system_host_keys()
+        self.__transports = []
 
     def load_config_args(self):
         """
@@ -262,11 +263,35 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         except paramiko.ssh_exception.SSHException as e:
             if e.args == ('Key-exchange timed out waiting for key negotiation',):
                 print("Rekey timeout. Restarting client. Open transports may be interrupted")
+                reinit = []
+                for t in self.__transports:
+                    if t.session is not None:
+                        t.__exit__()
+                        reinit.append(t)
                 self.__exit__()
                 self.__enter__()
+                for t in reinit:
+                    t.__enter__()
                 return self.client.exec_command(command)
             else:
                 raise
+
+    def early_rekey(self):
+        packetizer = self.client.get_transport().packetizer
+        bytes_count = packetizer._Packetizer__received_bytes / packetizer.REKEY_BYTES
+        packets_count = packetizer._Packetizer__received_packets / packetizer.REKEY_PACKETS
+        if packets_count >= 0.8 or bytes_count >= 0.8:
+            reinit = []
+            for t in self.__transports:
+                if t.session is not None:
+                    t.__exit__()
+                    reinit.append(t)
+            self.__exit__()
+            self.__enter__()
+            for t in reinit:
+                t.__enter__()
+        bytes_count = packetizer._Packetizer__received_bytes / packetizer.REKEY_BYTES
+        packets_count = packetizer._Packetizer__received_packets / packetizer.REKEY_PACKETS
 
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
@@ -274,12 +299,14 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
         If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal
         """
+        self.early_rekey()
         raw_stdin, raw_stdout, raw_stderr = self._invoke(command)
         try:
             if interactive:
                 return make_interactive(raw_stdout.channel)
             stdout = io.BytesIO(raw_stdout.read())
             stderr = io.BytesIO(raw_stderr.read())
+            self.early_rekey()
             return raw_stdout.channel.recv_exit_status(), stdout, stderr
         except KeyboardInterrupt:
             print("Warning: Command will continue running on remote server as Paramiko has no way to interrupt commands", file=sys.stderr)
@@ -358,4 +385,6 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         Return a Transport object suitable for moving files between the
         SLURM cluster and the local filesystem
         """
-        return RemoteTransport(self.client)
+        t = RemoteTransport(self.client)
+        self.__transports.append(t)
+        return t
