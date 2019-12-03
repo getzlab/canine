@@ -51,7 +51,7 @@ class NFSLocalizer(BatchedLocalizer):
             self.__sbcast = True
             staging_dir = None
         self._local_dir = tempfile.TemporaryDirectory()
-        self.local_dir = staging_dir
+        self.local_dir = os.path.realpath(os.path.abspath(staging_dir))
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
         with self.backend.transport() as transport:
@@ -74,13 +74,16 @@ class NFSLocalizer(BatchedLocalizer):
                 'local'
             )
         elif os.path.exists(src):
-            src = os.path.abspath(src)
+            src = os.path.realpath(os.path.abspath(src))
             if not os.path.isdir(os.path.dirname(dest.localpath)):
                 os.makedirs(os.path.dirname(dest.localpath))
-            if os.path.isfile(src):
-                shutil.copyfile(src, dest.localpath)
+            if os.path.abspath(self.mount_path) == os.path.abspath(self.local_dir) and src.startswith(self.local_dir):
+                os.symlink(src, dest.localpath)
             else:
-                shutil.copytree(src, dest.localpath)
+                if os.path.isfile(src):
+                    shutil.copyfile(src, dest.localpath)
+                else:
+                    shutil.copytree(src, dest.localpath)
 
     def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
         """
