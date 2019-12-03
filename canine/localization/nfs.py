@@ -77,7 +77,7 @@ class NFSLocalizer(BatchedLocalizer):
             src = os.path.realpath(os.path.abspath(src))
             if not os.path.isdir(os.path.dirname(dest.localpath)):
                 os.makedirs(os.path.dirname(dest.localpath))
-            if os.path.abspath(self.mount_path) == os.path.abspath(self.local_dir) and src.localpath.startswith(self.local_dir):
+            if os.path.abspath(self.mount_path) == os.path.abspath(self.local_dir) and src.startswith(self.local_dir):
                 os.symlink(src, dest.localpath)
             else:
                 if os.path.isfile(src):
