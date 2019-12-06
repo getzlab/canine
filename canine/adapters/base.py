@@ -74,6 +74,13 @@ class ManualAdapter(AbstractAdapter):
             key: len(val) if isinstance(val, list) else 1
             for key, val in inputs.items()
         }
+
+        #
+        # HACK: deal with lists of length 1
+        for key, val in inputs.items():
+            if isinstance(val, list) and len(val) == 1:
+                inputs[key] = val[0]
+
         if self.product:
             self._job_length = reduce(lambda x,y: x*y, input_lengths.values(), 1)
             generator = product(
@@ -89,6 +96,8 @@ class ManualAdapter(AbstractAdapter):
                         raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
                 elif 1 != l != self._job_length:
                     raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
+            #
+            # XXX: simplify this with itertools.zip_longest() ?
             generator = zip(*[
                 inputs[key] if isinstance(inputs[key], list) else repeat(inputs[key], self._job_length)
                 for key in keys
