@@ -388,8 +388,8 @@ class AbstractLocalizer(abc.ABC):
                 if path.startswith('gs://') or os.path.exists(path):
                     common_dests[path] = self.reserve_path('common', os.path.basename(os.path.abspath(path)))
                     self.localize_file(path, common_dests[path], transport=transport)
-                else:
-                    print("Could not handle common file", path, file=sys.stderr)
+#                else:
+#                    print("Could not handle common file", path, file=sys.stderr)
             return {key: value for key, value in common_dests.items()}
 
     def finalize_staging_dir(self, jobs: typing.Iterable[str], transport: typing.Optional[AbstractTransport] = None) -> str:

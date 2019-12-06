@@ -325,7 +325,7 @@ class Orchestrator(object):
                             cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                         job = jid.split('_')[1]
-                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
+#                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
             for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
