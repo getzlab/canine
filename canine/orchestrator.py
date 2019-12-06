@@ -354,7 +354,7 @@ class Orchestrator(object):
                         'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
                         'cpu_hours': (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
                             cpu_time[batch_id+'_'+job_id] if batch_id+'_'+job_id in cpu_time else 0
-                        ))/3600,
+                        ))/3600 if prev_acct is not None else -1,
                         **self.job_spec[job_id],
                         **{
                             key: val[0] if isinstance(val, list) and len(val) == 1 else val
