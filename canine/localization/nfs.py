@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import fnmatch
+import subprocess
 from .base import PathType, Localization
 from .local import BatchedLocalizer
 from ..backends import AbstractSlurmBackend, AbstractTransport
@@ -81,7 +82,19 @@ class NFSLocalizer(BatchedLocalizer):
             if re.search(r"\.k9df\..*$", os.path.basename(src)) is None:
                 if not os.path.isdir(os.path.dirname(dest.localpath)):
                     os.makedirs(os.path.dirname(dest.localpath))
-                if os.path.abspath(self.mount_path) == os.path.abspath(self.local_dir) and src.startswith(self.local_dir):
+
+                #
+                # check if self.mount_path, self.local_dir, and src all exist on the same NFS share
+                # symlink if yes, copy if no
+                vols = subprocess.check_output(
+                  "df {} {} {} | awk 'NR > 1 {{ print $1 }}'".format(
+                    self.mount_path,
+                    self.local_dir,
+                    src
+                  ),
+                  shell = True
+                )
+                if len(set(vols.decode("utf-8").rstrip().split("\n"))) == 1:
                     os.symlink(src, dest.localpath)
                 else:
                     if os.path.isfile(src):
