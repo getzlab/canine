@@ -107,6 +107,9 @@ class Orchestrator(object):
         """
         config = Orchestrator.fill_config(config)
         self.name = config['name']
+
+        #
+        # script
         if 'script' not in config:
             raise KeyError("Config missing required key 'script'")
         self.script = config['script']
@@ -115,28 +118,42 @@ class Orchestrator(object):
                 raise FileNotFoundError(self.script)
         elif not isinstance(self.script, list):
             raise TypeError("script must be a path to a bash script or a list of bash commands")
+
+        #
+        # inputs/resources
         self.raw_inputs = Orchestrator.stringify(config['inputs']) if 'inputs' in config else {}
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
+
+        #
+        # adapter
         adapter = config['adapter']
         if adapter['type'] not in ADAPTERS:
             raise ValueError("Unknown adapter type '{type}'".format(**adapter))
         self._adapter_type=adapter['type']
         self.adapter = ADAPTERS[adapter['type']](**{arg:val for arg,val in adapter.items() if arg != 'type'})
+        self.job_spec = self.adapter.parse_inputs(self.raw_inputs)
+
+        #
+        # backend
         backend = config['backend']
         if backend['type'] not in BACKENDS:
             raise ValueError("Unknown backend type '{type}'".format(**backend))
         self._backend_type = backend['type']
         self._slurmconf_path = backend['slurm_conf_path'] if 'slurm_conf_path' in backend else None
         self.backend = BACKENDS[self._backend_type](**backend)
+
+        #
+        # localizer
         self.localizer_args = config['localization'] if 'localization' in config else {}
         if self.localizer_args['strategy'] not in LOCALIZERS:
             raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
         self._localizer_type = LOCALIZERS[self.localizer_args['strategy']]
-        self.localizer_args = {key:val for key,val in self.localizer_args.items() if key != 'strategy'}
         self.localizer_overrides = {}
         if 'overrides' in self.localizer_args:
             self.localizer_overrides = {**self.localizer_args['overrides']}
-            del self.localizer_args['overrides']
+
+        #
+        # outputs
         self.raw_outputs = Orchestrator.stringify(config['outputs']) if 'outputs' in config else {}
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
@@ -152,14 +169,13 @@ class Orchestrator(object):
         """
         if isinstance(self.backend, LocalSlurmBackend) and os.path.exists(output_dir):
             raise FileExistsError("Output directory {} already exists".format(output_dir))
-        job_spec = self.adapter.parse_inputs(self.raw_inputs)
 
-        if len(job_spec) == 0:
+        if len(self.job_spec) == 0:
             raise ValueError("You didn't specify any jobs!")
-        elif len(job_spec) > 4000000:
-            raise ValueError("Cannot exceede 4000000 jobs in one pipeline")
+        elif len(self.job_spec) > 4000000:
+            raise ValueError("Cannot exceed 4000000 jobs in one pipeline")
 
-        print("Preparing pipeline of", len(job_spec), "jobs")
+        print("Preparing pipeline of", len(self.job_spec), "jobs")
         print("Connecting to backend...")
         if isinstance(self.backend, RemoteSlurmBackend):
             self.backend.load_config_args()
@@ -167,40 +183,14 @@ class Orchestrator(object):
         with self.backend:
             print("Initializing pipeline workspace")
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
-                print("Localizing inputs...")
-                abs_staging_dir = localizer.localize(
-                    job_spec,
-                    self.raw_outputs,
-                    self.localizer_overrides
-                )
-                print("Job staged on SLURM controller in:", abs_staging_dir)
-                print("Preparing pipeline script")
-                env = localizer.environment('compute')
-                root_dir = env['CANINE_ROOT']
-                entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')
-                if isinstance(self.script, str):
-                    pipeline_path = os.path.join(root_dir, os.path.basename(self.script))
-                else:
-                    pipeline_path = self.backend.pack_batch_script(
-                        *self.script,
-                        script_path=os.path.join(root_dir, 'script.sh')
-                    )
-                with self.backend.transport() as transport:
-                    if isinstance(self.script, str):
-                        transport.send(self.script, pipeline_path)
-                        transport.chmod(pipeline_path, 0o775)
-                    with transport.open(entrypoint_path, 'w') as w:
-                        w.write(ENTRYPOINT.format(
-                            backend=self._backend_type,
-                            adapter=self._adapter_type,
-                            pipeline_script=pipeline_path,
-                            **env
-                        ))
-                    transport.chmod(entrypoint_path, 0o775)
-                    transport.chmod(pipeline_path, 0o775)
+                #
+                # localize inputs
+                entrypoint_path = self.localize_inputs_and_script(localizer)
+
                 if dry_run:
                     localizer.clean_on_exit = False
-                    return job_spec
+                    return self.job_spec
+
                 print("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
 
@@ -234,57 +224,21 @@ class Orchestrator(object):
                         except CalledProcessError:
                             traceback.print_exc()
                             print("Slurmctld restart failed")
+
+                #
+                # submit job
                 print("Submitting batch job")
-                batch_id = self.backend.sbatch(
-                    entrypoint_path,
-                    **{
-                        'requeue': True,
-                        'job_name': self.name,
-                        'array': "0-{}".format(len(job_spec)-1),
-                        'output': "{}/%a/stdout".format(env['CANINE_JOBS']),
-                        'error': "{}/%a/stderr".format(env['CANINE_JOBS']),
-                        **self.resources
-                    }
-                )
+                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('compute'))
                 print("Batch id:", batch_id)
+
+                #
+                # wait for jobs to finish
                 completed_jobs = []
                 cpu_time = {}
                 uptime = {}
                 prev_acct = None
                 try:
-                    waiting_jobs = {
-                        '{}_{}'.format(batch_id, i)
-                        for i in range(len(job_spec))
-                    }
-                    outputs = {}
-                    while len(waiting_jobs):
-                        time.sleep(30)
-                        acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
-                        for jid in [*waiting_jobs]:
-                            if jid in acct.index:
-                                if prev_acct is not None and jid in prev_acct.index and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
-                                    # Job has restarted since last update:
-                                    if jid in cpu_time:
-                                        cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
-                                    else:
-                                        cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
-                                if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
-                                    job = jid.split('_')[1]
-                                    print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
-                                    completed_jobs.append((job, jid))
-                                    waiting_jobs.remove(jid)
-                        for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
-                            if node in uptime:
-                                uptime[node] += 1
-                            else:
-                                uptime[node] = 1
-                        if prev_acct is None:
-                            prev_acct = acct
-                        else:
-                            prev_acct = pd.concat([
-                                acct,
-                                prev_acct.loc[[idx for idx in prev_acct.index if idx not in acct.index]]
-                            ])
+                    completed_jobs, cpu_time, uptime, prev_acct = self.wait_for_jobs_to_finish(batch_id)
                 except:
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
@@ -296,26 +250,11 @@ class Orchestrator(object):
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
-            acct = self.backend.sacct(job=batch_id)
-        runtime = time.monotonic() - start_time
-        df = pd.DataFrame(
-            data={
-                job_id: {
-                    'slurm_state': acct['State'][batch_id+'_'+job_id],
-                    'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
-                    'cpu_hours': (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
-                        cpu_time[batch_id+'_'+job_id] if batch_id+'_'+job_id in cpu_time else 0
-                    ))/3600,
-                    **job_spec[job_id],
-                    **{
-                        key: val[0] if isinstance(val, list) and len(val) == 1 else val
-                        for key, val in outputs[job_id].items()
-                    }
-                }
-                for job_id in job_spec
-            }
-        ).T.set_index(pd.Index([*job_spec], name='job_id')).astype({'cpu_hours': int})
+
+        df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct)
+
         try:
+            runtime = time.monotonic() - start_time
             print("Estimated total cluster cost:", self.backend.estimate_cost(
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
@@ -326,3 +265,119 @@ class Orchestrator(object):
             traceback.print_exc()
         finally:
             return df
+
+    def localize_inputs_and_script(self, localizer) -> str:
+        print("Localizing inputs...")
+        abs_staging_dir = localizer.localize(
+            self.job_spec,
+            self.raw_outputs,
+            self.localizer_overrides
+        )
+        print("Job staged on SLURM controller in:", abs_staging_dir)
+        print("Preparing pipeline script")
+        env = localizer.environment('compute')
+        root_dir = env['CANINE_ROOT']
+        entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')
+        if isinstance(self.script, str):
+            pipeline_path = os.path.join(root_dir, os.path.basename(self.script))
+        else:
+            pipeline_path = self.backend.pack_batch_script(
+                *self.script,
+                script_path=os.path.join(root_dir, 'script.sh')
+            )
+        with self.backend.transport() as transport:
+            if isinstance(self.script, str):
+                transport.send(self.script, pipeline_path)
+                transport.chmod(pipeline_path, 0o775)
+            with transport.open(entrypoint_path, 'w') as w:
+                w.write(ENTRYPOINT.format(
+                    backend=self._backend_type,
+                    adapter=self._adapter_type,
+                    pipeline_script=pipeline_path,
+                    **env
+                ))
+            transport.chmod(entrypoint_path, 0o775)
+            transport.chmod(pipeline_path, 0o775)
+
+        return entrypoint_path
+
+    def wait_for_jobs_to_finish(self, batch_id):
+        completed_jobs = []
+        cpu_time = {}
+        uptime = {}
+        prev_acct = None
+
+        waiting_jobs = {
+            '{}_{}'.format(batch_id, i)
+            for i in range(len(self.job_spec))
+        }
+
+        while len(waiting_jobs):
+            time.sleep(30)
+            acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
+            for jid in [*waiting_jobs]:
+                if jid in acct.index:
+                    if prev_acct is not None and jid in prev_acct.index and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
+                        # Job has restarted since last update:
+                        if jid in cpu_time:
+                            cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
+                        else:
+                            cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
+                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
+                        job = jid.split('_')[1]
+                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
+                        completed_jobs.append((job, jid))
+                        waiting_jobs.remove(jid)
+            for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
+                if node in uptime:
+                    uptime[node] += 1
+                else:
+                    uptime[node] = 1
+            if prev_acct is None:
+                prev_acct = acct
+            else:
+                prev_acct = pd.concat([
+                    acct,
+                    prev_acct.loc[[idx for idx in prev_acct.index if idx not in acct.index]]
+                ])
+
+        return completed_jobs, cpu_time, uptime, prev_acct
+
+    def make_output_DF(self, batch_id, outputs, cpu_time, prev_acct) -> pd.DataFrame:
+        acct = self.backend.sacct(job=batch_id)
+
+        df = pd.DataFrame(
+            data={
+                job_id: {
+                    'slurm_state': acct['State'][batch_id+'_'+job_id],
+                    'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
+                    'cpu_hours': (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
+                        cpu_time[batch_id+'_'+job_id] if batch_id+'_'+job_id in cpu_time else 0
+                    ))/3600,
+                    **self.job_spec[job_id],
+                    **{
+                        key: val[0] if isinstance(val, list) and len(val) == 1 else val
+                        for key, val in outputs[job_id].items()
+                    }
+                }
+                for job_id in self.job_spec
+            }
+        ).T.set_index(pd.Index([*self.job_spec], name='job_id')).astype({'cpu_hours': int})
+
+        return df
+
+    def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}):
+        batch_id = self.backend.sbatch(
+            entrypoint_path,
+            **{
+                'requeue': True,
+                'job_name': self.name,
+                'array': "0-{}".format(len(self.job_spec)-1),
+                'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
+                'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
+                **self.resources,
+                **Orchestrator.stringify(extra_sbatch_args)
+            }
+        )
+
+        return batch_id
