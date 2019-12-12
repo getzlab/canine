@@ -56,7 +56,10 @@ setup(
         "Programming Language :: Python :: 3",
         "Intended Audience :: Science/Research",
         "Topic :: Scientific/Engineering :: Bio-Informatics",
-        "Topic :: Scientific/Engineering :: Interface Engine/Protocol Translator",
+        "Topic :: System :: Clustering",
+        "Topic :: System :: Distributed Computing",
+        "Typing :: Typed",
+        "License :: OSI Approved :: BSD License"
     ],
     license="BSD3"
 )
