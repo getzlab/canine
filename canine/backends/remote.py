@@ -207,10 +207,15 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
                 'banner_timeout': 30,
                 'auth_timeout': 60
             },
-            **kwargs
+            **{
+                key:val for key,val in kwargs.items()
+                if key != 'type'
+            }
         }
+        self._force_rekey = True
         self.client = paramiko.SSHClient()
         self.client.load_system_host_keys()
+        self.__transports = []
 
     def load_config_args(self):
         """
@@ -253,7 +258,39 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         """
         if self.client._transport is None:
             raise paramiko.SSHException("Client is not connected")
-        return self.client.exec_command(command, get_pty=pty)
+        try:
+            return self.client.exec_command(command, get_pty=pty)
+        except paramiko.ssh_exception.SSHException as e:
+            if e.args == ('Key-exchange timed out waiting for key negotiation',):
+                print("Rekey timeout. Restarting client. Open transports may be interrupted")
+                reinit = []
+                for t in self.__transports:
+                    if t.session is not None:
+                        t.__exit__()
+                        reinit.append(t)
+                self.__exit__()
+                self.__enter__()
+                for t in reinit:
+                    t.__enter__()
+                return self.client.exec_command(command, get_pty=pty)
+            else:
+                raise
+
+    def early_rekey(self):
+        if self._force_rekey:
+            packetizer = self.client.get_transport().packetizer
+            bytes_count = packetizer._Packetizer__received_bytes / packetizer.REKEY_BYTES
+            packets_count = packetizer._Packetizer__received_packets / packetizer.REKEY_PACKETS
+            if packets_count >= 0.8 or bytes_count >= 0.8:
+                reinit = []
+                for t in self.__transports:
+                    if t.session is not None:
+                        t.__exit__()
+                        reinit.append(t)
+                self.__exit__()
+                self.__enter__()
+                for t in reinit:
+                    t.__enter__()
 
     def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
@@ -263,12 +300,14 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         NOTE: For interactive commands, we recommend you prefix your command with 'stty -echo &&' to disable echoing your input on stdout.
         EX: backend.invoke('stty -echo && python', True) would invoke an interactive python session without your input also appearing in stdout
         """
+        self.early_rekey()
         raw_stdin, raw_stdout, raw_stderr = self._invoke(command, pty=interactive)
         try:
             if interactive:
                 return make_interactive(raw_stdout.channel)
             stdout = io.BytesIO(raw_stdout.read())
             stderr = io.BytesIO(raw_stderr.read())
+            self.early_rekey()
             return raw_stdout.channel.recv_exit_status(), stdout, stderr
         except KeyboardInterrupt:
             print("Warning: Command will continue running on remote server as Paramiko has no way to interrupt commands", file=sys.stderr)
@@ -302,6 +341,33 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             status, stdout, stderr = self.invoke(command)
             check_call(command, status, stdout, stderr)
 
+    def disable_paramiko_rekey(self):
+        """
+        Disables the re-key feature of SSH2.
+        Paramiko's implementation deadlocks during rekey (see paramiko #822).
+        """
+        warnings.warn(
+            "User disabled paramiko rekey. An attacker may be able to read data in the SSH channel",
+            stacklevel=2
+        )
+        __NEED_REKEY__ = self.client.get_transport().packetizer.need_rekey
+        def need_rekey(*args, **kwargs):
+            if __NEED_REKEY__(*args, **kwargs):
+                warnings.warn(
+                    "Supressing rekey request from paramiko to avoid deadlock. Current SSH channel should be considered insecure",
+                    stacklevel=2
+                )
+                packetizer = self.client.get_transport().packetizer
+                packetizer._Packetizer__need_rekey = False
+                packetizer._Packetizer__received_bytes = 0
+                packetizer._Packetizer__received_packets = 0
+                packetizer._Packetizer__received_bytes_overflow = 0
+                packetizer._Packetizer__received_packets_overflow = 0
+            return False
+
+        self.client.get_transport().packetizer.need_rekey = need_rekey
+        self._force_rekey = False
+
     def __enter__(self):
         """
         Establishes a connection to the remote server
@@ -320,4 +386,6 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         Return a Transport object suitable for moving files between the
         SLURM cluster and the local filesystem
         """
-        return RemoteTransport(self.client)
+        t = RemoteTransport(self.client)
+        self.__transports.append(t)
+        return t
