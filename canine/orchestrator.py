@@ -132,11 +132,9 @@ class Orchestrator(object):
         if self.localizer_args['strategy'] not in LOCALIZERS:
             raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
         self._localizer_type = LOCALIZERS[self.localizer_args['strategy']]
-        self.localizer_args = {key:val for key,val in self.localizer_args.items() if key != 'strategy'}
         self.localizer_overrides = {}
         if 'overrides' in self.localizer_args:
             self.localizer_overrides = {**self.localizer_args['overrides']}
-            del self.localizer_args['overrides']
         self.raw_outputs = Orchestrator.stringify(config['outputs']) if 'outputs' in config else {}
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
