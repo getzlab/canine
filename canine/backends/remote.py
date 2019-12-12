@@ -252,14 +252,14 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             except:
                 warnings.warn("Unable to add specified key file to ssh agent. Mojave users may be unable to authenticate")
 
-    def _invoke(self, command: str) -> typing.Tuple[paramiko.ChannelFile, paramiko.ChannelFile, paramiko.ChannelFile]:
+    def _invoke(self, command: str, pty: typing.Optional[bool] = False) -> typing.Tuple[paramiko.ChannelFile, paramiko.ChannelFile, paramiko.ChannelFile]:
         """
         Raw handle to exec_command
         """
         if self.client._transport is None:
             raise paramiko.SSHException("Client is not connected")
         try:
-            return self.client.exec_command(command)
+            return self.client.exec_command(command, get_pty=pty)
         except paramiko.ssh_exception.SSHException as e:
             if e.args == ('Key-exchange timed out waiting for key negotiation',):
                 print("Rekey timeout. Restarting client. Open transports may be interrupted")
@@ -272,7 +272,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
                 self.__enter__()
                 for t in reinit:
                     t.__enter__()
-                return self.client.exec_command(command)
+                return self.client.exec_command(command, get_pty=pty)
             else:
                 raise
 
@@ -296,10 +296,12 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         """
         Invoke an arbitrary command in the slurm console
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
-        If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal
+        If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal.
+        NOTE: For interactive commands, we recommend you prefix your command with 'stty -echo &&' to disable echoing your input on stdout.
+        EX: backend.invoke('stty -echo && python', True) would invoke an interactive python session without your input also appearing in stdout
         """
         self.early_rekey()
-        raw_stdin, raw_stdout, raw_stderr = self._invoke(command)
+        raw_stdin, raw_stdout, raw_stderr = self._invoke(command, pty=interactive)
         try:
             if interactive:
                 return make_interactive(raw_stdout.channel)

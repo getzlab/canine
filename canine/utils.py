@@ -100,39 +100,41 @@ def make_interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.Bina
     and also buffered in a ByteStream for later reading
     Returns (exit status, Stdout buffer, Stderr bufer)
     """
-    infd = os.dup(sys.stdin.fileno())
-    try:
-        poll = select.poll()
-        poll.register(infd)
-        poll.register(channel, select.POLLIN+select.POLLPRI+select.POLLERR+select.POLLHUP)
-        stdout = io.BytesIO()
-        stderr = io.BytesIO()
-        while not channel.exit_status_ready():
-            for fd, event in poll.poll(0.5):
-                if fd == infd and event == select.POLLIN or event == select.POLLPRI:
-                    # Text available on python stdin
-                    channel.send(os.read(infd, 4096))
-            if channel.recv_ready():
-                content = channel.recv(4096)
-                sys.stdout.write(content.decode())
-                stdout.write(content)
-            if channel.recv_stderr_ready():
-                content = channel.recv_stderr(4096)
-                sys.stderr.write(content.decode())
-                stderr.write(content)
+    infd = sys.stdin.fileno()
+    channelfd = channel.fileno()
+    poll = select.poll()
+    poll.register(infd, select.POLLIN+select.POLLPRI+select.POLLERR+select.POLLHUP)
+    poll.register(channelfd, select.POLLIN+select.POLLPRI+select.POLLERR+select.POLLHUP)
+    stdout = io.BytesIO()
+    stderr = io.BytesIO()
+    while not channel.exit_status_ready():
+        for fd, event in poll.poll(0.5):
+            if fd == infd and event & (select.POLLIN + select.POLLPRI):
+                # Text available on python stdin
+                channel.send(os.read(infd, 4096))
         if channel.recv_ready():
             content = channel.recv(4096)
             sys.stdout.write(content.decode())
+            sys.stdout.flush()
             stdout.write(content)
         if channel.recv_stderr_ready():
             content = channel.recv_stderr(4096)
             sys.stderr.write(content.decode())
+            sys.stderr.flush()
             stderr.write(content)
-        stdout.seek(0,0)
-        stderr.seek(0,0)
-        return channel.recv_exit_status(), stdout, stderr
-    finally:
-        os.close(infd)
+    if channel.recv_ready():
+        content = channel.recv(4096)
+        sys.stdout.write(content.decode())
+        sys.stdout.flush()
+        stdout.write(content)
+    if channel.recv_stderr_ready():
+        content = channel.recv_stderr(4096)
+        sys.stderr.write(content.decode())
+        sys.stderr.flush()
+        stderr.write(content)
+    stdout.seek(0,0)
+    stderr.seek(0,0)
+    return channel.recv_exit_status(), stdout, stderr
 
 __DEFAULT_GCP_PROJECT__ = None
 
