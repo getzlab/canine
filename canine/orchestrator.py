@@ -251,7 +251,7 @@ class Orchestrator(object):
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
 
-        df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct)
+            df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct)
 
         try:
             runtime = time.monotonic() - start_time
