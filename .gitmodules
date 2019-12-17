@@ -1,3 +1,6 @@
 [submodule "canine/backends/slurm-gcp"]
 	path = canine/backends/slurm-gcp
 	url = https://github.com/agraubert/slurm-gcp.git
+[submodule "canine/backends/slurm-docker"]
+	path = canine/backends/slurm-docker
+	url = https://github.com/julianhess/cga_pipeline.git

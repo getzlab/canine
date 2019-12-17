@@ -26,6 +26,7 @@ setup(
         '':[
             'backends/slurm-gcp/*',
             'backends/slurm-gcp/scripts/*'
+            'backends/slurm-docker/src/*'
         ],
     },
     entry_points={
