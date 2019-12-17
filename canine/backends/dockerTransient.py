@@ -94,6 +94,17 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 )
                 print("done", flush = True)
 
+    def mount_NFS(self):
+        nfs_prov_script = os.path.join(
+                            os.path.dirname(__file__),
+                            'slurm-docker/src/nfs_provision_worker.sh'
+                          )
+        nfs_nodename = self.config["worker_prefix"] + "-nfs"
+
+        subprocess.check_call("{nps} {nnn}".format(
+          nps = nfs_prov_script, nnn = nfs_nodename
+        ), shell = True)
+
 # }}}                
 
 # Python version of checks in docker_run.sh
