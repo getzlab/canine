@@ -6,6 +6,7 @@ import os
 import sys
 import docker
 import re
+import socket
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost
