@@ -11,7 +11,7 @@ from ..utils import get_default_gcp_project, gcp_hourly_cost
 
 import pandas as pd
 
-def DockerTransientImageSlurmBackend(TransientImageSlurmBackend):
+class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):
     def __init__(self, **kwargs):
         kwargs["worker_prefix"] = socket.gethostname()
         super().__init__(**kwargs)
