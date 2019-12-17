@@ -16,24 +16,29 @@ import pandas as pd
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage.sh",
-        nfs_disk_size = 100, nfs_disk_type = "pd-standard", **kwargs
+        nfs_disk_size = 100, nfs_disk_type = "pd-standard", image_family = "pydpiper",
+        image = None, **kwargs
     ):
-        kwargs["worker_prefix"] = socket.gethostname()
+        if "image" not in kwargs:
+            kwargs["image"] = image
+
+        # superclass constructor does something special with compute_script so
+        # we need to pass it in
         kwargs["compute_script"] = "/usr/local/share/cga_pipeline/src/provision_worker.sh {worker_prefix}".format(**kwargs)
         super().__init__(**kwargs)
 
         self.config = {
+          "worker_prefix" : socket.gethostname(),
           "nfs_compute_script" :
             "--metadata startup-script=\"{script} {nfsds:d} {nfsdt}\"".format(
               script = nfs_compute_script,
               nfsds = nfs_disk_size,
               nfsdt = nfs_disk_type
             ),
-          **self.config
+          "image_family" : image_family,
+          "image" : self.get_latest_image(image_family)["name"] if image is None else image,
+          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image" } }
         }
-
-        # TODO: need to specify size of the NFS disk here
-        # <set image to latest in family> (obv. need to check if this exists first)
 
     def init_slurm(self):
         self.dkr = docker.from_env()
@@ -105,6 +110,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         subprocess.check_call("{nps} {nnn}".format(
           nps = nfs_prov_script, nnn = nfs_nodename
         ), shell = True)
+
+    def get_latest_image(self, image_family = None):
+        image_family = self.config["image_family"] if image_family is None else image_family
+        return gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
 
 # }}}                
 
