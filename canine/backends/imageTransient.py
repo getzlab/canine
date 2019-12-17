@@ -93,7 +93,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 "--metadata-from-file startup-script={}".format(compute_script_file)
                 if compute_script_file else "",
             "compute_script" :
-                "--metadata startup-script={}".format(compute_script)
+                "--metadata startup-script=\"{}\"".format(compute_script)
                 if compute_script else "",
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else "root",
