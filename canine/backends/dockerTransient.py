@@ -7,6 +7,7 @@ import sys
 import docker
 import re
 import socket
+import psutil
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost
@@ -69,7 +70,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.mount_NFS()
 
         #
-        # ensure that Docker can start (no Slurm processes already running)
+        # ensure that Docker can start (no Slurm processes outside of Docker already running)
         try:
             ready_for_docker()
         except:
@@ -111,7 +112,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if nfs_inst.empty:
             subprocess.check_call(
                 """gcloud compute instances create {nfs_nodename} \
-                   --image {image} --machine-type n1-highcpu-4 --zone {compute_zone} \
+                   --image {image} --machine-type n1-standard-4 --zone {compute_zone} \
                    {nfs_compute_script} {preemptible} \
                    --tags caninetransientimage
                 """.format(nfs_nodename = nfs_nodename, **self.config),
@@ -172,18 +173,17 @@ def ready_for_docker():
                        ["slurmdbd", "The Slurm database daemon"],
                        ["munged", "Munge"]]
 
+    all_procs = { x.name() : x.pid for x in psutil.process_iter() }
+
     for proc, desc in already_running:
-        try:
-            ret = subprocess.check_call(
-              "pgrep {} &> /dev/null".format(proc),
-              shell = True,
-              executable = '/bin/bash'
-            )
-        except subprocess.CalledProcessError:
-            ret = 1
-        finally:
-            if ret == 0:
-                raise Exception("{desc} is already running on this machine. Please run `[sudo] killall {proc}' and try again.".format(desc = desc, proc = proc))
+        # is the process is running at all?
+        if proc in all_procs:
+            # iterate through parents to see if it was launched in a Docker (containerd) 
+            for parent_proc in psutil.Process(all_procs[proc]).parents():
+                if parent_proc.name() == "containerd":
+                    break
+                if parent_proc.pid == 1:
+                    raise Exception("{desc} is already running on this machine (outside of a Docker container). Please run `[sudo] killall {proc}' and try again.".format(desc = desc, proc = proc))
 
     #
     # check if mountpoint exists

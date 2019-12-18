@@ -50,8 +50,9 @@ setup(
         'agutil>=4.1.0',
         'hound>=0.2.0',
         'firecloud-dalmatian>=0.0.17',
-        'google-api-python-client>=1.7.11'
-        'docker>=4.1.0'
+        'google-api-python-client>=1.7.11',
+        'docker>=4.1.0',
+        'psutil>=5.6.7'
     ],
     classifiers = [
         "Development Status :: 4 - Beta",
