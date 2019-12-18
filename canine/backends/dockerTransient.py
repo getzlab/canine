@@ -8,6 +8,7 @@ import docker
 import re
 import socket
 import psutil
+import io
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost
@@ -162,6 +163,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def get_latest_image(self, image_family = None):
         image_family = self.config["image_family"] if image_family is None else image_family
         return gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
+
+    def invoke(self, command, interactive = False):
+        return_code, (stdout, stderr) = self.container().exec_run(
+          command, demux = True, tty = interactive, stdin = interactive
+        )
+        return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
 
 # }}}                
 
