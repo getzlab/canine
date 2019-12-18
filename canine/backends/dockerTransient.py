@@ -170,6 +170,18 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         )
         return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
 
+    def stop(self, action_on_stop = None):
+        if action_on_stop is None:
+            action_on_stop = self.config["action_on_stop"]
+
+        #
+        # stop running worker nodes
+        super().stop(action_on_stop)
+
+        #
+        # stop NFS node and Docker
+        #if action_on_stop == "delete":
+
 # }}}                
 
 # Python version of checks in docker_run.sh
