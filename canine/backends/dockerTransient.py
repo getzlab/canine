@@ -17,8 +17,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage.sh",
         nfs_disk_size = 100, nfs_disk_type = "pd-standard", image_family = "pydpiper",
-        image = None, **kwargs
+        image = None, cluster_name = None, **kwargs
     ):
+        if cluster_name is None:
+            raise ValueError("You must specify a name for this Slurm cluster!")
+
         if "image" not in kwargs:
             kwargs["image"] = image
 
@@ -28,6 +31,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         super().__init__(**kwargs)
 
         self.config = {
+          "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
           "nfs_compute_script" :
             "--metadata startup-script=\"{script} {nfsds:d} {nfsdt}\"".format(
@@ -40,6 +44,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image" } }
         }
 
+        # placeholder for Docker API
+        self.dkr = None
+
+        # placeholder for Docker container object
+        self.container = None
+
     def init_slurm(self):
         self.dkr = docker.from_env()
 
@@ -51,8 +61,45 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             raise Exception("You have not yet built or pulled the Slurm Docker image!")
 
         #
-        # start the Slurm container if it's not already running
+        # start the NFS
+        self.start_NFS()
+
+        #
+        # mount the NFS
+        self.mount_NFS()
+
+        #
+        # ensure that Docker can start (no Slurm processes already running)
+        try:
+            ready_for_docker()
+        except:
+            print("Docker host is not ready to start container!")
+            raise
+
+        #
+        # create the Slurm container if it's not already present
+        if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
         #if image not in [x.image for x in self.dkr.containers.list()]:
+            self.container = self.dkr.containers.run(
+              image = image.tags[0], detach = True, network_mode = "host",
+              volumes = { "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" } },
+              name = self.config["cluster_name"], command = "/bin/bash",
+              stdin_open = True, remove = True
+            )
+
+        # otherwise, try and start it if it's stopped
+        else:
+            self.container = self._get_container(self.config["cluster_name"])
+            if self.container().status == "exited":
+                self.container().start()
+
+        # TODO: should we restart slurmctld in the container here?
+
+    def _get_container(self, container_name):
+        def closure():
+            return self.dkr.containers.get(container_name)
+
+        return closure
 
     def start_NFS(self):
         nfs_nodename = self.config["worker_prefix"] + "-nfs"
