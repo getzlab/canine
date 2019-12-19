@@ -30,7 +30,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # superclass constructor does something special with compute_script so
         # we need to pass it in
-        kwargs["compute_script"] = "/usr/local/share/cga_pipeline/src/provision_worker.sh {worker_prefix}".format(**kwargs)
+        kwargs["compute_script"] = "/usr/local/share/cga_pipeline/src/provision_worker.sh {worker_prefix}".format(worker_prefix = socket.gethostname())
         super().__init__(**kwargs)
 
         self.config = {
