@@ -9,6 +9,7 @@ import re
 import socket
 import psutil
 import io
+import pickle
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost
@@ -51,6 +52,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # placeholder for Docker container object
         self.container = None
+
+        self.NFS_server_ready = False
+        self.NFS_ready = False
 
     def init_slurm(self):
         self.dkr = docker.from_env()
@@ -96,6 +100,29 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 self.container().start()
 
         # TODO: should we restart slurmctld in the container here?
+
+        #
+        # save the configuration to disk so that Slurm knows how to configure
+        # the nodes it creates
+        subprocess.check_call("""
+          [ ! -d /mnt/nfs/clust_conf/canine ] && mkdir -p /mnt/nfs/clust_conf/canine ||
+            echo -n
+          """, shell = True, executable = '/bin/bash')
+        with open("/mnt/nfs/clust_conf/canine/backend_conf.pickle", "wb") as f:
+            pickle.dump(self.config, f)
+        # TODO: erase this when the backend exits
+
+    def init_nodes(self):
+        if not self.NFS_ready:
+            raise Exception("NFS must be mounted before starting nodes!")
+
+        parts = []
+        with open("/mnt/nfs/clust_conf/slurm/slurm.conf", "r") as f:
+            for line in f:
+                if re.match(r"^PartitionName", line) is None:
+                    continue
+                parts.append({ y[0] : y[1] for y in [x.split("=") for x in line.rstrip().split(" ")] })
+        parts = pd.DataFrame(parts)
 
     def _get_container(self, container_name):
         def closure():
@@ -149,7 +176,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 )
                 print("done", flush = True)
 
+        self.NFS_server_ready = True
+
     def mount_NFS(self):
+        if not self.NFS_server_ready:
+            raise Exception("Need to start NFS server before attempting to mount!")
+
         nfs_prov_script = os.path.join(
                             os.path.dirname(__file__),
                             'slurm-docker/src/nfs_provision_worker.sh'
@@ -159,6 +191,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         subprocess.check_call("{nps} {nnn}".format(
           nps = nfs_prov_script, nnn = nfs_nodename
         ), shell = True)
+
+        self.NFS_ready = True
 
     def get_latest_image(self, image_family = None):
         image_family = self.config["image_family"] if image_family is None else image_family
