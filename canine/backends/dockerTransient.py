@@ -10,6 +10,7 @@ import socket
 import psutil
 import io
 import pickle
+import math
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost
@@ -20,7 +21,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage.sh",
         nfs_disk_size = 100, nfs_disk_type = "pd-standard", nfs_action_on_stop = None,
-        image_family = "pydpiper", image = None, cluster_name = None, **kwargs
+        image_family = "pydpiper", image = None, cluster_name = None, clust_frac = 0.01,
+        **kwargs
     ):
         if cluster_name is None:
             raise ValueError("You must specify a name for this Slurm cluster!")
@@ -46,6 +48,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             else self.config["action_on_stop"],
           "image_family" : image_family,
           "image" : self.get_latest_image(image_family)["name"] if image is None else image,
+          "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image" } }
         }
 
@@ -128,13 +131,33 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # although this backend does not manage starting/stopping nodes
         # -- this is handled by Slurm's elastic scaling, it will stop any
         # nodes still running when __exit__() is called.
-        self.nodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
+        # TODO: deal with nodes that already exist
+        allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
+
+        # we only care about nodes that Slurm will actually dispatch jobs to;
+        # the rest will be set to "drain" (i.e., blacklisted) below.
+        self.nodes = allnodes.groupby("machine_type").apply(
+          lambda x : x.iloc[0:math.ceil(len(x)*self.config["clust_frac"])]
+        ).droplevel(0)
+
+        # set nodes that will never be used to drain
+        for _, g in allnodes.loc[~allnodes.index.isin(self.nodes.index)].groupby("machine_type"):
+            node_expr = re.sub(
+                          r"(.*worker)(\d+)\1(\d+)", r"\1[\2-\3]",
+                          "".join(g.iloc[[0, -1]].index.tolist())
+                        )
+            (ret, _, _) = self.invoke(
+                                      """scontrol update nodename={}
+                                         state=drain reason=unused""".format(node_expr)
+                                    )
+            if ret != 0:
+                raise RuntimeError("Could not drain nodes!")
+
+        # add NFS server to node list
         self.nodes = pd.concat([
           self.nodes,
           pd.DataFrame({ "machine_type" : "nfs" }, index = [self.config["worker_prefix"] + "-nfs"])
         ])
-
-        # TODO: deal with nodes that already exist
 
     def stop(self):
         # stop the Docker
