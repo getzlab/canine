@@ -414,7 +414,20 @@ class AbstractSlurmBackend(abc.ABC):
         """
         Blocks until the main partition is marked as up
         """
-        df = self.sinfo()
+        # sometimes, it takes a few seconds for the Slurm controller to be
+        # responsive. the first time we invoke sinfo, it might exit nonzero.
+        # however, any subsequent nonzero returns should throw an exception.
+        while True:
+            success = True
+            try:
+                df = self.sinfo()
+            except:
+                print("Error querying sinfo, retrying in 10 seconds ...", flush = True)
+                success = False
+                time.sleep(10)
+            finally:
+                if success:
+                    break
         default = df.index[df.index.str.contains(r"\*$")]
 
         # wait for partition to appear
