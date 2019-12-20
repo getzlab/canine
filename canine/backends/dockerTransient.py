@@ -20,9 +20,9 @@ import pandas as pd
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage.sh",
-        nfs_disk_size = 100, nfs_disk_type = "pd-standard", nfs_action_on_stop = None,
-        image_family = "pydpiper", image = None, cluster_name = None, clust_frac = 0.01,
-        **kwargs
+        nfs_disk_size = 100, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop",
+        action_on_stop = "delete", image_family = "pydpiper", image = None,
+        cluster_name = None, clust_frac = 0.01, **kwargs
     ):
         if cluster_name is None:
             raise ValueError("You must specify a name for this Slurm cluster!")
@@ -44,6 +44,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
               nfsds = nfs_disk_size,
               nfsdt = nfs_disk_type
             ),
+          "action_on_stop" : action_on_stop,
           "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
             else self.config["action_on_stop"],
           "image_family" : image_family,
