@@ -19,8 +19,8 @@ import pandas as pd
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage.sh",
-        nfs_disk_size = 100, nfs_disk_type = "pd-standard", image_family = "pydpiper",
-        image = None, cluster_name = None, **kwargs
+        nfs_disk_size = 100, nfs_disk_type = "pd-standard", nfs_action_on_stop = None,
+        image_family = "pydpiper", image = None, cluster_name = None, **kwargs
     ):
         if cluster_name is None:
             raise ValueError("You must specify a name for this Slurm cluster!")
@@ -42,6 +42,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
               nfsds = nfs_disk_size,
               nfsdt = nfs_disk_type
             ),
+          "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
+            else self.config["action_on_stop"],
           "image_family" : image_family,
           "image" : self.get_latest_image(image_family)["name"] if image is None else image,
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image" } }
@@ -52,6 +54,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # placeholder for Docker container object
         self.container = None
+
+        # placeholder for node list (loaded from lookup table)
+        self.nodes = None
 
         self.NFS_server_ready = False
         self.NFS_ready = False
@@ -111,19 +116,46 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           """, shell = True, executable = '/bin/bash')
         with open("/mnt/nfs/clust_conf/canine/backend_conf.pickle", "wb") as f:
             pickle.dump(self.config, f)
-        # TODO: erase this when the backend exits
 
     def init_nodes(self):
         if not self.NFS_ready:
             raise Exception("NFS must be mounted before starting nodes!")
 
-        parts = []
-        with open("/mnt/nfs/clust_conf/slurm/slurm.conf", "r") as f:
-            for line in f:
-                if re.match(r"^PartitionName", line) is None:
-                    continue
-                parts.append({ y[0] : y[1] for y in [x.split("=") for x in line.rstrip().split(" ")] })
-        parts = pd.DataFrame(parts)
+        self.wait_for_cluster_ready()
+
+        # list all the nodes that Slurm is aware of
+
+        # although this backend does not manage starting/stopping nodes
+        # -- this is handled by Slurm's elastic scaling, it will stop any
+        # nodes still running when __exit__() is called.
+        self.nodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
+        self.nodes = pd.concat([
+          self.nodes,
+          pd.DataFrame({ "machine_type" : "nfs" }, index = [self.config["worker_prefix"] + "-nfs"])
+        ])
+
+        # TODO: deal with nodes that already exist
+
+    def stop(self):
+        # stop the Docker
+        self.container().stop()
+
+        # delete node configuration file
+        subprocess.check_call("rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle", shell = True)
+
+        # get list of nodes that still exist
+        allnodes = self.nodes
+        extant_nodes = self.list_instances_all_zones() 
+        self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
+                       (allnodes["machine_type"] != "nfs")]
+
+        # superclass method will stop/delete/leave these running, depending on how
+        # self.config["action_on_stop"] is set
+        super().stop()
+
+        # we handle the NFS separately
+        self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
+        super().stop(action_on_stop = self.config["nfs_action_on_stop"])
 
     def _get_container(self, container_name):
         def closure():
@@ -204,18 +236,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           command, demux = True, tty = interactive, stdin = interactive
         )
         return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
-
-    def stop(self, action_on_stop = None):
-        if action_on_stop is None:
-            action_on_stop = self.config["action_on_stop"]
-
-        #
-        # stop running worker nodes
-        super().stop(action_on_stop)
-
-        #
-        # stop NFS node and Docker
-        #if action_on_stop == "delete":
 
 # }}}                
 
