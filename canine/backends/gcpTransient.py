@@ -292,23 +292,6 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         df.index = df.index.map(str)
         return df
 
-    def wait_for_cluster_ready(self):
-        """
-        Blocks until the main partition is marked as up. Overrides base method,
-        which waits until >= 1 node is in a ready state. Because TransientGCP
-        starts all nodes in a powersave state, the base method would hang
-        indefinitely.
-        """
-        df = self.sinfo()
-        default = [value for value in df.index if value.endswith('*')]
-        while len(default) == 0:
-            time.sleep(10)
-            df = self.sinfo()
-            default = [value for value in df.index if value.endswith('*')]
-        while (df.AVAIL[default] != 'up').all():
-            time.sleep(10)
-            df = self.sinfo()
-
     def estimate_cost(self, clock_uptime: typing.Optional[float] = None, node_uptime: typing.Optional[float] = None, job_cpu_time: typing.Optional[typing.Dict[str, float]] = None) -> typing.Tuple[float, typing.Optional[typing.Dict[str, float]]]:
         """
         Returns a cost estimate for the cluster, based on any cost information available

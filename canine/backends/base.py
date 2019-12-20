@@ -410,7 +410,7 @@ class AbstractSlurmBackend(abc.ABC):
             transport.chmod(script_path, 0o775)
         return script_path
 
-    def wait_for_cluster_ready(self):
+    def wait_for_cluster_ready(self, elastic = True):
         """
         Blocks until the main partition is marked as up
         """
@@ -435,11 +435,17 @@ class AbstractSlurmBackend(abc.ABC):
             time.sleep(10)
             df = self.sinfo()
             default = df.index[df.index.str.contains(r"\*$")]
-
-        # wait for any node in the partition to be ready
-        while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle~?|completing|allocated\+?)$").any():
+        while (df.loc[default, "AVAIL"] != 'up').all():
             time.sleep(10)
             df = self.sinfo()
+
+        # if Canine is responsible for managing worker nodes, then we have to check
+        # whether any workers have started.
+        if not elastic:
+            # wait for any node in the partition to be ready
+            while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle~?|completing|allocated\+?)$").any():
+                time.sleep(10)
+                df = self.sinfo()
 
     def estimate_cost(self, clock_uptime: typing.Optional[float] = None, node_uptime: typing.Optional[float] = None, job_cpu_time: typing.Optional[typing.Dict[str, float]] = None) -> typing.Tuple[float, typing.Optional[typing.Dict[str, float]]]:
         """
