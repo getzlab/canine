@@ -86,12 +86,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # create the Slurm container if it's not already present
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
         #if image not in [x.image for x in self.dkr.containers.list()]:
-            self.container = self.dkr.containers.run(
+            self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
               volumes = { "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" } },
               name = self.config["cluster_name"], command = "/bin/bash",
               stdin_open = True, remove = True
             )
+            self.container = self._get_container(self.config["cluster_name"])
 
         # otherwise, try and start it if it's stopped
         else:
