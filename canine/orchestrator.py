@@ -154,7 +154,18 @@ class Orchestrator(object):
 
         #
         # outputs
-        self.raw_outputs = Orchestrator.stringify(config['outputs']) if 'outputs' in config else {}
+        if "outputs" in config:
+            # process optional output postprocessing functions
+            self.output_map = {}
+            for k, v in config["outputs"].items():
+                if type(v) == tuple and callable(v[1]):
+                    self.output_map[k] = v[1]
+                    config["outputs"][k] = v[0]
+
+            self.raw_outputs = Orchestrator.stringify(config['outputs'])
+        else:
+            self.raw_outputs = {}
+
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
         if 'stdout' not in self.raw_outputs:
@@ -366,6 +377,16 @@ class Orchestrator(object):
                 },
                 orient = "index"
             ).rename_axis(index = "_job_id").astype({('job', 'cpu_hours'): int})
+
+            #
+            # apply functions to output columns (if any)
+            if len(self.output_map) > 0:
+                # columns that receive no (i.e., identity) transformation
+                identity_map = { x : lambda y : y for x in set(df.columns.get_loc_level("outputs")[1]) - self.output_map.keys() }
+
+                # we get back all columns from the dataframe by aggregating columns
+                # that don't receive any transformation with transformed columns
+                df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
         except:
             df = pd.DataFrame()
 
