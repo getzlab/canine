@@ -25,7 +25,7 @@ setup(
     package_data={
         '':[
             'backends/slurm-gcp/*',
-            'backends/slurm-gcp/scripts/*'
+            'backends/slurm-gcp/scripts/*',
             'backends/slurm-docker/src/*'
         ],
     },
