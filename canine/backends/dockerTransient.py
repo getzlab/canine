@@ -22,7 +22,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage.sh",
         nfs_disk_size = 100, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop",
         action_on_stop = "delete", image_family = "pydpiper", image = None,
-        cluster_name = None, clust_frac = 0.01, **kwargs
+        cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
     ):
         if cluster_name is None:
             raise ValueError("You must specify a name for this Slurm cluster!")
@@ -50,6 +50,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "image_family" : image_family,
           "image" : self.get_latest_image(image_family)["name"] if image is None else image,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
+          "user" : user,
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image" } }
         }
 
@@ -99,7 +100,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
               image = image.tags[0], detach = True, network_mode = "host",
               volumes = { "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" } },
               name = self.config["cluster_name"], command = "/bin/bash",
-              stdin_open = True, remove = True
+              user = self.config["user"], stdin_open = True, remove = True
             )
             self.container = self._get_container(self.config["cluster_name"])
 
@@ -148,7 +149,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                           "".join(g.iloc[[0, -1]].index.tolist())
                         )
             (ret, _, _) = self.invoke(
-                                      """scontrol update nodename={}
+                                      """sudo -E scontrol update nodename={}
                                          state=drain reason=unused""".format(node_expr)
                                     )
             if ret != 0:
