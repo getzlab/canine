@@ -19,7 +19,8 @@ import pandas as pd
 
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
-        self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage.sh",
+        self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage_container_host.sh",
+        compute_script = "/usr/local/share/cga_pipeline/src/provision_worker_container_host.sh",
         nfs_disk_size = 100, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop",
         action_on_stop = "delete", image_family = "pydpiper", image = None,
         cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
@@ -32,7 +33,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # superclass constructor does something special with compute_script so
         # we need to pass it in
-        kwargs["compute_script"] = "/usr/local/share/cga_pipeline/src/provision_worker.sh {worker_prefix}".format(worker_prefix = socket.gethostname())
+        kwargs["compute_script"] = "{script} {worker_prefix}".format(
+          script = compute_script,
+          worker_prefix = socket.gethostname()
+        )
         super().__init__(**kwargs)
 
         self.config = {
