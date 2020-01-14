@@ -21,7 +21,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage_container_host.sh",
         compute_script = "/usr/local/share/cga_pipeline/src/provision_worker_container_host.sh",
-        nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop",
+        nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
         action_on_stop = "delete", image_family = "pydpiper", image = None,
         cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
     ):
@@ -43,10 +43,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
           "nfs_compute_script" :
-            "--metadata startup-script=\"{script} {nfsds:d} {nfsdt}\"".format(
+            "--metadata startup-script=\"{script} {nfsds:d} {nfsdt} {nfsimg}\"".format(
               script = nfs_compute_script,
               nfsds = nfs_disk_size,
-              nfsdt = nfs_disk_type
+              nfsdt = nfs_disk_type,
+              nfsimg = nfs_image
             ),
           "action_on_stop" : action_on_stop,
           "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
