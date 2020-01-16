@@ -3,8 +3,10 @@ import warnings
 import shutil
 import tempfile
 import os
+import re
 import shlex
 import fnmatch
+import subprocess
 from .base import PathType, Localization
 from .local import BatchedLocalizer
 from ..backends import AbstractSlurmBackend, AbstractTransport
@@ -64,8 +66,9 @@ class NFSLocalizer(BatchedLocalizer):
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
         Localizes the given file.
-        gs:// files are copied to the staging directory
-        local files are symlinked to the staging directory
+        * gs:// files are copied to the specified destination
+        * local files are symlinked to the specified destination
+        * results dataframes are copied to the specified directory
         """
         if src.startswith('gs://'):
             self.gs_copy(
@@ -75,15 +78,31 @@ class NFSLocalizer(BatchedLocalizer):
             )
         elif os.path.exists(src):
             src = os.path.realpath(os.path.abspath(src))
-            if not os.path.isdir(os.path.dirname(dest.localpath)):
-                os.makedirs(os.path.dirname(dest.localpath))
-            if os.path.abspath(self.mount_path) == os.path.abspath(self.local_dir) and src.startswith(self.local_dir):
-                os.symlink(src, dest.localpath)
-            else:
-                if os.path.isfile(src):
-                    shutil.copyfile(src, dest.localpath)
+
+            if re.search(r"\.k9df\..*$", os.path.basename(src)) is None:
+                if not os.path.isdir(os.path.dirname(dest.localpath)):
+                    os.makedirs(os.path.dirname(dest.localpath))
+
+                #
+                # check if self.mount_path, self.local_dir, and src all exist on the same NFS share
+                # symlink if yes, copy if no
+                vols = subprocess.check_output(
+                  "df {} {} {} | awk 'NR > 1 {{ print $1 }}'".format(
+                    self.mount_path,
+                    self.local_dir,
+                    src
+                  ),
+                  shell = True
+                )
+                if len(set(vols.decode("utf-8").rstrip().split("\n"))) == 1:
+                    os.symlink(src, dest.localpath)
                 else:
-                    shutil.copytree(src, dest.localpath)
+                    if os.path.isfile(src):
+                        shutil.copyfile(src, dest.localpath)
+                    else:
+                        shutil.copytree(src, dest.localpath)
+            else:
+                shutil.copyfile(src, dest.localpath)
 
     def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
         """

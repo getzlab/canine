@@ -251,7 +251,7 @@ class Orchestrator(object):
             print("Parsing output data")
             self.adapter.parse_outputs(outputs)
 
-            df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct)
+            df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
 
         try:
             runtime = time.monotonic() - start_time
@@ -325,7 +325,7 @@ class Orchestrator(object):
                             cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                         job = jid.split('_')[1]
-                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
+#                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
             for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
@@ -343,26 +343,35 @@ class Orchestrator(object):
 
         return completed_jobs, cpu_time, uptime, prev_acct
 
-    def make_output_DF(self, batch_id, outputs, cpu_time, prev_acct) -> pd.DataFrame:
-        acct = self.backend.sacct(job=batch_id)
+    def make_output_DF(self, batch_id, outputs, cpu_time, prev_acct, localizer = None) -> pd.DataFrame:
+        try:
+            acct = self.backend.sacct(job=batch_id)
 
-        df = pd.DataFrame(
-            data={
-                job_id: {
-                    'slurm_state': acct['State'][batch_id+'_'+job_id],
-                    'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
-                    'cpu_hours': (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
-                        cpu_time[batch_id+'_'+job_id] if batch_id+'_'+job_id in cpu_time else 0
-                    ))/3600,
-                    **self.job_spec[job_id],
-                    **{
-                        key: val[0] if isinstance(val, list) and len(val) == 1 else val
-                        for key, val in outputs[job_id].items()
+            df = pd.DataFrame(
+                data={
+                    job_id: {
+                        'slurm_state': acct['State'][batch_id+'_'+job_id],
+                        'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
+                        'cpu_hours': (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
+                            cpu_time[batch_id+'_'+job_id] if batch_id+'_'+job_id in cpu_time else 0
+                        ))/3600 if prev_acct is not None else -1,
+                        **self.job_spec[job_id],
+                        **{
+                            key: val[0] if isinstance(val, list) and len(val) == 1 else val
+                            for key, val in outputs[job_id].items()
+                        }
                     }
+                    for job_id in self.job_spec
                 }
-                for job_id in self.job_spec
-            }
-        ).T.set_index(pd.Index([*self.job_spec], name='job_id')).astype({'cpu_hours': int})
+            ).T.set_index(pd.Index([*self.job_spec], name='job_id')).astype({'cpu_hours': int})
+        except:
+            df = pd.DataFrame()
+
+        if isinstance(localizer, AbstractLocalizer):
+            fname = "results.k9df.pickle"
+            df.to_pickle(fname)
+            localizer.localize_file(fname, localizer.reserve_path(localizer.staging_dir, "results.k9df.pickle"))
+            os.remove(fname)
 
         return df
 
