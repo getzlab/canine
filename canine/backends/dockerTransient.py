@@ -187,6 +187,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
         super().stop(action_on_stop = self.config["nfs_action_on_stop"])
 
+        if self.config["nfs_action_on_stop"] != "run":
+            try:
+                subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
+            except subprocess.CalledProcessError:
+                print("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
+
     def _get_container(self, container_name):
         def closure():
             return self.dkr.containers.get(container_name)
