@@ -1,6 +1,7 @@
 import typing
 import os
 import time
+import shutil
 import sys
 import warnings
 import traceback
@@ -458,4 +459,4 @@ class Orchestrator(object):
 
             # remove output directories of failed jobs
             for k in self.job_spec:
-                os.rmdir(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
+                shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
