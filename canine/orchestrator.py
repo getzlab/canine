@@ -399,6 +399,10 @@ class Orchestrator(object):
         return df
 
     def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}):
+        # this job was avoided
+        if len(self.job_spec) == 0:
+            return -2
+            
         batch_id = self.backend.sbatch(
             entrypoint_path,
             **{
