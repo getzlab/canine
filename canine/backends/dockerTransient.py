@@ -165,7 +165,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def stop(self):
         # stop the Docker
-        self.container().stop()
+        if self.container is not None:
+            self.container().stop()
 
         # delete node configuration file
         subprocess.check_call("rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle", shell = True)
