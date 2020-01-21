@@ -421,26 +421,37 @@ class Orchestrator(object):
             # load in results and job spec dataframes
             r_df = pd.read_pickle(df_path.localpath)
             js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
-            js_df.columns = pd.MultiIndex.from_product([["inputs"], js_df.columns])
-
-            r_df = r_df.reset_index(col_level = 0, col_fill = "_job_id")
-            js_df = js_df.reset_index(col_level = 0, col_fill = "_job_id")
 
             # check if jobs are compatible: they must have identical inputs and index,
             # and output columns must be matching
-            if not r_df["inputs"].columns.equals(js_df["inputs"].columns):
+            if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
+                    js_df.columns.isin(r_df["inputs"].columns).all()):
                 raise ValueError("Cannot job avoid; set of input parameters do not match")
 
-            r_df_inputs = r_df[["inputs", "_job_id"]].droplevel(0, axis = 1)
-            js_df_inputs = js_df[["inputs", "_job_id"]].droplevel(0, axis = 1)
+            # FIXME: removing stdout/stderr from output keys is a bug fix --
+            #        for some reason these aren't getting propagated to the output DF
+            output_temp = pd.Series(index = self.raw_outputs.keys() - {'stdout', 'stderr'})
+            if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
+                    output_temp.index.isin(r_df["outputs"].columns).all()):
+                raise ValueError("Cannot job avoid; sets of output parameters do not match")
 
-            merge_df = r_df_inputs.join(js_df_inputs, how = "outer", lsuffix = "__r", rsuffix = "__js")
-            merge_df.columns = pd.MultiIndex.from_tuples([x.split("__")[::-1] for x in merge_df.columns])
+            # check that values of inputs are the same
+            # we have to sort because the order of jobs might differ for the same
+            # inputs
+            sort_cols = r_df.columns.to_series()["inputs"]
+            r_df = r_df.sort_values(sort_cols.tolist())
+            js_df = js_df.sort_values(sort_cols.index.tolist())
 
-            if not merge_df["r"].equals(merge_df["js"]):
-                raise ValueError("Cannot job avoid; values of input parameters do not match")
+            if not r_df["inputs"].equals(js_df):
+                raise ValueError("Cannot job avoid; values of input parameters do not match!")
 
-            # if jobs are indeed compatible, we can figure out which need to be re-run
-            r_df.loc[r_df[("job", "slurm_state")] == "FAILED"]
+            # if all is well, figure out which jobs need to be re-run
+            fail_idx = r_df[("job", "slurm_state")] == "FAILED"
 
-            # destroy their output directories
+            # remove jobs that don't need to be re-run from job_spec
+            for k in r_df.index[~fail_idx]:
+                self.job_spec.pop(k, None)
+
+            # remove output directories of failed jobs
+            for k in self.job_spec:
+                os.rmdir(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
