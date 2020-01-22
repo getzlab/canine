@@ -252,6 +252,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if not self.NFS_server_ready:
             raise Exception("Need to start NFS server before attempting to mount!")
 
+        # TODO: don't hardcode this script path; make it a parameter instead
         nfs_prov_script = os.path.join(
                             os.path.dirname(__file__),
                             'slurm-docker/src/nfs_provision_worker.sh'
