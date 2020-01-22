@@ -11,6 +11,7 @@ from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBacken
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
 from .utils import check_call
 import yaml
+import numpy as np
 import pandas as pd
 from agutil import status_bar
 version = '0.7.0'
@@ -420,12 +421,24 @@ class Orchestrator(object):
         return batch_id
 
     def job_avoid(self, localizer, overwrite = False): #TODO: add params for type of avoidance (force, only if failed, etc.)
-        # is there preexisting output?
         df_path = localizer.reserve_path(localizer.staging_dir, "results.k9df.pickle")
-        if os.path.exists(df_path.localpath): 
+
+        # remove all output if specified
+        if overwrite:
+            if os.path.isdir(localizer.staging_dir):
+                shutil.rmtree(localizer.staging_dir)
+            return 0
+
+        # check for preexisting jobs' output
+        if os.path.exists(df_path.localpath):
             # load in results and job spec dataframes
             r_df = pd.read_pickle(df_path.localpath)
             js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
+
+            if r_df.empty:
+                print("Could not recover previous job results; overwriting output and aborting job avoidance.")
+                shutil.rmtree(localizer.staging_dir)
+                return 0
 
             # check if jobs are compatible: they must have identical inputs and index,
             # and output columns must be matching
@@ -452,6 +465,7 @@ class Orchestrator(object):
 
             # if all is well, figure out which jobs need to be re-run
             fail_idx = r_df[("job", "slurm_state")] == "FAILED"
+            self.df_avoided = r_df.loc[~fail_idx]
 
             # remove jobs that don't need to be re-run from job_spec
             for k in r_df.index[~fail_idx]:
@@ -460,3 +474,12 @@ class Orchestrator(object):
             # remove output directories of failed jobs
             for k in self.job_spec:
                 shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
+
+            return np.count_nonzero(~fail_idx)
+
+        # if the output directory exists but there's no output dataframe, assume
+        # it's corrupted and remove it
+        elif os.path.isdir(localizer.staging_dir):
+            shutil.rmtree(localizer.staging_dir)
+        
+        return 0
