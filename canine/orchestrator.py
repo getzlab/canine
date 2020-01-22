@@ -175,6 +175,10 @@ class Orchestrator(object):
         if 'stderr' not in self.raw_outputs:
             self.raw_outputs['stderr'] = '../stderr'
 
+        # placeholder for dataframe containing previous results that were
+        # job avoided
+        self.df_avoided = None
+
     def run_pipeline(self, output_dir: str = 'canine_output', dry_run: bool = False) -> pd.DataFrame:
         """
         Runs the configured pipeline
@@ -390,8 +394,14 @@ class Orchestrator(object):
                 # that don't receive any transformation with transformed columns
                 df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
         except:
+            traceback.print_exc()
             df = pd.DataFrame()
 
+        # concatenate with any previously existing job avoided results
+        if self.df_avoided is not None:
+            df = pd.concat([df, self.df_avoided])
+
+        # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
             fname = "results.k9df.pickle"
             df.to_pickle(fname)
