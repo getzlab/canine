@@ -394,12 +394,11 @@ class Orchestrator(object):
                 # that don't receive any transformation with transformed columns
                 df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
         except:
-            traceback.print_exc()
             df = pd.DataFrame()
 
         # concatenate with any previously existing job avoided results
         if self.df_avoided is not None:
-            df = pd.concat([df, self.df_avoided])
+            df = pd.concat([df, self.df_avoided]).sort_index()
 
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
