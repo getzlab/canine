@@ -368,10 +368,10 @@ class Orchestrator(object):
             df = pd.DataFrame.from_dict(
                 data={
                     job_id: {
-                        ('job', 'slurm_state'): acct['State'][batch_id+'_'+job_id],
-                        ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+job_id],
-                        ('job', 'cpu_hours'): (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
-                            cpu_time[batch_id+'_'+job_id] if batch_id+'_'+job_id in cpu_time else 0
+                        ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
+                        ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
+                        ('job', 'cpu_hours'): (prev_acct['CPUTimeRAW'][batch_id+'_'+str(array_id)] + (
+                            cpu_time[batch_id+'_'+str(array_id)] if batch_id+'_'+str(array_id) in cpu_time else 0
                         ))/3600 if prev_acct is not None else -1,
                         **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
                         **{
@@ -379,7 +379,7 @@ class Orchestrator(object):
                             for key, val in outputs[job_id].items()
                         }
                     }
-                    for job_id in self.job_spec
+                    for array_id, job_id in enumerate(self.job_spec)
                 },
                 orient = "index"
             ).rename_axis(index = "_job_id").astype({('job', 'cpu_hours'): int})
