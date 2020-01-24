@@ -56,7 +56,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "image" : self.get_latest_image(image_family)["name"] if image is None else image,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           "user" : user,
-          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image", "user" } }
+          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image", "user", "action_on_stop" } }
         }
 
         # placeholder for Docker API
