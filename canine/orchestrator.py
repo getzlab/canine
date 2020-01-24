@@ -441,52 +441,56 @@ class Orchestrator(object):
 
         # check for preexisting jobs' output
         if os.path.exists(df_path.localpath):
-            # load in results and job spec dataframes
-            r_df = pd.read_pickle(df_path.localpath)
-            js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
+            try:
+                # load in results and job spec dataframes
+                r_df = pd.read_pickle(df_path.localpath)
+                js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
 
-            if r_df.empty:
-                print("Could not recover previous job results; overwriting output and aborting job avoidance.")
-                shutil.rmtree(localizer.staging_dir)
-                os.makedirs(localizer.staging_dir)
+                if r_df.empty:
+                    print("Could not recover previous job results; overwriting output and aborting job avoidance.")
+                    shutil.rmtree(localizer.staging_dir)
+                    os.makedirs(localizer.staging_dir)
+                    return 0
+
+                # check if jobs are compatible: they must have identical inputs and index,
+                # and output columns must be matching
+                if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
+                        js_df.columns.isin(r_df["inputs"].columns).all()):
+                    raise ValueError("Cannot job avoid; set of input parameters do not match")
+
+                # FIXME: removing stdout/stderr from output keys is a bug fix --
+                #        for some reason these aren't getting propagated to the output DF
+                output_temp = pd.Series(index = self.raw_outputs.keys() - {'stdout', 'stderr'})
+                if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
+                        output_temp.index.isin(r_df["outputs"].columns).all()):
+                    raise ValueError("Cannot job avoid; sets of output parameters do not match")
+
+                # check that values of inputs are the same
+                # we have to sort because the order of jobs might differ for the same
+                # inputs
+                sort_cols = r_df.columns.to_series()["inputs"]
+                r_df = r_df.sort_values(sort_cols.tolist())
+                js_df = js_df.sort_values(sort_cols.index.tolist())
+
+                if not r_df["inputs"].equals(js_df):
+                    raise ValueError("Cannot job avoid; values of input parameters do not match!")
+
+                # if all is well, figure out which jobs need to be re-run
+                fail_idx = r_df[("job", "slurm_state")] == "FAILED"
+                self.df_avoided = r_df.loc[~fail_idx]
+
+                # remove jobs that don't need to be re-run from job_spec
+                for k in r_df.index[~fail_idx]:
+                    self.job_spec.pop(k, None)
+
+                # remove output directories of failed jobs
+                for k in self.job_spec:
+                    shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
+
+                return np.count_nonzero(~fail_idx)
+            except ValueError as e:
+                print(e)
                 return 0
-
-            # check if jobs are compatible: they must have identical inputs and index,
-            # and output columns must be matching
-            if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
-                    js_df.columns.isin(r_df["inputs"].columns).all()):
-                raise ValueError("Cannot job avoid; set of input parameters do not match")
-
-            # FIXME: removing stdout/stderr from output keys is a bug fix --
-            #        for some reason these aren't getting propagated to the output DF
-            output_temp = pd.Series(index = self.raw_outputs.keys() - {'stdout', 'stderr'})
-            if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
-                    output_temp.index.isin(r_df["outputs"].columns).all()):
-                raise ValueError("Cannot job avoid; sets of output parameters do not match")
-
-            # check that values of inputs are the same
-            # we have to sort because the order of jobs might differ for the same
-            # inputs
-            sort_cols = r_df.columns.to_series()["inputs"]
-            r_df = r_df.sort_values(sort_cols.tolist())
-            js_df = js_df.sort_values(sort_cols.index.tolist())
-
-            if not r_df["inputs"].equals(js_df):
-                raise ValueError("Cannot job avoid; values of input parameters do not match!")
-
-            # if all is well, figure out which jobs need to be re-run
-            fail_idx = r_df[("job", "slurm_state")] == "FAILED"
-            self.df_avoided = r_df.loc[~fail_idx]
-
-            # remove jobs that don't need to be re-run from job_spec
-            for k in r_df.index[~fail_idx]:
-                self.job_spec.pop(k, None)
-
-            # remove output directories of failed jobs
-            for k in self.job_spec:
-                shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
-
-            return np.count_nonzero(~fail_idx)
 
         # if the output directory exists but there's no output dataframe, assume
         # it's corrupted and remove it
