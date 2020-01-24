@@ -436,6 +436,7 @@ class Orchestrator(object):
         if overwrite:
             if os.path.isdir(localizer.staging_dir):
                 shutil.rmtree(localizer.staging_dir)
+                os.makedirs(localizer.staging_dir)
             return 0
 
         # check for preexisting jobs' output
@@ -447,6 +448,7 @@ class Orchestrator(object):
             if r_df.empty:
                 print("Could not recover previous job results; overwriting output and aborting job avoidance.")
                 shutil.rmtree(localizer.staging_dir)
+                os.makedirs(localizer.staging_dir)
                 return 0
 
             # check if jobs are compatible: they must have identical inputs and index,
@@ -490,5 +492,6 @@ class Orchestrator(object):
         # it's corrupted and remove it
         elif os.path.isdir(localizer.staging_dir):
             shutil.rmtree(localizer.staging_dir)
+            os.makedirs(localizer.staging_dir)
         
         return 0
