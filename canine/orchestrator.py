@@ -447,23 +447,32 @@ class Orchestrator(object):
                 js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
 
                 if r_df.empty:
-                    print("Could not recover previous job results; overwriting output and aborting job avoidance.")
-                    shutil.rmtree(localizer.staging_dir)
-                    os.makedirs(localizer.staging_dir)
-                    return 0
+                    raise ValueError("Could not recover previous job results!")
 
                 # check if jobs are compatible: they must have identical inputs and index,
                 # and output columns must be matching
                 if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
                         js_df.columns.isin(r_df["inputs"].columns).all()):
-                    raise ValueError("Cannot job avoid; set of input parameters do not match")
+                    r_df_set = set(r_df["inputs"].columns)
+                    js_df_set = set(js_df.columns)
+                    raise ValueError(
+                      "Cannot job avoid; sets of input parameters do not match:\n" + \
+                      "\u21B3saved: " + ", ".join(r_df_set - js_df_set) + "\n" + \
+                      "\u21B3job: " + ", ".join(js_df_set - r_df_set)
+                    )
 
                 # FIXME: removing stdout/stderr from output keys is a bug fix --
                 #        for some reason these aren't getting propagated to the output DF
                 output_temp = pd.Series(index = self.raw_outputs.keys() - {'stdout', 'stderr'})
                 if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
                         output_temp.index.isin(r_df["outputs"].columns).all()):
-                    raise ValueError("Cannot job avoid; sets of output parameters do not match")
+                    r_df_set = set(r_df["outputs"].columns)
+                    o_df_set = set(output_temp.index)
+                    raise ValueError(
+                      "Cannot job avoid; sets of output parameters do not match:\n" + \
+                      "\u21B3saved: " + ", ".join(r_df_set - o_df_set) + "\n" + \
+                      "\u21B3job: " + ", ".join(o_df_set - r_df_set)
+                    )
 
                 # check that values of inputs are the same
                 # we have to sort because the order of jobs might differ for the same
@@ -490,6 +499,9 @@ class Orchestrator(object):
                 return np.count_nonzero(~fail_idx)
             except ValueError as e:
                 print(e)
+                print("Overwriting output and aborting job avoidance.")
+                shutil.rmtree(localizer.staging_dir)
+                os.makedirs(localizer.staging_dir)
                 return 0
 
         # if the output directory exists but there's no output dataframe, assume
