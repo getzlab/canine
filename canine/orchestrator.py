@@ -371,9 +371,9 @@ class Orchestrator(object):
                     job_id: {
                         ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
                         ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
-                        ('job', 'cpu_hours'): (prev_acct['CPUTimeRAW'][batch_id+'_'+str(array_id)] + (
+                        ('job', 'cpu_seconds'): (prev_acct['CPUTimeRAW'][batch_id+'_'+str(array_id)] + (
                             cpu_time[batch_id+'_'+str(array_id)] if batch_id+'_'+str(array_id) in cpu_time else 0
-                        ))/3600 if prev_acct is not None else -1,
+                        )) if prev_acct is not None else -1,
                         **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
                         **{
                             ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
