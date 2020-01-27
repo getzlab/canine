@@ -285,7 +285,7 @@ class NFSLocalizer(BatchedLocalizer):
         """
         vols = subprocess.check_output(
           "df {} | awk 'NR > 1 {{ print $1 }}'".format(
-            " ".join([self.mount_path, self.local_dir, *args])
+            " ".join([shlex.quote(x) for x in [self.mount_path, self.local_dir, *args]])
           ),
           shell = True
         )
