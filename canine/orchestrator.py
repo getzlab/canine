@@ -278,7 +278,7 @@ class Orchestrator(object):
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
             )[0])
-            job_cost = self.backend.estimate_cost(job_cpu_time=df['cpu_hours'].to_dict())[1]
+            job_cost = self.backend.estimate_cost(job_cpu_time=df['cpu_seconds'].to_dict())[1]
             df['est_cost'] = [job_cost[job_id] for job_id in df.index] if job_cost is not None else [0] * len(df)
         except:
             traceback.print_exc()
@@ -383,7 +383,7 @@ class Orchestrator(object):
                     for array_id, job_id in enumerate(self.job_spec)
                 },
                 orient = "index"
-            ).rename_axis(index = "_job_id").astype({('job', 'cpu_hours'): int})
+            ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int})
 
             #
             # apply functions to output columns (if any)
