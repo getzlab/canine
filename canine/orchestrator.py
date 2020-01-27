@@ -3,6 +3,7 @@ import os
 import time
 import shutil
 import sys
+import uuid
 import warnings
 import traceback
 from subprocess import CalledProcessError
@@ -402,7 +403,7 @@ class Orchestrator(object):
 
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
-            fname = "results.k9df.pickle"
+            fname = str(uuid.uuid4()) + "-results.k9df.pickle"
             df.to_pickle(fname)
             localizer.localize_file(fname, localizer.reserve_path(localizer.staging_dir, "results.k9df.pickle"))
             os.remove(fname)
