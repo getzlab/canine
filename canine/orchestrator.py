@@ -447,7 +447,9 @@ class Orchestrator(object):
                 r_df = pd.read_pickle(df_path.localpath)
                 js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
 
-                if r_df.empty:
+                if r_df.empty or \
+                   "inputs" not in r_df or \
+                   ("outputs" not in r_df and len(self.raw_outputs) > 0):
                     raise ValueError("Could not recover previous job results!")
 
                 # check if jobs are compatible: they must have identical inputs and index,
