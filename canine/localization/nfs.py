@@ -110,7 +110,7 @@ class NFSLocalizer(BatchedLocalizer):
             overrides = {}
 
         # automatically override inputs that are absolute paths residing on the same
-        # NFS share
+        # NFS share and are not Canine outputs
 
         # XXX: this can be potentially slow, since it has to iterate over every
         #      single input. It would make more sense to do this before the adapter
@@ -118,7 +118,8 @@ class NFSLocalizer(BatchedLocalizer):
         for input_dict in inputs.values():
             for k, v in input_dict.items():
                 if k not in overrides:
-                    if re.match(r"^/", v) is not None and self.same_volume(v):
+                    if re.match(r"^/", v) is not None and self.same_volume(v) and \
+                      re.match(r".*/outputs/\d+/.*?/[^/]+$", v) is None:
                         overrides[k] = None
 
         overrides = {k:v.lower() if isinstance(v, str) else None for k,v in overrides.items()}
