@@ -167,10 +167,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         ])
 
     def stop(self):
-        # stop the Docker
-        if self.container is not None:
-            self.container().stop()
-
         # delete node configuration file
         subprocess.check_call("rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle", shell = True)
 
@@ -184,15 +180,22 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # self.config["action_on_stop"] is set
         super().stop()
 
-        # we handle the NFS separately
-        self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
-        super().stop(action_on_stop = self.config["nfs_action_on_stop"])
+        # stop the Docker 
+        if self.container is not None:
+            self.container().stop()
 
+        # unmount the NFS (this needs to be the last step, since Docker will
+        # hang if NFS is pulled out from under it)
         if self.config["nfs_action_on_stop"] != "run":
             try:
                 subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
             except subprocess.CalledProcessError:
                 print("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
+
+        # superclass method will stop/delete/leave the NFS running, depending on
+        # how self.config["nfs_action_on_stop"] is set.
+        self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
+        super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
 
     def _get_container(self, container_name):
         def closure():
