@@ -151,7 +151,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
     def init_nodes(self):
         #
-        # create/start worker nodes 
+        # create/start worker nodes
         print("Checking for preexisting cluster nodes ... ", end = "", flush = True)
 
         nodenames = pd.DataFrame(index = [
@@ -299,6 +299,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         ], axis = 0).reset_index(drop = True)
 
     def wait_for_cluster_ready(self):
+        """
+        Blocks until the main partition is marked as up
+        """
         super().wait_for_cluster_ready(elastic = False)
 
     # a handy wrapper to automatically add this instance's project and zone to
