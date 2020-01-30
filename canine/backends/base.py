@@ -5,6 +5,7 @@ import shutil
 import os
 import time
 import stat
+import sys
 from contextlib import ExitStack
 from uuid import uuid4 as uuid
 from ..utils import ArgumentHelper, check_call
