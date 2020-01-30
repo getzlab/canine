@@ -129,7 +129,7 @@ SLURM cluster and the local filesystem</p>
 
 <dl class="method">
 <dt id="canine.backends.LocalSlurmBackend.wait_for_cluster_ready">
-<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.LocalSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><em class="sig-param">elastic: bool = True</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.LocalSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
 <dd><p>Blocks until the main partition is marked as up</p>
 </dd></dl>
 
@@ -414,7 +414,7 @@ SLURM cluster and the local filesystem</p>
 
 <dl class="method">
 <dt id="canine.backends.RemoteSlurmBackend.wait_for_cluster_ready">
-<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.RemoteSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><em class="sig-param">elastic: bool = True</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.RemoteSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
 <dd><p>Blocks until the main partition is marked as up</p>
 </dd></dl>
 
@@ -707,10 +707,7 @@ SLURM cluster and the local filesystem</p>
 <dl class="method">
 <dt id="canine.backends.TransientGCPSlurmBackend.wait_for_cluster_ready">
 <code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.TransientGCPSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
-<dd><p>Blocks until the main partition is marked as up. Overrides base method,
-which waits until &gt;= 1 node is in a ready state. Because TransientGCP
-starts all nodes in a powersave state, the base method would hang
-indefinitely.</p>
+<dd><p>Blocks until the main partition is marked as up</p>
 </dd></dl>
 
 </dd></dl>
@@ -842,6 +839,114 @@ SLURM cluster and the local filesystem</p>
 <dl class="method">
 <dt id="canine.backends.TransientImageSlurmBackend.wait_for_cluster_ready">
 <code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.TransientImageSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
+<dd><p>Blocks until the main partition is marked as up</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="canine.backends.DockerTransientImageSlurmBackend">
+<em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">DockerTransientImageSlurmBackend</code><span class="sig-paren">(</span><em class="sig-param">nfs_compute_script='/usr/local/share/cga_pipeline/src/provision_storage_container_host.sh'</em>, <em class="sig-param">compute_script='/usr/local/share/cga_pipeline/src/provision_worker_container_host.sh'</em>, <em class="sig-param">nfs_disk_size=2000</em>, <em class="sig-param">nfs_disk_type='pd-standard'</em>, <em class="sig-param">nfs_action_on_stop='stop'</em>, <em class="sig-param">nfs_image=''</em>, <em class="sig-param">action_on_stop='delete'</em>, <em class="sig-param">image_family='pydpiper'</em>, <em class="sig-param">image=None</em>, <em class="sig-param">cluster_name=None</em>, <em class="sig-param">clust_frac=0.01</em>, <em class="sig-param">user='aarong'</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.estimate_cost">
+<code class="sig-name descname">estimate_cost</code><span class="sig-paren">(</span><em class="sig-param">clock_uptime: Optional[float] = None</em>, <em class="sig-param">node_uptime: Optional[float] = None</em>, <em class="sig-param">job_cpu_time: Optional[Dict[str</em>, <em class="sig-param">float]] = None</em><span class="sig-paren">)</span> &#x2192; Tuple[float, Optional[Dict[str, float]]]<a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.estimate_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a cost estimate for the cluster, based on any cost information available
+to the backend. May provide total node uptime (for cluster cost estimate)
+and/or cpu_time for each job to get job specific cost estimates.
+Clock uptime may be provided and is useful if the cluster has an inherrant
+overhead for uptime (ie: controller nodes).
+Note: Job cost estimates may not sum up to the total cluster cost if the
+cluster was not at full utilization.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.invoke">
+<code class="sig-name descname">invoke</code><span class="sig-paren">(</span><em class="sig-param">command</em>, <em class="sig-param">interactive=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.invoke" title="Permalink to this definition">¶</a></dt>
+<dd><p>Invoke an arbitrary command on the Slurm controller node
+Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
+If interactive is True, stdin, stdout, and stderr should all be connected live to the user’s terminal.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.list_instances_all_zones">
+<code class="sig-name descname">list_instances_all_zones</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.list_instances_all_zones" title="Permalink to this definition">¶</a></dt>
+<dd><p>List all instances across all zones in <cite>self.config[“project”]</cite></p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.pack_batch_script">
+<code class="sig-name descname">pack_batch_script</code><span class="sig-paren">(</span><em class="sig-param">*commands</em>, <em class="sig-param">script_path: Optional[str] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.pack_batch_script" title="Permalink to this definition">¶</a></dt>
+<dd><p>writes the list of commands to a file and runs it
+Script_path may be the path to where the script should be written or None</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.sacct">
+<code class="sig-name descname">sacct</code><span class="sig-paren">(</span><em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.sacct" title="Permalink to this definition">¶</a></dt>
+<dd><p>Shows the current job accounting information
+slurmopts and slurmparams are passed into an ArgumentHelper and unpacked
+as command line arguments</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.sbatch">
+<code class="sig-name descname">sbatch</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.sbatch" title="Permalink to this definition">¶</a></dt>
+<dd><p>Runs the given command in the background
+The first argument MUST contain the entire command and options to run
+Additional arguments and keyword arguments provided are passed as slurm arguments to sbatch
+Returns the jobID of the batch request</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.scancel">
+<code class="sig-name descname">scancel</code><span class="sig-paren">(</span><em class="sig-param">jobID: str</em>, <em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.scancel" title="Permalink to this definition">¶</a></dt>
+<dd><p>Cancels the given jobID
+The first argument MUST be the jobID
+Additional arguments and keyword arguments are passed as slurm arguments
+to scancel</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.sinfo">
+<code class="sig-name descname">sinfo</code><span class="sig-paren">(</span><em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.sinfo" title="Permalink to this definition">¶</a></dt>
+<dd><p>Shows the current cluster information
+slurmopts and slurmparams are passed into an ArgumentHelper and unpacked
+as command line arguments</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.squeue">
+<code class="sig-name descname">squeue</code><span class="sig-paren">(</span><em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.squeue" title="Permalink to this definition">¶</a></dt>
+<dd><p>Shows the current status of the job queue
+slurmopts and kwargs are passed into an ArgumentHelper and unpacked
+as command line arguments</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.srun">
+<code class="sig-name descname">srun</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.srun" title="Permalink to this definition">¶</a></dt>
+<dd><p>Runs the given command interactively
+The first argument MUST contain the entire command and options to run
+Additional arguments and keyword arguments provided are passed as slurm arguments to srun
+Returns a tuple containing (exit status, stdout buffer, stderr buffer)</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.stop">
+<code class="sig-name descname">stop</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.stop" title="Permalink to this definition">¶</a></dt>
+<dd><p>Delete or stop (default) compute instances</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.transport">
+<code class="sig-name descname">transport</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; canine.backends.local.LocalTransport<a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.transport" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return a Transport object suitable for moving files between the
+SLURM cluster and the local filesystem</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DockerTransientImageSlurmBackend.wait_for_cluster_ready">
+<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
 <dd><p>Blocks until the main partition is marked as up</p>
 </dd></dl>
 

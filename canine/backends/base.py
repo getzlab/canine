@@ -10,6 +10,7 @@ from uuid import uuid4 as uuid
 from ..utils import ArgumentHelper, check_call
 import pandas as pd
 
+SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
 batch_job_pattern = re.compile(r'Submitted batch job (\d+)')
 
 class AbstractTransport(abc.ABC):
@@ -305,6 +306,11 @@ class AbstractSlurmBackend(abc.ABC):
         """
         command = 'sinfo'+ArgumentHelper(*slurmopts, **slurmparams).commandline
         status, stdout, stderr = self.invoke(command)
+        while status != 0 and SLURM_PARTITION_RECON in stderr.read():
+            print("Slurm controller not ready. Retrying in 10s...", file=sys.stderr)
+            time.sleep(10)
+            status, stdout, stderr = self.invoke(command)
+        stderr.seek(0,0)
         check_call(command, status, stdout, stderr)
         df = pd.read_fwf(
             stdout,
@@ -410,24 +416,11 @@ class AbstractSlurmBackend(abc.ABC):
             transport.chmod(script_path, 0o775)
         return script_path
 
-    def wait_for_cluster_ready(self, elastic = True):
+    def wait_for_cluster_ready(self, elastic: bool = True):
         """
         Blocks until the main partition is marked as up
         """
-        # sometimes, it takes a few seconds for the Slurm controller to be
-        # responsive. the first time we invoke sinfo, it might exit nonzero.
-        # however, any subsequent nonzero returns should throw an exception.
-        while True:
-            success = True
-            try:
-                df = self.sinfo()
-            except:
-                print("Error querying sinfo, retrying in 10 seconds ...", flush = True)
-                success = False
-                time.sleep(10)
-            finally:
-                if success:
-                    break
+        df = self.sinfo()
         default = df.index[df.index.str.contains(r"\*$")]
 
         # wait for partition to appear
