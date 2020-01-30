@@ -19,8 +19,8 @@ import pandas as pd
 
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
-        self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage_container_host.sh",
-        compute_script = "/usr/local/share/cga_pipeline/src/provision_worker_container_host.sh",
+        self, nfs_compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
+        compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
         nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
         action_on_stop = "delete", image_family = "pydpiper", image = None,
         cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
