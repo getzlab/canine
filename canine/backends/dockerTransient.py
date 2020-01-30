@@ -273,10 +273,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         return gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
 
     def invoke(self, command, interactive = False):
-        return_code, (stdout, stderr) = self.container().exec_run(
-          command, demux = True, tty = interactive, stdin = interactive
-        )
-        return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
+        if self.container is not None and self.container().status == "running":
+            return_code, (stdout, stderr) = self.container().exec_run(
+              command, demux = True, tty = interactive, stdin = interactive
+            )
+            return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
+        else:
+            return (1, io.BytesIO(), io.BytesIO(b"Container is not running!"))
 
 # }}}                
 
