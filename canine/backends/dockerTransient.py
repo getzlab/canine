@@ -176,7 +176,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # get list of nodes that still exist
         allnodes = self.nodes
-        extant_nodes = self.list_instances_all_zones() 
+        extant_nodes = self.list_instances_all_zones()
         self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
                        (allnodes["machine_type"] != "nfs")]
 
@@ -275,7 +275,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         )
         return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
 
-# }}}                
+# }}}
 
 # Python version of checks in docker_run.sh
 def ready_for_docker():
@@ -290,7 +290,7 @@ def ready_for_docker():
     for proc, desc in already_running:
         # is the process is running at all?
         if proc in all_procs:
-            # iterate through parents to see if it was launched in a Docker (containerd) 
+            # iterate through parents to see if it was launched in a Docker (containerd)
             for parent_proc in psutil.Process(all_procs[proc]).parents():
                 if parent_proc.name() == "containerd":
                     break
