@@ -19,8 +19,9 @@ import pandas as pd
 
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
-        self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage.sh",
-        nfs_disk_size = 100, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop",
+        self, nfs_compute_script = "/usr/local/share/cga_pipeline/src/provision_storage_container_host.sh",
+        compute_script = "/usr/local/share/cga_pipeline/src/provision_worker_container_host.sh",
+        nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
         action_on_stop = "delete", image_family = "pydpiper", image = None,
         cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
     ):
@@ -32,17 +33,21 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # superclass constructor does something special with compute_script so
         # we need to pass it in
-        kwargs["compute_script"] = "/usr/local/share/cga_pipeline/src/provision_worker.sh {worker_prefix}".format(worker_prefix = socket.gethostname())
-        super().__init__(**kwargs)
+        kwargs["compute_script"] = "{script} {worker_prefix}".format(
+          script = compute_script,
+          worker_prefix = socket.gethostname()
+        )
+        super().__init__(**{**kwargs, **{ "slurm_conf_path" : "" }})
 
         self.config = {
           "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
           "nfs_compute_script" :
-            "--metadata startup-script=\"{script} {nfsds:d} {nfsdt}\"".format(
+            "--metadata startup-script=\"{script} {nfsds:d} {nfsdt} {nfsimg}\"".format(
               script = nfs_compute_script,
               nfsds = nfs_disk_size,
-              nfsdt = nfs_disk_type
+              nfsdt = nfs_disk_type,
+              nfsimg = nfs_image
             ),
           "action_on_stop" : action_on_stop,
           "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
@@ -51,7 +56,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "image" : self.get_latest_image(image_family)["name"] if image is None else image,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           "user" : user,
-          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image", "user" } }
+          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image", "user", "action_on_stop" } }
         }
 
         # placeholder for Docker API
@@ -163,14 +168,15 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def stop(self):
         # stop the Docker
-        self.container().stop()
+        if self.container is not None:
+            self.container().stop()
 
         # delete node configuration file
         subprocess.check_call("rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle", shell = True)
 
         # get list of nodes that still exist
         allnodes = self.nodes
-        extant_nodes = self.list_instances_all_zones() 
+        extant_nodes = self.list_instances_all_zones()
         self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
                        (allnodes["machine_type"] != "nfs")]
 
@@ -181,6 +187,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # we handle the NFS separately
         self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
         super().stop(action_on_stop = self.config["nfs_action_on_stop"])
+
+        if self.config["nfs_action_on_stop"] != "run":
+            try:
+                subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
+            except subprocess.CalledProcessError:
+                print("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
 
     def _get_container(self, container_name):
         def closure():
@@ -240,6 +252,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if not self.NFS_server_ready:
             raise Exception("Need to start NFS server before attempting to mount!")
 
+        # TODO: don't hardcode this script path; make it a parameter instead
         nfs_prov_script = os.path.join(
                             os.path.dirname(__file__),
                             'slurm-docker/src/nfs_provision_worker.sh'
@@ -262,7 +275,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         )
         return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
 
-# }}}                
+# }}}
 
 # Python version of checks in docker_run.sh
 def ready_for_docker():
@@ -277,7 +290,7 @@ def ready_for_docker():
     for proc, desc in already_running:
         # is the process is running at all?
         if proc in all_procs:
-            # iterate through parents to see if it was launched in a Docker (containerd) 
+            # iterate through parents to see if it was launched in a Docker (containerd)
             for parent_proc in psutil.Process(all_procs[proc]).parents():
                 if parent_proc.name() == "containerd":
                     break

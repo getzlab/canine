@@ -511,8 +511,9 @@ Returns the remote staging directory, which is now ready for final startup</p>
 <dt id="canine.localization.NFSLocalizer.localize_file">
 <code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: canine.localization.base.PathType</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
 <dd><p>Localizes the given file.
-gs:// files are copied to the staging directory
-local files are symlinked to the staging directory</p>
+* gs:// files are copied to the specified destination
+* local files are symlinked to the specified destination
+* results dataframes are copied to the specified directory</p>
 </dd></dl>
 
 <dl class="method">

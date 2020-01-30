@@ -140,7 +140,7 @@ class NFSLocalizer(BatchedLocalizer):
                 with open(script_path.localpath, 'w') as w:
                     w.write(teardown_script)
                 os.chmod(script_path.localpath, 0o775)
-            os.symlink(
+            shutil.copyfile(
                 os.path.join(
                     os.path.dirname(__file__),
                     'delocalization.py'
@@ -218,7 +218,7 @@ class NFSLocalizer(BatchedLocalizer):
                 '#!/bin/bash',
                 'if [[ -d {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
                 # 'mv ../stderr ../stdout .',
-                'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} -c {3}; else python {0} {1} {2} -c {3}; fi'.format(
+                'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3}; else python {0} {1} {2} {3}; fi'.format(
                     os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     compute_env['CANINE_OUTPUT'],
                     jobId,

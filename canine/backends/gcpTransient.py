@@ -12,7 +12,6 @@ from ..utils import get_default_gcp_project, ArgumentHelper, check_call, gcp_hou
 import yaml
 import pandas as pd
 
-SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
 PARAMIKO_PEM_KEY = os.path.expanduser('~/.ssh/canine_pem_key')
 GPU_SCRIPT = ' && '.join([
     # 'sudo yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r)',
@@ -267,30 +266,11 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         super().__exit__()
         self.stop()
 
-    def sinfo(self, *slurmopts: str, **slurmparams: typing.Any) -> pd.DataFrame:
+    def wait_for_cluster_ready(self):
         """
-        Shows the current cluster information
-        slurmopts and slurmparams are passed into an ArgumentHelper and unpacked
-        as command line arguments
+        Blocks until the main partition is marked as up
         """
-        command = 'sinfo'+ArgumentHelper(*slurmopts, **slurmparams).commandline
-        status, stdout, stderr = self.invoke(command)
-        if status != 0 and SLURM_PARTITION_RECON in stderr.read():
-            print("Transient controller timed out while checking partitions. Retrying...", file=sys.stderr)
-            time.sleep(120)
-            status, stdout, stderr = self.invoke(command)
-            if status != 0 and SLURM_PARTITION_RECON in stderr.read():
-                print("Transient controller timed out while checking partitions. Making one final retry", file=sys.stderr)
-                time.sleep(120)
-                status, stdout, stderr = self.invoke(command)
-        stderr.seek(0,0)
-        check_call(command, status, stdout, stderr)
-        df = pd.read_fwf(
-            stdout,
-            index_col=0
-        )
-        df.index = df.index.map(str)
-        return df
+        super().wait_for_cluster_ready(elastic = False)
 
     def estimate_cost(self, clock_uptime: typing.Optional[float] = None, node_uptime: typing.Optional[float] = None, job_cpu_time: typing.Optional[typing.Dict[str, float]] = None) -> typing.Tuple[float, typing.Optional[typing.Dict[str, float]]]:
         """
