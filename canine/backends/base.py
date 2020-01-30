@@ -5,11 +5,13 @@ import shutil
 import os
 import time
 import stat
+import sys
 from contextlib import ExitStack
 from uuid import uuid4 as uuid
 from ..utils import ArgumentHelper, check_call
 import pandas as pd
 
+SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
 batch_job_pattern = re.compile(r'Submitted batch job (\d+)')
 
 class AbstractTransport(abc.ABC):
@@ -305,6 +307,11 @@ class AbstractSlurmBackend(abc.ABC):
         """
         command = 'sinfo'+ArgumentHelper(*slurmopts, **slurmparams).commandline
         status, stdout, stderr = self.invoke(command)
+        while status != 0 and SLURM_PARTITION_RECON in stderr.read():
+            print("Slurm controller not ready. Retrying in 10s...", file=sys.stderr)
+            time.sleep(10)
+            status, stdout, stderr = self.invoke(command)
+        stderr.seek(0,0)
         check_call(command, status, stdout, stderr)
         df = pd.read_fwf(
             stdout,
@@ -410,7 +417,7 @@ class AbstractSlurmBackend(abc.ABC):
             transport.chmod(script_path, 0o775)
         return script_path
 
-    def wait_for_cluster_ready(self):
+    def wait_for_cluster_ready(self, elastic: bool = True):
         """
         Blocks until the main partition is marked as up
         """
@@ -422,11 +429,17 @@ class AbstractSlurmBackend(abc.ABC):
             time.sleep(10)
             df = self.sinfo()
             default = df.index[df.index.str.contains(r"\*$")]
-
-        # wait for any node in the partition to be ready
-        while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle~?|completing|allocated\+?)$").any():
+        while (df.loc[default, "AVAIL"] != 'up').all():
             time.sleep(10)
             df = self.sinfo()
+
+        # if Canine is responsible for managing worker nodes, then we have to check
+        # whether any workers have started.
+        if not elastic:
+            # wait for any node in the partition to be ready
+            while ~df.loc[default, "STATE"].str.contains(r"(?:mixed|idle~?|completing|allocated\+?)$").any():
+                time.sleep(10)
+                df = self.sinfo()
 
     def estimate_cost(self, clock_uptime: typing.Optional[float] = None, node_uptime: typing.Optional[float] = None, job_cpu_time: typing.Optional[typing.Dict[str, float]] = None) -> typing.Tuple[float, typing.Optional[typing.Dict[str, float]]]:
         """
