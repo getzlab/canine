@@ -73,6 +73,14 @@ class Orchestrator(object):
                 key:Orchestrator.stringify(val)
                 for key, val in obj.items()
             }
+        elif isinstance(obj, pd.core.series.Series):
+            return [
+                Orchestrator.stringify(elem)
+                for elem in obj.tolist()
+            ]
+        elif isinstance(obj, pd.core.frame.DataFrame):
+            return Orchestrator.stringify(obj.to_dict(orient = "list"))
+
         return str(obj)
 
     @staticmethod
@@ -104,7 +112,12 @@ class Orchestrator(object):
         return cfg
 
 
-    def __init__(self, config: typing.Union[str, typing.Dict[str, typing.Any]]):
+    def __init__(self, config: typing.Union[
+      str,
+      typing.Dict[str, typing.Any],
+      pd.core.frame.DataFrame,
+      pd.core.series.Series
+    ]):
         """
         Initializes the Orchestrator from a given config
         """
