@@ -5,7 +5,7 @@ import tempfile
 import os
 import re
 import shlex
-import fnmatch
+import glob
 import subprocess
 from .base import PathType, Localization
 from .local import BatchedLocalizer
@@ -256,13 +256,9 @@ class NFSLocalizer(BatchedLocalizer):
                 if os.path.isdir(dirpath):
                     if outputname not in patterns:
                         warnings.warn("Detected output directory {} which was not declared".format(dirpath))
-                    for output in os.listdir(dirpath):
-                        fullname = os.path.join(dirpath, output)
-                        if fnmatch.fnmatch(fullname, patterns[outputname]) or fnmatch.fnmatch(os.path.relpath(fullname, dirpath), patterns[outputname]):
-                            if outputname not in output_files[jobId]:
-                                output_files[jobId][outputname] = [os.path.abspath(fullname)]
-                            else:
-                                output_files[jobId][outputname].append(os.path.abspath(fullname))
+                    output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
+                elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
+                    output_files[jobId][outputname] = [dirpath]
         return output_files
 
     def finalize_staging_dir(self, jobs: typing.Iterable[str], transport: typing.Optional[AbstractTransport] = None) -> str:

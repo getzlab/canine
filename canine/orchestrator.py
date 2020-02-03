@@ -15,7 +15,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.7.0'
+version = '0.7.1'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -278,7 +278,7 @@ class Orchestrator(object):
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
             )[0])
-            job_cost = self.backend.estimate_cost(job_cpu_time=df['cpu_seconds'].to_dict())[1]
+            job_cost = self.backend.estimate_cost(job_cpu_time=df[('job', 'cpu_seconds')].to_dict())[1]
             df['est_cost'] = [job_cost[job_id] for job_id in df.index] if job_cost is not None else [0] * len(df)
         except:
             traceback.print_exc()
