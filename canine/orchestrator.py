@@ -12,7 +12,7 @@ from .utils import check_call
 import yaml
 import pandas as pd
 from agutil import status_bar
-version = '0.7.0'
+version = '0.7.1'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -260,7 +260,7 @@ class Orchestrator(object):
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
             )[0])
-            job_cost = self.backend.estimate_cost(job_cpu_time=df['cpu_hours'].to_dict())[1]
+            job_cost = self.backend.estimate_cost(job_cpu_time=df[('job', 'cpu_hours')].to_dict())[1]
             df['est_cost'] = [job_cost[job_id] for job_id in df.index] if job_cost is not None else [0] * len(df)
         except:
             traceback.print_exc()
@@ -396,7 +396,7 @@ class Orchestrator(object):
     def job_avoid(self, localizer, overwrite = False): #TODO: add params for type of avoidance (force, only if failed, etc.)
         # is there preexisting output?
         df_path = localizer.reserve_path(localizer.staging_dir, "results.k9df.pickle")
-        if os.path.exists(df_path.localpath): 
+        if os.path.exists(df_path.localpath):
             # load in results and job spec dataframes
             r_df = pd.read_pickle(df_path.localpath)
             js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
