@@ -93,7 +93,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 "--metadata-from-file startup-script={}".format(compute_script_file)
                 if compute_script_file else "",
             "compute_script" :
-                "--metadata startup-script={}".format(compute_script)
+                "--metadata startup-script=\"{}\"".format(compute_script)
                 if compute_script else "",
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else "root",
@@ -113,132 +113,11 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
     def __enter__(self):
         try:
-            #
-            # check if Slurm is already running locally; start (with hard reset) if not
+            # start Slurm controller (and associated programs)
+            self.init_slurm()
 
-            print("Checking for running Slurm controller ... ", end = "", flush = True)
-
-            subprocess.check_call(
-                """sudo -E -u {user} bash -c 'pgrep slurmctld || slurmctld -c -f {slurm_conf_path} &&
-                   slurmctld reconfigure; pgrep slurmdbd || slurmdbd; pgrep munged || munged -f'
-                """.format(**self.config),
-                shell = True,
-                stdout = subprocess.DEVNULL
-            )
-
-            # ensure all started successfully
-            subprocess.check_call("pgrep slurmctld && pgrep slurmdbd && pgrep munged", shell = True,
-                                  stdout = subprocess.DEVNULL)
-
-            print("done", flush = True)
-
-            #
-            # create/start worker nodes
-
-            print("Checking for preexisting cluster nodes ... ", end = "", flush = True)
-
-            nodenames = pd.DataFrame(index = [
-                          self.config["worker_prefix"] + str(x) for x in
-                          range(1, self.config["tot_node_count"] + 1)
-                        ])
-
-            # check which worker nodes exist outside of Canine
-            instances = self.list_instances_all_zones()
-            k9_inst_idx = instances["tags"].apply(lambda x : "caninetransientimage" in x)
-
-            nodenames["is_ex_node"] = nodenames.index.isin(instances.loc[~k9_inst_idx, "name"])
-
-            # check which worker nodes were previous created by Canine
-            nodenames["is_k9_node"] = nodenames.index.isin(instances.loc[k9_inst_idx, "name"])
-
-            instances = instances.merge(nodenames, left_on = "name", right_index = True,
-                          how = "right")
-
-            print("done", flush = True)
-
-            # handle nodes that will not be created
-            if (nodenames["is_ex_node"] | nodenames["is_k9_node"]).any():
-                # WARN about worker nodes outside of Canine
-                ex_nodes = nodenames.index[nodenames["is_ex_node"]]
-
-                if not ex_nodes.empty:
-                    print("WARNING: the following nodes already exist outside of Canine:\n - ",
-                      file = sys.stderr, end = "")
-                    print("\n - ".join(ex_nodes), file = sys.stderr)
-                    print("Canine will not touch these nodes.")
-
-                # ERROR if any instance types (Canine or external) are incongruous
-                # with given definition
-                typemismatch_idx = ~instances.loc[:, "machineType"].isna() & \
-                                   (instances.loc[:, "machineType"] != self.config["worker_type"])
-
-                if typemismatch_idx.any():
-                    print("ERROR: nodes that already exist do not match specified machine type ({worker_type}):".format(**self.config), file = sys.stderr)
-                    print(instances.drop(columns = "selfLink").loc[typemismatch_idx] \
-                      .to_string(index = False), file = sys.stderr)
-                    print("This will result in Slurm bitmap corruption.", file = sys.stderr)
-
-                    raise RuntimeError('Preexisting cluster nodes do not match specified machine type for new nodes')
-
-                # WARN if any nodes (Canine or external) are already defined but
-                # present in other zones
-                zonemismatch_idx = ~instances.loc[:, "zone"].isna() & \
-                                   (instances.loc[:, "zone"] != self.config["compute_zone"])
-
-                if zonemismatch_idx.any():
-                    print("WARNING: nodes that already exist do not match specified compute zone ({compute_zone}):".format(**self.config), file = sys.stderr)
-                    print(instances.drop(columns = "selfLink").loc[zonemismatch_idx] \
-                      .to_string(index = False), file = sys.stderr)
-                    print("This may result in degraded performance or egress charges.",
-                      file = sys.stderr)
-
-            self.nodes = nodenames.loc[~nodenames["is_ex_node"]]
-
-            # create the nodes
-
-            # TODO: support the other config flags
-            # TODO: use API to launch these
-
-            if (~self.nodes["is_k9_node"]).any():
-                nodes_to_create = self.nodes.index[~self.nodes["is_k9_node"]].values
-
-                print("Creating {0:d} worker nodes ... ".format(nodes_to_create.shape[0]),
-                      end = "", flush = True)
-                subprocess.check_call(
-                    """gcloud compute instances create {workers} \
-                       --image {image} --machine-type {worker_type} --zone {compute_zone} \
-                       {compute_script} {compute_script_file} {preemptible} \
-                       --tags caninetransientimage
-                    """.format(**self.config, workers = " ".join(nodes_to_create)),
-                    shell = True
-                )
-                print("done", flush = True)
-
-            # start nodes previously created by Canine
-
-            instances_to_start = instances.loc[instances["is_k9_node"] &
-              (instances["status"] == "TERMINATED"), "name"]
-
-            # TODO: use API to start these
-            if instances_to_start.shape[0] > 0:
-                print("Starting {0:d} preexisting worker nodes ... ".format(instances_to_start.shape[0]),
-                      end = "", flush = True)
-                subprocess.check_call(
-                    """gcloud compute instances start {workers} --zone {compute_zone} \
-                    """.format(**self.config, workers = " ".join(instances_to_start.values)),
-                    shell = True
-                )
-                print("done", flush = True)
-
-            #
-            # shut down nodes exceeding init_node_count
-
-            for node in self.nodes.index[self.config["init_node_count"]:]:
-                try:
-                    self._pzw(gce.instances().stop)(instance = node).execute()
-                except Exception as e:
-                    print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
-                    print(e)
+            # start nodes
+            self.init_nodes()
 
             return self
         except Exception as e:
@@ -249,6 +128,134 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
     def __exit__(self, *args):
         self.stop()
+
+    def init_slurm(self):
+        #
+        # check if Slurm is already running locally; start (with hard reset) if not
+
+        print("Checking for running Slurm controller ... ", end = "", flush = True)
+
+        subprocess.check_call(
+            """sudo -E -u {user} bash -c 'pgrep slurmctld || slurmctld -c -f {slurm_conf_path} &&
+               slurmctld reconfigure; pgrep slurmdbd || slurmdbd; pgrep munged || munged -f'
+            """.format(**self.config),
+            shell = True,
+            stdout = subprocess.DEVNULL
+        )
+
+        # ensure all started successfully
+        subprocess.check_call("pgrep slurmctld && pgrep slurmdbd && pgrep munged", shell = True,
+                              stdout = subprocess.DEVNULL)
+
+        print("done", flush = True)
+
+    def init_nodes(self):
+        #
+        # create/start worker nodes
+        print("Checking for preexisting cluster nodes ... ", end = "", flush = True)
+
+        nodenames = pd.DataFrame(index = [
+                      self.config["worker_prefix"] + str(x) for x in
+                      range(1, self.config["tot_node_count"] + 1)
+                    ])
+
+        # check which worker nodes exist outside of Canine
+        instances = self.list_instances_all_zones()
+        k9_inst_idx = instances["tags"].apply(lambda x : "caninetransientimage" in x)
+
+        nodenames["is_ex_node"] = nodenames.index.isin(instances.loc[~k9_inst_idx, "name"])
+
+        # check which worker nodes were previous created by Canine
+        nodenames["is_k9_node"] = nodenames.index.isin(instances.loc[k9_inst_idx, "name"])
+
+        instances = instances.merge(nodenames, left_on = "name", right_index = True,
+                      how = "right")
+
+        print("done", flush = True)
+
+        # handle nodes that will not be created
+        if (nodenames["is_ex_node"] | nodenames["is_k9_node"]).any():
+            # WARN about worker nodes outside of Canine
+            ex_nodes = nodenames.index[nodenames["is_ex_node"]]
+
+            if not ex_nodes.empty:
+                print("WARNING: the following nodes already exist outside of Canine:\n - ",
+                  file = sys.stderr, end = "")
+                print("\n - ".join(ex_nodes), file = sys.stderr)
+                print("Canine will not touch these nodes.")
+
+            # ERROR if any instance types (Canine or external) are incongruous
+            # with given definition
+            typemismatch_idx = ~instances.loc[:, "machineType"].isna() & \
+                               (instances.loc[:, "machineType"] != self.config["worker_type"])
+
+            if typemismatch_idx.any():
+                print("ERROR: nodes that already exist do not match specified machine type ({worker_type}):".format(**self.config), file = sys.stderr)
+                print(instances.drop(columns = "selfLink").loc[typemismatch_idx] \
+                  .to_string(index = False), file = sys.stderr)
+                print("This will result in Slurm bitmap corruption.", file = sys.stderr)
+
+                raise RuntimeError('Preexisting cluster nodes do not match specified machine type for new nodes')
+
+            # WARN if any nodes (Canine or external) are already defined but
+            # present in other zones
+            zonemismatch_idx = ~instances.loc[:, "zone"].isna() & \
+                               (instances.loc[:, "zone"] != self.config["compute_zone"])
+
+            if zonemismatch_idx.any():
+                print("WARNING: nodes that already exist do not match specified compute zone ({compute_zone}):".format(**self.config), file = sys.stderr)
+                print(instances.drop(columns = "selfLink").loc[zonemismatch_idx] \
+                  .to_string(index = False), file = sys.stderr)
+                print("This may result in degraded performance or egress charges.",
+                  file = sys.stderr)
+
+        self.nodes = nodenames.loc[~nodenames["is_ex_node"]]
+
+        # create the nodes
+
+        # TODO: support the other config flags
+        # TODO: use API to launch these
+
+        if (~self.nodes["is_k9_node"]).any():
+            nodes_to_create = self.nodes.index[~self.nodes["is_k9_node"]].values
+
+            print("Creating {0:d} worker nodes ... ".format(nodes_to_create.shape[0]),
+                  end = "", flush = True)
+            subprocess.check_call(
+                """gcloud compute instances create {workers} \
+                   --image {image} --machine-type {worker_type} --zone {compute_zone} \
+                   {compute_script} {compute_script_file} {preemptible} \
+                   --tags caninetransientimage
+                """.format(**self.config, workers = " ".join(nodes_to_create)),
+                shell = True
+            )
+            print("done", flush = True)
+
+        # start nodes previously created by Canine
+
+        instances_to_start = instances.loc[instances["is_k9_node"] &
+          (instances["status"] == "TERMINATED"), "name"]
+
+        # TODO: use API to start these
+        if instances_to_start.shape[0] > 0:
+            print("Starting {0:d} preexisting worker nodes ... ".format(instances_to_start.shape[0]),
+                  end = "", flush = True)
+            subprocess.check_call(
+                """gcloud compute instances start {workers} --zone {compute_zone} \
+                """.format(**self.config, workers = " ".join(instances_to_start.values)),
+                shell = True
+            )
+            print("done", flush = True)
+
+        #
+        # shut down nodes exceeding init_node_count
+
+        for node in self.nodes.index[self.config["init_node_count"]:]:
+            try:
+                self._pzw(gce.instances().stop)(instance = node).execute()
+            except Exception as e:
+                print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
+                print(e)
 
     def stop(self, action_on_stop = None):
         """
@@ -284,6 +291,12 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
           list_instances(zone = x["name"], project = self.config["project"])
           for x in zone_dict["items"]
         ], axis = 0).reset_index(drop = True)
+
+    def wait_for_cluster_ready(self):
+        """
+        Blocks until the main partition is marked as up
+        """
+        super().wait_for_cluster_ready(elastic = False)
 
     # a handy wrapper to automatically add this instance's project and zone to
     # GCP API calls

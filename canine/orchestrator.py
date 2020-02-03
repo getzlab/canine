@@ -185,6 +185,7 @@ class Orchestrator(object):
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
+                self.job_avoid(localizer)
                 entrypoint_path = self.localize_inputs_and_script(localizer)
 
                 if dry_run:
@@ -347,23 +348,24 @@ class Orchestrator(object):
         try:
             acct = self.backend.sacct(job=batch_id)
 
-            df = pd.DataFrame(
+            df = pd.DataFrame.from_dict(
                 data={
                     job_id: {
-                        'slurm_state': acct['State'][batch_id+'_'+job_id],
-                        'exit_code': acct['ExitCode'][batch_id+'_'+job_id],
-                        'cpu_hours': (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
+                        ('job', 'slurm_state'): acct['State'][batch_id+'_'+job_id],
+                        ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+job_id],
+                        ('job', 'cpu_hours'): (prev_acct['CPUTimeRAW'][batch_id+'_'+job_id] + (
                             cpu_time[batch_id+'_'+job_id] if batch_id+'_'+job_id in cpu_time else 0
                         ))/3600 if prev_acct is not None else -1,
-                        **self.job_spec[job_id],
+                        **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
                         **{
-                            key: val[0] if isinstance(val, list) and len(val) == 1 else val
+                            ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
                             for key, val in outputs[job_id].items()
                         }
                     }
                     for job_id in self.job_spec
-                }
-            ).T.set_index(pd.Index([*self.job_spec], name='job_id')).astype({'cpu_hours': int})
+                },
+                orient = "index"
+            ).rename_axis(index = "_job_id").astype({('job', 'cpu_hours'): int})
         except:
             df = pd.DataFrame()
 
@@ -390,3 +392,34 @@ class Orchestrator(object):
         )
 
         return batch_id
+
+    def job_avoid(self, localizer, overwrite = False): #TODO: add params for type of avoidance (force, only if failed, etc.)
+        # is there preexisting output?
+        df_path = localizer.reserve_path(localizer.staging_dir, "results.k9df.pickle")
+        if os.path.exists(df_path.localpath): 
+            # load in results and job spec dataframes
+            r_df = pd.read_pickle(df_path.localpath)
+            js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
+            js_df.columns = pd.MultiIndex.from_product([["inputs"], js_df.columns])
+
+            r_df = r_df.reset_index(col_level = 0, col_fill = "_job_id")
+            js_df = js_df.reset_index(col_level = 0, col_fill = "_job_id")
+
+            # check if jobs are compatible: they must have identical inputs and index,
+            # and output columns must be matching
+            if not r_df["inputs"].columns.equals(js_df["inputs"].columns):
+                raise ValueError("Cannot job avoid; set of input parameters do not match")
+
+            r_df_inputs = r_df[["inputs", "_job_id"]].droplevel(0, axis = 1)
+            js_df_inputs = js_df[["inputs", "_job_id"]].droplevel(0, axis = 1)
+
+            merge_df = r_df_inputs.join(js_df_inputs, how = "outer", lsuffix = "__r", rsuffix = "__js")
+            merge_df.columns = pd.MultiIndex.from_tuples([x.split("__")[::-1] for x in merge_df.columns])
+
+            if not merge_df["r"].equals(merge_df["js"]):
+                raise ValueError("Cannot job avoid; values of input parameters do not match")
+
+            # if jobs are indeed compatible, we can figure out which need to be re-run
+            r_df.loc[r_df[("job", "slurm_state")] == "FAILED"]
+
+            # destroy their output directories
