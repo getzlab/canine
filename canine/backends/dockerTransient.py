@@ -11,6 +11,8 @@ import psutil
 import io
 import pickle
 import math
+import threading
+import time
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost
@@ -70,6 +72,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         self.NFS_server_ready = False
         self.NFS_ready = False
+        self.NFS_monitor_thread = None
+        self.NFS_monitor_lock = None
 
     def init_slurm(self):
         self.dkr = docker.from_env()
@@ -184,7 +188,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # self.config["action_on_stop"] is set
         super().stop()
 
+        #
         # we handle the NFS separately
+
+        # kill thread monitoring NFS to auto-restart it
+        self.NFS_monitor_lock.set()
+
         self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
         super().stop(action_on_stop = self.config["nfs_action_on_stop"])
 
@@ -246,6 +255,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 )
                 print("done", flush = True)
 
+        # start NFS monitoring thread
+        self.NFS_monitor_lock = threading.Event()
+        self.NFS_monitor_thread = threading.Thread(
+          target = self.autorestart_preempted_node,
+          args = (nfs_nodename,)
+        )
+        self.NFS_monitor_thread.start()
+
         self.NFS_server_ready = True
 
     def mount_NFS(self):
@@ -274,6 +291,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           command, demux = True, tty = interactive, stdin = interactive
         )
         return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
+
+    def autorestart_preempted_node(self, nodename):
+        while not self.NFS_monitor_lock.is_set():
+            inst_details = self._pzw(gce.instances().get)(instance = nodename).execute()
+            if inst_details["status"] != "RUNNING":
+                self._pzw(gce.instances().start)(instance = nodename).execute()
+
+            time.sleep(60)
 
 # }}}
 
