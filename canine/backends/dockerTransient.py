@@ -135,7 +135,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if not self.NFS_ready:
             raise Exception("NFS must be mounted before starting nodes!")
 
-        self.wait_for_cluster_ready()
+        self.wait_for_cluster_ready(elastic = True)
 
         # list all the nodes that Slurm is aware of
 
