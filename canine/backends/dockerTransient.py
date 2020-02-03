@@ -171,10 +171,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         ])
 
     def stop(self):
-        # stop the Docker
-        if self.container is not None:
-            self.container().stop()
-
         # delete node configuration file
         subprocess.check_call("rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle", shell = True)
 
@@ -188,20 +184,27 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # self.config["action_on_stop"] is set
         super().stop()
 
-        #
-        # we handle the NFS separately
+        # stop the Docker (needs to happen after super().stop() is invoked,
+        # which calls scancel, which in turn requires a running Slurm controller Docker
+        if self.container is not None:
+            self.container().stop()
 
-        # kill thread monitoring NFS to auto-restart it
-        self.NFS_monitor_lock.set()
-
-        self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
-        super().stop(action_on_stop = self.config["nfs_action_on_stop"])
-
+        # unmount the NFS (this needs to be the last step, since Docker will
+        # hang if NFS is pulled out from under it)
         if self.config["nfs_action_on_stop"] != "run":
             try:
                 subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
             except subprocess.CalledProcessError:
                 print("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
+
+        # superclass method will stop/delete/leave the NFS running, depending on
+        # how self.config["nfs_action_on_stop"] is set.
+
+        # kill thread that auto-restarts NFS
+        self.NFS_monitor_lock.set()
+
+        self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
+        super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
 
     def _get_container(self, container_name):
         def closure():
@@ -287,10 +290,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         return gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
 
     def invoke(self, command, interactive = False):
-        return_code, (stdout, stderr) = self.container().exec_run(
-          command, demux = True, tty = interactive, stdin = interactive
-        )
-        return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
+        if self.container is not None and self.container().status == "running":
+            return_code, (stdout, stderr) = self.container().exec_run(
+              command, demux = True, tty = interactive, stdin = interactive
+            )
+            return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
+        else:
+            return (1, io.BytesIO(), io.BytesIO(b"Container is not running!"))
 
     def autorestart_preempted_node(self, nodename):
         while not self.NFS_monitor_lock.is_set():

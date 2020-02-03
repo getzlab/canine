@@ -257,7 +257,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
                 print(e)
 
-    def stop(self, action_on_stop = None):
+    def stop(self, action_on_stop = None, kill_straggling_jobs = True):
         """
         Delete or stop (default) compute instances
         """
@@ -265,8 +265,14 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             action_on_stop = self.config["action_on_stop"]
 
         #
-        # stop, delete, or leave running compute nodes
+        # kill any still-running jobs
+        if kill_straggling_jobs:
+            self.scancel(jobID = "", state = "RUNNING")
+            self.scancel(jobID = "", state = "PENDING")
+            self.scancel(jobID = "", state = "SUSPENDED")
 
+        #
+        # stop, delete, or leave running compute nodes
         for node in self.nodes.index:
             try:
                 if action_on_stop == "delete":
