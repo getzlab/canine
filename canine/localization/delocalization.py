@@ -15,7 +15,10 @@ def main(dest, jobId, patterns, copy):
         os.makedirs(jobdir)
     for name, pattern in patterns:
         for target in glob.iglob(pattern):
-            dest = os.path.join(jobdir, name, os.path.basename(target))
+            if name in {'stdout', 'stderr'}:
+                dest = os.path.join(jobdir, name)
+            else:
+                dest = os.path.join(jobdir, name, os.path.relpath(target))
             if not os.path.exists(dest):
                 if not os.path.isdir(os.path.dirname(dest)):
                     os.makedirs(os.path.dirname(dest))

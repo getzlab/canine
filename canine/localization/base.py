@@ -2,7 +2,7 @@ import abc
 import os
 import sys
 import typing
-import fnmatch
+import glob
 import shlex
 import tempfile
 import subprocess
@@ -359,13 +359,9 @@ class AbstractLocalizer(abc.ABC):
                 if os.path.isdir(dirpath):
                     if outputname not in patterns:
                         warnings.warn("Detected output directory {} which was not declared".format(dirpath))
-                    for output in os.listdir(dirpath):
-                        fullname = os.path.join(dirpath, output)
-                        if fnmatch.fnmatch(fullname, patterns[outputname]) or fnmatch.fnmatch(os.path.relpath(fullname, dirpath), patterns[outputname]):
-                            if outputname not in output_files[jobId]:
-                                output_files[jobId][outputname] = [os.path.abspath(fullname)]
-                            else:
-                                output_files[jobId][outputname].append(os.path.abspath(fullname))
+                    output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
+                elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
+                    output_files[jobId][outputname] = [dirpath]
         return output_files
 
     def pick_common_inputs(self, inputs: typing.Dict[str, typing.Dict[str, str]], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None) -> typing.Dict[str, str]:
