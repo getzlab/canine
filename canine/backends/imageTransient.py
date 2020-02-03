@@ -267,9 +267,13 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         #
         # kill any still-running jobs
         if kill_straggling_jobs:
-            self.scancel(jobID = "", state = "RUNNING")
-            self.scancel(jobID = "", state = "PENDING")
-            self.scancel(jobID = "", state = "SUSPENDED")
+            for state in ["RUNNING", "PENDING", "SUSPENDED"]:
+                try:
+                    self.scancel(jobID = "", state = state)
+                except:
+                    # TODO: in verbose logging mode, print that no jobs in this
+                    #       state could be killed
+                    pass
 
         #
         # stop, delete, or leave running compute nodes
