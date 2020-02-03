@@ -294,9 +294,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def autorestart_preempted_node(self, nodename):
         while not self.NFS_monitor_lock.is_set():
-            inst_details = self._pzw(gce.instances().get)(instance = nodename).execute()
-            if inst_details["status"] != "RUNNING":
-                self._pzw(gce.instances().start)(instance = nodename).execute()
+            try:
+                inst_details = self._pzw(gce.instances().get)(instance = nodename).execute()
+                if inst_details["status"] != "RUNNING":
+                    self._pzw(gce.instances().start)(instance = nodename).execute()
+            except:
+                print("Error querying NFS server status; retrying in 60s ...", file = sys.stderr)
 
             time.sleep(60)
 
