@@ -1,5 +1,6 @@
 # vim: set expandtab:
 
+import time
 import typing
 import subprocess
 import os
@@ -267,9 +268,21 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         #
         # kill any still-running jobs
         if kill_straggling_jobs:
-            self.scancel(jobID = "", state = "RUNNING")
-            self.scancel(jobID = "", state = "PENDING")
-            self.scancel(jobID = "", state = "SUSPENDED")
+            try:
+                self.scancel(jobID = "", user = self.config["user"])
+            except:
+                # how do we handle this error?
+                pass
+
+            # wait for jobs to finish
+            print("Terminating all jobs ... ", end = "", flush = True)
+            tot_time = 0
+            while True:
+                if self.squeue().empty or tot_time > 60:
+                    break
+                tot_time += 1
+                time.sleep(1)
+            print("done")
 
         #
         # stop, delete, or leave running compute nodes
