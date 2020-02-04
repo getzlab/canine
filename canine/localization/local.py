@@ -72,7 +72,7 @@ class BatchedLocalizer(AbstractLocalizer):
         os.mkdir(self.environment('local')['CANINE_OUTPUT'])
         return self
 
-    def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
+    def localize(self, inputs: typing.Dict[str, typing.Dict[str, typing.Union[str, typing.List[str]]]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
         """
         3 phase task:
         1) Pre-scan inputs to determine proper localization strategy for all inputs

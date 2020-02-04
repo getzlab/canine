@@ -19,7 +19,7 @@ from hound.client import _getblob_bucket
 from agutil import status_bar
 
 Localization = namedtuple("Localization", ['type', 'path'])
-# types: stream, download, None
+# types: stream, download, array, None
 # indicates what kind of action needs to be taken during job startup
 
 PathType = namedtuple(
@@ -364,7 +364,7 @@ class AbstractLocalizer(abc.ABC):
                     output_files[jobId][outputname] = [dirpath]
         return output_files
 
-    def pick_common_inputs(self, inputs: typing.Dict[str, typing.Dict[str, str]], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None) -> typing.Dict[str, str]:
+    def pick_common_inputs(self, inputs: typing.Dict[str, typing.Dict[str, typing.Union[str, typing.List[str]]]], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None) -> typing.Dict[str, str]:
         """
         Scans input configuration and overrides to choose inputs which should be treated as common.
         Returns the dictionary of common inputs {input path: common path}
@@ -373,12 +373,13 @@ class AbstractLocalizer(abc.ABC):
             self.common_inputs = set()
             seen = set()
             for jobId, values in inputs.items():
-                for arg, path in values.items():
-                    if path in seen and (arg not in overrides or overrides[arg] == 'common'):
-                        self.common_inputs.add(path)
-                    if arg in overrides and overrides[arg] == 'common':
-                        self.common_inputs.add(path)
-                    seen.add(path)
+                for arg, paths in values.items():
+                    for path in (paths if isinstance(paths, list) else (paths,)):
+                        if path in seen and (arg not in overrides or overrides[arg] == 'common'):
+                            self.common_inputs.add(path)
+                        if arg in overrides and overrides[arg] == 'common':
+                            self.common_inputs.add(path)
+                        seen.add(path)
             common_dests = {}
             for path in self.common_inputs:
                 if path.startswith('gs://') or os.path.exists(path):
@@ -404,81 +405,106 @@ class AbstractLocalizer(abc.ABC):
                 transport.mkdir(controller_env['CANINE_OUTPUT'])
             return transport.normpath(self.staging_dir)
 
-    def prepare_job_inputs(self, jobId: str, job_inputs: typing.Dict[str, str], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None):
+    def handle_input(self, jobId: str, input_name: str, input_value: typing.Union[str, typing.List[str]], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: AbstractTransport) -> Localization:
+        """
+        Handles a singular input.
+        Localizes sraightforward files. Stream/Delay files are marked for later handling
+        Returns Localization objects for the determined actions still required
+        (Localization objects are handled during setup_teardown)
+        Job array inputs have their elements individually handled here
+        """
+        if isinstance(input_value, list):
+            return Localization(
+                'array',
+                [
+                    self.handle_input(
+                        jobId,
+                        input_name,
+                        common_dests,
+                        overrides,
+                        transport
+                    )
+                    for elem in input_value
+                ]
+            )
+        mode = overrides[input_name] if input_name in overrides else False
+        if input_value in common_dests or mode == 'common':
+            # common override already handled
+            # No localization needed
+            return Localization(None, common_dests[input_value])
+        elif mode is not False: # User has specified an override
+            if mode == 'stream':
+                if input_value.startswith('gs://'):
+                    return Localization('stream', input_value)
+                print("Ignoring 'stream' override for", input_name, "with value", input_value, "and localizing now", file=sys.stderr)
+            elif mode == 'delayed':
+                if input_value.startswith('gs://'):
+                    return Localization('download', input_value)
+                print("Ignoring 'delayed' override for", input_name, "with value", input_value, "and localizing now", file=sys.stderr)
+            elif mode == None:
+                return Localization(None, input_value)
+        # At this point, no overrides have taken place, so handle by default
+        if os.path.exists(input_value) or input_value.startswith('gs://'):
+            remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(input_value)))
+            self.localize_file(input_value, remote_path, transport=transport)
+            input_value = remote_path
+        return Localization(
+            None,
+            # value will either be a PathType, if localized above,
+            # or an unchanged string if not handled
+            input_value
+        )
+
+
+    def prepare_job_inputs(self, jobId: str, job_inputs: typing.Dict[str, typing.Union[str, typing.List[str]]], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None):
         """
         Prepares job-specific inputs.
         Fills self.inputs[jobId] with Localization objects for each input
+        Just a slight logical wrapper over the recursive handle_input
         """
         if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
             overrides['CANINE_JOB_ALIAS'] = None
         with self.transport_context(transport) as transport:
             self.inputs[jobId] = {}
             for arg, value in job_inputs.items():
-                mode = overrides[arg] if arg in overrides else False
-                if value in common_dests or mode == 'common':
-                    # common override already handled
-                    # No localization needed, already copied
-                    self.inputs[jobId][arg] = Localization(None, common_dests[value])
-                elif mode is not False:
-                    if mode == 'stream':
-                        if not value.startswith('gs://'):
-                            print("Ignoring 'stream' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
-                            self.inputs[jobId][arg] = Localization(
-                                None,
-                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                            )
-                            self.localize_file(
-                                value,
-                                self.inputs[jobId][arg].path,
-                                transport=transport
-                            )
-                        else:
-                            self.inputs[jobId][arg] = Localization(
-                                'stream',
-                                value
-                            )
-                    elif mode == 'localize':
-                        self.inputs[jobId][arg] = Localization(
-                            None,
-                            self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                        )
-                        self.localize_file(
-                            value,
-                            self.inputs[jobId][arg].path,
-                            transport=transport
-                        )
-                    elif mode == 'delayed':
-                        if not value.startswith('gs://'):
-                            print("Ignoring 'delayed' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
-                            self.inputs[jobId][arg] = Localization(
-                                None,
-                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                            )
-                            self.localize_file(
-                                value,
-                                self.inputs[jobId][arg].path,
-                                transport=transport
-                            )
-                        else:
-                            self.inputs[jobId][arg] = Localization(
-                                'download',
-                                value
-                            )
-                    elif mode is None:
-                        # Do not reserve path here
-                        # null override treats input as string
-                        self.inputs[jobId][arg] = Localization(None, value)
-                else:
-                    if os.path.exists(value) or value.startswith('gs://'):
-                        remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                        self.localize_file(value, remote_path, transport=transport)
-                        value = remote_path
-                    self.inputs[jobId][arg] = Localization(
-                        None,
-                        # value will either be a PathType, if localized above,
-                        # or an unchanged string if not handled
-                        value
-                    )
+                self.inputs[jobId][arg] = self.handle_input(
+                    jobId,
+                    arg,
+                    value,
+                    common_dests,
+                    overrides,
+                    transport
+                )
+
+    def final_localization(self, jobId: str, request: Localization) -> typing.Tuple[typing.List[str], str]:
+        """
+        Processes final localization commands.
+        Returns a list of extra tasts to add, as well as the final exportable value
+        """
+        if request.type == 'stream':
+            dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(request.path)))
+            return [
+                'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
+                'mkfifo {}'.format(dest.computepath),
+                "gsutil {} cat {} > {} &".format(
+                    '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(request.path) else '',
+                    shlex.quote(request.path),
+                    dest.computepath
+                )
+            ], '"{}"'.format(dest.computepath)
+        elif request.type == 'download':
+            dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(request.path)))
+            return [
+                "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
+                    '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(request.path) else '',
+                    shlex.quote(request.path),
+                    dest.computepath
+                )
+            ], '"{}"'.format(dest.computepath)
+        elif request.type == None:
+            return [], shlex.quote(request.path.computepath if isinstance(request.path, PathType) else request.path)
+        raise TypeError("request type '{}' not supported at this stage".format(request.type))
+
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str]:
         """
@@ -492,44 +518,29 @@ class AbstractLocalizer(abc.ABC):
         ]
         compute_env = self.environment('compute')
         for key, val in self.inputs[jobId].items():
-            if val.type == 'stream':
-                job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                extra_tasks += [
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
-                    'mkfifo {}'.format(dest.computepath),
-                    "gsutil {} cat {} > {} &".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.computepath
+            job_vars.append(shlex.quote(key))
+            if val.type == 'array':
+                # Hack: the array elements are exposed here as the Localization arg's .path attr
+                array_values = []
+                for request in val.path:
+                    new_tasks, exportable_value = self.final_localization(
+                        jobId, request
                     )
-                ]
+                    extra_tasks += new_tasks
+                    array_values.append(exportable_value)
                 exports.append('export {}="{}"'.format(
                     key,
-                    dest.computepath
-                ))
-            elif val.type == 'download':
-                job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                extra_tasks += [
-                    "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.computepath
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.computepath
-                ))
-            elif val.type is None:
-                job_vars.append(shlex.quote(key))
-                exports.append('export {}={}'.format(
-                    key,
-                    shlex.quote(val.path.computepath if isinstance(val.path, PathType) else val.path)
+                    ':'.join(array_values)
                 ))
             else:
-                print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
+                new_tasks, exportable_value = self.final_localization(
+                    jobId, val
+                )
+                extra_tasks += new_tasks
+                exports.append('export {}={}'.format(
+                    key,
+                    exportable_value
+                ))
         setup_script = '\n'.join(
             line.rstrip()
             for line in [
@@ -592,7 +603,7 @@ class AbstractLocalizer(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
+    def localize(self, inputs: typing.Dict[str, typing.Dict[str, typing.Union[str, typing.List[str]]]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
         """
         3 phase task:
         1) Pre-scan inputs to determine proper localization strategy for all inputs

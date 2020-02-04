@@ -3,12 +3,49 @@ import typing
 from itertools import product, repeat
 from functools import reduce
 
+class _FixedArray(object):
+    """
+    Helper to capture arrays which are marked as fixed
+    """
+    def __init__(self, items):
+        self.items = items
+
+    @property
+    def is_2d(self):
+        return len(self.items) > 0 and isinstance(self.items[0], list)
+
+    def __len__(self):
+        return len(self.items) if self.is_2d else 1
+
+    def __iter__(self):
+        if not self.is_2d:
+            raise ValueError("FixedArray is not 2d")
+        for elem in self.items:
+            if isinstance(elem, list):
+                yield _FixedArray(elem)
+            else:
+                yield elem
+
+    def __getitem__(self, n):
+        if self.is_2d and len(self) > n:
+            elem = self.items[n]
+            if isinstance(elem, list):
+                return _FixedArray(elem)
+            return elem
+        raise ValueError("FixedArray is not 2d")
+
+    def stringify(self):
+        return [
+            [str(item) for item in elem] if self.is_2d else str(elem)
+            for elem in self.items
+        ]
+
 class AbstractAdapter(abc.ABC):
     """
     Base class for pipeline input adapters
     """
 
-    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None):
+    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, arrays: typing.List[str] = None):
         """
         Initializes the adapter.
         If alias is provided, it is used to specify custom job aliases.
@@ -16,6 +53,7 @@ class AbstractAdapter(abc.ABC):
         (the input variable to use as the alias)
         """
         self.alias = alias
+        self.arrays = arrays if arrays is not None else []
 
 
     @abc.abstractmethod
@@ -50,7 +88,7 @@ class ManualAdapter(AbstractAdapter):
     Does pretty much nothing, except maybe combining arguments
     """
 
-    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, product: bool = False):
+    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, product: bool = False, arrays: typing.List[str] = None):
         """
         Initializes the adapter
         If product is True, array arguments will be combined, instead of co-iterated.
@@ -58,7 +96,7 @@ class ManualAdapter(AbstractAdapter):
         alias may be a list of strings (an alias for each job) or a single string
         (the input variable to use as the alias)
         """
-        super().__init__(alias=alias)
+        super().__init__(alias=alias, arrays=arrays)
         self.product = product
         self.__spec = None
         self._job_length = 0
@@ -69,14 +107,24 @@ class ManualAdapter(AbstractAdapter):
         Returns a job input specification useable for Localization
         Also sets self.spec to the same dictionary
         """
+
+        #Pin fixed arrays
+        inputs = {
+            key: _FixedArray(val) if key in self.arrays else val
+            for key,val in inputs.items()
+        }
+
         keys = sorted(inputs)
         input_lengths = {
-            key: len(val) if isinstance(val, list) else 1
+            # FixedArrays return actual length if they are 2d
+            key: len(val) if isinstance(val, list) or (isinstance(val, _FixedArray) and val.is_2d) else 1
             for key, val in inputs.items()
         }
 
         #
         # HACK: deal with lists of length 1
+        # We don't want to also unpack FixedArrays because an explicit fixed [[...]]
+        # should not simply become a regular-ass list or a commonized array
         for key, val in inputs.items():
             if isinstance(val, list) and len(val) == 1:
                 inputs[key] = val[0]
@@ -84,7 +132,9 @@ class ManualAdapter(AbstractAdapter):
         if self.product:
             self._job_length = reduce(lambda x,y: x*y, input_lengths.values(), 1)
             generator = product(
-                *[inputs[key] if isinstance(inputs[key], list) else (inputs[key],)
+                *[inputs[key] if isinstance(inputs[key], list) else (
+                    iter(inputs[key]) if isinstance(inputs[key], _FixedArray) and inputs[key].is_2d else (inputs[key],)
+                )
                 for key in keys]
             )
         else:
@@ -99,12 +149,16 @@ class ManualAdapter(AbstractAdapter):
             #
             # XXX: simplify this with itertools.zip_longest() ?
             generator = zip(*[
-                inputs[key] if isinstance(inputs[key], list) else repeat(inputs[key], self._job_length)
+                inputs[key] if isinstance(inputs[key], list) else (
+                    iter(inputs[key]) if isinstance(inputs[key], _FixedArray) and inputs[key].is_2d else repeat(inputs[key], self._job_length)
+                )
                 for key in keys
             ])
         self.__spec = {
             str(i): {
-                key: str(val)
+                # Unpack fixed arrays here
+                # From localizer perspective, any lists are intentionally fixed lists
+                key: val.stringify() if isinstance(val, _FixedArray) else str(val)
                 for key, val in zip(keys, job)
             }
             for i, job in enumerate(generator)

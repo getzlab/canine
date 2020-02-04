@@ -34,6 +34,9 @@ resources: # slurm resources
   varname: value {--resources varname:value}
 adapter: # Job input adapter configuration
   type: [One of: Manual (default), Firecloud] The adapter to map inputs into actual job inputs {--adapter type:value}
+  arrays: # list of input varnames which should be interpreted as a single input array rather than a list of variable values
+    - varname # 1-d inputs will be interpreted as a single list which gets exported to all jobs
+    - varname # 2-d inputs will be interpreted as a list of arrays to export to individual jobs
   # Other Keyword arguments to provide to adapter
   # Manual Args:
   product: (bool, default false) Whether adapter should take the product of all inputs rather than iterating {--adapter product:value}

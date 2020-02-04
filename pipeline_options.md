@@ -90,6 +90,11 @@ adapter to use, and how it should be configured. Adapters are used to parse the
 input configuration provided by the user into a specific set of inputs for each
 job. Below are the two types of available input adapters, and an example configuration for each.
 
+### Global Options
+
+* `arrays`: A list of input names which should be considered a bash array, instead of
+an array of individual arguments
+
 ### Manual (default) adapter
 
 The Manual adapter is default. It takes inputs at face value. Constant inputs will
