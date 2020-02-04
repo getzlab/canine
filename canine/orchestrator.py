@@ -472,20 +472,18 @@ class Orchestrator(object):
                     r_df_set = set(r_df["inputs"].columns)
                     js_df_set = set(js_df.columns)
                     raise ValueError(
-                      "Cannot job avoid; sets of input parameters do not match:\n" + \
+                      "Cannot job avoid; sets of input parameters do not match! Parameters unique to:\n" + \
                       "\u21B3saved: " + ", ".join(r_df_set - js_df_set) + "\n" + \
                       "\u21B3job: " + ", ".join(js_df_set - r_df_set)
                     )
 
-                # FIXME: removing stdout/stderr from output keys is a bug fix --
-                #        for some reason these aren't getting propagated to the output DF
-                output_temp = pd.Series(index = self.raw_outputs.keys() - {'stdout', 'stderr'})
+                output_temp = pd.Series(index = self.raw_outputs.keys())
                 if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
                         output_temp.index.isin(r_df["outputs"].columns).all()):
                     r_df_set = set(r_df["outputs"].columns)
                     o_df_set = set(output_temp.index)
                     raise ValueError(
-                      "Cannot job avoid; sets of output parameters do not match:\n" + \
+                      "Cannot job avoid; sets of output parameters do not match! Parameters unique to:\n" + \
                       "\u21B3saved: " + ", ".join(r_df_set - o_df_set) + "\n" + \
                       "\u21B3job: " + ", ".join(o_df_set - r_df_set)
                     )
