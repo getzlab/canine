@@ -154,6 +154,7 @@ class Orchestrator(object):
 
         #
         # outputs
+        self.output_map = {}
         if "outputs" in config:
             # process optional output postprocessing functions
             self.output_map = {}
