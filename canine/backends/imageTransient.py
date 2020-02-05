@@ -271,19 +271,19 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         if kill_straggling_jobs:
             try:
                 self.scancel(jobID = "", user = self.config["user"])
-            except:
-                # how do we handle this error?
-                pass
 
-            # wait for jobs to finish
-            print("Terminating all jobs ... ", end = "", flush = True)
-            tot_time = 0
-            while True:
-                if self.squeue().empty or tot_time > 60:
-                    break
-                tot_time += 1
-                time.sleep(1)
-            print("done")
+                # wait for jobs to finish
+                print("Terminating all jobs ... ", end = "", flush = True)
+                tot_time = 0
+                while True:
+                    if self.squeue().empty or tot_time > 60:
+                        break
+                    tot_time += 1
+                    time.sleep(1)
+                print("done")
+            except Exception as e:
+                print("Error terminating all jobs!", file = sys.stderr)
+                print(e, file = sys.stderr)
 
         #
         # stop, delete, or leave running compute nodes
