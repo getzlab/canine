@@ -10,6 +10,7 @@ from .local import LocalSlurmBackend
 from ..utils import get_default_gcp_project, gcp_hourly_cost
 
 import googleapiclient.discovery as gd
+import googleapiclient.errors
 import pandas as pd
 
 gce = gd.build('compute', 'v1')
@@ -296,6 +297,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 else:
                     # default behavior is to shut down
                     self._pzw(gce.instances().stop)(instance = node).execute()
+            except googleapiclient.errors.HttpError as e:
+                if e.resp != 404:
+                    print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
+                    print(e)
             except Exception as e:
                 print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
                 print(e)

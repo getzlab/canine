@@ -174,23 +174,37 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # delete node configuration file
         subprocess.check_call("rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle", shell = True)
 
-        # get list of nodes that still exist
+        #
+        # shutdown nodes that are still running (except NFS)
         allnodes = self.nodes
-        extant_nodes = self.list_instances_all_zones()
-        self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
-                       (allnodes["machine_type"] != "nfs")]
+
+        # sometimes the Google API will spectacularly fail; in that case, we
+        # just try to shutdown everything in the node list, regardless of whether
+        # it exists.
+        try:
+            extant_nodes = self.list_instances_all_zones()
+            self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
+                           (allnodes["machine_type"] != "nfs")]
+        except:
+            self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
 
         # superclass method will stop/delete/leave these running, depending on how
         # self.config["action_on_stop"] is set
         super().stop()
 
-        # stop the Docker (needs to happen after super().stop() is invoked,
-        # which calls scancel, which in turn requires a running Slurm controller Docker
+        #
+        # stop the Docker
+
+        # this needs to happen after super().stop() is invoked, since that
+        # calls scancel, which in turn requires a running Slurm controller Docker
         if self.container is not None:
             self.container().stop()
 
-        # unmount the NFS (this needs to be the last step, since Docker will
-        # hang if NFS is pulled out from under it)
+        #
+        # unmount the NFS
+
+        # this needs to be the last step, since Docker will hang if NFS is pulled
+        # out from under it
         if self.config["nfs_action_on_stop"] != "run":
             try:
                 subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
