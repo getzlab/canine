@@ -45,7 +45,7 @@ class AbstractAdapter(abc.ABC):
     Base class for pipeline input adapters
     """
 
-    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, arrays: typing.List[str] = None):
+    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None):
         """
         Initializes the adapter.
         If alias is provided, it is used to specify custom job aliases.
@@ -53,7 +53,6 @@ class AbstractAdapter(abc.ABC):
         (the input variable to use as the alias)
         """
         self.alias = alias
-        self.arrays = arrays if arrays is not None else []
 
 
     @abc.abstractmethod
@@ -96,7 +95,8 @@ class ManualAdapter(AbstractAdapter):
         alias may be a list of strings (an alias for each job) or a single string
         (the input variable to use as the alias)
         """
-        super().__init__(alias=alias, arrays=arrays)
+        super().__init__(alias=alias)
+        self.arrays = arrays if arrays is not None else []
         self.product = product
         self.__spec = None
         self._job_length = 0

@@ -90,11 +90,6 @@ adapter to use, and how it should be configured. Adapters are used to parse the
 input configuration provided by the user into a specific set of inputs for each
 job. Below are the two types of available input adapters, and an example configuration for each.
 
-### Global Options
-
-* `arrays`: A list of input names which should be considered a bash array, instead of
-an array of individual arguments
-
 ### Manual (default) adapter
 
 The Manual adapter is default. It takes inputs at face value. Constant inputs will
@@ -105,6 +100,13 @@ be launched for every value of the arrays. If `adapter.product` is enabled, arra
 may be of different lengths, and each job will be launched with a unique combination
 of array inputs. The manual adapter does not do any handling of outputs besides
 base delocalization.
+
+* `product`: If false (the default) all inputs must be of equal length or a constant.
+In this case, inputs will take one value per job. If true, arrays may be of unequal length
+and one job will be launched for each combination of elements
+* `arrays`: A list of input names which should be considered a bash array, instead of
+an array of individual arguments
+
 
 Here is an example adapter configuration using the default settings:
 ```yaml
