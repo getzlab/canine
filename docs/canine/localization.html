@@ -59,11 +59,25 @@ Location must be one of {“local”, “controller”, “compute”}</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.BatchedLocalizer.final_localization">
+<code class="sig-name descname">final_localization</code><span class="sig-paren">(</span><em class="sig-param">jobId: str</em>, <em class="sig-param">request: canine.localization.base.Localization</em><span class="sig-paren">)</span> &#x2192; Tuple[List[str], str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.final_localization" title="Permalink to this definition">¶</a></dt>
+<dd><p>Processes final localization commands.
+Returns a list of extra tasts to add, as well as the final exportable value</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.BatchedLocalizer.finalize_staging_dir">
 <code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param">jobs: Iterable[str], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.BatchedLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.BatchedLocalizer.flatten_inputs">
+<code class="sig-name descname">flatten_inputs</code><span class="sig-paren">(</span><em class="sig-param">obj: Any</em><span class="sig-paren">)</span> &#x2192; Generator[str, None, None]<a class="headerlink" href="#canine.localization.BatchedLocalizer.flatten_inputs" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recurses over any object given to yield the flattened elements.
+Used to pick out the filepaths which will be commonized</p>
 </dd></dl>
 
 <dl class="method">
@@ -95,6 +109,16 @@ but its parent does</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.BatchedLocalizer.handle_input">
+<code class="sig-name descname">handle_input</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, input_name: str, input_value: Union[str, List[str]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: canine.backends.base.AbstractTransport</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.Localization<a class="headerlink" href="#canine.localization.BatchedLocalizer.handle_input" title="Permalink to this definition">¶</a></dt>
+<dd><p>Handles a singular input.
+Localizes sraightforward files. Stream/Delay files are marked for later handling
+Returns Localization objects for the determined actions still required
+(Localization objects are handled during setup_teardown)
+Job array inputs have their elements individually handled here</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.BatchedLocalizer.job_setup_teardown">
 <code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns a tuple of (setup script, teardown script) for the given job id.
@@ -103,7 +127,7 @@ Must call after pre-scanning inputs</p>
 
 <dl class="method">
 <dt id="canine.localization.BatchedLocalizer.localize">
-<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.BatchedLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, Union[str, List[str]]]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.BatchedLocalizer.localize" title="Permalink to this definition">¶</a></dt>
 <dd><p>3 phase task:
 1) Pre-scan inputs to determine proper localization strategy for all inputs
 2) Begin localizing job inputs. For each job, check the predetermined strategy
@@ -123,16 +147,17 @@ local files are symlinked to the staging directory</p>
 
 <dl class="method">
 <dt id="canine.localization.BatchedLocalizer.pick_common_inputs">
-<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, Union[str, List[str]]]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
 Returns the dictionary of common inputs {input path: common path}</p>
 </dd></dl>
 
 <dl class="method">
 <dt id="canine.localization.BatchedLocalizer.prepare_job_inputs">
-<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, str], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, Union[str, List[str]]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Prepares job-specific inputs.
-Fills self.inputs[jobId] with Localization objects for each input</p>
+Fills self.inputs[jobId] with Localization objects for each input
+Just a slight logical wrapper over the recursive handle_input</p>
 </dd></dl>
 
 <dl class="method">
@@ -194,11 +219,25 @@ Location must be one of {“local”, “controller”, “compute”}</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.LocalLocalizer.final_localization">
+<code class="sig-name descname">final_localization</code><span class="sig-paren">(</span><em class="sig-param">jobId: str</em>, <em class="sig-param">request: canine.localization.base.Localization</em><span class="sig-paren">)</span> &#x2192; Tuple[List[str], str]<a class="headerlink" href="#canine.localization.LocalLocalizer.final_localization" title="Permalink to this definition">¶</a></dt>
+<dd><p>Processes final localization commands.
+Returns a list of extra tasts to add, as well as the final exportable value</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.LocalLocalizer.finalize_staging_dir">
 <code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param">jobs: Iterable[str], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.LocalLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.LocalLocalizer.flatten_inputs">
+<code class="sig-name descname">flatten_inputs</code><span class="sig-paren">(</span><em class="sig-param">obj: Any</em><span class="sig-paren">)</span> &#x2192; Generator[str, None, None]<a class="headerlink" href="#canine.localization.LocalLocalizer.flatten_inputs" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recurses over any object given to yield the flattened elements.
+Used to pick out the filepaths which will be commonized</p>
 </dd></dl>
 
 <dl class="method">
@@ -230,6 +269,16 @@ but its parent does</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.LocalLocalizer.handle_input">
+<code class="sig-name descname">handle_input</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, input_name: str, input_value: Union[str, List[str]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: canine.backends.base.AbstractTransport</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.Localization<a class="headerlink" href="#canine.localization.LocalLocalizer.handle_input" title="Permalink to this definition">¶</a></dt>
+<dd><p>Handles a singular input.
+Localizes sraightforward files. Stream/Delay files are marked for later handling
+Returns Localization objects for the determined actions still required
+(Localization objects are handled during setup_teardown)
+Job array inputs have their elements individually handled here</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.LocalLocalizer.job_setup_teardown">
 <code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns a tuple of (setup script, teardown script) for the given job id.
@@ -238,7 +287,7 @@ Must call after pre-scanning inputs</p>
 
 <dl class="method">
 <dt id="canine.localization.LocalLocalizer.localize">
-<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.LocalLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, Union[str, List[str]]]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.LocalLocalizer.localize" title="Permalink to this definition">¶</a></dt>
 <dd><p>3 phase task:
 1) Pre-scan inputs to determine proper localization strategy for all inputs
 2) Begin localizing job inputs. For each job, check the predetermined strategy
@@ -258,16 +307,17 @@ local files are symlinked to the staging directory</p>
 
 <dl class="method">
 <dt id="canine.localization.LocalLocalizer.pick_common_inputs">
-<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, Union[str, List[str]]]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
 Returns the dictionary of common inputs {input path: common path}</p>
 </dd></dl>
 
 <dl class="method">
 <dt id="canine.localization.LocalLocalizer.prepare_job_inputs">
-<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, str], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, Union[str, List[str]]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Prepares job-specific inputs.
-Fills self.inputs[jobId] with Localization objects for each input</p>
+Fills self.inputs[jobId] with Localization objects for each input
+Just a slight logical wrapper over the recursive handle_input</p>
 </dd></dl>
 
 <dl class="method">
@@ -321,11 +371,25 @@ Location must be one of {“local”, “controller”, “compute”}</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.RemoteLocalizer.final_localization">
+<code class="sig-name descname">final_localization</code><span class="sig-paren">(</span><em class="sig-param">jobId: str</em>, <em class="sig-param">request: canine.localization.base.Localization</em><span class="sig-paren">)</span> &#x2192; Tuple[List[str], str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.final_localization" title="Permalink to this definition">¶</a></dt>
+<dd><p>Processes final localization commands.
+Returns a list of extra tasts to add, as well as the final exportable value</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.RemoteLocalizer.finalize_staging_dir">
 <code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param">jobs: Iterable[str], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.RemoteLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.flatten_inputs">
+<code class="sig-name descname">flatten_inputs</code><span class="sig-paren">(</span><em class="sig-param">obj: Any</em><span class="sig-paren">)</span> &#x2192; Generator[str, None, None]<a class="headerlink" href="#canine.localization.RemoteLocalizer.flatten_inputs" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recurses over any object given to yield the flattened elements.
+Used to pick out the filepaths which will be commonized</p>
 </dd></dl>
 
 <dl class="method">
@@ -357,6 +421,16 @@ but its parent does</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.RemoteLocalizer.handle_input">
+<code class="sig-name descname">handle_input</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, input_name: str, input_value: Union[str, List[str]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: canine.backends.base.AbstractTransport</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.Localization<a class="headerlink" href="#canine.localization.RemoteLocalizer.handle_input" title="Permalink to this definition">¶</a></dt>
+<dd><p>Handles a singular input.
+Localizes sraightforward files. Stream/Delay files are marked for later handling
+Returns Localization objects for the determined actions still required
+(Localization objects are handled during setup_teardown)
+Job array inputs have their elements individually handled here</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.RemoteLocalizer.job_setup_teardown">
 <code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns a tuple of (setup script, teardown script) for the given job id.
@@ -384,16 +458,17 @@ All files are immediately transferred</p>
 
 <dl class="method">
 <dt id="canine.localization.RemoteLocalizer.pick_common_inputs">
-<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, Union[str, List[str]]]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
 Returns the dictionary of common inputs {input path: common path}</p>
 </dd></dl>
 
 <dl class="method">
 <dt id="canine.localization.RemoteLocalizer.prepare_job_inputs">
-<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, str], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, Union[str, List[str]]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Prepares job-specific inputs.
-Fills self.inputs[jobId] with Localization objects for each input</p>
+Fills self.inputs[jobId] with Localization objects for each input
+Just a slight logical wrapper over the recursive handle_input</p>
 </dd></dl>
 
 <dl class="method">
@@ -453,11 +528,25 @@ Location must be one of {“local”, “controller”, “compute”}</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.NFSLocalizer.final_localization">
+<code class="sig-name descname">final_localization</code><span class="sig-paren">(</span><em class="sig-param">jobId: str</em>, <em class="sig-param">request: canine.localization.base.Localization</em><span class="sig-paren">)</span> &#x2192; Tuple[List[str], str]<a class="headerlink" href="#canine.localization.NFSLocalizer.final_localization" title="Permalink to this definition">¶</a></dt>
+<dd><p>Processes final localization commands.
+Returns a list of extra tasts to add, as well as the final exportable value</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.NFSLocalizer.finalize_staging_dir">
 <code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param">jobs: Iterable[str], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.NFSLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.NFSLocalizer.flatten_inputs">
+<code class="sig-name descname">flatten_inputs</code><span class="sig-paren">(</span><em class="sig-param">obj: Any</em><span class="sig-paren">)</span> &#x2192; Generator[str, None, None]<a class="headerlink" href="#canine.localization.NFSLocalizer.flatten_inputs" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recurses over any object given to yield the flattened elements.
+Used to pick out the filepaths which will be commonized</p>
 </dd></dl>
 
 <dl class="method">
@@ -486,6 +575,16 @@ where the command should be run
 When uploading to gs://, the destination gs:// director does not have to exist
 When downloading from gs:// the destination directory does not have to exist,
 but its parent does</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.NFSLocalizer.handle_input">
+<code class="sig-name descname">handle_input</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, input_name: str, input_value: Union[str, List[str]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: canine.backends.base.AbstractTransport</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.Localization<a class="headerlink" href="#canine.localization.NFSLocalizer.handle_input" title="Permalink to this definition">¶</a></dt>
+<dd><p>Handles a singular input.
+Localizes sraightforward files. Stream/Delay files are marked for later handling
+Returns Localization objects for the determined actions still required
+(Localization objects are handled during setup_teardown)
+Job array inputs have their elements individually handled here</p>
 </dd></dl>
 
 <dl class="method">
@@ -518,16 +617,17 @@ Returns the remote staging directory, which is now ready for final startup</p>
 
 <dl class="method">
 <dt id="canine.localization.NFSLocalizer.pick_common_inputs">
-<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.NFSLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, Union[str, List[str]]]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.NFSLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
 Returns the dictionary of common inputs {input path: common path}</p>
 </dd></dl>
 
 <dl class="method">
 <dt id="canine.localization.NFSLocalizer.prepare_job_inputs">
-<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, str], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, Union[str, List[str]]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Prepares job-specific inputs.
-Fills self.inputs[jobId] with Localization objects for each input</p>
+Fills self.inputs[jobId] with Localization objects for each input
+Just a slight logical wrapper over the recursive handle_input</p>
 </dd></dl>
 
 <dl class="method">

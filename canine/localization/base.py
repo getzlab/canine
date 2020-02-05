@@ -364,29 +364,50 @@ class AbstractLocalizer(abc.ABC):
                     output_files[jobId][outputname] = [dirpath]
         return output_files
 
+    def flatten_inputs(self, obj: typing.Any) -> typing.Generator[str, None, None]:
+        """
+        Recurses over any object given to yield the flattened elements.
+        Used to pick out the filepaths which will be commonized
+        """
+        if isinstance(obj, dict):
+            for val in obj.values():
+                yield from self.flatten_inputs(val)
+        elif isinstance(obj, list):
+            for val in obj:
+                yield from self.flatten_inputs(val)
+        else:
+            yield obj
+
     def pick_common_inputs(self, inputs: typing.Dict[str, typing.Dict[str, typing.Union[str, typing.List[str]]]], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None) -> typing.Dict[str, str]:
         """
         Scans input configuration and overrides to choose inputs which should be treated as common.
         Returns the dictionary of common inputs {input path: common path}
         """
         with self.transport_context(transport) as transport:
-            self.common_inputs = set()
             seen = set()
+            self.common_inputs = set()
+            seen_forced = set()
             for jobId, values in inputs.items():
                 for arg, paths in values.items():
-                    for path in (paths if isinstance(paths, list) else (paths,)):
-                        if path in seen and (arg not in overrides or overrides[arg] == 'common'):
-                            self.common_inputs.add(path)
-                        if arg in overrides and overrides[arg] == 'common':
-                            self.common_inputs.add(path)
-                        seen.add(path)
+                    if arg not in overrides:
+                        print(arg, "is not overridden; scanning inputs")
+                        for path in self.flatten_inputs(paths):
+                            if path in seen:
+                                print("already encountered", path, " (adding to common)")
+                                self.common_inputs.add(path)
+                            else:
+                                print("first encounter of", path)
+                                seen.add(path)
+                    elif arg not in seen_forced and overrides[arg] == 'common':
+                        print("Arg", arg, "not already forced")
+                        print("Forcing", arg, [*self.flatten_inputs(paths)])
+                        seen_forced.add(arg)
+                        self.common_inputs |= {*self.flatten_inputs(paths)}
             common_dests = {}
             for path in self.common_inputs:
                 if path.startswith('gs://') or os.path.exists(path):
                     common_dests[path] = self.reserve_path('common', os.path.basename(os.path.abspath(path)))
                     self.localize_file(path, common_dests[path], transport=transport)
-#                else:
-#                    print("Could not handle common file", path, file=sys.stderr)
             return {key: value for key, value in common_dests.items()}
 
     def finalize_staging_dir(self, jobs: typing.Iterable[str], transport: typing.Optional[AbstractTransport] = None) -> str:
@@ -420,6 +441,7 @@ class AbstractLocalizer(abc.ABC):
                     self.handle_input(
                         jobId,
                         input_name,
+                        elem,
                         common_dests,
                         overrides,
                         transport
@@ -528,9 +550,9 @@ class AbstractLocalizer(abc.ABC):
                     )
                     extra_tasks += new_tasks
                     array_values.append(exportable_value)
-                exports.append('export {}="{}"'.format(
+                exports.append('export {}={}'.format(
                     key,
-                    ':'.join(array_values)
+                    shlex.quote('\t'.join(array_values))
                 ))
             else:
                 new_tasks, exportable_value = self.final_localization(
