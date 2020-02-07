@@ -176,7 +176,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def stop(self):
         # delete node configuration file
         try:
-            subprocess.check_call("rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle", shell = True)
+            subprocess.check_call(
+              "rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle",
+              shell = True,
+              timeout = 10
+            )
         except subprocess.CalledProcessError as e:
             print("Couldn't delete node configuration file:", file = sys.stderr)
             print(e)
