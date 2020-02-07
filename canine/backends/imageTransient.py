@@ -122,6 +122,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             self.init_nodes()
 
             return self
+        except KeyboardInterrupt:
+            print("Cancelling cluster startup ...", file = sys.stderr)
+
+            self.stop()
         except Exception as e:
             print("ERROR: Could not initialize cluster; attempting to tear down.", file = sys.stderr)
 
