@@ -104,10 +104,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # create the Slurm container if it's not already present
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
-        #if image not in [x.image for x in self.dkr.containers.list()]:
             self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
-              volumes = { "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" } },
+              # FIXME: /etc/gcloud is cloud-provider specific. how can we make this more generic?
+              volumes = {
+                "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" },
+                "/etc/gcloud" : { "bind" : "/etc/gcloud", "mode" : "rw" }
+               },
               name = self.config["cluster_name"], command = "/bin/bash",
               user = self.config["user"], stdin_open = True, remove = True
             )
