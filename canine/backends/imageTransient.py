@@ -123,7 +123,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
             return self
         except KeyboardInterrupt:
-            print("Cancelling cluster startup ...", file = sys.stderr)
+            print("\nCancelling cluster startup ...", file = sys.stderr)
 
             self.stop()
         except Exception as e:

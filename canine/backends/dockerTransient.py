@@ -68,7 +68,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.container = None
 
         # placeholder for node list (loaded from lookup table)
-        self.nodes = None
+        self.nodes = pd.DataFrame()
 
         self.NFS_server_ready = False
         self.NFS_ready = False
