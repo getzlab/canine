@@ -24,7 +24,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self, nfs_compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
         compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
         nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
-        action_on_stop = "delete", image_family = "pydpiper", image = None,
+        action_on_stop = "delete", image_family = "slurm-gcp-docker", image = None,
         cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
     ):
         if cluster_name is None:
@@ -81,7 +81,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # check if image exists
         try:
-            image = self.dkr.images.get('broadinstitute/pydpiper:latest')
+            image = self.dkr.images.get('broadinstitute/slurm_gcp_docker:latest')
         except docker.errors.ImageNotFound:
             raise Exception("You have not yet built or pulled the Slurm Docker image!")
 
