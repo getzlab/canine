@@ -24,6 +24,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self, nfs_startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
         startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
         shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
+        nfs_shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
         nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
         action_on_stop = "delete", image_family = "slurm-gcp-docker", image = None,
         cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
@@ -34,24 +35,32 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if "image" not in kwargs:
             kwargs["image"] = image
 
-        # superclass constructor does something special with startup_script so
+        # superclass constructor does something special with startup|shutdown_script so
         # we need to pass it in
         kwargs["startup_script"] = "{script} {worker_prefix}".format(
           script = startup_script,
           worker_prefix = socket.gethostname()
         )
+        kwargs["shutdown_script"] = shutdown_script
         super().__init__(**{**kwargs, **{ "slurm_conf_path" : "" }})
+
+        # handle NFS startup/shutdown scripts
+        nfs_compute_script = {
+          "startup-script" : "{script} {nfsds:d} {nfsdt} {nfsimg}".format(
+            script = nfs_startup_script,
+            nfsds = nfs_disk_size,
+            nfsdt = nfs_disk_type,
+            nfsimg = nfs_image
+          ),
+          "shutdown_script" : nfs_shutdown_script
+        }
 
         self.config = {
           "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
-          "nfs_startup_script" :
-            "--metadata startup-script=\"{script} {nfsds:d} {nfsdt} {nfsimg}\"".format(
-              script = nfs_startup_script,
-              nfsds = nfs_disk_size,
-              nfsdt = nfs_disk_type,
-              nfsimg = nfs_image
-            ),
+          "nfs_compute_script" :
+            "--metadata " + \
+            ",".join([ "{}=\"{}\"".format(k, v) for k, v in nfs_compute_script.items() if v is not None ]),
           "action_on_stop" : action_on_stop,
           "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
             else self.config["action_on_stop"],
@@ -250,7 +259,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             subprocess.check_call(
                 """gcloud compute instances create {nfs_nodename} \
                    --image {image} --machine-type n1-standard-4 --zone {compute_zone} \
-                   {nfs_compute_script} {shutdown_script} {preemptible} \
+                   {nfs_compute_script} {preemptible} \
                    --tags caninetransientimage
                 """.format(nfs_nodename = nfs_nodename, **self.config),
                 shell = True

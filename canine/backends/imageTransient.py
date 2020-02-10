@@ -80,8 +80,14 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             raise ValueError("Cannot simultaneously specifiy startup_script_file and startup_script.")
         if shutdown_script_file is not None and shutdown_script is not None:
             raise ValueError("Cannot simultaneously specifiy shutdown_script_file and shutdown_script.")
-        compute_script = { "startup-script" : startup_script, "shutdown_script" : shutdown_script }
-        compute_script_file = { "startup-script" : startup_script_file, "shutdown_script" : shutdown_script_file }
+        compute_script = {
+          "startup-script" : startup_script,
+          "shutdown_script" : shutdown_script
+        }
+        compute_script_file = {
+          "startup-script" : startup_script_file,
+          "shutdown_script" : shutdown_script_file
+        }
 
         if slurm_conf_path is None:
             raise ValueError("Currently, path to slurm.conf must be explicitly specified.")
@@ -97,12 +103,16 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "preemptible" : "--preemptible" if preemptible else "",
             "gpu_type" : gpu_type,
             "gpu_count" : gpu_count,
+            # XXX: this assumes that we won't have any metadata besides
+            #      startup/shutdown scripts.
             "compute_script_file" :
-                "--metadata-from-file startup-script={}".format(startup_script_file)
-                if startup_script_file else "",
+                "--metadata-from-file " + \
+                ",".join([ "{}={}".format(k, v) for k, v in compute_script_file.items() if v is not None ])
+                if startup_script_file or shutdown_script_file else "",
             "compute_script" :
-                "--metadata startup-script=\"{}\"".format(startup_script)
-                if startup_script else "",
+                "--metadata " + \
+                ",".join([ "{}=\"{}\"".format(k, v) for k, v in compute_script.items() if v is not None ])
+                if startup_script or shutdown_script else "",
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else "root",
             "slurm_conf_path" : slurm_conf_path,
