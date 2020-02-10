@@ -170,9 +170,9 @@ class Orchestrator(object):
 
         #
         # outputs
+        self.output_map = {}
         if "outputs" in config:
             # process optional output postprocessing functions
-            self.output_map = {}
             for k, v in config["outputs"].items():
                 if type(v) == tuple and callable(v[1]):
                     self.output_map[k] = v[1]
