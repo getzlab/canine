@@ -508,7 +508,19 @@ class Orchestrator(object):
 
                 # remove output directories of failed jobs
                 for k in self.job_spec:
-                    shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
+                    # sometimes, rmtree will hang due to NFS lag. retry five times,
+                    # then abort
+                    tries = 0
+                    while True:
+                        try:
+                            shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
+                            break
+                        except FileNotFoundError:
+                            time.sleep(5)
+
+                        if tries >= 4:
+                            raise ValueError("Cannot partially job avoid; error removing job directory!")
+                        tries += 1
 
                 return np.count_nonzero(~fail_idx)
             except ValueError as e:
