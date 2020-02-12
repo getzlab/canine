@@ -10,6 +10,8 @@ import shlex
 from subprocess import CalledProcessError
 import google.auth
 import paramiko
+import shutil
+import time
 
 class ArgumentHelper(dict):
     """
@@ -264,3 +266,21 @@ def gcp_hourly_cost(mtype: str, preemptible: bool = False, ssd_size: int = 0, hd
             else (gpu_pricing[gpu_type][1 if preemptible else 0] * gpu_count)
         )
     )
+
+def rmtree_retry(path, max_tries = 5, timeout = 5):
+    """
+    Repeatedly invoke shutil.rmtree to remove stubborn directories.  Sometimes,
+    rmtree will hang due to NFS lag. Retry up to a default of five times with a
+    default of five seconds between attempts, then raise an OSError.
+    """
+    n_tries = 0
+    while True:
+        try:
+            shutil.rmtree(path)
+            break
+        except FileNotFoundError:
+            time.sleep(timeout)
+
+        if n_tries >= max_tries - 1:
+            raise OSError("Cannot remove " + path)
+        n_tries += 1
