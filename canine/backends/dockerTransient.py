@@ -21,8 +21,10 @@ import pandas as pd
 
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
-        self, nfs_compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
-        compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
+        self, nfs_startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
+        startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
+        shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
+        nfs_shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
         nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
         action_on_stop = "delete", image_family = "slurm-gcp-docker", image = None,
         cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
@@ -33,24 +35,32 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if "image" not in kwargs:
             kwargs["image"] = image
 
-        # superclass constructor does something special with compute_script so
+        # superclass constructor does something special with startup|shutdown_script so
         # we need to pass it in
-        kwargs["compute_script"] = "{script} {worker_prefix}".format(
-          script = compute_script,
+        kwargs["startup_script"] = "{script} {worker_prefix}".format(
+          script = startup_script,
           worker_prefix = socket.gethostname()
         )
+        kwargs["shutdown_script"] = shutdown_script
         super().__init__(**{**kwargs, **{ "slurm_conf_path" : "" }})
+
+        # handle NFS startup/shutdown scripts
+        nfs_compute_script = {
+          "startup-script" : "{script} {nfsds:d} {nfsdt} {nfsimg}".format(
+            script = nfs_startup_script,
+            nfsds = nfs_disk_size,
+            nfsdt = nfs_disk_type,
+            nfsimg = nfs_image
+          ),
+          "shutdown_script" : nfs_shutdown_script
+        }
 
         self.config = {
           "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
           "nfs_compute_script" :
-            "--metadata startup-script=\"{script} {nfsds:d} {nfsdt} {nfsimg}\"".format(
-              script = nfs_compute_script,
-              nfsds = nfs_disk_size,
-              nfsdt = nfs_disk_type,
-              nfsimg = nfs_image
-            ),
+            "--metadata " + \
+            ",".join([ "{}=\"{}\"".format(k, v) for k, v in nfs_compute_script.items() if v is not None ]),
           "action_on_stop" : action_on_stop,
           "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
             else self.config["action_on_stop"],
