@@ -318,7 +318,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                     # default behavior is to shut down
                     self._pzw(gce.instances().stop)(instance = node).execute()
             except googleapiclient.errors.HttpError as e:
-                if e.resp != 404:
+                if "status" in e.resp and e.resp["status"] != "404":
                     print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
                     print(e)
             except Exception as e:
