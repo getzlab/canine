@@ -522,6 +522,11 @@ class Orchestrator(object):
                             raise ValueError("Cannot partially job avoid; error removing job directory!")
                         tries += 1
 
+                # we also have to remove the common inputs directory, so that
+                # the localizer can regenerate it
+                if len(self.job_spec) > 0:
+                    shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], "common"))
+
                 return np.count_nonzero(~fail_idx)
             except ValueError as e:
                 print(e)
