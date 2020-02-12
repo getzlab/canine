@@ -1,7 +1,6 @@
 import typing
 import os
 import time
-import shutil
 import sys
 import uuid
 import warnings
@@ -10,7 +9,7 @@ from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
-from .utils import check_call
+from .utils import check_call, rmtree_retry
 import yaml
 import numpy as np
 import pandas as pd
@@ -449,7 +448,7 @@ class Orchestrator(object):
         # remove all output if specified
         if overwrite:
             if os.path.isdir(localizer.staging_dir):
-                shutil.rmtree(localizer.staging_dir)
+                rmtree_retry(localizer.staging_dir)
                 os.makedirs(localizer.staging_dir)
             return 0
 
@@ -508,37 +507,25 @@ class Orchestrator(object):
 
                 # remove output directories of failed jobs
                 for k in self.job_spec:
-                    # sometimes, rmtree will hang due to NFS lag. retry five times,
-                    # then abort
-                    tries = 0
-                    while True:
-                        try:
-                            shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
-                            break
-                        except FileNotFoundError:
-                            time.sleep(5)
-
-                        if tries >= 4:
-                            raise ValueError("Cannot partially job avoid; error removing job directory!")
-                        tries += 1
+                    rmtree_retry(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
 
                 # we also have to remove the common inputs directory, so that
                 # the localizer can regenerate it
                 if len(self.job_spec) > 0:
-                    shutil.rmtree(os.path.join(localizer.environment('local')["CANINE_JOBS"], "common"))
+                    rmtree_retry(os.path.join(localizer.environment('local')["CANINE_JOBS"], "common"))
 
                 return np.count_nonzero(~fail_idx)
-            except ValueError as e:
+            except (ValueError, OSError) as e:
                 print(e)
                 print("Overwriting output and aborting job avoidance.")
-                shutil.rmtree(localizer.staging_dir)
+                rmtree_retry(localizer.staging_dir)
                 os.makedirs(localizer.staging_dir)
                 return 0
 
         # if the output directory exists but there's no output dataframe, assume
         # it's corrupted and remove it
         elif os.path.isdir(localizer.staging_dir):
-            shutil.rmtree(localizer.staging_dir)
+            rmtree_retry(localizer.staging_dir)
             os.makedirs(localizer.staging_dir)
         
         return 0
