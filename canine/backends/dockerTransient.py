@@ -193,7 +193,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
               shell = True,
               timeout = 10
             )
-        except subprocess.CalledProcessError as e:
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             print("Couldn't delete node configuration file:", file = sys.stderr)
             print(e)
 
