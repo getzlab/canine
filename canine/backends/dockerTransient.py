@@ -26,7 +26,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
         nfs_shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
         nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
-        action_on_stop = "delete", image_family = None, image = None,
+        nfs_image_project = "", action_on_stop = "delete", image_family = None, image = None,
         cluster_name = None, clust_frac = 0.01, user = os.environ["USER"], **kwargs
     ):
         if cluster_name is None:
@@ -46,11 +46,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # handle NFS startup/shutdown scripts
         nfs_compute_script = {
-          "startup-script" : "{script} {nfsds:d} {nfsdt} {nfsimg}".format(
+          "startup-script" : "{script} {nfsds:d} {nfsdt} {nfsimg} {nfsproj}".format(
             script = nfs_startup_script,
             nfsds = nfs_disk_size,
             nfsdt = nfs_disk_type,
-            nfsimg = nfs_image
+            nfsimg = nfs_image,
+            nfsproj = nfs_image_project
           ),
           "shutdown_script" : nfs_shutdown_script
         }
