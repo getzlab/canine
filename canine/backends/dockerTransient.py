@@ -201,19 +201,22 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # shutdown nodes that are still running (except NFS)
         allnodes = self.nodes
 
-        # sometimes the Google API will spectacularly fail; in that case, we
-        # just try to shutdown everything in the node list, regardless of whether
-        # it exists.
-        try:
-            extant_nodes = self.list_instances_all_zones()
-            self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
-                           (allnodes["machine_type"] != "nfs")]
-        except:
-            self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
+        # if we're aborting before the NFS has even been started, there are no
+        # nodes to shutdown.
+        if not allnodes.empty:
+            # sometimes the Google API will spectacularly fail; in that case, we
+            # just try to shutdown everything in the node list, regardless of whether
+            # it exists.
+            try:
+                extant_nodes = self.list_instances_all_zones()
+                self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
+                               (allnodes["machine_type"] != "nfs")]
+            except:
+                self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
 
-        # superclass method will stop/delete/leave these running, depending on how
-        # self.config["action_on_stop"] is set
-        super().stop()
+            # superclass method will stop/delete/leave these running, depending on how
+            # self.config["action_on_stop"] is set
+            super().stop()
 
         #
         # stop the Docker
@@ -240,8 +243,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # kill thread that auto-restarts NFS
         self.NFS_monitor_lock.set()
 
-        self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
-        super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
+        if not allnodes.empty:
+            self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
+            super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
 
     def _get_container(self, container_name):
         def closure():
