@@ -25,7 +25,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         nfs_compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
         compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
         nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
-        action_on_stop = "delete", image_family = "slurm-gcp-docker", image = None,
+        action_on_stop = "delete", image_family = None, image = None,
         clust_frac = 0.01, user = os.environ.get("USER"), **kwargs
     ):
         if user is None:
@@ -56,12 +56,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "action_on_stop" : action_on_stop,
           "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
             else self.config["action_on_stop"],
-          "image_family" : image_family,
-          "image" : self.get_latest_image(image_family)["name"] if image is None else image,
+          "image_family" : image_family if image_family is not None else "slurm-gcp-docker-" + user,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           "user" : user,
-          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image", "user", "action_on_stop" } }
+          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
+        self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
 
         # placeholder for Docker API
         self.dkr = None
