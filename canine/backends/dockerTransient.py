@@ -241,7 +241,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # how self.config["nfs_action_on_stop"] is set.
 
         # kill thread that auto-restarts NFS
-        self.NFS_monitor_lock.set()
+        if self.NFS_monitor_lock is not None:
+            self.NFS_monitor_lock.set()
 
         if not allnodes.empty:
             self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
