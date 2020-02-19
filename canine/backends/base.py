@@ -211,6 +211,50 @@ class AbstractTransport(abc.ABC):
         for dirname in dirnames:
             yield from self.walk(os.path.join(path, dirname))
 
+    def rmtree(self, path: str, max_retries: int = 5, timeout: int = 5):
+        """
+        Recursively remove the directory tree rooted at the given path.
+        Automatically retries failures after a brief timeout
+        """
+        pathstat = self.stat(path)
+        if not stat.S_ISDIR(pathstat.st_mode):
+            raise NotADirectoryError(path)
+        for attempt in range(max_retries):
+            try:
+                return self._rmtree(path, pathstat)
+            except (OSError, FileNotFoundError, IOError, NotADirectoryError):
+                # Helps to preserve the exception traceback by conditionally re-raising here
+                if attempt >= (max_retries - 1):
+                    raise
+            time.sleep(timeout)
+        # Should not be possible to reach here
+        raise RuntimeError("AbstractTransport.rmtree exceeded retries without exception")
+
+    def _rmtree(self, path: str, pathstat: os.stat_result):
+        """
+        (Internal)
+        Recursively remove the directory tree rooted at the given path.
+        Automatically retries failures after a brief timeout
+        """
+        if not stat.S_ISDIR(pathstat.st_mode):
+            raise NotADirectoryError(path)
+        for fname in self.listdir(path):
+            fname = os.path.join(path, fname)
+            try:
+                fstat = self.stat(fname)
+            except FileNotFoundError:
+                # Handling for broken symlinks is bad
+                self.remove(fname)
+            else:
+                if stat.S_ISDIR(fstat.st_mode):
+                    self._rmtree(
+                        fname,
+                        fstat
+                    )
+                else:
+                    self.remove(fname)
+        self.rmdir(path)
+
     def sendtree(self, src: str, dest: str):
         """
         Copy the full local file tree src to the remote path dest

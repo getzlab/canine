@@ -50,6 +50,13 @@ Applies Canine defaults, then returns the final config dictionary</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.xargs.Xargs.job_avoid">
+<code class="sig-name descname">job_avoid</code><span class="sig-paren">(</span><em class="sig-param">localizer: canine.localization.base.AbstractLocalizer</em>, <em class="sig-param">overwrite: bool = False</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.xargs.Xargs.job_avoid" title="Permalink to this definition">¶</a></dt>
+<dd><p>Detects jobs which have previously been run in this staging directory.
+Succeeded jobs are skipped. Failed jobs are reset and rerun</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.xargs.Xargs.run_pipeline">
 <code class="sig-name descname">run_pipeline</code><span class="sig-paren">(</span><em class="sig-param">dry_run: bool = False</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.xargs.Xargs.run_pipeline" title="Permalink to this definition">¶</a></dt>
 <dd><p>Runs the configured pipeline

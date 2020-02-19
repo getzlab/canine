@@ -9,7 +9,7 @@ from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
-from .utils import check_call, rmtree_retry
+from .utils import check_call
 import yaml
 import numpy as np
 import pandas as pd
@@ -215,7 +215,7 @@ class Orchestrator(object):
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
-                self.job_avoid(localizer)
+                self.job_avoid(localizer) # AG: This raises an exception if job avoidance fails due to mismatched inputs. Should we instead clear the staging dir?
                 entrypoint_path = self.localize_inputs_and_script(localizer)
 
                 if dry_run:
@@ -276,7 +276,8 @@ class Orchestrator(object):
                     localizer.clean_on_exit = False
                     raise
                 finally:
-                    if len(completed_jobs):
+                    # Check if fully job-avoided so we still delocalize
+                    if batch_id == -2 or len(completed_jobs):
                         print("Delocalizing outputs")
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
             print("Parsing output data")
@@ -375,39 +376,42 @@ class Orchestrator(object):
         return completed_jobs, cpu_time, uptime, prev_acct
 
     def make_output_DF(self, batch_id, outputs, cpu_time, prev_acct, localizer = None) -> pd.DataFrame:
-        try:
-            acct = self.backend.sacct(job=batch_id)
+        df = pd.DataFrame()
+        if batch_id != -2:
+            try:
+                acct = self.backend.sacct(job=batch_id)
 
-            df = pd.DataFrame.from_dict(
-                data={
-                    job_id: {
-                        ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
-                        ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
-                        ('job', 'cpu_seconds'): (prev_acct['CPUTimeRAW'][batch_id+'_'+str(array_id)] + (
-                            cpu_time[batch_id+'_'+str(array_id)] if batch_id+'_'+str(array_id) in cpu_time else 0
-                        )) if prev_acct is not None else -1,
-                        **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
-                        **{
-                            ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
-                            for key, val in outputs[job_id].items()
+                df = pd.DataFrame.from_dict(
+                    data={
+                        job_id: {
+                            ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
+                            ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
+                            ('job', 'cpu_seconds'): (prev_acct['CPUTimeRAW'][batch_id+'_'+str(array_id)] + (
+                                cpu_time[batch_id+'_'+str(array_id)] if batch_id+'_'+str(array_id) in cpu_time else 0
+                            )) if prev_acct is not None else -1,
+                            **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
+                            **{
+                                ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
+                                for key, val in outputs[job_id].items()
+                            }
                         }
-                    }
-                    for array_id, job_id in enumerate(self.job_spec)
-                },
-                orient = "index"
-            ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int})
+                        for array_id, job_id in enumerate(self.job_spec)
+                    },
+                    orient = "index"
+                ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int})
 
-            #
-            # apply functions to output columns (if any)
-            if len(self.output_map) > 0:
-                # columns that receive no (i.e., identity) transformation
-                identity_map = { x : lambda y : y for x in set(df.columns.get_loc_level("outputs")[1]) - self.output_map.keys() }
+                #
+                # apply functions to output columns (if any)
+                if len(self.output_map) > 0:
+                    # columns that receive no (i.e., identity) transformation
+                    identity_map = { x : lambda y : y for x in set(df.columns.get_loc_level("outputs")[1]) - self.output_map.keys() }
 
-                # we get back all columns from the dataframe by aggregating columns
-                # that don't receive any transformation with transformed columns
-                df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
-        except:
-            df = pd.DataFrame()
+                    # we get back all columns from the dataframe by aggregating columns
+                    # that don't receive any transformation with transformed columns
+                    df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
+            except:
+                traceback.print_exc()
+
 
         # concatenate with any previously existing job avoided results
         if self.df_avoided is not None:
@@ -415,18 +419,19 @@ class Orchestrator(object):
 
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
-            fname = str(uuid.uuid4()) + "-results.k9df.pickle"
-            df.to_pickle(fname)
-            localizer.localize_file(fname, localizer.reserve_path(localizer.staging_dir, "results.k9df.pickle"))
-            os.remove(fname)
-
+            with localizer.transport_context() as transport:
+                dest = localizer.reserve_path("results.k9df.pickle").controllerpath
+                if not transport.isdir(os.path.dirname(dest)):
+                    transport.makedirs(os.path.dirname(dest))
+                with transport.open(dest, 'wb') as w:
+                    df.to_pickle(w, compression=None)
         return df
 
-    def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}):
+    def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}) -> int:
         # this job was avoided
         if len(self.job_spec) == 0:
             return -2
-            
+
         batch_id = self.backend.sbatch(
             entrypoint_path,
             **{
@@ -442,90 +447,99 @@ class Orchestrator(object):
 
         return batch_id
 
-    def job_avoid(self, localizer, overwrite = False): #TODO: add params for type of avoidance (force, only if failed, etc.)
-        df_path = localizer.reserve_path(localizer.staging_dir, "results.k9df.pickle")
+    def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)
+        """
+        Detects jobs which have previously been run in this staging directory.
+        Succeeded jobs are skipped. Failed jobs are reset and rerun
+        """
+        with localizer.transport_context() as transport:
+            df_path = localizer.reserve_path("results.k9df.pickle").controllerpath
 
-        # remove all output if specified
-        if overwrite:
-            if os.path.isdir(localizer.staging_dir):
-                rmtree_retry(localizer.staging_dir)
-                os.makedirs(localizer.staging_dir)
-            return 0
-
-        # check for preexisting jobs' output
-        if os.path.exists(df_path.localpath):
-            try:
-                # load in results and job spec dataframes
-                r_df = pd.read_pickle(df_path.localpath)
-                js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
-
-                if r_df.empty or \
-                   "inputs" not in r_df or \
-                   ("outputs" not in r_df and len(self.raw_outputs) > 0):
-                    raise ValueError("Could not recover previous job results!")
-
-                # check if jobs are compatible: they must have identical inputs and index,
-                # and output columns must be matching
-                if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
-                        js_df.columns.isin(r_df["inputs"].columns).all()):
-                    r_df_set = set(r_df["inputs"].columns)
-                    js_df_set = set(js_df.columns)
-                    raise ValueError(
-                      "Cannot job avoid; sets of input parameters do not match! Parameters unique to:\n" + \
-                      "\u21B3saved: " + ", ".join(r_df_set - js_df_set) + "\n" + \
-                      "\u21B3job: " + ", ".join(js_df_set - r_df_set)
-                    )
-
-                output_temp = pd.Series(index = self.raw_outputs.keys())
-                if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
-                        output_temp.index.isin(r_df["outputs"].columns).all()):
-                    r_df_set = set(r_df["outputs"].columns)
-                    o_df_set = set(output_temp.index)
-                    raise ValueError(
-                      "Cannot job avoid; sets of output parameters do not match! Parameters unique to:\n" + \
-                      "\u21B3saved: " + ", ".join(r_df_set - o_df_set) + "\n" + \
-                      "\u21B3job: " + ", ".join(o_df_set - r_df_set)
-                    )
-
-                # check that values of inputs are the same
-                # we have to sort because the order of jobs might differ for the same
-                # inputs
-                sort_cols = r_df.columns.to_series()["inputs"]
-                r_df = r_df.sort_values(sort_cols.tolist())
-                js_df = js_df.sort_values(sort_cols.index.tolist())
-
-                if not r_df["inputs"].equals(js_df):
-                    raise ValueError("Cannot job avoid; values of input parameters do not match!")
-
-                # if all is well, figure out which jobs need to be re-run
-                fail_idx = r_df[("job", "slurm_state")] == "FAILED"
-                self.df_avoided = r_df.loc[~fail_idx]
-
-                # remove jobs that don't need to be re-run from job_spec
-                for k in r_df.index[~fail_idx]:
-                    self.job_spec.pop(k, None)
-
-                # remove output directories of failed jobs
-                for k in self.job_spec:
-                    rmtree_retry(os.path.join(localizer.environment('local')["CANINE_JOBS"], k))
-
-                # we also have to remove the common inputs directory, so that
-                # the localizer can regenerate it
-                if len(self.job_spec) > 0:
-                    rmtree_retry(os.path.join(localizer.environment('local')["CANINE_JOBS"], "common"))
-
-                return np.count_nonzero(~fail_idx)
-            except (ValueError, OSError) as e:
-                print(e)
-                print("Overwriting output and aborting job avoidance.")
-                rmtree_retry(localizer.staging_dir)
-                os.makedirs(localizer.staging_dir)
+            #remove all output if specified
+            if overwrite:
+                if transport.isdir(localizer.staging_dir):
+                    transport.rmtree(localizer.staging_dir)
+                    transport.makedirs(localizer.staging_dir)
                 return 0
 
-        # if the output directory exists but there's no output dataframe, assume
-        # it's corrupted and remove it
-        elif os.path.isdir(localizer.staging_dir):
-            rmtree_retry(localizer.staging_dir)
-            os.makedirs(localizer.staging_dir)
-        
+            # check for preexisting jobs' output
+            if transport.exists(df_path):
+                try:
+                    # load in results and job spec dataframes
+                    with transport.open(df_path) as r:
+                        r_df = pd.read_pickle(r, compression=None)
+                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
+
+                    if r_df.empty or \
+                       "inputs" not in r_df or \
+                       ("outputs" not in r_df and len(self.raw_outputs) > 0):
+                        raise ValueError("Could not recover previous job results!")
+
+                    # check if jobs are compatible: they must have identical inputs and index,
+                    # and output columns must be matching                    
+                    if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
+                            js_df.columns.isin(r_df["inputs"].columns).all()):
+                        r_df_set = set(r_df["inputs"].columns)
+                        js_df_set = set(js_df.columns)
+                        raise ValueError(
+                          "Cannot job avoid; sets of input parameters do not match! Parameters unique to:\n" + \
+                          "\u21B3saved: " + ", ".join(r_df_set - js_df_set) + "\n" + \
+                          "\u21B3job: " + ", ".join(js_df_set - r_df_set)
+                        )
+
+                    output_temp = pd.Series(index = self.raw_outputs.keys())
+                    if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
+                            output_temp.index.isin(r_df["outputs"].columns).all()):
+                        r_df_set = set(r_df["outputs"].columns)
+                        o_df_set = set(output_temp.index)
+                        raise ValueError(
+                          "Cannot job avoid; sets of output parameters do not match! Parameters unique to:\n" + \
+                          "\u21B3saved: " + ", ".join(r_df_set - o_df_set) + "\n" + \
+                          "\u21B3job: " + ", ".join(o_df_set - r_df_set)
+                        )
+
+                    # check that values of inputs are the same
+                    # we have to sort because the order of jobs might differ for the same
+                    # inputs
+                    sort_cols = r_df.columns.to_series()["inputs"]
+                    r_df = r_df.sort_values(sort_cols.tolist())
+                    js_df = js_df.sort_values(sort_cols.index.tolist())
+
+                    if not r_df["inputs"].equals(js_df):
+                        raise ValueError("Cannot job avoid; values of input parameters do not match!")
+
+                    # if all is well, figure out which jobs need to be re-run
+                    fail_idx = r_df[("job", "slurm_state")] == "FAILED"
+                    self.df_avoided = r_df.loc[~fail_idx]
+
+                    # remove jobs that don't need to be re-run from job_spec
+                    for k in r_df.index[~fail_idx]:
+                        self.job_spec.pop(k, None)
+
+                    # remove output directories of failed jobs
+                    for k in self.job_spec:
+                        transport.rmtree(
+                            localizer.reserve_path('jobs', k).controllerpath
+                        )
+
+                    # we also have to remove the common inputs directory, so that
+                    # the localizer can regenerate it
+                    if len(self.job_spec) > 0:
+                        transport.rmtree(
+                            localizer.reserve_path('common').controllerpath
+                        )
+
+                    return np.count_nonzero(~fail_idx)
+                except (ValueError, OSError) as e:
+                    print(e)
+                    print("Overwriting output and aborting job avoidance.")
+                    transport.rmtree(localizer.staging_dir)
+                    transport.makedirs(localizer.staging_dir)
+                    return 0
+
+            # if the output directory exists but there's no output dataframe, assume
+            # it's corrupted and remove it
+            elif transport.isdir(localizer.staging_dir):
+                transport.rmtree(localizer.staging_dir)
+                transport.makedirs(localizer.staging_dir)
         return 0
