@@ -2,7 +2,6 @@ import typing
 import os
 import time
 import sys
-import uuid
 import warnings
 import traceback
 from subprocess import CalledProcessError
@@ -215,7 +214,7 @@ class Orchestrator(object):
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
-                self.job_avoid(localizer) # AG: This raises an exception if job avoidance fails due to mismatched inputs. Should we instead clear the staging dir?
+                self.job_avoid(localizer)
                 entrypoint_path = self.localize_inputs_and_script(localizer)
 
                 if dry_run:
@@ -476,7 +475,7 @@ class Orchestrator(object):
                         raise ValueError("Could not recover previous job results!")
 
                     # check if jobs are compatible: they must have identical inputs and index,
-                    # and output columns must be matching                    
+                    # and output columns must be matching
                     if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
                             js_df.columns.isin(r_df["inputs"].columns).all()):
                         r_df_set = set(r_df["inputs"].columns)
