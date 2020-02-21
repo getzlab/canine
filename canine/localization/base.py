@@ -464,10 +464,12 @@ class AbstractLocalizer(abc.ABC):
                                 'download',
                                 value
                             )
-                    elif mode is None:
+                    elif mode is None or mode == 'null':
                         # Do not reserve path here
                         # null override treats input as string
                         self.inputs[jobId][arg] = Localization(None, value)
+                    else:
+                        raise ValueError("Invalid override option [{}]".format(mode))
                 else:
                     if os.path.exists(value) or value.startswith('gs://'):
                         remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
