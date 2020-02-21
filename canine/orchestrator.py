@@ -6,7 +6,7 @@ import warnings
 import traceback
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
-from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
+from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
 from .utils import check_call
 import yaml
@@ -24,7 +24,8 @@ BACKENDS = {
     'Local': LocalSlurmBackend,
     'Remote': RemoteSlurmBackend,
     'TransientGCP': TransientGCPSlurmBackend,
-    'TransientImage': TransientImageSlurmBackend
+    'TransientImage': TransientImageSlurmBackend,
+    'Dummy': DummySlurmBackend
 }
 
 LOCALIZERS = {

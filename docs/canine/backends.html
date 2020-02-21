@@ -559,6 +559,275 @@ Each iteration yields a 3-tuple:
 </dd></dl>
 
 <dl class="class">
+<dt id="canine.backends.DummySlurmBackend">
+<em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">DummySlurmBackend</code><span class="sig-paren">(</span><em class="sig-param">n_workers: int</em>, <em class="sig-param">network: str = None</em>, <em class="sig-param">cpus: Optional[int] = None</em>, <em class="sig-param">memory: Optional[int] = None</em>, <em class="sig-param">compute_script: str = ''</em>, <em class="sig-param">controller_script: str = ''</em>, <em class="sig-param">image: str = 'gcr.io/broad-cga-aarong-gtex/slurmind'</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend" title="Permalink to this definition">¶</a></dt>
+<dd><p>Operates a SLURM cluster locally, using docker containers.
+Only docker is required (the cluster will use local compute resources).
+Useful for unittesting or for running Canine on a single, powerful compute node.</p>
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.estimate_cost">
+<code class="sig-name descname">estimate_cost</code><span class="sig-paren">(</span><em class="sig-param">clock_uptime: Optional[float] = None</em>, <em class="sig-param">node_uptime: Optional[float] = None</em>, <em class="sig-param">job_cpu_time: Optional[Dict[str</em>, <em class="sig-param">float]] = None</em><span class="sig-paren">)</span> &#x2192; Tuple[float, Optional[Dict[str, float]]]<a class="headerlink" href="#canine.backends.DummySlurmBackend.estimate_cost" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a cost estimate for the cluster, based on any cost information available
+to the backend. May provide total node uptime (for cluster cost estimate)
+and/or cpu_time for each job to get job specific cost estimates.
+Clock uptime may be provided and is useful if the cluster has an inherrant
+overhead for uptime (ie: controller nodes).
+Note: Job cost estimates may not sum up to the total cluster cost if the
+cluster was not at full utilization.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.exec_run">
+<code class="sig-name descname">exec_run</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend.exec_run" title="Permalink to this definition">¶</a></dt>
+<dd><p>staticmethod(function) -&gt; method</p>
+<p>Convert a function to be a static method.</p>
+<p>A static method does not receive an implicit first argument.
+To declare a static method, use this idiom:</p>
+<blockquote>
+<div><dl>
+<dt>class C:</dt><dd><p>&#64;staticmethod
+def f(arg1, arg2, …):</p>
+<blockquote>
+<div><p>…</p>
+</div></blockquote>
+</dd>
+</dl>
+</div></blockquote>
+<p>It can be called either on the class (e.g. C.f()) or on an instance
+(e.g. C().f()).  The instance is ignored except for its class.</p>
+<p>Static methods in Python are similar to those found in Java or C++.
+For a more advanced concept, see the classmethod builtin.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.invoke">
+<code class="sig-name descname">invoke</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">interactive: bool = False</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.DummySlurmBackend.invoke" title="Permalink to this definition">¶</a></dt>
+<dd><p>Invoke an arbitrary command in the slurm console
+Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
+If interactive is True, stdin, stdout, and stderr should all be connected live to the user’s terminal</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.pack_batch_script">
+<code class="sig-name descname">pack_batch_script</code><span class="sig-paren">(</span><em class="sig-param">*commands</em>, <em class="sig-param">script_path: Optional[str] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend.pack_batch_script" title="Permalink to this definition">¶</a></dt>
+<dd><p>writes the list of commands to a file and runs it
+Script_path may be the path to where the script should be written or None</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.sacct">
+<code class="sig-name descname">sacct</code><span class="sig-paren">(</span><em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.backends.DummySlurmBackend.sacct" title="Permalink to this definition">¶</a></dt>
+<dd><p>Shows the current job accounting information
+slurmopts and slurmparams are passed into an ArgumentHelper and unpacked
+as command line arguments</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.sbatch">
+<code class="sig-name descname">sbatch</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.backends.DummySlurmBackend.sbatch" title="Permalink to this definition">¶</a></dt>
+<dd><p>Runs the given command in the background
+The first argument MUST contain the entire command and options to run
+Additional arguments and keyword arguments provided are passed as slurm arguments to sbatch
+Returns the jobID of the batch request</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.scancel">
+<code class="sig-name descname">scancel</code><span class="sig-paren">(</span><em class="sig-param">jobID: str</em>, <em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend.scancel" title="Permalink to this definition">¶</a></dt>
+<dd><p>Cancels the given jobID
+The first argument MUST be the jobID
+Additional arguments and keyword arguments are passed as slurm arguments
+to scancel</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.sinfo">
+<code class="sig-name descname">sinfo</code><span class="sig-paren">(</span><em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.backends.DummySlurmBackend.sinfo" title="Permalink to this definition">¶</a></dt>
+<dd><p>Shows the current cluster information
+slurmopts and slurmparams are passed into an ArgumentHelper and unpacked
+as command line arguments</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.squeue">
+<code class="sig-name descname">squeue</code><span class="sig-paren">(</span><em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.backends.DummySlurmBackend.squeue" title="Permalink to this definition">¶</a></dt>
+<dd><p>Shows the current status of the job queue
+slurmopts and kwargs are passed into an ArgumentHelper and unpacked
+as command line arguments</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.srun">
+<code class="sig-name descname">srun</code><span class="sig-paren">(</span><em class="sig-param">command: str</em>, <em class="sig-param">*slurmopts</em>, <em class="sig-param">**slurmparams</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.backends.DummySlurmBackend.srun" title="Permalink to this definition">¶</a></dt>
+<dd><p>Runs the given command interactively
+The first argument MUST contain the entire command and options to run
+Additional arguments and keyword arguments provided are passed as slurm arguments to srun
+Returns a tuple containing (exit status, stdout buffer, stderr buffer)</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.transport">
+<code class="sig-name descname">transport</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; canine.backends.dummy.DummyTransport<a class="headerlink" href="#canine.backends.DummySlurmBackend.transport" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return a Transport object suitable for moving files between the
+SLURM cluster and the local filesystem</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummySlurmBackend.wait_for_cluster_ready">
+<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><em class="sig-param">elastic: bool = False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
+<dd><p>Blocks until the main partition is marked as up</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="class">
+<dt id="canine.backends.DummyTransport">
+<em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">DummyTransport</code><span class="sig-paren">(</span><em class="sig-param">mount_path: str</em>, <em class="sig-param">container: docker.models.containers.Container</em>, <em class="sig-param">port: int</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport" title="Permalink to this definition">¶</a></dt>
+<dd><p>Handles filesystem interaction with the NFS container for the Dummy Backend.
+Files existing within the mount_path are reached via the bind path on the local file system.
+Files outside the mount_path are reached via SFTP to the controller</p>
+<dl class="method">
+<dt id="canine.backends.DummyTransport.chmod">
+<code class="sig-name descname">chmod</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">mode: int</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.chmod" title="Permalink to this definition">¶</a></dt>
+<dd><p>Change file permissions</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.exists">
+<code class="sig-name descname">exists</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.backends.DummyTransport.exists" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the given path exists</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.get_mount_filename">
+<code class="sig-name descname">get_mount_filename</code><span class="sig-paren">(</span><em class="sig-param">filename: str</em><span class="sig-paren">)</span> &#x2192; Optional[str]<a class="headerlink" href="#canine.backends.DummyTransport.get_mount_filename" title="Permalink to this definition">¶</a></dt>
+<dd><p>Gets the externally visible filepath given a filename that is valid within the container.
+Returns None if the filename cannot be accessed via the bind mount (indicates that the transport must use SFTP)</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.isdir">
+<code class="sig-name descname">isdir</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.backends.DummyTransport.isdir" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the requested path is a directory</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.isfile">
+<code class="sig-name descname">isfile</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.backends.DummyTransport.isfile" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the requested path is a regular file</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.islink">
+<code class="sig-name descname">islink</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.backends.DummyTransport.islink" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the requested path is a symlink</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.listdir">
+<code class="sig-name descname">listdir</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; List[str]<a class="headerlink" href="#canine.backends.DummyTransport.listdir" title="Permalink to this definition">¶</a></dt>
+<dd><p>Lists the contents of the requested path</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.makedirs">
+<code class="sig-name descname">makedirs</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">exist_okay: bool = False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.makedirs" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recursively build the requested directory structure</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.mkdir">
+<code class="sig-name descname">mkdir</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.mkdir" title="Permalink to this definition">¶</a></dt>
+<dd><p>Creates the requested directory</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.mklink">
+<code class="sig-name descname">mklink</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.mklink" title="Permalink to this definition">¶</a></dt>
+<dd><p>Creates a symlink from dest-&gt;src</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.normpath">
+<code class="sig-name descname">normpath</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.backends.DummyTransport.normpath" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a normalized path relative to the transport</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.open">
+<code class="sig-name descname">open</code><span class="sig-paren">(</span><em class="sig-param">filename: str</em>, <em class="sig-param">mode: str = 'r'</em>, <em class="sig-param">bufsize: int = -1</em><span class="sig-paren">)</span> &#x2192; IO<a class="headerlink" href="#canine.backends.DummyTransport.open" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a File-Like object open on the slurm cluster</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.receive">
+<code class="sig-name descname">receive</code><span class="sig-paren">(</span><em class="sig-param">remotefile: Union[str, IO], localfile: Union[str, IO]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.receive" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copies the requested file from the slurm cluster
+Both localfile and remotefile can either be a filepath or a file object
+If remotefile is a file object, it must have been opened by this transport
+or the copy will not behave as expected</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.receivetree">
+<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.receivetree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copy the full remote file tree src to the local path dest</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.remove">
+<code class="sig-name descname">remove</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.remove" title="Permalink to this definition">¶</a></dt>
+<dd><p>Removes the file at the given path</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.rename">
+<code class="sig-name descname">rename</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.rename" title="Permalink to this definition">¶</a></dt>
+<dd><p>Move the file or folder ‘src’ to ‘dest’
+Will overwrite dest if it exists</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.rmdir">
+<code class="sig-name descname">rmdir</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.rmdir" title="Permalink to this definition">¶</a></dt>
+<dd><p>Removes the directory at the given path</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.send">
+<code class="sig-name descname">send</code><span class="sig-paren">(</span><em class="sig-param">localfile: Union[str, IO], remotefile: Union[str, IO]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.send" title="Permalink to this definition">¶</a></dt>
+<dd><p>Sends the requested file to the slurm cluster
+Both localfile and remotefile can either be a filepath or a file object
+If remotefile is a file object, it must have been opened by this transport
+or the copy will not behave as expected</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.sendtree">
+<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.sendtree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copy the full local file tree src to the remote path dest</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.stat">
+<code class="sig-name descname">stat</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.backends.DummyTransport.stat" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns stat information</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.walk">
+<code class="sig-name descname">walk</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; Generator[Tuple[str, List[str], List[str]], None, None]<a class="headerlink" href="#canine.backends.DummyTransport.walk" title="Permalink to this definition">¶</a></dt>
+<dd><p>Walk through a directory tree
+Each iteration yields a 3-tuple:
+(dirpath, dirnames, filenames) -&gt;
+* dirpath: The current filepath relative to the starting path
+* dirnames: The base names of all subdirectories in the current directory
+* filenames: The base names of all files in the current directory</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="class">
 <dt id="canine.backends.TransientGCPSlurmBackend">
 <em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">TransientGCPSlurmBackend</code><span class="sig-paren">(</span><em class="sig-param">name: str = 'slurm-canine'</em>, <em class="sig-param">*</em>, <em class="sig-param">max_node_count: int = 10</em>, <em class="sig-param">compute_zone: str = 'us-central1-a'</em>, <em class="sig-param">controller_type: str = 'n1-standard-16'</em>, <em class="sig-param">login_type: str = 'n1-standard-1'</em>, <em class="sig-param">preemptible: bool = True</em>, <em class="sig-param">worker_type: str = 'n1-highcpu-2'</em>, <em class="sig-param">login_count: int = 0</em>, <em class="sig-param">compute_disk_size: int = 20</em>, <em class="sig-param">controller_disk_size: int = 200</em>, <em class="sig-param">gpu_type: Optional[str] = None</em>, <em class="sig-param">gpu_count: int = 0</em>, <em class="sig-param">compute_script: str = ''</em>, <em class="sig-param">controller_script: str = ''</em>, <em class="sig-param">secondary_disk_size: int = 0</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.TransientGCPSlurmBackend" title="Permalink to this definition">¶</a></dt>
 <dd><p>Backend for transient slurm clusters which need to be deployed and configured
