@@ -464,7 +464,7 @@ class AbstractLocalizer(abc.ABC):
                                 'download',
                                 value
                             )
-                    elif mode is None:
+                    elif mode is None or mode == 'null':
                         # Do not reserve path here
                         # null override treats input as string
                         self.inputs[jobId][arg] = Localization(None, value)
