@@ -91,7 +91,7 @@ class AbstractTransport(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def stat(self, path: str) -> typing.Any:
+    def stat(self, path: str, follow_symlinks: bool = True) -> typing.Any:
         """
         Returns stat information
         """

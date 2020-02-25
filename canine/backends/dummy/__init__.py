@@ -42,8 +42,11 @@ class DummyTransport(RemoteTransport):
             subprocess.check_call('docker exec {} mkdir -p -m 600 /root/.ssh/'.format(
                 self.container.short_id
             ), shell=True)
-            subprocess.check_call('docker cp {}.pub {}:/root/.ssh/authorized_keys'.format(
+            subprocess.check_call('docker cp {}.pub {}:/root/tmpkey'.format(
                 self.ssh_key_path,
+                self.container.short_id
+            ), shell=True)
+            subprocess.check_call('docker exec {} bash -c "cat /root/tmpkey >> /root/.ssh/authorized_keys"'.format(
                 self.container.short_id
             ), shell=True)
             subprocess.check_call('docker exec {} chown root:root /root/.ssh/authorized_keys'.format(
@@ -82,6 +85,11 @@ class DummyTransport(RemoteTransport):
         super().__exit__()
         self.client = None
 
+class DummyBind(object):
+    """
+    Mimics the tempfile.TemporaryDirectory API for a predefined directory
+    """
+    pass
 
 class DummySlurmBackend(AbstractSlurmBackend):
     """
@@ -103,7 +111,10 @@ class DummySlurmBackend(AbstractSlurmBackend):
         """
         Saves configuration.
         No containers are started until the backend is __enter__'ed
+        Memory is in GiB
         """
+        if n_workers < 1:
+            raise ValueError("n_workers must be at least 1 worker")
         super().__init__(**kwargs)
         self.n_workers = n_workers
         self.network = network
@@ -145,6 +156,8 @@ class DummySlurmBackend(AbstractSlurmBackend):
         except docker.errors.NotFound:
             print("Pulling image", self.image)
             self.dkr.images.pull(self.image)
+        if not os.path.isdir(os.path.expanduser('~/.config/gcloud')):
+            os.makedirs(os.path.expanduser('~/.config/gcloud'))
         try:
             self.controller = self.dkr.containers.run(
                 self.image,
@@ -154,7 +167,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
                     cpus='--cpus {}'.format(self.cpus) if self.cpus is not None else '',
                     mem='--memory {}'.format(self.mem) if self.mem is not None else ''
                 ),
-                # auto_remove=True,
+                auto_remove=True,
                 detach=True,
                 # --interactive?
                 tty=True,
@@ -248,6 +261,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
         """
         Kills all running containers
         """
+        print("Cleaning up Slurm Cluster", self.controller.short_id)
         # FIXME: use agutil.parallelize on this list? 5s/container is SLOW
         for worker in self.workers:
             worker.stop()

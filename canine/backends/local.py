@@ -44,11 +44,11 @@ class LocalTransport(AbstractTransport):
         """
         return os.mkdir(path)
 
-    def stat(self, path: str) -> typing.Any:
+    def stat(self, path: str, follow_symlinks: bool = True) -> typing.Any:
         """
         Returns stat information
         """
-        return os.stat(path)
+        return os.stat(path, follow_symlinks=follow_symlinks)
 
     def chmod(self, path: str, mode: int):
         """

@@ -44,7 +44,7 @@ def boot_node(network, cpus=None, mem=None):
                 shell=True
             ).decode().strip(),
             cpus='' if cpus is None else '--cpus {}'.format(cpus),
-            mem='' if mem is None else '--memory {}'.format(mem)
+            mem='' if mem is None else '--memory {}'.format(mem*(1024**3))
         ),
         shell=True
     ).decode().strip()[:12]
@@ -88,7 +88,7 @@ def format_node(name, network, cpus, mem):
         name,
         get_docker_ip(name, network),
         cpus if cpus is not None else cpu_count(),
-        int(mem) if mem is not None else int(virtual_memory().total/1101004) # bytes->mb with small safety margin
+        int(mem*1024) if mem is not None else int(virtual_memory().total/1101004) # bytes->mb with small safety margin
     )
 
 def main(network, nodes, cpus, mem):
