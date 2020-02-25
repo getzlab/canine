@@ -26,8 +26,9 @@ RUN pip3 install psutil
 COPY controller.py /
 COPY worker.py /
 COPY conf /conf_templates
+COPY docker /usr/local/bin
 
-RUN chmod 755 controller.py worker.py
+RUN chmod 755 controller.py worker.py /usr/local/bin/docker
 
 ENTRYPOINT
 CMD /bin/bash

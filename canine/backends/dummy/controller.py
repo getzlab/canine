@@ -29,15 +29,16 @@ def get_docker_ip(hostname, network):
         return ip
     print("No ip for", hostname)
 
-def boot_node(network, nfs_volume, cpus=None, mem=None):
+def boot_node(network, cpus=None, mem=None):
     x = subprocess.check_output(
+        # Docker wrapper takes care of remapping /mnt/nfs and /root/.config/gcloud to the appropriate host path
         'docker run --rm -it -d '
-        '-v {nfs_volume}:/mnt/nfs '
+        '-v /mnt/nfs:/mnt/nfs '
         '-v /var/run/docker.sock:/var/run/docker.sock '
+        '-v /root/.config/gcloud:/root/.config/gcloud '
         '{cpus} {mem} '
         '--network {network} {image} /worker.py'.format(
             network=network,
-            nfs_volume=nfs_volume,
             image=subprocess.check_output(
                 'docker inspect --format "{{{{.Image}}}}" {}'.format(socket.gethostname()),
                 shell=True
@@ -90,7 +91,7 @@ def format_node(name, network, cpus, mem):
         int(mem) if mem is not None else int(virtual_memory().total/1101004) # bytes->mb with small safety margin
     )
 
-def main(network, nfs, nodes, cpus, mem):
+def main(network, nodes, cpus, mem):
     if os.path.exists("/mnt/nfs/controller.ready"):
         os.remove("/mnt/nfs/controller.ready")
     subprocess.check_call('service ssh start', shell=True)
@@ -103,7 +104,7 @@ def main(network, nfs, nodes, cpus, mem):
         network
     )
     nodenames = [
-        boot_node(network, nfs, cpus, mem)
+        boot_node(network, cpus, mem)
         for i in range(nodes)
     ]
     # Allow containers to start
@@ -139,10 +140,6 @@ if __name__ == '__main__':
         help="Name of docker network"
     )
     parser.add_argument(
-        'nfs',
-        help='Name of docker volume mounted over /mnt/nfs'
-    )
-    parser.add_argument(
         'nodes',
         type=int,
         help="Number of nodes to start"
@@ -161,4 +158,4 @@ if __name__ == '__main__':
     )
 
     args = parser.parse_args()
-    main(args.network, args.nfs, args.nodes, args.cpus, args.memory)
+    main(args.network, args.nodes, args.cpus, args.memory)

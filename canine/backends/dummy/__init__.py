@@ -17,17 +17,15 @@ from agutil.parallel import parallelize2
 class DummyTransport(RemoteTransport):
     """
     Handles filesystem interaction with the NFS container for the Dummy Backend.
-    Files existing within the mount_path are reached via the bind path on the local file system.
-    Files outside the mount_path are reached via SFTP to the controller
+    Uses SFTP to interact with the docker filesystem
     """
 
-    def __init__(self, mount_path: str , container: docker.models.containers.Container, port: int):
+    def __init__(self, mount_path: str, container: docker.models.containers.Container, port: int):
         """
         In the dummy backend, the mount_path is mounted within all containers at /mnt/nfs.
-        This transport simulates interacting with files in the containers by interacting
-        with the local copies at mount_path. The container is used for some actions, like symlinking objects
+        This transport simulates interacting with files in the containers by
+        connecting over SFTP to the controller
         """
-        self.mount_path = mount_path
         self.ssh_key_path = os.path.join(mount_path, '.ssh', 'id_rsa')
         self.container = container
         self.port = port
@@ -39,19 +37,27 @@ class DummyTransport(RemoteTransport):
         Opens a paramiko SFTP connection to the host container
         """
         if not os.path.exists(self.ssh_key_path):
-            os.makedirs(os.path.dirname(self.ssh_key_path), exist_okay=True)
+            os.makedirs(os.path.dirname(self.ssh_key_path), exist_ok=True)
             subprocess.check_call('ssh-keygen -q -b 2048 -t rsa -f {} -N ""'.format(self.ssh_key_path), shell=True)
+            subprocess.check_call('docker exec {} mkdir -p -m 600 /root/.ssh/'.format(
+                self.container.short_id
+            ), shell=True)
             subprocess.check_call('docker cp {}.pub {}:/root/.ssh/authorized_keys'.format(
                 self.ssh_key_path,
                 self.container.short_id
-            ))
+            ), shell=True)
+            subprocess.check_call('docker exec {} chown root:root /root/.ssh/authorized_keys'.format(
+                self.container.short_id
+            ), shell=True)
             RemoteSlurmBackend.add_key_to_agent(self.ssh_key_path)
         self.client = paramiko.SSHClient()
         self.client.load_system_host_keys()
+        self.client.set_missing_host_key_policy(IgnoreKeyPolicy)
         self.client.connect(
             'localhost',
             port=self.port,
-            key_filename=self.ssh_key_path
+            key_filename=self.ssh_key_path,
+            username='root'
         )
 
         # Disable re-keying. This is a local-only ssh connection
@@ -76,87 +82,6 @@ class DummyTransport(RemoteTransport):
         super().__exit__()
         self.client = None
 
-    def get_mount_filename(self, filename: str) -> typing.Optional[str]:
-        """
-        Gets the externally visible filepath given a filename that is valid within the container.
-        Returns None if the filename cannot be accessed via the bind mount (indicates that the transport must use SFTP)
-        """
-        if filename.startswith('/mnt/nfs/'):
-            return filename.replace('/mnt/nfs/', self.mount_path, 1)
-
-    def open(self, filename: str, mode: str = 'r', bufsize: int = -1) -> typing.IO:
-        """
-        Returns a File-Like object open on the slurm cluster
-        """
-        path = self.get_mount_filename(filename)
-        if path is not None:
-            return open(path, mode=mode, buffering=bufsize)
-        return super().open(filename, mode, bufsize)
-
-    def listdir(self, path: str) -> typing.List[str]:
-        """
-        Lists the contents of the requested path
-        """
-        canon_path = self.get_mount_filename(path)
-        if canon_path is not None:
-            return os.listdir(canon_path)
-        return super().listdir(path)
-
-    def mkdir(self, path: str):
-        """
-        Creates the requested directory
-        """
-        canon_path = self.get_mount_filename(path)
-        if canon_path is not None:
-            return os.mkdir(canon_path)
-        return super().mkdir(path)
-
-    def stat(self, path: str) -> typing.Any:
-        """
-        Returns stat information
-        """
-        canon_path = self.get_mount_filename(path)
-        if canon_path is not None:
-            return os.stat(canon_path)
-        return super().stat(path)
-
-    def chmod(self, path: str, mode: int):
-        """
-        Change file permissions
-        """
-        canon_path = self.get_mount_filename(path)
-        if canon_path is not None:
-            return os.chmod(canon_path, mode)
-        return super().chmod(path, mode)
-
-    def remove(self, path: str):
-        """
-        Removes the file at the given path
-        """
-        canon_path = self.get_mount_filename(path)
-        if canon_path is not None:
-            return os.remove(canon_path)
-        return super().remove(path)
-
-    def rmdir(self, path: str):
-        """
-        Removes the directory at the given path
-        """
-        canon_path = self.get_mount_filename(path)
-        if canon_path is not None:
-            return os.rmdir(canon_path)
-        return super().rmdir(path)
-
-    def rename(self, src: str, dest: str):
-        """
-        Move the file or folder 'src' to 'dest'
-        Will overwrite dest if it exists
-        """
-        canon_src = self.get_mount_filename(src)
-        canon_dest = self.get_mount_filename(dest)
-        if canon_src is not None and canon_dest is not None:
-            return os.rename(canon_src, canon_dest)
-        return super().rename(src, dest)
 
 class DummySlurmBackend(AbstractSlurmBackend):
     """
@@ -165,8 +90,8 @@ class DummySlurmBackend(AbstractSlurmBackend):
     Useful for unittesting or for running Canine on a single, powerful compute node.
     """
 
-    @parallelize2()
     @staticmethod
+    @parallelize2()
     def exec_run(container: docker.models.containers.Container, command: str, **kwargs) -> typing.Callable[[], docker.models.containers.ExecResult]:
         """
         Invoke the given command within the given container.
@@ -174,14 +99,16 @@ class DummySlurmBackend(AbstractSlurmBackend):
         """
         return container.exec_run(command, **kwargs)
 
-    def __init__(self, n_workers: int, network: str = None, cpus: typing.Optional[int] = None, memory: typing.Optional[int] = None, compute_script: str = "", controller_script: str = "", image: str = "gcr.io/broad-cga-aarong-gtex/slurmind", **kwargs):
+    def __init__(self, n_workers: int, network: str = 'canine_dummy_slurm', cpus: typing.Optional[int] = None, memory: typing.Optional[int] = None, compute_script: str = "", controller_script: str = "", image: str = "gcr.io/broad-cga-aarong-gtex/slurmind", **kwargs):
         """
         Saves configuration.
         No containers are started until the backend is __enter__'ed
         """
         super().__init__(**kwargs)
         self.n_workers = n_workers
-        self.network = Networks
+        self.network = network
+        if '-' in self.network:
+            raise ValueError("Network name cannot contain '-'")
         self.cpus = cpus
         self.mem = memory
         self.compute_script = compute_script
@@ -201,49 +128,79 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Controller starts all necessary workers and fills slurm config
         """
         self.port = port_for.select_random()
-        self.bind_path = tempfile.TemporaryDirectory()
+        self.bind_path = tempfile.TemporaryDirectory(dir=os.path.expanduser('~'))
         self.dkr = docker.from_env()
-        self.dkr.images.pull(self.image)
-        self.controller = self.dkr.containers.run(
-            self.image,
-            '/controller.py {network} {mount} {workers} {cpus} {mem}'.format(
+        try:
+            # Check that the chosen network exists
+            self.dkr.networks.get(self.network)
+        except docker.errors.NotFound:
+            # Network does not exist; create it
+            print("Creating bridge network", self.network)
+            self.dkr.networks.create(
+                self.network,
+                driver='bridge'
+            )
+        try:
+            self.dkr.images.get(self.image)
+        except docker.errors.NotFound:
+            print("Pulling image", self.image)
+            self.dkr.images.pull(self.image)
+        try:
+            self.controller = self.dkr.containers.run(
+                self.image,
+                '/controller.py {network} {workers} {cpus} {mem}'.format(
+                    network=self.network,
+                    workers=self.n_workers,
+                    cpus='--cpus {}'.format(self.cpus) if self.cpus is not None else '',
+                    mem='--memory {}'.format(self.mem) if self.mem is not None else ''
+                ),
+                # auto_remove=True,
+                detach=True,
+                # --interactive?
+                tty=True,
                 network=self.network,
-                mount=self.bind_path.name,
-                workers=self.n_workers,
-                cpus='--cpus {}'.format(self.cpus) if self.cpus is not None else '',
-                mem='--memory {}'.format(self.mem) if self.mem is not None else ''
-            ),
-            auto_remove=True,
-            detach=True,
-            # --interactive?
-            tty=True,
-            network=self.network,
-            volumes={
-                self.bind_path.name: {
-                    'bind': '/mnt/nfs', 'mode': 'rw'
-                }
-            },
-            ports={'22/tcp': self.port}
-        )
+                volumes={
+                    self.bind_path.name: {
+                        'bind': '/mnt/nfs', 'mode': 'rw',
+                    },
+                    '/var/run/docker.sock': {
+                        'bind': '/var/run/docker.sock', 'mode': 'rw'
+                    },
+                    os.path.expanduser('~/.config/gcloud'): {
+                        'bind': '/root/.config/gcloud', 'mode': 'rw'
+                    },
+                },
+                ports={'22/tcp': self.port}
+            )
+        except docker.errors.APIError as e:
+            if sys.platform == 'darwin':
+                raise RuntimeError("Check your docker preferences and ensure that {} is bindable".format(self.bind_path.name)) from e
+            raise
         print("Slurm controller started in", self.controller.short_id)
         print("Waiting for containers to start...")
         proc = subprocess.Popen(
             'docker logs -f {}'.format(self.controller.short_id),
             shell=True
         ) # let the user follow the startup logs
+        time.sleep(5)
         self.controller.reload()
         with self.transport() as transport:
             while self.controller.status in {'running', 'created'} and not transport.exists("/mnt/nfs/controller.ready"):
                 time.sleep(5)
                 self.controller.reload()
         proc.terminate()
-        self.workers = self.dkr.containers.list(
-            since=self.controller.short_id,
-            filters={'network': self.network}
-        )
+        self.workers = [
+            container for container in self.dkr.containers.list(
+                filters={
+                    'network': self.network,
+                    'since': self.controller.id
+                }
+            )
+            # 'since' kwarg is inclusive, so the controller shows up in this list
+            if container.id != self.controller.id
+        ]
         if len(self.workers) != self.n_workers:
             raise RuntimeError("Number of worker containers ({}) does not match expected count ({})".format(len(self.workers), self.n_workers))
-        self.controller.exec_run()
         self.startup_callbacks = []
         if len(self.controller_script.strip()):
             self.startup_callbacks.append(DummySlurmBackend.exec_run(self.controller, 'bash -c \'{}\''.format(self.controller_script), stderr=True, demux=True))
@@ -258,7 +215,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Blocks until the main partition is marked as up
         """
         # Ensure that all user-provided startup scripts are called
-        for callback in self.startup_callbacks():
+        for callback in self.startup_callbacks:
             callback()
         return super().wait_for_cluster_ready(elastic)
 
@@ -272,7 +229,8 @@ class DummySlurmBackend(AbstractSlurmBackend):
         if interactive:
             # Interactive commands are kind of shit using the docker API, so we outsource them
             return LocalSlurmBackend.invoke(
-                'docker exec -it {}'.format(command),
+                self,
+                'docker exec -it {} {}'.format(self.controller.short_id, command),
                 interactive=True
             )
         result = DummySlurmBackend.exec_run(
@@ -290,6 +248,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
         """
         Kills all running containers
         """
+        # FIXME: use agutil.parallelize on this list? 5s/container is SLOW
         for worker in self.workers:
             worker.stop()
         self.controller.stop()
