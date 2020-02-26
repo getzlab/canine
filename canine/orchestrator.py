@@ -261,10 +261,11 @@ class Orchestrator(object):
                     if len(completed_jobs):
                         print("Delocalizing outputs")
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
-            print("Parsing output data")
-            self.adapter.parse_outputs(outputs)
 
-            df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
+                print("Parsing output data")
+                self.adapter.parse_outputs(outputs)
+
+                df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
 
         try:
             runtime = time.monotonic() - start_time
@@ -389,13 +390,16 @@ class Orchestrator(object):
                 # that don't receive any transformation with transformed columns
                 df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
         except:
+            traceback.print_exc()
             df = pd.DataFrame()
 
         if isinstance(localizer, AbstractLocalizer):
-            fname = "results.k9df.pickle"
-            df.to_pickle(fname)
-            localizer.localize_file(fname, localizer.reserve_path(localizer.staging_dir, "results.k9df.pickle"))
-            os.remove(fname)
+            with localizer.transport_context() as transport:
+                dest = localizer.reserve_path("results.k9df.pickle").controllerpath
+                if not transport.isdir(os.path.dirname(dest)):
+                    transport.makedirs(os.path.dirname(dest))
+                with transport.open(dest, 'wb') as w:
+                    df.to_pickle(w, compression=None)
 
         return df
 

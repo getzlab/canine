@@ -256,7 +256,7 @@ or the copy will not behave as expected</p>
 
 <dl class="method">
 <dt id="canine.backends.LocalTransport.stat">
-<code class="sig-name descname">stat</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.backends.LocalTransport.stat" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">stat</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">follow_symlinks: bool = True</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.backends.LocalTransport.stat" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns stat information</p>
 </dd></dl>
 
@@ -399,7 +399,7 @@ Returns a tuple containing (exit status, stdout buffer, stderr buffer)</p>
 
 <dl class="method">
 <dt id="canine.backends.RemoteSlurmBackend.ssh_agent">
-<em class="property">static </em><code class="sig-name descname">ssh_agent</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; Optional[str]<a class="headerlink" href="#canine.backends.RemoteSlurmBackend.ssh_agent" title="Permalink to this definition">¶</a></dt>
+<em class="property">static </em><code class="sig-name descname">ssh_agent</code><span class="sig-paren">(</span><em class="sig-param">restart=True</em><span class="sig-paren">)</span> &#x2192; Optional[str]<a class="headerlink" href="#canine.backends.RemoteSlurmBackend.ssh_agent" title="Permalink to this definition">¶</a></dt>
 <dd><p>Ensures proper environment variables are set for the ssh agent
 Returns the current value of SSH_AUTH_SOCK or None, if the agent could
 not be located/started</p>
@@ -541,7 +541,7 @@ or the copy will not behave as expected</p>
 
 <dl class="method">
 <dt id="canine.backends.RemoteTransport.stat">
-<code class="sig-name descname">stat</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.backends.RemoteTransport.stat" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">stat</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">follow_symlinks: bool = True</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.backends.RemoteTransport.stat" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns stat information</p>
 </dd></dl>
 
@@ -560,7 +560,7 @@ Each iteration yields a 3-tuple:
 
 <dl class="class">
 <dt id="canine.backends.DummySlurmBackend">
-<em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">DummySlurmBackend</code><span class="sig-paren">(</span><em class="sig-param">n_workers: int</em>, <em class="sig-param">network: str = None</em>, <em class="sig-param">cpus: Optional[int] = None</em>, <em class="sig-param">memory: Optional[int] = None</em>, <em class="sig-param">compute_script: str = ''</em>, <em class="sig-param">controller_script: str = ''</em>, <em class="sig-param">image: str = 'gcr.io/broad-cga-aarong-gtex/slurmind'</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">DummySlurmBackend</code><span class="sig-paren">(</span><em class="sig-param">n_workers: int</em>, <em class="sig-param">network: str = 'canine_dummy_slurm'</em>, <em class="sig-param">cpus: Optional[int] = None</em>, <em class="sig-param">memory: Optional[int] = None</em>, <em class="sig-param">compute_script: str = ''</em>, <em class="sig-param">controller_script: str = ''</em>, <em class="sig-param">image: str = 'gcr.io/broad-cga-aarong-gtex/slurmind'</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend" title="Permalink to this definition">¶</a></dt>
 <dd><p>Operates a SLURM cluster locally, using docker containers.
 Only docker is required (the cluster will use local compute resources).
 Useful for unittesting or for running Canine on a single, powerful compute node.</p>
@@ -578,25 +578,9 @@ cluster was not at full utilization.</p>
 
 <dl class="method">
 <dt id="canine.backends.DummySlurmBackend.exec_run">
-<code class="sig-name descname">exec_run</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend.exec_run" title="Permalink to this definition">¶</a></dt>
-<dd><p>staticmethod(function) -&gt; method</p>
-<p>Convert a function to be a static method.</p>
-<p>A static method does not receive an implicit first argument.
-To declare a static method, use this idiom:</p>
-<blockquote>
-<div><dl>
-<dt>class C:</dt><dd><p>&#64;staticmethod
-def f(arg1, arg2, …):</p>
-<blockquote>
-<div><p>…</p>
-</div></blockquote>
-</dd>
-</dl>
-</div></blockquote>
-<p>It can be called either on the class (e.g. C.f()) or on an instance
-(e.g. C().f()).  The instance is ignored except for its class.</p>
-<p>Static methods in Python are similar to those found in Java or C++.
-For a more advanced concept, see the classmethod builtin.</p>
+<em class="property">static </em><code class="sig-name descname">exec_run</code><span class="sig-paren">(</span><em class="sig-param">container: docker.models.containers.Container</em>, <em class="sig-param">command: str</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span> &#x2192; Callable[[], docker.models.containers.ExecResult]<a class="headerlink" href="#canine.backends.DummySlurmBackend.exec_run" title="Permalink to this definition">¶</a></dt>
+<dd><p>Invoke the given command within the given container.
+Returns a callback object</p>
 </dd></dl>
 
 <dl class="method">
@@ -666,6 +650,12 @@ Returns a tuple containing (exit status, stdout buffer, stderr buffer)</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.backends.DummySlurmBackend.stop_containers">
+<em class="property">static </em><code class="sig-name descname">stop_containers</code><span class="sig-paren">(</span><em class="sig-param">containers: List[docker.models.containers.Container]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummySlurmBackend.stop_containers" title="Permalink to this definition">¶</a></dt>
+<dd><p>Stops all given containers in parallel</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.backends.DummySlurmBackend.transport">
 <code class="sig-name descname">transport</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; canine.backends.dummy.DummyTransport<a class="headerlink" href="#canine.backends.DummySlurmBackend.transport" title="Permalink to this definition">¶</a></dt>
 <dd><p>Return a Transport object suitable for moving files between the
@@ -684,8 +674,7 @@ SLURM cluster and the local filesystem</p>
 <dt id="canine.backends.DummyTransport">
 <em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">DummyTransport</code><span class="sig-paren">(</span><em class="sig-param">mount_path: str</em>, <em class="sig-param">container: docker.models.containers.Container</em>, <em class="sig-param">port: int</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport" title="Permalink to this definition">¶</a></dt>
 <dd><p>Handles filesystem interaction with the NFS container for the Dummy Backend.
-Files existing within the mount_path are reached via the bind path on the local file system.
-Files outside the mount_path are reached via SFTP to the controller</p>
+Uses SFTP to interact with the docker filesystem</p>
 <dl class="method">
 <dt id="canine.backends.DummyTransport.chmod">
 <code class="sig-name descname">chmod</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">mode: int</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.chmod" title="Permalink to this definition">¶</a></dt>
@@ -696,13 +685,6 @@ Files outside the mount_path are reached via SFTP to the controller</p>
 <dt id="canine.backends.DummyTransport.exists">
 <code class="sig-name descname">exists</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.backends.DummyTransport.exists" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns True if the given path exists</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.backends.DummyTransport.get_mount_filename">
-<code class="sig-name descname">get_mount_filename</code><span class="sig-paren">(</span><em class="sig-param">filename: str</em><span class="sig-paren">)</span> &#x2192; Optional[str]<a class="headerlink" href="#canine.backends.DummyTransport.get_mount_filename" title="Permalink to this definition">¶</a></dt>
-<dd><p>Gets the externally visible filepath given a filename that is valid within the container.
-Returns None if the filename cannot be accessed via the bind mount (indicates that the transport must use SFTP)</p>
 </dd></dl>
 
 <dl class="method">
@@ -810,7 +792,7 @@ or the copy will not behave as expected</p>
 
 <dl class="method">
 <dt id="canine.backends.DummyTransport.stat">
-<code class="sig-name descname">stat</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.backends.DummyTransport.stat" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">stat</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">follow_symlinks: bool = True</em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.backends.DummyTransport.stat" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns stat information</p>
 </dd></dl>
 
@@ -954,7 +936,7 @@ Returns a tuple containing (exit status, stdout buffer, stderr buffer)</p>
 
 <dl class="method">
 <dt id="canine.backends.TransientGCPSlurmBackend.ssh_agent">
-<em class="property">static </em><code class="sig-name descname">ssh_agent</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; Optional[str]<a class="headerlink" href="#canine.backends.TransientGCPSlurmBackend.ssh_agent" title="Permalink to this definition">¶</a></dt>
+<em class="property">static </em><code class="sig-name descname">ssh_agent</code><span class="sig-paren">(</span><em class="sig-param">restart=True</em><span class="sig-paren">)</span> &#x2192; Optional[str]<a class="headerlink" href="#canine.backends.TransientGCPSlurmBackend.ssh_agent" title="Permalink to this definition">¶</a></dt>
 <dd><p>Ensures proper environment variables are set for the ssh agent
 Returns the current value of SSH_AUTH_SOCK or None, if the agent could
 not be located/started</p>

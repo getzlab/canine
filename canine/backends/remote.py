@@ -68,6 +68,11 @@ class RemoteTransport(AbstractTransport):
         handle.name = filename
         if 'w' in mode:
             handle.set_pipelined(True)
+        elif mode == 'r':
+            actual_read = handle.read
+            def read_decode(size=None, encoding=sys.getdefaultencoding()):
+                return actual_read(size=size).decode(encoding=encoding)
+            handle.read = read_decode
         return handle
 
     def listdir(self, path: str) -> typing.List[str]:

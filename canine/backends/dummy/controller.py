@@ -74,7 +74,6 @@ def write_conf(conf, path):
     Dumps a configuration. If any values are not set (ie: settings that map to NONE)
     an exception will be raised
     """
-    print(conf.settings)
     text = '' + conf.text # Make a copy; Don't edit original text
     for key, val in conf.settings.items():
         if val is None:
