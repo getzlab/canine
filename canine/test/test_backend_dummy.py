@@ -45,7 +45,7 @@ class TestUnit(unittest.TestCase):
             result.output,
             b'bin\nboot\nconf_templates\ncontroller.py\ndev\netc\ngcsdk\nhome'
             b'\nlib\nlib32\nlib64\nlibx32\nmedia\nmnt\nopt\nproc\nroot\nrun'
-            b'\nsbin\nsrv\nsys\ntmp\nusr\nvar\nworker.py\n'
+            b'\nsbin\nsrv\nsys\ntmp\nusr\nvar\nworker.sh\n'
         )
 
         container.stop(timeout=1)
@@ -77,7 +77,7 @@ class TestUnit(unittest.TestCase):
                         '.dockerenv', 'bin', 'boot', 'conf_templates', 'controller.py',
                          'dev', 'etc', 'gcsdk', 'home', 'lib', 'lib32', 'lib64',
                          'libx32', 'media', 'mnt', 'opt', 'proc', 'root',
-                         'run', 'sbin', 'srv', 'sys', 'tmp', 'usr', 'var', 'worker.py'
+                         'run', 'sbin', 'srv', 'sys', 'tmp', 'usr', 'var', 'worker.sh'
                     ])
                 )
 
@@ -156,7 +156,7 @@ class TestIntegration(unittest.TestCase):
             for node in nodelist.split(','):
                 self.assertTrue(node in nodes)
 
-        time.sleep(5)
+        time.sleep(10)
         self.assertTrue((self.backend.sinfo().STATE == 'idle').all())
 
     @with_timeout(60)
@@ -191,7 +191,7 @@ class TestIntegration(unittest.TestCase):
             os.path.join('/root', path),
             array='0-9'
         )
-        time.sleep(2)
+        time.sleep(5)
 
         squeue = self.backend.squeue()
         self.assertTrue(len(squeue) >= 10)
@@ -206,7 +206,7 @@ class TestIntegration(unittest.TestCase):
             os.path.join('/root', path),
             array='0-9'
         )
-        time.sleep(2)
+        time.sleep(5)
 
         squeue = self.backend.squeue()
         self.assertTrue(len(squeue) >= 10)

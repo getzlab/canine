@@ -12,7 +12,7 @@ from ...utils import ArgumentHelper, check_call
 import docker
 import paramiko
 import port_for
-from agutil.parallel import parallelize2
+from agutil.parallel import parallelize, parallelize2
 
 class DummyTransport(RemoteTransport):
     """
@@ -106,6 +106,15 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Returns a callback object
         """
         return container.exec_run(command, **kwargs)
+
+    @staticmethod
+    @parallelize()
+    def stop_containers(containers: typing.List[docker.models.containers.Container]):
+        """
+        Stops all given containers in parallel
+        """
+        containers.stop()
+        return containers
 
     def __init__(self, n_workers: int, network: str = 'canine_dummy_slurm', cpus: typing.Optional[int] = None, memory: typing.Optional[int] = None, compute_script: str = "", controller_script: str = "", image: str = "gcr.io/broad-cga-aarong-gtex/slurmind", **kwargs):
         """
@@ -222,6 +231,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
                 DummySlurmBackend.exec_run(worker, 'bash -c \'{}\''.format(self.compute_script), stderr=True, demux=True)
                 for worker in self.workers
             ]
+        return self
 
     def wait_for_cluster_ready(self, elastic: bool = False):
         """
@@ -263,9 +273,8 @@ class DummySlurmBackend(AbstractSlurmBackend):
         """
         print("Cleaning up Slurm Cluster", self.controller.short_id)
         # FIXME: use agutil.parallelize on this list? 5s/container is SLOW
-        for worker in self.workers:
-            worker.stop()
-        self.controller.stop()
+        for container in DummySlurmBackend.stop_containers(self.workers + [self.controller]):
+            print("Stopped", container.short_id)
         self.bind_path.cleanup()
         self.bind_path = None
         self.port = None

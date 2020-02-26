@@ -37,7 +37,7 @@ def boot_node(network, cpus=None, mem=None):
         '-v /var/run/docker.sock:/var/run/docker.sock '
         '-v /root/.config/gcloud:/root/.config/gcloud '
         '{cpus} {mem} '
-        '--network {network} {image} /worker.py'.format(
+        '--network {network} {image} /worker.sh'.format(
             network=network,
             image=subprocess.check_output(
                 'docker inspect --format "{{{{.Image}}}}" {}'.format(socket.gethostname()),

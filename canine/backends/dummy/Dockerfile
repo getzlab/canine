@@ -24,11 +24,11 @@ RUN curl -fsSL https://download.docker.com/linux/ubuntu/gpg | apt-key add - && \
 RUN pip3 install psutil
 
 COPY controller.py /
-COPY worker.py /
+COPY worker.sh /
 COPY conf /conf_templates
 COPY docker /usr/local/bin
 
-RUN chmod 755 controller.py worker.py /usr/local/bin/docker
+RUN chmod 755 controller.py worker.sh /usr/local/bin/docker
 
 ENTRYPOINT
 CMD /bin/bash
