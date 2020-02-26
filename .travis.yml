@@ -1,0 +1,22 @@
+language: python
+dist: bionic
+# addons:
+#   apt:
+#     sources:
+#       -	docker-bionic
+#     packages:
+#       - docker
+services: docker
+python:
+  - 3.7
+  - 3.8
+install:
+  - pip install -e .
+  - pip install -r canine/tests/requirements.txt
+  - pip install coveralls
+
+script:
+  - coverage run --source=canine --omit=*__init__.py -m unittest discover canine/test
+
+after_success:
+  - coveralls
