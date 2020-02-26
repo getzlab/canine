@@ -86,6 +86,8 @@ class NFSLocalizer(BatchedLocalizer):
                 #
                 # check if self.mount_path, self.local_dir, and src all exist on the same NFS share
                 # symlink if yes, copy if no
+                # FIXME: This should be staging_dir until we get around to enforcing the local == staging == mount assumption
+                # Even if everything's on the same device, it assumes that all mount points are identical
                 vols = subprocess.check_output(
                   "df {} {} {} | awk 'NR > 1 {{ print $1 }}'".format(
                     self.mount_path,
