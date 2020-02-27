@@ -5,6 +5,7 @@ import sys
 import subprocess
 import tempfile
 import time
+import shutil
 from ..base import AbstractSlurmBackend
 from ..local import LocalSlurmBackend
 from ..remote import IgnoreKeyPolicy, RemoteTransport, RemoteSlurmBackend
@@ -56,12 +57,27 @@ class DummyTransport(RemoteTransport):
         self.client = paramiko.SSHClient()
         self.client.load_system_host_keys()
         self.client.set_missing_host_key_policy(IgnoreKeyPolicy)
-        self.client.connect(
-            'localhost',
-            port=self.port,
-            key_filename=self.ssh_key_path,
-            username='root'
-        )
+        if os.path.exists('/.dockerenv'):
+            # We are inside a container
+            self.container.reload()
+            if 'NetworkSettings' in self.container.attrs and 'Networks' in self.container.attrs['NetworkSettings'] and len(self.container.attrs['NetworkSettings']['Networks']) == 1:
+                self.client.connect(
+                    [net['IPAddress'] for net in self.container.attrs['NetworkSettings']['Networks'].values()][0],
+                    key_filename=self.ssh_key_path,
+                    username='root',
+                    timeout=10
+                )
+            else:
+                raise RuntimeError(
+                    "Canine is running inside a docker but was unable to determine network settings of peer docker"
+                )
+        else:
+            self.client.connect(
+                'localhost',
+                port=self.port,
+                key_filename=self.ssh_key_path,
+                username='root'
+            )
 
         # Disable re-keying. This is a local-only ssh connection
         __NEED_REKEY__ = self.client.get_transport().packetizer.need_rekey
@@ -85,11 +101,40 @@ class DummyTransport(RemoteTransport):
         super().__exit__()
         self.client = None
 
-class DummyBind(object):
+class ManualBind(object):
     """
     Mimics the tempfile.TemporaryDirectory API for a predefined directory
     """
-    pass
+    def __init__(self, path: str):
+        """
+        Creates the given dirpath if it does not exist already
+        """
+        self.name = path
+        self._cleanup = False
+        if not os.path.exists(self.name):
+            os.makedirs(self.name)
+            self._cleanup = True
+
+    def __enter__(self):
+        """
+        Returns the name
+        """
+        return self.name
+
+    def cleanup(self):
+        """
+        Removes the directory, if it was created at start.
+        If the directory already existed, it is left intact
+        """
+        if self._cleanup and os.path.exists(self.name):
+            shutil.rmtree(self.name)
+            self._cleanup = False
+
+    def __exit__(self, *args):
+        """
+        Calls .cleanup()
+        """
+        self.cleanup()
 
 class DummySlurmBackend(AbstractSlurmBackend):
     """
@@ -116,16 +161,22 @@ class DummySlurmBackend(AbstractSlurmBackend):
         containers.stop()
         return containers
 
-    def __init__(self, n_workers: int, network: str = 'canine_dummy_slurm', cpus: typing.Optional[int] = None, memory: typing.Optional[int] = None, compute_script: str = "", controller_script: str = "", image: str = "gcr.io/broad-cga-aarong-gtex/slurmind", **kwargs):
+    def __init__(
+        self, n_workers: int, network: str = 'canine_dummy_slurm',
+        cpus: typing.Optional[int] = None, memory: typing.Optional[int] = None,
+        compute_script: str = "", controller_script: str = "",
+        image: str = "gcr.io/broad-cga-aarong-gtex/slurmind", staging_dir: typing.Optional[str] = None, **kwargs
+    ):
         """
         Saves configuration.
         No containers are started until the backend is __enter__'ed
-        Memory is in GiB
+        Memory is in GiB.
+        If staging dir is provided, th
         """
-        if n_workers < 1:
+        if int(n_workers) < 1:
             raise ValueError("n_workers must be at least 1 worker")
         super().__init__(**kwargs)
-        self.n_workers = n_workers
+        self.n_workers = int(n_workers)
         self.network = network
         if '-' in self.network:
             raise ValueError("Network name cannot contain '-'")
@@ -134,6 +185,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
         self.compute_script = compute_script
         self.controller_script = controller_script
         self.image = image
+        self.staging_dir = staging_dir
         self.bind_path = None
         self.dkr = None
         self.controller = None
@@ -272,7 +324,6 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Kills all running containers
         """
         print("Cleaning up Slurm Cluster", self.controller.short_id)
-        # FIXME: use agutil.parallelize on this list? 5s/container is SLOW
         for container in DummySlurmBackend.stop_containers(self.workers + [self.controller]):
             print("Stopped", container.short_id)
         self.bind_path.cleanup()

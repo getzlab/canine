@@ -11,7 +11,14 @@ from ..utils import get_default_gcp_project, gcp_hourly_cost
 import googleapiclient.discovery as gd
 import pandas as pd
 
-gce = gd.build('compute', 'v1')
+try:
+    gce = gd.build('compute', 'v1')
+except gd._auth.google.auth.exceptions.GoogleAuthError:
+    print(
+        "Unable to load gcloud credentials. Transient Backends may not be available",
+        file=sys.stderr
+    )
+    gce = None
 
 def list_instances(zone: str, project: str) -> pd.DataFrame:
     """

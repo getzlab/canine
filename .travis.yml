@@ -16,7 +16,7 @@ install:
   - pip install coveralls
 
 script:
-  - coverage run --source=canine --omit=*__init__.py -m unittest discover canine/test
+  - coverage run --source=canine --omit='canine/backends/dummy/controller.py,*canine/test/*.py,canine/localization/delocalization.py,canine/__main__.py,canine/xargs.py' -m unittest discover canine/test
 
 after_success:
   - coveralls

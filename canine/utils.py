@@ -143,8 +143,14 @@ def get_default_gcp_project():
     Returns the currently configured default project
     """
     global __DEFAULT_GCP_PROJECT__
-    if __DEFAULT_GCP_PROJECT__ is None:
-        __DEFAULT_GCP_PROJECT__ = google.auth.default()[1]
+    try:
+        if __DEFAULT_GCP_PROJECT__ is None:
+            __DEFAULT_GCP_PROJECT__ = google.auth.default()[1]
+    except google.auth.exceptions.GoogleAuthError:
+        warnings.warn(
+            "Unable to load gcloud credentials. Some features may not function properly",
+            stacklevel=1
+        )
     return __DEFAULT_GCP_PROJECT__
 
 def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None, stderr: typing.Optional[typing.BinaryIO] = None):

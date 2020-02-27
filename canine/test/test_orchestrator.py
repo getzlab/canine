@@ -8,6 +8,7 @@ import time
 import subprocess
 from multiprocessing import cpu_count
 from contextlib import contextmanager
+from canine.backends.dummy import DummySlurmBackend
 from canine.orchestrator import Orchestrator, version
 from timeout_decorator import timeout as with_timeout
 import pandas as pd
@@ -216,6 +217,52 @@ class TestIntegration(unittest.TestCase):
     """
     Runs integration tests using full example pipelines
     """
+
+    @with_timeout(180)
+    def test_cmd(self):
+        """
+        Runs the example pipeline, but again from the commandline
+        """
+        with tempfile.TemporaryDirectory() as tempdir:
+            subprocess.check_call(
+                'canine examples/example_pipeline.yaml --backend type:Dummy --backend n_workers:1 --localization staging_dir:/mnt/nfs/canine --output-dir {}'.format(
+                    tempdir
+                ),
+                shell=True
+            )
+
+    @with_timeout(180)
+    def test_xargs(self):
+        """
+        Runs a quick test of the xargs orchestrator
+        """
+        with DummySlurmBackend(n_workers=1) as backend:
+            with backend.transport() as transport:
+                transport.sendtree(
+                    os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+                    '/opt/canine'
+                )
+            rc, stdout, stderr = backend.invoke(
+                "bash -c 'pip3 install -e /opt/canine && pip3 install pyopenssl; echo foo | canine-xargs -d /mnt/nfs echo @'"
+            )
+            self.assertFalse(rc)
+            time.sleep(5)
+            sacct = backend.sacct()
+            self.assertIn(
+                '2_0',
+                sacct.index.values
+            )
+            self.assertTrue(
+                (sacct['ExitCode'] == '0:0').all()
+            )
+            with backend.transport() as transport:
+                self.assertTrue(transport.isfile('/mnt/nfs/2.0.stdout'))
+                with transport.open('/mnt/nfs/2.0.stdout', 'r') as r:
+                    self.assertEqual(
+                        r.read().strip(),
+                        'foo'
+                    )
+
 
     @with_timeout(180)
     def test_example_pipeline(self):
