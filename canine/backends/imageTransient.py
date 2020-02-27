@@ -1,5 +1,6 @@
 # vim: set expandtab:
 
+import time
 import typing
 import subprocess
 import os
@@ -9,6 +10,7 @@ from .local import LocalSlurmBackend
 from ..utils import get_default_gcp_project, gcp_hourly_cost
 
 import googleapiclient.discovery as gd
+import googleapiclient.errors
 import pandas as pd
 
 try:
@@ -264,7 +266,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
                 print(e)
 
-    def stop(self, action_on_stop = None):
+    def stop(self, action_on_stop = None, kill_straggling_jobs = True):
         """
         Delete or stop (default) compute instances
         """
@@ -272,8 +274,26 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             action_on_stop = self.config["action_on_stop"]
 
         #
-        # stop, delete, or leave running compute nodes
+        # kill any still-running jobs
+        if kill_straggling_jobs:
+            try:
+                self.scancel(jobID = "", user = self.config["user"])
 
+                # wait for jobs to finish
+                print("Terminating all jobs ... ", end = "", flush = True)
+                tot_time = 0
+                while True:
+                    if self.squeue().empty or tot_time > 60:
+                        break
+                    tot_time += 1
+                    time.sleep(1)
+                print("done")
+            except Exception as e:
+                print("Error terminating all jobs!", file = sys.stderr)
+                print(e, file = sys.stderr)
+
+        #
+        # stop, delete, or leave running compute nodes
         for node in self.nodes.index:
             try:
                 if action_on_stop == "delete":
@@ -284,6 +304,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 else:
                     # default behavior is to shut down
                     self._pzw(gce.instances().stop)(instance = node).execute()
+            except googleapiclient.errors.HttpError as e:
+                if e.resp != 404:
+                    print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
+                    print(e)
             except Exception as e:
                 print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
                 print(e)
@@ -299,11 +323,11 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
           for x in zone_dict["items"]
         ], axis = 0).reset_index(drop = True)
 
-    def wait_for_cluster_ready(self):
+    def wait_for_cluster_ready(self, elastic = False):
         """
         Blocks until the main partition is marked as up
         """
-        super().wait_for_cluster_ready(elastic = False)
+        super().wait_for_cluster_ready(elastic = elastic)
 
     # a handy wrapper to automatically add this instance's project and zone to
     # GCP API calls

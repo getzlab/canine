@@ -240,6 +240,13 @@ Will overwrite dest if it exists</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.backends.LocalTransport.rmtree">
+<code class="sig-name descname">rmtree</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">max_retries: int = 5</em>, <em class="sig-param">timeout: int = 5</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.LocalTransport.rmtree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recursively remove the directory tree rooted at the given path.
+Automatically retries failures after a brief timeout</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.backends.LocalTransport.send">
 <code class="sig-name descname">send</code><span class="sig-paren">(</span><em class="sig-param">localfile: Union[str, IO], remotefile: Union[str, IO]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.LocalTransport.send" title="Permalink to this definition">¶</a></dt>
 <dd><p>Sends the requested file to the slurm cluster
@@ -525,6 +532,13 @@ Will overwrite dest if it exists</p>
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.backends.RemoteTransport.rmtree">
+<code class="sig-name descname">rmtree</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">max_retries: int = 5</em>, <em class="sig-param">timeout: int = 5</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.RemoteTransport.rmtree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recursively remove the directory tree rooted at the given path.
+Automatically retries failures after a brief timeout</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.backends.RemoteTransport.send">
 <code class="sig-name descname">send</code><span class="sig-paren">(</span><em class="sig-param">localfile: Union[str, IO], remotefile: Union[str, IO]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.RemoteTransport.send" title="Permalink to this definition">¶</a></dt>
 <dd><p>Sends the requested file to the slurm cluster
@@ -773,6 +787,13 @@ Will overwrite dest if it exists</p>
 <dt id="canine.backends.DummyTransport.rmdir">
 <code class="sig-name descname">rmdir</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.rmdir" title="Permalink to this definition">¶</a></dt>
 <dd><p>Removes the directory at the given path</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.backends.DummyTransport.rmtree">
+<code class="sig-name descname">rmtree</code><span class="sig-paren">(</span><em class="sig-param">path: str</em>, <em class="sig-param">max_retries: int = 5</em>, <em class="sig-param">timeout: int = 5</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DummyTransport.rmtree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Recursively remove the directory tree rooted at the given path.
+Automatically retries failures after a brief timeout</p>
 </dd></dl>
 
 <dl class="method">
@@ -1076,7 +1097,7 @@ Returns a tuple containing (exit status, stdout buffer, stderr buffer)</p>
 
 <dl class="method">
 <dt id="canine.backends.TransientImageSlurmBackend.stop">
-<code class="sig-name descname">stop</code><span class="sig-paren">(</span><em class="sig-param">action_on_stop=None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.TransientImageSlurmBackend.stop" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">stop</code><span class="sig-paren">(</span><em class="sig-param">action_on_stop=None</em>, <em class="sig-param">kill_straggling_jobs=True</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.TransientImageSlurmBackend.stop" title="Permalink to this definition">¶</a></dt>
 <dd><p>Delete or stop (default) compute instances</p>
 </dd></dl>
 
@@ -1089,7 +1110,7 @@ SLURM cluster and the local filesystem</p>
 
 <dl class="method">
 <dt id="canine.backends.TransientImageSlurmBackend.wait_for_cluster_ready">
-<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.TransientImageSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><em class="sig-param">elastic=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.TransientImageSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
 <dd><p>Blocks until the main partition is marked as up</p>
 </dd></dl>
 
@@ -1097,7 +1118,7 @@ SLURM cluster and the local filesystem</p>
 
 <dl class="class">
 <dt id="canine.backends.DockerTransientImageSlurmBackend">
-<em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">DockerTransientImageSlurmBackend</code><span class="sig-paren">(</span><em class="sig-param">nfs_compute_script='/usr/local/share/cga_pipeline/src/provision_storage_container_host.sh'</em>, <em class="sig-param">compute_script='/usr/local/share/cga_pipeline/src/provision_worker_container_host.sh'</em>, <em class="sig-param">nfs_disk_size=2000</em>, <em class="sig-param">nfs_disk_type='pd-standard'</em>, <em class="sig-param">nfs_action_on_stop='stop'</em>, <em class="sig-param">nfs_image=''</em>, <em class="sig-param">action_on_stop='delete'</em>, <em class="sig-param">image_family='pydpiper'</em>, <em class="sig-param">image=None</em>, <em class="sig-param">cluster_name=None</em>, <em class="sig-param">clust_frac=0.01</em>, <em class="sig-param">user='aarong'</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.backends.</code><code class="sig-name descname">DockerTransientImageSlurmBackend</code><span class="sig-paren">(</span><em class="sig-param">cluster_name</em>, <em class="sig-param">*</em>, <em class="sig-param">nfs_compute_script='/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh'</em>, <em class="sig-param">compute_script='/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh'</em>, <em class="sig-param">nfs_disk_size=2000</em>, <em class="sig-param">nfs_disk_type='pd-standard'</em>, <em class="sig-param">nfs_action_on_stop='stop'</em>, <em class="sig-param">nfs_image=''</em>, <em class="sig-param">action_on_stop='delete'</em>, <em class="sig-param">image_family='slurm-gcp-docker'</em>, <em class="sig-param">image=None</em>, <em class="sig-param">clust_frac=0.01</em>, <em class="sig-param">user='aarong'</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend" title="Permalink to this definition">¶</a></dt>
 <dd><dl class="method">
 <dt id="canine.backends.DockerTransientImageSlurmBackend.estimate_cost">
 <code class="sig-name descname">estimate_cost</code><span class="sig-paren">(</span><em class="sig-param">clock_uptime: Optional[float] = None</em>, <em class="sig-param">node_uptime: Optional[float] = None</em>, <em class="sig-param">job_cpu_time: Optional[Dict[str</em>, <em class="sig-param">float]] = None</em><span class="sig-paren">)</span> &#x2192; Tuple[float, Optional[Dict[str, float]]]<a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.estimate_cost" title="Permalink to this definition">¶</a></dt>
@@ -1197,7 +1218,7 @@ SLURM cluster and the local filesystem</p>
 
 <dl class="method">
 <dt id="canine.backends.DockerTransientImageSlurmBackend.wait_for_cluster_ready">
-<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">wait_for_cluster_ready</code><span class="sig-paren">(</span><em class="sig-param">elastic=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.backends.DockerTransientImageSlurmBackend.wait_for_cluster_ready" title="Permalink to this definition">¶</a></dt>
 <dd><p>Blocks until the main partition is marked as up</p>
 </dd></dl>
 
