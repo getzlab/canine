@@ -218,7 +218,7 @@ class TestIntegration(unittest.TestCase):
 
                 output_patterns = {'stdout': '../stdout', 'stderr': '../stderr', 'output-glob': '*.txt', 'output-file': 'file.tar.gz'}
 
-                staging_dir = localizer.localize(inputs, output_patterns, {'gs-stream': 'stream', 'gs-download': 'delayed'})
+                staging_dir = localizer.localize(inputs, output_patterns, {'gs-stream': 'stream', 'gs-download': 'delayed', 'file-common': 'common', 'file-incommon': 'localize'})
                 with localizer.transport_context() as transport:
                     self.assertTrue(transport.isdir(staging_dir))
                     self.assertTrue(transport.isfile(os.path.join(staging_dir, 'delocalization.py')))

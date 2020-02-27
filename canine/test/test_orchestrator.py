@@ -130,10 +130,9 @@ class TestUnit(unittest.TestCase):
             sorted(jobs),
             sorted([(str(i), '{}_{}'.format(batch_id, i)) for i in range(len(self.orchestrator.job_spec))])
         )
-        self.assertTrue((acct['CPUTimeRAW'] >= 9).all())
-        self.assertTrue((acct['CPUTimeRAW'] < 11).all())
+        self.assertTrue((acct['CPUTimeRAW'] >= 10).all())
 
-    @with_timeout(20)
+    # @with_timeout(20)
     def test_make_output_df(self):
         path = self.backend.pack_batch_script('echo hello, world')
         batch_id = self.backend.sbatch(
@@ -180,7 +179,7 @@ class TestUnit(unittest.TestCase):
 
         self.assertTrue((df[('job', 'slurm_state')] == 'COMPLETED').all())
         self.assertTrue((df[('job', 'exit_code')] == '0:0').all())
-        self.assertTrue((df[('job', 'cpu_hours')] == 0).all())
+        self.assertTrue((df[('job', 'cpu_seconds')] == 5).all())
         self.assertTrue((df[('inputs', 'common_file')] == __file__).all())
         self.assertTrue((df[('outputs', 'output-glob')] == 3).all())
 

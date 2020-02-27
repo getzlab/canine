@@ -348,6 +348,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         overhead for uptime (ie: controller nodes).
         Note: Job cost estimates may not sum up to the total cluster cost if the
         cluster was not at full utilization.
+        All units are in hours
         """
         cluster_cost = 0
         worker_cpu_cost = 0

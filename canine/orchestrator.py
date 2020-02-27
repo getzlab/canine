@@ -292,7 +292,7 @@ class Orchestrator(object):
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
             )[0])
-            job_cost = self.backend.estimate_cost(job_cpu_time=df[('job', 'cpu_seconds')].to_dict())[1]
+            job_cost = self.backend.estimate_cost(job_cpu_time=(df[('job', 'cpu_seconds')]/3600).to_dict())[1]
             df['est_cost'] = [job_cost[job_id] for job_id in df.index] if job_cost is not None else [0] * len(df)
         except:
             traceback.print_exc()
@@ -378,6 +378,7 @@ class Orchestrator(object):
 
     def make_output_DF(self, batch_id, outputs, cpu_time, prev_acct, localizer = None) -> pd.DataFrame:
         df = pd.DataFrame()
+
         if batch_id != -2:
             try:
                 acct = self.backend.sacct(job=batch_id)
