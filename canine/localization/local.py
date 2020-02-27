@@ -40,6 +40,7 @@ class BatchedLocalizer(AbstractLocalizer):
         super().__init__(backend, transfer_bucket, common, staging_dir, mount_path, project)
         self.queued_gs = [] # Queued gs:// -> remote staging transfers
         self.queued_batch = [] # Queued local -> remote directory transfers
+        self._has_localized = False
 
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
@@ -47,20 +48,36 @@ class BatchedLocalizer(AbstractLocalizer):
         gs:// files are queued for later transfer
         local files are symlinked to the staging directory
         """
-        if src.startswith('gs://'):
-            self.queued_gs.append((
-                src,
-                dest.controllerpath,
-                'remote'
-            ))
-        elif os.path.exists(src):
-            src = os.path.abspath(src)
-            if not os.path.isdir(os.path.dirname(dest.localpath)):
-                os.makedirs(os.path.dirname(dest.localpath))
-            if os.path.isfile(src):
-                os.symlink(src, dest.localpath)
-            else:
-                self.queued_batch.append((src, os.path.join(dest.controllerpath, os.path.basename(src))))
+        if not self._has_localized:
+            if src.startswith('gs://'):
+                self.queued_gs.append((
+                    src,
+                    dest.controllerpath,
+                    'remote'
+                ))
+            elif os.path.exists(src):
+                src = os.path.abspath(src)
+                if not os.path.isdir(os.path.dirname(dest.localpath)):
+                    os.makedirs(os.path.dirname(dest.localpath))
+                if os.path.isfile(src):
+                    os.symlink(src, dest.localpath)
+                else:
+                    self.queued_batch.append((src, os.path.join(dest.controllerpath, os.path.basename(src))))
+        else:
+            warnings.warn("BatchedLocalizer.localize_file called after main localization. Ignoring normal handling and sending over transport")
+            with self.transport_context(transport) as transport:
+                if not transport.isdir(os.path.dirname(dest.controllerpath)):
+                    transport.makedirs(os.path.dirname(dest.controllerpath))
+                if src.startswith('gs://'):
+                    self.gs_copy(
+                        src,
+                        dest.controllerpath,
+                        'remote'
+                    )
+                elif os.path.isfile(src):
+                    transport.send(src, dest.controllerpath)
+                else:
+                    transport.sendtree(src, dest.controllerpath)
 
     def __enter__(self):
         """
@@ -118,13 +135,14 @@ class BatchedLocalizer(AbstractLocalizer):
             self.sendtree(
                 self.local_dir,
                 self.staging_dir,
-                transport
+                transport,exist_okay=True
             )
             staging_dir = self.finalize_staging_dir(inputs.keys(), transport=transport)
             for src, dest, context in self.queued_gs:
                 self.gs_copy(src, dest, context)
             for src, dest in self.queued_batch:
                 self.sendtree(src, os.path.dirname(dest))
+            self._has_localized = True
             return staging_dir
 
 class LocalLocalizer(BatchedLocalizer):
@@ -147,17 +165,33 @@ class LocalLocalizer(BatchedLocalizer):
         gs:// files are queued for later transfer
         local files are symlinked to the staging directory
         """
-        if src.startswith('gs://'):
-            self.gs_copy(
-                src,
-                dest.localpath,
-                'local'
-            )
-        elif os.path.exists(src):
-            src = os.path.abspath(src)
-            if not os.path.isdir(os.path.dirname(dest.localpath)):
-                os.makedirs(os.path.dirname(dest.localpath))
-            if os.path.isfile(src):
-                os.symlink(src, dest.localpath)
-            else:
-                self.queued_batch.append((src, os.path.join(dest.controllerpath, os.path.basename(src))))
+        if self._has_localized:
+            if src.startswith('gs://'):
+                self.gs_copy(
+                    src,
+                    dest.localpath,
+                    'local'
+                )
+            elif os.path.exists(src):
+                src = os.path.abspath(src)
+                if not os.path.isdir(os.path.dirname(dest.localpath)):
+                    os.makedirs(os.path.dirname(dest.localpath))
+                if os.path.isfile(src):
+                    os.symlink(src, dest.localpath)
+                else:
+                    self.queued_batch.append((src, os.path.join(dest.controllerpath, os.path.basename(src))))
+        else:
+            warnings.warn("LocalLocalizer.localize_file called after main localization. Ignoring normal handling and sending over transport")
+            with self.transport_context(transport) as transport:
+                if not transport.isdir(os.path.dirname(dest.controllerpath)):
+                    transport.makedirs(os.path.dirname(dest.controllerpath))
+                if src.startswith('gs://'):
+                    self.gs_copy(
+                        src,
+                        dest.controllerpath,
+                        'remote'
+                    )
+                elif os.path.isfile(src):
+                    transport.send(src, dest.controllerpath)
+                else:
+                    transport.sendtree(src, dest.controllerpath)

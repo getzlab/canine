@@ -437,7 +437,7 @@ class AbstractLocalizer(abc.ABC):
                                 'stream',
                                 value
                             )
-                    elif mode == 'localize':
+                    elif mode in ['localize', 'symlink']:
                         self.inputs[jobId][arg] = Localization(
                             None,
                             self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))

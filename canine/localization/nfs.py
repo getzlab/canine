@@ -86,15 +86,7 @@ class NFSLocalizer(BatchedLocalizer):
                 #
                 # check if self.mount_path, self.local_dir, and src all exist on the same NFS share
                 # symlink if yes, copy if no
-                vols = subprocess.check_output(
-                  "df {} {} {} | awk 'NR > 1 {{ print $1 }}'".format(
-                    self.mount_path,
-                    self.local_dir,
-                    src
-                  ),
-                  shell = True
-                )
-                if len(set(vols.decode("utf-8").rstrip().split("\n"))) == 1:
+                if self.same_volume(src):
                     os.symlink(src, dest.localpath)
                 else:
                     if os.path.isfile(src):
@@ -116,6 +108,20 @@ class NFSLocalizer(BatchedLocalizer):
         """
         if overrides is None:
             overrides = {}
+
+        # automatically override inputs that are absolute paths residing on the same
+        # NFS share and are not Canine outputs
+
+        # XXX: this can be potentially slow, since it has to iterate over every
+        #      single input. It would make more sense to do this before the adapter
+        #      converts raw inputs.
+        for input_dict in inputs.values():
+            for k, v in input_dict.items():
+                if k not in overrides:
+                    if re.match(r"^/", v) is not None and self.same_volume(v) and \
+                      re.match(r".*/outputs/\d+/.*", v) is None:
+                        overrides[k] = None
+
         overrides = {k:v.lower() if isinstance(v, str) else None for k,v in overrides.items()}
         with self.backend.transport() as transport:
             if self.common:
@@ -269,3 +275,15 @@ class NFSLocalizer(BatchedLocalizer):
         if len(jobs) and not os.path.isdir(controller_env['CANINE_OUTPUT']):
             os.mkdir(controller_env['CANINE_OUTPUT'])
         return self.staging_dir
+
+    def same_volume(self, *args):
+        """
+        Check if *args are stored on the same NFS mount as the output directory.
+        """
+        vols = subprocess.check_output(
+          "df {} | awk 'NR > 1 {{ print $1 }}'".format(
+            " ".join([shlex.quote(x) for x in [self.mount_path, self.local_dir, *args]])
+          ),
+          shell = True
+        )
+        return len(set(vols.decode("utf-8").rstrip().split("\n"))) == 1

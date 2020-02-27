@@ -10,6 +10,8 @@ import shlex
 from subprocess import CalledProcessError
 import google.auth
 import paramiko
+import shutil
+import time
 
 class ArgumentHelper(dict):
     """
@@ -264,3 +266,5 @@ def gcp_hourly_cost(mtype: str, preemptible: bool = False, ssd_size: int = 0, hd
             else (gpu_pricing[gpu_type][1 if preemptible else 0] * gpu_count)
         )
     )
+
+# rmtree_retry removed in favor of AbstractTransport.rmtree
