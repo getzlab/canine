@@ -73,6 +73,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "controller_disk_type": "pd-ssd",
           "controller_disk_size_gb": int(controller_disk_size),
           "controller_secondary_disk": secondary_disk_size > 0,
+          "external_compute_ips": True,
           "login_machine_type": login_type,
           "login_node_count": int(login_count),
           "login_disk_size_gb": 10,

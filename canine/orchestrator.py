@@ -419,7 +419,7 @@ class Orchestrator(object):
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
             with localizer.transport_context() as transport:
-                dest = localizer.reserve_path("results.k9df.pickle").controllerpath
+                dest = localizer.reserve_path("results.k9df.pickle").remotepath
                 if not transport.isdir(os.path.dirname(dest)):
                     transport.makedirs(os.path.dirname(dest))
                 with transport.open(dest, 'wb') as w:
@@ -452,7 +452,7 @@ class Orchestrator(object):
         Succeeded jobs are skipped. Failed jobs are reset and rerun
         """
         with localizer.transport_context() as transport:
-            df_path = localizer.reserve_path("results.k9df.pickle").controllerpath
+            df_path = localizer.reserve_path("results.k9df.pickle").remotepath
 
             #remove all output if specified
             if overwrite:
@@ -518,14 +518,14 @@ class Orchestrator(object):
                     # remove output directories of failed jobs
                     for k in self.job_spec:
                         transport.rmtree(
-                            localizer.reserve_path('jobs', k).controllerpath
+                            localizer.reserve_path('jobs', k).remotepath
                         )
 
                     # we also have to remove the common inputs directory, so that
                     # the localizer can regenerate it
                     if len(self.job_spec) > 0:
                         transport.rmtree(
-                            localizer.reserve_path('common').controllerpath
+                            localizer.reserve_path('common').remotepath
                         )
 
                     return np.count_nonzero(~fail_idx)

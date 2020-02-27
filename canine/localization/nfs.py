@@ -148,88 +148,6 @@ class NFSLocalizer(BatchedLocalizer):
             )
             return self.finalize_staging_dir(inputs)
 
-    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str]:
-        """
-        Returns a tuple of (setup script, teardown script) for the given job id.
-        Must call after pre-scanning inputs
-        """
-        job_vars = []
-        exports = []
-        extra_tasks = [
-            'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
-        ]
-        compute_env = self.environment('local')
-        for key, val in self.inputs[jobId].items():
-            if val.type == 'stream':
-                job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                extra_tasks += [
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.localpath),
-                    'mkfifo {}'.format(dest.localpath),
-                    "gsutil {} cat {} > {} &".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.localpath
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.localpath
-                ))
-            elif val.type == 'download':
-                job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                extra_tasks += [
-                "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.localpath
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.localpath
-                ))
-            elif val.type is None:
-                job_vars.append(shlex.quote(key))
-                exports.append('export {}={}'.format(
-                    key,
-                    shlex.quote(val.path.localpath if isinstance(val.path, PathType) else val.path)
-                ))
-            else:
-                print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
-        setup_script = '\n'.join(
-            line.rstrip()
-            for line in [
-                '#!/bin/bash',
-                'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
-                'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
-                'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
-                'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
-                'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
-                'mkdir -p $CANINE_JOB_INPUTS',
-                'mkdir -p $CANINE_JOB_ROOT',
-            ] + exports + extra_tasks
-        ) + '\ncd $CANINE_JOB_ROOT\n'
-        teardown_script = '\n'.join(
-            line.rstrip()
-            for line in [
-                '#!/bin/bash',
-                'if [[ -d {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
-                # 'mv ../stderr ../stdout .',
-                'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3}; else python {0} {1} {2} {3}; fi'.format(
-                    os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
-                    compute_env['CANINE_OUTPUT'],
-                    jobId,
-                    ' '.join(
-                        '-p {} {}'.format(name, shlex.quote(pattern))
-                        for name, pattern in patterns.items()
-                    )
-                ),
-            ]
-        )
-        return setup_script, teardown_script
-
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: typing.Optional[str] = None) -> typing.Dict[str, typing.Dict[str, str]]:
         """
         Delocalizes output from all jobs.
@@ -271,7 +189,7 @@ class NFSLocalizer(BatchedLocalizer):
 
     def same_volume(self, *args):
         """
-        Check if *args are stored on the same NFS mount as the output directory.
+        Check if args are stored on the same NFS mount as the output directory.
         """
         vols = subprocess.check_output(
           "df {} | awk 'NR > 1 {{ print $1 }}'".format(
