@@ -25,6 +25,8 @@ def main(dest, jobId, patterns, copy):
                 if os.path.isfile(target):
                     if copy:
                         shutil.copyfile(os.path.abspath(target), dest)
+                    elif os.stat(target).st_dev == os.stat(os.path.dirname(dest)).st_dev:
+                        os.symlink(os.path.relpath(target, os.path.dirname(dest)), dest)
                     else:
                         os.symlink(os.path.abspath(target), dest)
                 else:
