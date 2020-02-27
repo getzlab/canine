@@ -258,7 +258,7 @@ class Orchestrator(object):
                 #
                 # submit job
                 print("Submitting batch job")
-                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('compute'))
+                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'))
                 print("Batch id:", batch_id)
 
                 #
@@ -306,7 +306,7 @@ class Orchestrator(object):
         )
         print("Job staged on SLURM controller in:", abs_staging_dir)
         print("Preparing pipeline script")
-        env = localizer.environment('compute')
+        env = localizer.environment('remote')
         root_dir = env['CANINE_ROOT']
         entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')
         if isinstance(self.script, str):

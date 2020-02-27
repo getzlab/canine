@@ -28,15 +28,16 @@ class NFSLocalizer(BatchedLocalizer):
 
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
-        common: bool = True, staging_dir: str = None, mount_path: str = None,
+        common: bool = True, staging_dir: str = None,
         project: typing.Optional[str] = None, **kwargs
     ):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
         the localizer's entire life cycle.
-        Note: staging_dir refers to the directory on the LOCAL filesystem
-        Note: mount_path refers to the mounted directory on the REMOTE filesystem (both the controller and worker nodes)
+        Note: staging_dir refers to the NFS mount path on the local and remote filesystems
+        This localization strategy requires that {staging_dir} is a valid NFS mount shared between
+        the local system, the slurm controller, and all slurm compute nodes
         """
         if staging_dir is None:
             raise TypeError("staging_dir is a required argument for NFSLocalizer")
@@ -46,19 +47,11 @@ class NFSLocalizer(BatchedLocalizer):
         self.common = common
         self.common_inputs = set()
         self.__sbcast = False
-        if staging_dir == 'SBCAST':
-            # FIXME: This doesn't actually do anything yet
-            # If sbcast is true, then localization needs to use backend.sbcast to move files to the remote system
-            # Not sure at all how delocalization would work
-            self.__sbcast = True
-            staging_dir = None
-        self._local_dir = tempfile.TemporaryDirectory()
-        self.local_dir = os.path.realpath(os.path.abspath(staging_dir))
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
         with self.backend.transport() as transport:
-            self.mount_path = transport.normpath(mount_path if mount_path is not None else staging_dir)
-        self.staging_dir = self.mount_path
+            self.staging_dir = transport.normpath(staging_dir)
+            self.local_dir = staging_dir
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
@@ -84,7 +77,7 @@ class NFSLocalizer(BatchedLocalizer):
                     os.makedirs(os.path.dirname(dest.localpath))
 
                 #
-                # check if self.mount_path, self.local_dir, and src all exist on the same NFS share
+                # check if self.mount_path, self.staging_dir, and src all exist on the same NFS share
                 # symlink if yes, copy if no
                 if self.same_volume(src):
                     os.symlink(src, dest.localpath)
@@ -165,43 +158,43 @@ class NFSLocalizer(BatchedLocalizer):
         extra_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
-        compute_env = self.environment('compute')
+        compute_env = self.environment('local')
         for key, val in self.inputs[jobId].items():
             if val.type == 'stream':
                 job_vars.append(shlex.quote(key))
                 dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                 extra_tasks += [
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
-                    'mkfifo {}'.format(dest.computepath),
+                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.localpath),
+                    'mkfifo {}'.format(dest.localpath),
                     "gsutil {} cat {} > {} &".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
-                        dest.computepath
+                        dest.localpath
                     )
                 ]
                 exports.append('export {}="{}"'.format(
                     key,
-                    dest.computepath
+                    dest.localpath
                 ))
             elif val.type == 'download':
                 job_vars.append(shlex.quote(key))
                 dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                 extra_tasks += [
-                    "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
+                "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
-                        dest.computepath
+                        dest.localpath
                     )
                 ]
                 exports.append('export {}="{}"'.format(
                     key,
-                    dest.computepath
+                    dest.localpath
                 ))
             elif val.type is None:
                 job_vars.append(shlex.quote(key))
                 exports.append('export {}={}'.format(
                     key,
-                    shlex.quote(val.path.computepath if isinstance(val.path, PathType) else val.path)
+                    shlex.quote(val.path.localpath if isinstance(val.path, PathType) else val.path)
                 ))
             else:
                 print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
@@ -243,8 +236,8 @@ class NFSLocalizer(BatchedLocalizer):
         NFSLocalizer does not delocalize files. Data is copied from output dir
         """
         if output_dir is not None:
-            warnings.warn("output_dir has no bearing on NFSLocalizer. outputs are available in {}/outputs".format(self.local_dir))
-        output_dir = os.path.join(self.local_dir, 'outputs')
+            warnings.warn("output_dir has no bearing on NFSLocalizer. outputs are available in {}/outputs".format(self.staging_dir))
+        output_dir = os.path.join(self.staging_dir, 'outputs')
         output_files = {}
         for jobId in os.listdir(output_dir):
             start_dir = os.path.join(output_dir, jobId)
@@ -282,7 +275,7 @@ class NFSLocalizer(BatchedLocalizer):
         """
         vols = subprocess.check_output(
           "df {} | awk 'NR > 1 {{ print $1 }}'".format(
-            " ".join([shlex.quote(x) for x in [self.mount_path, self.local_dir, *args]])
+            " ".join([shlex.quote(x) for x in [self.staging_dir, *args]])
           ),
           shell = True
         )

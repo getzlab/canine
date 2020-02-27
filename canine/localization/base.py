@@ -24,7 +24,7 @@ Localization = namedtuple("Localization", ['type', 'path'])
 
 PathType = namedtuple(
     'PathType',
-    ['localpath', 'controllerpath', 'computepath']
+    ['localpath', 'remotepath']
 )
 
 class AbstractLocalizer(abc.ABC):
@@ -35,7 +35,7 @@ class AbstractLocalizer(abc.ABC):
 
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
-        common: bool = True, staging_dir: str = None, mount_path: str = None,
+        common: bool = True, staging_dir: str = None,
         project: typing.Optional[str] = None, **kwargs
     ):
         """
@@ -50,18 +50,10 @@ class AbstractLocalizer(abc.ABC):
         self.backend = backend
         self.common = common
         self.common_inputs = set()
-        self.__sbcast = False
-        if staging_dir == 'SBCAST':
-            # FIXME: This doesn't actually do anything yet
-            # If sbcast is true, then localization needs to use backend.sbcast to move files to the remote system
-            # Not sure at all how delocalization would work
-            self.__sbcast = True
-            staging_dir = None
-        self.staging_dir = staging_dir if staging_dir is not None else str(uuid4())
         self._local_dir = tempfile.TemporaryDirectory()
         self.local_dir = self._local_dir.name
         with self.backend.transport() as transport:
-            self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
+            self.staging_dir = transport.normpath(staging_dir if staging_dir is not None else str(uuid4()))
             # if transport.isdir(self.staging_dir) and not force:
             #     raise FileExistsError("{} already exists. Supply force=True to override".format(
             #         self.staging_dir
@@ -105,10 +97,10 @@ class AbstractLocalizer(abc.ABC):
     def environment(self, location: str) -> typing.Dict[str, str]:
         """
         Returns environment variables relative to the given location.
-        Location must be one of {"local", "controller", "compute"}
+        Location must be one of {"local", "remote"}
         """
-        if location not in {"local", "controller", "compute"}:
-            raise ValueError('location must be one of {"local", "controller", "compute"}')
+        if location not in {"local", "remote"}:
+            raise ValueError('location must be one of {"local", "remote"}')
         if location == 'local':
             return {
                 'CANINE_ROOT': self.local_dir,
@@ -116,20 +108,14 @@ class AbstractLocalizer(abc.ABC):
                 'CANINE_OUTPUT': os.path.join(self.local_dir, 'outputs'), #outputs/jobid/outputname/...files...
                 'CANINE_JOBS': os.path.join(self.local_dir, 'jobs'),
             }
-        elif location == "controller":
+        elif location == "remote":
             return {
                 'CANINE_ROOT': self.staging_dir,
                 'CANINE_COMMON': os.path.join(self.staging_dir, 'common'),
                 'CANINE_OUTPUT': os.path.join(self.staging_dir, 'outputs'), #outputs/jobid/outputname/...files...
                 'CANINE_JOBS': os.path.join(self.staging_dir, 'jobs'),
             }
-        elif location == "compute":
-            return {
-                'CANINE_ROOT': self.mount_path,
-                'CANINE_COMMON': os.path.join(self.mount_path, 'common'),
-                'CANINE_OUTPUT': os.path.join(self.mount_path, 'outputs'),
-                'CANINE_JOBS': os.path.join(self.mount_path, 'jobs'),
-            }
+
     def gs_dircp(self, src: str, dest: str, context: str, transport: typing.Optional[AbstractTransport] = None):
         """
         gs_copy for directories
@@ -335,8 +321,7 @@ class AbstractLocalizer(abc.ABC):
         """
         return PathType(
             os.path.join(self.environment('local')['CANINE_ROOT'], *(str(component) for component in args)),
-            os.path.join(self.environment('controller')['CANINE_ROOT'], *(str(component) for component in args)),
-            os.path.join(self.environment('compute')['CANINE_ROOT'], *(str(component) for component in args))
+            os.path.join(self.environment('remote')['CANINE_ROOT'], *(str(component) for component in args)),
         )
 
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output') -> typing.Dict[str, typing.Dict[str, str]]:
@@ -344,7 +329,7 @@ class AbstractLocalizer(abc.ABC):
         Delocalizes output from all jobs
         """
         self.receivetree(
-            self.environment('controller')['CANINE_OUTPUT'],
+            self.environment('remote')['CANINE_OUTPUT'],
             output_dir,
             exist_okay=True
         )
@@ -394,7 +379,7 @@ class AbstractLocalizer(abc.ABC):
         (such as those dropped during transfer for being empty).
         Returns the absolute path of the remote staging directory on the controller node.
         """
-        controller_env = self.environment('controller')
+        controller_env = self.environment('remote')
         with self.transport_context(transport) as transport:
             if not transport.isdir(controller_env['CANINE_COMMON']):
                 transport.mkdir(controller_env['CANINE_COMMON'])
@@ -402,7 +387,7 @@ class AbstractLocalizer(abc.ABC):
                 transport.mkdir(controller_env['CANINE_JOBS'])
             if len(jobs) and not transport.isdir(controller_env['CANINE_OUTPUT']):
                 transport.mkdir(controller_env['CANINE_OUTPUT'])
-            return transport.normpath(self.staging_dir)
+            return self.staging_dir
 
     def prepare_job_inputs(self, jobId: str, job_inputs: typing.Dict[str, str], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None):
         """
@@ -492,23 +477,23 @@ class AbstractLocalizer(abc.ABC):
         extra_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
-        compute_env = self.environment('compute')
+        compute_env = self.environment('remote')
         for key, val in self.inputs[jobId].items():
             if val.type == 'stream':
                 job_vars.append(shlex.quote(key))
                 dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                 extra_tasks += [
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
-                    'mkfifo {}'.format(dest.computepath),
+                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.remotepath),
+                    'mkfifo {}'.format(dest.remotepath),
                     "gsutil {} cat {} > {} &".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
-                        dest.computepath
+                        dest.remotepath
                     )
                 ]
                 exports.append('export {}="{}"'.format(
                     key,
-                    dest.computepath
+                    dest.remotepath
                 ))
             elif val.type == 'download':
                 job_vars.append(shlex.quote(key))
@@ -517,18 +502,18 @@ class AbstractLocalizer(abc.ABC):
                     "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
-                        dest.computepath
+                        dest.remotepath
                     )
                 ]
                 exports.append('export {}="{}"'.format(
                     key,
-                    dest.computepath
+                    dest.remotepath
                 ))
             elif val.type is None:
                 job_vars.append(shlex.quote(key))
                 exports.append('export {}={}'.format(
                     key,
-                    shlex.quote(val.path.computepath if isinstance(val.path, PathType) else val.path)
+                    shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path)
                 ))
             else:
                 print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)

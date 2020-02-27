@@ -49,8 +49,8 @@ backend: # SLURM backend configuration
   argname: argvalue {--backend argname:argvalue}
 localization: # Localization options
   common: (bool, default True) Files (gs:// or otherwise) which are shared by multiple tasks will be downloaded only once {--localization common:value}
-  staging_dir: (str, default tempdir) Directory in which files for this job should be staged. For Remote backends, this should be set within the NFS share. If no NFS share exists, set this to "SBCAST" {--localization staging-dir:path}
-  mount_path: (str, default null) Path within compute nodes where the staging dir can be found {--localization mount-path:path}
+  staging_dir: (str, default tempdir) Directory in which files for this job should be staged. For Remote backends, this should be set within the NFS share.
+   {--localization staging-dir:path}
   strategy: [One of: Batched, Local, Remote] Strategy for staging inputs {--localization strategy:mode}
   transfer_bucket: (str, default null) Transfer directories via the given bucket instead of directly over SFTP. Bucket transfer generally faster
   overrides: # Override localization handling for specific inputs
