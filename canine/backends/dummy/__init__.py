@@ -200,7 +200,10 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Controller starts all necessary workers and fills slurm config
         """
         self.port = port_for.select_random()
-        self.bind_path = tempfile.TemporaryDirectory(dir=os.path.expanduser('~'))
+        if self.staging_dir is None:
+            self.bind_path = tempfile.TemporaryDirectory(dir=os.path.expanduser('~'))
+        else:
+            self.bind_path = ManualBind(self.staging_dir)
         self.dkr = docker.from_env()
         try:
             # Check that the chosen network exists
