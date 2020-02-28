@@ -480,6 +480,8 @@ The file will only be localized once. If the job is restarted (for instance, if 
   already finish
 * `Common`: Forces the input to be localized to the common directory. This will
 override default common behavior (the file will always be localized to the `$CANINE_COMMON` directory)
+    * **NOTE:** `Common` can also be used to explicitly declare that an input which is a list should be shared across
+    all jobs, instead of one element per job
 * `null`: Forces the input to be treated as a plain string. No handling whatsoever
 will be applied to the input.
 

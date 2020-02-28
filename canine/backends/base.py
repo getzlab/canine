@@ -91,7 +91,7 @@ class AbstractTransport(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def stat(self, path: str) -> typing.Any:
+    def stat(self, path: str, follow_symlinks: bool = True) -> typing.Any:
         """
         Returns stat information
         """
@@ -241,12 +241,12 @@ class AbstractTransport(abc.ABC):
         for fname in self.listdir(path):
             fname = os.path.join(path, fname)
             try:
-                fstat = self.stat(fname)
+                fstat = self.stat(fname, follow_symlinks=False)
             except FileNotFoundError:
                 # Handling for broken symlinks is bad
                 self.remove(fname)
             else:
-                if stat.S_ISDIR(fstat.st_mode):
+                if stat.S_ISDIR(fstat.st_mode) and not stat.S_ISLNK(fstat.st_mode):
                     self._rmtree(
                         fname,
                         fstat

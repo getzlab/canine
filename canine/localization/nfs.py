@@ -60,7 +60,6 @@ class NFSLocalizer(BatchedLocalizer):
             self.mount_path = transport.normpath(mount_path if mount_path is not None else staging_dir)
         self.staging_dir = self.mount_path
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
-        self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
 
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
@@ -173,8 +172,8 @@ class NFSLocalizer(BatchedLocalizer):
             for outputname in os.listdir(start_dir):
                 dirpath = os.path.join(start_dir, outputname)
                 if os.path.isdir(dirpath):
-                    if outputname not in patterns:
-                        warnings.warn("Detected output directory {} which was not declared".format(dirpath))
+                    # if outputname not in patterns:
+                    #     warnings.warn("Detected output directory {} which was not declared".format(dirpath))
                     output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]

@@ -17,6 +17,7 @@ class FirecloudAdapter(AbstractAdapter):
         self, workspace: str, entityType: str, entityName: str,
         entityExpression: typing.Optional[str] = None, write_to_workspace: bool = True,
         alias: typing.Union[None, str, typing.List[str]] = None,
+        common_inputs: typing.Optional[typing.Set[str]] = None
     ):
         """
         Initializes the adapter
@@ -30,7 +31,7 @@ class FirecloudAdapter(AbstractAdapter):
         alias may be a list of strings (an alias for each job) or a single string
         (the input variable to use as the alias)
         """
-        super().__init__(alias=alias)
+        super().__init__(alias=alias, common_inputs=common_inputs)
         self.workspace = dalmatian.WorkspaceManager(workspace)
         if entityName not in self.workspace._get_entities_internal(entityType).index:
             raise NameError('No such {} "{}" in workspace {}'.format(

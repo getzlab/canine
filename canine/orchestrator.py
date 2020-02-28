@@ -139,13 +139,27 @@ class Orchestrator(object):
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
 
         #
+        # localizer
+        self.localizer_args = config['localization'] if 'localization' in config else {}
+        if self.localizer_args['strategy'] not in LOCALIZERS:
+            raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
+        self._localizer_type = LOCALIZERS[self.localizer_args['strategy']]
+        self.localizer_overrides = {}
+        if 'overrides' in self.localizer_args:
+            self.localizer_overrides = {**self.localizer_args['overrides']}
+
+        #
         # adapter
         adapter = config['adapter']
         if adapter['type'] not in ADAPTERS:
             raise ValueError("Unknown adapter type '{type}'".format(**adapter))
         self._adapter_type=adapter['type']
-        self.adapter = ADAPTERS[adapter['type']](**{arg:val for arg,val in adapter.items() if arg != 'type'})
+        self.adapter = ADAPTERS[adapter['type']](
+            common_inputs={arg for arg, val in self.localizer_overrides.items() if val.lower() in {'common', 'array'}},
+            **{arg:val for arg,val in adapter.items() if arg != 'type'}
+        )
         self.job_spec = self.adapter.parse_inputs(self.raw_inputs)
+        print(self.job_spec)
 
         #
         # backend
@@ -155,16 +169,6 @@ class Orchestrator(object):
         self._backend_type = backend['type']
         self._slurmconf_path = backend['slurm_conf_path'] if 'slurm_conf_path' in backend else None
         self.backend = BACKENDS[self._backend_type](**backend)
-
-        #
-        # localizer
-        self.localizer_args = config['localization'] if 'localization' in config else {}
-        if self.localizer_args['strategy'] not in LOCALIZERS:
-            raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
-        self._localizer_type = LOCALIZERS[self.localizer_args['strategy']]
-        self.localizer_overrides = {}
-        if 'overrides' in self.localizer_args:
-            self.localizer_overrides = {**self.localizer_args['overrides']}
 
         #
         # outputs
@@ -218,7 +222,6 @@ class Orchestrator(object):
                 entrypoint_path = self.localize_inputs_and_script(localizer)
 
                 if dry_run:
-                    localizer.clean_on_exit = False
                     return self.job_spec
 
                 print("Waiting for cluster to finish startup...")
@@ -272,7 +275,6 @@ class Orchestrator(object):
                 except:
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
-                    localizer.clean_on_exit = False
                     raise
                 finally:
                     # Check if fully job-avoided so we still delocalize

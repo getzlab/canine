@@ -67,7 +67,6 @@ class AbstractLocalizer(abc.ABC):
             #         self.staging_dir
             #     ))
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
-        self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
 
     def get_requester_pays(self, path: str) -> bool:
@@ -357,8 +356,8 @@ class AbstractLocalizer(abc.ABC):
             for outputname in os.listdir(start_dir):
                 dirpath = os.path.join(start_dir, outputname)
                 if os.path.isdir(dirpath):
-                    if outputname not in patterns:
-                        warnings.warn("Detected output directory {} which was not declared".format(dirpath))
+                    # if outputname not in patterns:
+                    #     warnings.warn("Detected output directory {} which was not declared".format(dirpath))
                     output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
@@ -453,7 +452,7 @@ class AbstractLocalizer(abc.ABC):
         if input_value in common_dests or mode == 'common':
             # common override already handled
             # No localization needed
-            return Localization(None, common_dests[input_value])
+            return Localization(None, common_dests[input_value] if input_value in common_dests else input_value)
         elif mode is not False: # User has specified an override
             if mode == 'stream':
                 if input_value.startswith('gs://'):
@@ -610,12 +609,6 @@ class AbstractLocalizer(abc.ABC):
         """
         if self._local_dir is not None:
             self._local_dir.cleanup()
-        if self.clean_on_exit:
-            try:
-                with self.backend.transport() as transport:
-                    transport.rmdir(self.staging_dir)
-            except:
-                pass
 
     @abc.abstractmethod
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):

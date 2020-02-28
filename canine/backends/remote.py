@@ -84,13 +84,25 @@ class RemoteTransport(AbstractTransport):
             raise paramiko.SSHException("Transport is not connected")
         return self.session.mkdir(path)
 
-    def stat(self, path: str) -> typing.Any:
+    def stat(self, path: str, follow_symlinks: bool = True) -> typing.Any:
         """
         Returns stat information
         """
         if self.session is None:
             raise paramiko.SSHException("Transport is not connected")
-        return self.session.stat(path)
+        if follow_symlinks:
+            return self.session.stat(path)
+        else:
+            try:
+                dirname = os.path.dirname(path)
+                if dirname == '':
+                    dirname = '.'
+                return {
+                    attr.filename: attr
+                    for attr in self.session.listdir_attr()
+                }[os.path.basename(path)]
+            except KeyError as e:
+                raise FileNotFoundError(path) from e
 
     def chmod(self, path: str, mode: int):
         """

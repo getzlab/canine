@@ -10,6 +10,19 @@ class _FixedArray(object):
     def __init__(self, items):
         self.items = items
 
+    @staticmethod
+    def flatten(items):
+        """
+        Flattens the array tp the specified depth.
+        "Common" inputs only allowed 1D arrays
+        Otherwise only allowed 2D
+        """
+        if not isinstance(items, list):
+            yield items
+        else:
+            for item in items:
+                yield from _FixedArray.flatten(item)
+
     @property
     def is_2d(self):
         for item in self.items:
@@ -37,18 +50,20 @@ class _FixedArray(object):
             return elem
         raise ValueError("FixedArray is not 2d")
 
-    def stringify(self):
-        return [
-            [str(item) for item in elem] if self.is_2d else str(elem)
-            for elem in self.items
-        ]
+    def stringify(self, two_d):
+        if two_d and self.is_2d:
+            return [
+                [str(item) for item in _FixedArray.flatten(row)]
+                for row in self.items
+            ]
+        return [str(item) for item in _FixedArray.flatten(self.items)]
 
 class AbstractAdapter(abc.ABC):
     """
     Base class for pipeline input adapters
     """
 
-    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None):
+    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, common_inputs: typing.Optional[typing.Set[str]] = None):
         """
         Initializes the adapter.
         If alias is provided, it is used to specify custom job aliases.
@@ -56,6 +71,7 @@ class AbstractAdapter(abc.ABC):
         (the input variable to use as the alias)
         """
         self.alias = alias
+        self.common_inputs = common_inputs if common_inputs is not None else set()
 
 
     @abc.abstractmethod
@@ -84,13 +100,19 @@ class AbstractAdapter(abc.ABC):
         """
         pass
 
+    def pin_arrays(self, key, val):
+        pinned = _FixedArray(val)
+        if pinned.is_2d or key in self.common_inputs:
+            return pinned
+        return val
+
 class ManualAdapter(AbstractAdapter):
     """
     Handles manual argument formatting
     Does pretty much nothing, except maybe combining arguments
     """
 
-    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, product: bool = False, common_inputs: typing.List[str] = None):
+    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, product: bool = False, common_inputs: typing.Optional[typing.Set[str]] = None):
         """
         Initializes the adapter
         If product is True, array arguments will be combined, instead of co-iterated.
@@ -98,18 +120,10 @@ class ManualAdapter(AbstractAdapter):
         alias may be a list of strings (an alias for each job) or a single string
         (the input variable to use as the alias)
         """
-        super().__init__(alias=alias)
-        self.common_inputs = common_inputs if common_inputs is not None else []
+        super().__init__(alias=alias, common_inputs=common_inputs)
         self.product = product
         self.__spec = None
         self._job_length = 0
-
-    def pin_arrays(self, key, val):
-        pinned = _FixedArray(val)
-        if pinned.is_2d or key in self.common_inputs:
-            return pinned
-        return val
-
 
     def parse_inputs(self, inputs: typing.Dict[str, typing.Union[typing.Any, typing.List[typing.Any]]]) -> typing.Dict[str, typing.Dict[str, str]]:
         """
@@ -123,11 +137,14 @@ class ManualAdapter(AbstractAdapter):
             key: self.pin_arrays(key, val)
             for key,val in inputs.items()
         }
+        print(inputs)
+        import pdb; pdb.set_trace()
+
 
         keys = sorted(inputs)
         input_lengths = {
             # FixedArrays return actual length if they are 2d
-            key: len(val) if isinstance(val, list) or (isinstance(val, _FixedArray) and val.is_2d) else 1
+            key: len(val) if isinstance(val, list) or (isinstance(val, _FixedArray) and key not in self.common_inputs) else 1
             for key, val in inputs.items()
         }
 
@@ -160,7 +177,7 @@ class ManualAdapter(AbstractAdapter):
             # XXX: simplify this with itertools.zip_longest() ?
             generator = zip(*[
                 inputs[key] if isinstance(inputs[key], list) else (
-                    iter(inputs[key]) if isinstance(inputs[key], _FixedArray) and inputs[key].is_2d else repeat(inputs[key], self._job_length)
+                    iter(inputs[key]) if isinstance(inputs[key], _FixedArray) and key not in self.common_inputs else repeat(inputs[key], self._job_length)
                 )
                 for key in keys
             ])
@@ -168,7 +185,7 @@ class ManualAdapter(AbstractAdapter):
             str(i): {
                 # Unpack fixed arrays here
                 # From localizer perspective, any lists are intentionally fixed lists
-                key: val.stringify() if isinstance(val, _FixedArray) else str(val)
+                key: val.stringify(key not in self.common_inputs) if isinstance(val, _FixedArray) else str(val)
                 for key, val in zip(keys, job)
             }
             for i, job in enumerate(generator)
