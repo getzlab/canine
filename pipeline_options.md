@@ -104,9 +104,6 @@ base delocalization.
 * `product`: If false (the default) all inputs must be of equal length or a constant.
 In this case, inputs will take one value per job. If true, arrays may be of unequal length
 and one job will be launched for each combination of elements
-* `arrays`: A list of input names which should be considered a bash array, instead of
-an array of individual arguments
-
 
 Here is an example adapter configuration using the default settings:
 ```yaml

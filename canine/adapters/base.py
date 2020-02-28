@@ -12,7 +12,10 @@ class _FixedArray(object):
 
     @property
     def is_2d(self):
-        return len(self.items) > 0 and isinstance(self.items[0], list)
+        for item in self.items:
+            if not isinstance(item, list):
+                return False
+        return len(self.items) > 0
 
     def __len__(self):
         return len(self.items) if self.is_2d else 1
@@ -87,7 +90,7 @@ class ManualAdapter(AbstractAdapter):
     Does pretty much nothing, except maybe combining arguments
     """
 
-    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, product: bool = False, arrays: typing.List[str] = None):
+    def __init__(self, alias: typing.Union[None, str, typing.List[str]] = None, product: bool = False, common_inputs: typing.List[str] = None):
         """
         Initializes the adapter
         If product is True, array arguments will be combined, instead of co-iterated.
@@ -96,10 +99,17 @@ class ManualAdapter(AbstractAdapter):
         (the input variable to use as the alias)
         """
         super().__init__(alias=alias)
-        self.arrays = arrays if arrays is not None else []
+        self.common_inputs = common_inputs if common_inputs is not None else []
         self.product = product
         self.__spec = None
         self._job_length = 0
+
+    def pin_arrays(self, key, val):
+        pinned = _FixedArray(val)
+        if pinned.is_2d or key in self.common_inputs:
+            return pinned
+        return val
+
 
     def parse_inputs(self, inputs: typing.Dict[str, typing.Union[typing.Any, typing.List[typing.Any]]]) -> typing.Dict[str, typing.Dict[str, str]]:
         """
@@ -110,7 +120,7 @@ class ManualAdapter(AbstractAdapter):
 
         #Pin fixed arrays
         inputs = {
-            key: _FixedArray(val) if key in self.arrays else val
+            key: self.pin_arrays(key, val)
             for key,val in inputs.items()
         }
 

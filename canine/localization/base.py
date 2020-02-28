@@ -429,7 +429,7 @@ class AbstractLocalizer(abc.ABC):
     def handle_input(self, jobId: str, input_name: str, input_value: typing.Union[str, typing.List[str]], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: AbstractTransport) -> Localization:
         """
         Handles a singular input.
-        Localizes sraightforward files. Stream/Delay files are marked for later handling
+        Localizes straightforward files. Stream/Delay files are marked for later handling
         Returns Localization objects for the determined actions still required
         (Localization objects are handled during setup_teardown)
         Job array inputs have their elements individually handled here
