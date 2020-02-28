@@ -463,7 +463,7 @@ class AbstractLocalizer(abc.ABC):
                 if input_value.startswith('gs://'):
                     return Localization('download', input_value)
                 print("Ignoring 'delayed' override for", input_name, "with value", input_value, "and localizing now", file=sys.stderr)
-            elif mode == None:
+            elif mode is None or mode == 'null':
                 return Localization(None, input_value)
         # At this point, no overrides have taken place, so handle by default
         if os.path.exists(input_value) or input_value.startswith('gs://'):

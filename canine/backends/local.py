@@ -3,6 +3,7 @@ import os
 import io
 import sys
 import subprocess
+import shutil
 from .base import AbstractSlurmBackend, AbstractTransport
 from ..utils import ArgumentHelper, check_call
 from agutil import StdOutAdapter
@@ -97,6 +98,14 @@ class LocalTransport(AbstractTransport):
         * filenames: The base names of all files in the current directory
         """
         yield from os.walk(path)
+
+    def _rmtree(self, path: str, pathstat: os.stat_result):
+        """
+        (Internal)
+        Recursively remove the directory tree rooted at the given path.
+        Automatically retries failures after a brief timeout
+        """
+        shutil.rmtree(path)
 
 class LocalSlurmBackend(AbstractSlurmBackend):
     """

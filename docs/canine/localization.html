@@ -112,7 +112,7 @@ but its parent does</p>
 <dt id="canine.localization.BatchedLocalizer.handle_input">
 <code class="sig-name descname">handle_input</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, input_name: str, input_value: Union[str, List[str]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: canine.backends.base.AbstractTransport</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.Localization<a class="headerlink" href="#canine.localization.BatchedLocalizer.handle_input" title="Permalink to this definition">¶</a></dt>
 <dd><p>Handles a singular input.
-Localizes sraightforward files. Stream/Delay files are marked for later handling
+Localizes straightforward files. Stream/Delay files are marked for later handling
 Returns Localization objects for the determined actions still required
 (Localization objects are handled during setup_teardown)
 Job array inputs have their elements individually handled here</p>
@@ -272,7 +272,7 @@ but its parent does</p>
 <dt id="canine.localization.LocalLocalizer.handle_input">
 <code class="sig-name descname">handle_input</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, input_name: str, input_value: Union[str, List[str]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: canine.backends.base.AbstractTransport</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.Localization<a class="headerlink" href="#canine.localization.LocalLocalizer.handle_input" title="Permalink to this definition">¶</a></dt>
 <dd><p>Handles a singular input.
-Localizes sraightforward files. Stream/Delay files are marked for later handling
+Localizes straightforward files. Stream/Delay files are marked for later handling
 Returns Localization objects for the determined actions still required
 (Localization objects are handled during setup_teardown)
 Job array inputs have their elements individually handled here</p>
@@ -424,7 +424,7 @@ but its parent does</p>
 <dt id="canine.localization.RemoteLocalizer.handle_input">
 <code class="sig-name descname">handle_input</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, input_name: str, input_value: Union[str, List[str]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: canine.backends.base.AbstractTransport</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.Localization<a class="headerlink" href="#canine.localization.RemoteLocalizer.handle_input" title="Permalink to this definition">¶</a></dt>
 <dd><p>Handles a singular input.
-Localizes sraightforward files. Stream/Delay files are marked for later handling
+Localizes straightforward files. Stream/Delay files are marked for later handling
 Returns Localization objects for the determined actions still required
 (Localization objects are handled during setup_teardown)
 Job array inputs have their elements individually handled here</p>
@@ -581,7 +581,7 @@ but its parent does</p>
 <dt id="canine.localization.NFSLocalizer.handle_input">
 <code class="sig-name descname">handle_input</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, input_name: str, input_value: Union[str, List[str]], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: canine.backends.base.AbstractTransport</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.Localization<a class="headerlink" href="#canine.localization.NFSLocalizer.handle_input" title="Permalink to this definition">¶</a></dt>
 <dd><p>Handles a singular input.
-Localizes sraightforward files. Stream/Delay files are marked for later handling
+Localizes straightforward files. Stream/Delay files are marked for later handling
 Returns Localization objects for the determined actions still required
 (Localization objects are handled during setup_teardown)
 Job array inputs have their elements individually handled here</p>
@@ -643,6 +643,12 @@ Source must be a remote folder, and dest must not exist</p>
 <dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
 Returns a PathType object which can be used to view the path relative to
 local, compute, or controller contexts</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.NFSLocalizer.same_volume">
+<code class="sig-name descname">same_volume</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.same_volume" title="Permalink to this definition">¶</a></dt>
+<dd><p>Check if <a href="#id1"><span class="problematic" id="id2">*</span></a>args are stored on the same NFS mount as the output directory.</p>
 </dd></dl>
 
 <dl class="method">

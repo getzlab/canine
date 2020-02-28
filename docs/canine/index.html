@@ -37,7 +37,7 @@
 <p>A dalmatian-based job manager to schedule tasks using SLURM</p>
 <span class="target" id="module-canine"></span><dl class="class">
 <dt id="canine.Orchestrator">
-<em class="property">class </em><code class="sig-prename descclassname">canine.</code><code class="sig-name descname">Orchestrator</code><span class="sig-paren">(</span><em class="sig-param">config: Union[str, Dict[str, Any]]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.Orchestrator" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.</code><code class="sig-name descname">Orchestrator</code><span class="sig-paren">(</span><em class="sig-param">config: Union[str, Dict[str, Any], pandas.core.frame.DataFrame, pandas.core.series.Series]</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.Orchestrator" title="Permalink to this definition">¶</a></dt>
 <dd><p>Main class
 Parses a configuration object, initializes, runs, and cleans up a Canine Pipeline</p>
 <dl class="method">
@@ -45,6 +45,13 @@ Parses a configuration object, initializes, runs, and cleans up a Canine Pipelin
 <em class="property">static </em><code class="sig-name descname">fill_config</code><span class="sig-paren">(</span><em class="sig-param">cfg: Union[str, Dict[str, Any]]</em><span class="sig-paren">)</span> &#x2192; Dict[str, Any]<a class="headerlink" href="#canine.Orchestrator.fill_config" title="Permalink to this definition">¶</a></dt>
 <dd><p>Loads the given config object (or reads from the given filepath)
 Applies Canine defaults, then returns the final config dictionary</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.Orchestrator.job_avoid">
+<code class="sig-name descname">job_avoid</code><span class="sig-paren">(</span><em class="sig-param">localizer: canine.localization.base.AbstractLocalizer</em>, <em class="sig-param">overwrite: bool = False</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.Orchestrator.job_avoid" title="Permalink to this definition">¶</a></dt>
+<dd><p>Detects jobs which have previously been run in this staging directory.
+Succeeded jobs are skipped. Failed jobs are reset and rerun</p>
 </dd></dl>
 
 <dl class="method">
