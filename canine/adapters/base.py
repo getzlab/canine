@@ -137,9 +137,6 @@ class ManualAdapter(AbstractAdapter):
             key: self.pin_arrays(key, val)
             for key,val in inputs.items()
         }
-        print(inputs)
-        import pdb; pdb.set_trace()
-
 
         keys = sorted(inputs)
         input_lengths = {

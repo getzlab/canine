@@ -389,17 +389,12 @@ class AbstractLocalizer(abc.ABC):
             for jobId, values in inputs.items():
                 for arg, paths in values.items():
                     if arg not in overrides:
-                        print(arg, "is not overridden; scanning inputs")
                         for path in self.flatten_inputs(paths):
                             if path in seen:
-                                print("already encountered", path, " (adding to common)")
                                 self.common_inputs.add(path)
                             else:
-                                print("first encounter of", path)
                                 seen.add(path)
                     elif arg not in seen_forced and overrides[arg] == 'common':
-                        print("Arg", arg, "not already forced")
-                        print("Forcing", arg, [*self.flatten_inputs(paths)])
                         seen_forced.add(arg)
                         self.common_inputs |= {*self.flatten_inputs(paths)}
             common_dests = {}
