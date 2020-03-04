@@ -12,6 +12,7 @@ from .local import BatchedLocalizer
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project
 from agutil import status_bar
+import pandas as pd
 
 
 class NFSLocalizer(BatchedLocalizer):
@@ -237,6 +238,27 @@ class NFSLocalizer(BatchedLocalizer):
         )
         return setup_script, teardown_script
 
+    def build_manifest(self, transport: typing.Optional[AbstractTransport] = None) -> pd.DataFrame:
+        """
+        Returns the job output manifest from this pipeline.
+        Builds the manifest if it does not exist
+        """
+        output_dir = os.path.abspath(self.environment('local')['CANINE_OUTPUT'])
+        if not os.path.isfile(os.path.join(output_dir, '.canine_pipeline_manifest.tsv')):
+            script_path = self.backend.pack_batch_script(
+                'export CANINE_OUTPUTS={}'.format(output_dir),
+                'cat <(echo "jobId\tfield\tpath") $CANINE_OUTPUTS/*/.canine_job_manifest > $CANINE_OUTPUTS/.canine_pipeline_manifest.tsv',
+                'rm -f $CANINE_OUTPUTS/*/.canine_job_manifest'
+            )
+            check_call(
+                script_path,
+                *self.backend.invoke(transport.normpath(script_path))
+            )
+            os.remove(script_path)
+        with open(os.path.join(output_dir, '.canine_pipeline_manifest.tsv'), 'r') as r:
+            return pd.read_csv(r, sep='\t').set_index(['jobId', 'field'])
+
+
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: typing.Optional[str] = None) -> typing.Dict[str, typing.Dict[str, str]]:
         """
         Delocalizes output from all jobs.
@@ -244,6 +266,7 @@ class NFSLocalizer(BatchedLocalizer):
         """
         if output_dir is not None:
             warnings.warn("output_dir has no bearing on NFSLocalizer. outputs are available in {}/outputs".format(self.local_dir))
+        self.build_manifest()
         output_dir = os.path.join(self.local_dir, 'outputs')
         output_files = {}
         for jobId in os.listdir(output_dir):

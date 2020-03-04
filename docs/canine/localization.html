@@ -46,6 +46,13 @@ After staging, the directory is copied to the slurm controller
 (If a transfer bucket is provided, a more efficient copy is used)
 After all jobs have finished, the output directory is copied back here</p>
 <dl class="method">
+<dt id="canine.localization.BatchedLocalizer.build_manifest">
+<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.BatchedLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the job output manifest from this pipeline.
+Builds the manifest if it does not exist</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.BatchedLocalizer.delocalize">
 <code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.BatchedLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
 <dd><p>Delocalizes output from all jobs</p>
@@ -181,6 +188,13 @@ Unlike BatchedLocalizer, gs:// files are copied into the local staging directory
 prior to it being copied to the slurm node. This is less efficient (as it
 increases the size of the staging transfer) but utilizes local gsutil credentials</p>
 <dl class="method">
+<dt id="canine.localization.LocalLocalizer.build_manifest">
+<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.LocalLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the job output manifest from this pipeline.
+Builds the manifest if it does not exist</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.LocalLocalizer.delocalize">
 <code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.LocalLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
 <dd><p>Delocalizes output from all jobs</p>
@@ -307,6 +321,13 @@ If None (default) is provided, a new transport is opened, and closed after the c
 <em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">RemoteLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Remote Only strategy:
 Staging dir is created remotely and files are copied in</p>
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.build_manifest">
+<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.RemoteLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the job output manifest from this pipeline.
+Builds the manifest if it does not exist</p>
+</dd></dl>
+
 <dl class="method">
 <dt id="canine.localization.RemoteLocalizer.delocalize">
 <code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.RemoteLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
@@ -438,6 +459,13 @@ Local inputs are symlinked into the staging directory.</p>
 Unlike LocalLocalizer, there is no final transfer step.
 Files are staged locally and this strategy expects that the given local staging dir
 is NFS mounted to the slurm cluster</p>
+<dl class="method">
+<dt id="canine.localization.NFSLocalizer.build_manifest">
+<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.NFSLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the job output manifest from this pipeline.
+Builds the manifest if it does not exist</p>
+</dd></dl>
+
 <dl class="method">
 <dt id="canine.localization.NFSLocalizer.delocalize">
 <code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: Optional[str] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.NFSLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
