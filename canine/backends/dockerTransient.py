@@ -17,6 +17,9 @@ import time
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost
 
+from requests.exceptions import ConnectionError as RConnectionError
+from urllib3.exceptions import ProtocolError
+
 import pandas as pd
 
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
@@ -95,6 +98,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             image = self.dkr.images.get('broadinstitute/slurm_gcp_docker:latest')
         except docker.errors.ImageNotFound:
             raise Exception("You have not yet built or pulled the Slurm Docker image!")
+        except RConnectionError as e:
+            if isinstance(e.args[0], ProtocolError):
+                if isinstance(e.args[0].args[1], PermissionError):
+                    raise PermissionError("You do not have permission to run Docker!")
+        except Exception as e:
+            raise Exception("Problem starting Slurm Docker: {}: {}".format(
+              type(e).__name__, e 
+            ))
 
         #
         # start the NFS
