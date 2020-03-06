@@ -106,7 +106,7 @@ class RemoteTransport(AbstractTransport):
                     dirname = '.'
                 return {
                     attr.filename: attr
-                    for attr in self.session.listdir_attr()
+                    for attr in self.session.listdir_attr(dirname)
                 }[os.path.basename(path)]
             except KeyError as e:
                 raise FileNotFoundError(path) from e
