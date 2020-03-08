@@ -367,9 +367,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 # Python version of checks in docker_run.sh
 def ready_for_docker():
     #
-    # check if Slurm/Munge are already running
+    # check if Slurm/mysql/Munge are already running
     already_running = [["slurmctld", "A Slurm controller"],
                        ["slurmdbd", "The Slurm database daemon"],
+                       ["mysqld", "mysql"],
                        ["munged", "Munge"]]
 
     all_procs = { x.name() : x.pid for x in psutil.process_iter() }
