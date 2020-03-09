@@ -11,6 +11,7 @@ from canine.localization.base import Localization, PathType
 from canine.localization.remote import RemoteLocalizer
 from timeout_decorator import timeout as with_timeout
 
+STAGING_DIR = './travis_tmp' if 'TRAVIS' in os.environ else None
 WARNING_CONTEXT = None
 BACKEND = None
 
@@ -21,7 +22,7 @@ def setUpModule():
     WARNING_CONTEXT = warnings.catch_warnings()
     WARNING_CONTEXT.__enter__()
     warnings.simplefilter('ignore', ResourceWarning)
-    BACKEND = DummySlurmBackend(n_workers=1)
+    BACKEND = DummySlurmBackend(n_workers=1, staging_dir=STAGING_DIR)
     BACKEND.__enter__()
 
 def tearDownModule():
@@ -73,7 +74,7 @@ class TestIntegration(unittest.TestCase):
     """
     Tests high-level features of the localizer
     """
-    
+
     @with_timeout(30)
     def test_localize_delocalize(self):
         """

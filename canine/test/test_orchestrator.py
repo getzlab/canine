@@ -5,6 +5,7 @@ import os
 import stat
 import warnings
 import time
+import re
 import subprocess
 from multiprocessing import cpu_count
 from contextlib import contextmanager
@@ -14,6 +15,7 @@ from timeout_decorator import timeout as with_timeout
 import pandas as pd
 import yaml
 
+STAGING_DIR = './travis_tmp' if 'TRAVIS' in os.environ else None
 WARNING_CONTEXT = None
 
 def setUpModule():
@@ -50,6 +52,7 @@ class TestUnit(unittest.TestCase):
             'backend': {
                 'type': 'Dummy',
                 'n_workers': 1,
+                'staging_dir': STAGING_DIR
             },
             'inputs': {
                 'jobIndex': [0, 1, 2, 3, 4],
@@ -118,7 +121,7 @@ class TestUnit(unittest.TestCase):
             self.assertTrue(stat_result.st_mode & (stat.S_IXOTH | stat.S_IROTH))
 
 
-    @with_timeout(45)
+    @with_timeout(75)
     def test_wait_for_jobs(self):
         path = self.backend.pack_batch_script('echo start', 'sleep 10', 'echo end')
         batch_id = self.backend.sbatch(
@@ -132,7 +135,7 @@ class TestUnit(unittest.TestCase):
         )
         self.assertTrue((acct['CPUTimeRAW'] >= 10).all())
 
-    # @with_timeout(20)
+    @with_timeout(20)
     def test_make_output_df(self):
         path = self.backend.pack_batch_script('echo hello, world')
         batch_id = self.backend.sbatch(
@@ -199,11 +202,20 @@ class TestUnit(unittest.TestCase):
         time.sleep(15)
 
         squeue = self.backend.squeue()
+        queued_ids = set()
+
+        pattern = re.compile(r'{}_\[(\d+)\-(\d+)\]'.format(batch_id))
+        for idx in squeue.index:
+            if pattern.match(idx):
+                match = pattern.match(idx)
+                for i in range(int(match.group(1)), int(match.group(2))+1):
+                    queued_ids.add(i)
 
         for jid in range(len(self.orchestrator.job_spec)):
             self.assertTrue(
                 ('{}_{}'.format(batch_id, jid) in squeue.index.values) or
-                ('{}_[{}]'.format(batch_id, jid) in squeue.index.values)
+                ('{}_[{}]'.format(batch_id, jid) in squeue.index.values) or
+                jid in queued_ids
             )
         self.backend.scancel(batch_id)
 
@@ -224,7 +236,8 @@ class TestIntegration(unittest.TestCase):
         """
         with tempfile.TemporaryDirectory() as tempdir:
             subprocess.check_call(
-                'canine examples/example_pipeline.yaml --backend type:Dummy --backend n_workers:1 --localization staging_dir:/mnt/nfs/canine --output-dir {}'.format(
+                'canine examples/example_pipeline.yaml --backend type:Dummy --backend n_workers:1 {} --localization staging_dir:/mnt/nfs/canine --output-dir {}'.format(
+                    '--backend staging_dir:{}'.format(STAGING_DIR) if STAGING_DIR is not None else '',
                     tempdir
                 ),
                 shell=True
@@ -235,7 +248,7 @@ class TestIntegration(unittest.TestCase):
         """
         Runs a quick test of the xargs orchestrator
         """
-        with DummySlurmBackend(n_workers=1) as backend:
+        with DummySlurmBackend(n_workers=1, staging_dir=STAGING_DIR) as backend:
             with backend.transport() as transport:
                 transport.sendtree(
                     os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
@@ -282,7 +295,8 @@ class TestIntegration(unittest.TestCase):
                 **{
                     'backend': {
                         'type': 'Dummy',
-                        'n_workers': 1
+                        'n_workers': 1,
+                        'staging_dir': STAGING_DIR
                     },
                     'localization': {
                         'staging_dir': '/mnt/nfs/canine'
@@ -319,7 +333,8 @@ class TestIntegration(unittest.TestCase):
                 **{
                     'backend': {
                         'type': 'Dummy',
-                        'n_workers': 1
+                        'n_workers': 1,
+                        'staging_dir': STAGING_DIR
                     },
                     'localization': {
                         'staging_dir': '/mnt/nfs/canine'
@@ -353,7 +368,8 @@ class TestIntegration(unittest.TestCase):
                 'backend': {
                     'type': 'Dummy',
                     'n_workers': cpu_count(),
-                    'cpus': 1
+                    'cpus': 1,
+                    'staging_dir': STAGING_DIR
                 },
                 'resources': {
                     'cpus-per-task': 1,

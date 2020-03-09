@@ -10,6 +10,7 @@ import port_for
 from timeout_decorator import timeout as with_timeout
 
 WARNING_CONTEXT = None
+STAGING_DIR = './travis_tmp' if 'TRAVIS' in os.environ else None
 
 def setUpModule():
     global WARNING_CONTEXT
@@ -131,7 +132,7 @@ class TestIntegration(unittest.TestCase):
     @classmethod
     @with_timeout(120) # Fail the test if startup takes 2 minutes
     def setUpClass(cls):
-        cls.backend = DummySlurmBackend(n_workers=5)
+        cls.backend = DummySlurmBackend(n_workers=5, staging_dir=STAGING_DIR)
         cls.backend.__enter__()
 
     @classmethod

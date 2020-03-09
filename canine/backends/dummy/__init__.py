@@ -109,7 +109,7 @@ class ManualBind(object):
         """
         Creates the given dirpath if it does not exist already
         """
-        self.name = path
+        self.name = os.path.abspath(path)
         self._cleanup = False
         if not os.path.exists(self.name):
             os.makedirs(self.name)

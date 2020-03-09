@@ -10,6 +10,7 @@ from canine.backends.remote import RemoteSlurmBackend, RemoteTransport, IgnoreKe
 import paramiko
 from timeout_decorator import timeout as with_timeout
 
+STAGING_DIR = './travis_tmp' if 'TRAVIS' in os.environ else None
 WARNING_CONTEXT = None
 PROVIDER = None
 TEMPDIR = None
@@ -24,7 +25,7 @@ def setUpModule():
     WARNING_CONTEXT = warnings.catch_warnings()
     WARNING_CONTEXT.__enter__()
     warnings.simplefilter('ignore', ResourceWarning)
-    PROVIDER = DummySlurmBackend(n_workers=5)
+    PROVIDER = DummySlurmBackend(n_workers=5, staging_dir=STAGING_DIR)
     PROVIDER.__enter__()
     TEMPDIR = tempfile.TemporaryDirectory()
     KEYPATH = os.path.join(TEMPDIR.name, 'id_rsa')

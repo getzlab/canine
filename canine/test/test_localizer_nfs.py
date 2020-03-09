@@ -12,7 +12,7 @@ from canine.localization.base import Localization, PathType
 from canine.localization.nfs import NFSLocalizer
 from timeout_decorator import timeout as with_timeout
 
-WARNING_CONTEXT = None
+STAGING_DIR = './travis_tmp' if 'TRAVIS' in os.environ else None
 BACKEND = None
 
 @with_timeout(120)
@@ -22,7 +22,7 @@ def setUpModule():
     WARNING_CONTEXT = warnings.catch_warnings()
     WARNING_CONTEXT.__enter__()
     warnings.simplefilter('ignore', ResourceWarning)
-    BACKEND = DummySlurmBackend(n_workers=1)
+    BACKEND = DummySlurmBackend(n_workers=1, staging_dir=STAGING_DIR)
     BACKEND.__enter__()
 
 def tearDownModule():
