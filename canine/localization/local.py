@@ -153,7 +153,7 @@ class LocalLocalizer(BatchedLocalizer):
         gs:// files are queued for later transfer
         local files are symlinked to the staging directory
         """
-        if self._has_localized:
+        if not self._has_localized:
             warnings.warn(
                 "BatchedLocalizer.localize_file called after main localization. File may not be localized"
             )

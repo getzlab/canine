@@ -6,14 +6,14 @@ import warnings
 import traceback
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
-from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
+from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
 from .utils import check_call
 import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.7.1'
+version = '0.8.0'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -25,7 +25,8 @@ BACKENDS = {
     'Local': LocalSlurmBackend,
     'Remote': RemoteSlurmBackend,
     'TransientGCP': TransientGCPSlurmBackend,
-    'TransientImage': TransientImageSlurmBackend
+    'TransientImage': TransientImageSlurmBackend,
+    'Dummy': DummySlurmBackend
 }
 
 LOCALIZERS = {
@@ -279,10 +280,11 @@ class Orchestrator(object):
                     if batch_id == -2 or len(completed_jobs):
                         print("Delocalizing outputs")
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
-            print("Parsing output data")
-            self.adapter.parse_outputs(outputs)
 
-            df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
+                print("Parsing output data")
+                self.adapter.parse_outputs(outputs)
+
+                df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
 
         try:
             runtime = time.monotonic() - start_time
@@ -290,7 +292,7 @@ class Orchestrator(object):
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
             )[0])
-            job_cost = self.backend.estimate_cost(job_cpu_time=df[('job', 'cpu_seconds')].to_dict())[1]
+            job_cost = self.backend.estimate_cost(job_cpu_time=(df[('job', 'cpu_seconds')]/3600).to_dict())[1]
             df['est_cost'] = [job_cost[job_id] for job_id in df.index] if job_cost is not None else [0] * len(df)
         except:
             traceback.print_exc()
@@ -376,6 +378,7 @@ class Orchestrator(object):
 
     def make_output_DF(self, batch_id, outputs, cpu_time, prev_acct, localizer = None) -> pd.DataFrame:
         df = pd.DataFrame()
+
         if batch_id != -2:
             try:
                 acct = self.backend.sacct(job=batch_id)

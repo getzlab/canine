@@ -206,7 +206,7 @@ def xargs():
     for i in range(cmd.count(args.replacement_string)):
         cmd = cmd.replace(
             args.replacement_string,
-            'canine_arg{}'.format(i),
+            '$canine_arg{}'.format(i),
             1
         )
     Xargs(cmd, inputs, backend, args.name, args.working_directory, resources).run_pipeline()

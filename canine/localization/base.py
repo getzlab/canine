@@ -52,6 +52,7 @@ class AbstractLocalizer(abc.ABC):
         self.common_inputs = set()
         self._local_dir = tempfile.TemporaryDirectory()
         self.local_dir = self._local_dir.name
+        # FIXME: This doesn't actually make sense. Unless we assume staging_dir == mount_path, then transport.normpath gives an inaccurate mount_path
         with self.backend.transport() as transport:
             self.staging_dir = transport.normpath(staging_dir if staging_dir is not None else str(uuid4()))
             # if transport.isdir(self.staging_dir) and not force:
