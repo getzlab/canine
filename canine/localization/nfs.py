@@ -247,17 +247,18 @@ class NFSLocalizer(BatchedLocalizer):
         Returns the job output manifest from this pipeline.
         Builds the manifest if it does not exist
         """
-        output_dir = os.path.abspath(self.environment('local')['CANINE_OUTPUT'])
+        output_dir = self.environment('local')['CANINE_OUTPUT']
+        controller_output_dir = self.environment('controller')['CANINE_OUTPUT']
         if not os.path.isfile(os.path.join(output_dir, '.canine_pipeline_manifest.tsv')):
             script_path = self.backend.pack_batch_script(
                 'export CANINE_OUTPUTS={}'.format(output_dir),
                 'cat <(echo "jobId\tfield\tpath") $CANINE_OUTPUTS/*/.canine_job_manifest > $CANINE_OUTPUTS/.canine_pipeline_manifest.tsv',
-                'rm -f $CANINE_OUTPUTS/*/.canine_job_manifest'
+                'rm -f $CANINE_OUTPUTS/*/.canine_job_manifest',
+                script_path=os.path.join(controller_output_dir, 'manifest.sh')
             )
-            check_call(
-                script_path,
-                *self.backend.invoke(transport.normpath(script_path))
-            )
+            script_path = os.path.join(output_dir, 'manifest.sh')
+            assert os.path.isfile(script_path)
+            subprocess.check_call(script_path)
             os.remove(script_path)
         with open(os.path.join(output_dir, '.canine_pipeline_manifest.tsv'), 'r') as r:
             return pd.read_csv(r, sep='\t').set_index(['jobId', 'field'])
