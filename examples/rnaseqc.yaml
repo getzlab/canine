@@ -3,7 +3,7 @@ script:
   - sudo docker run --rm -v $CANINE_ROOT:$CANINE_ROOT -v $CANINE_JOB_ROOT:/output gcr.io/broad-cga-aarong-gtex/rnaseqc rnaseqc $genes_gtf $bam_file output --coverage -vv
 resources:
   cpus-per-task: 1
-  mem-per-cpu: 3072
+  mem-per-cpu: 3072M
 inputs:
   genes_gtf: gs://cga-aarong-resources/references/gencode.v19.genes.v7.patched_contigs.gtf
   bam_file:

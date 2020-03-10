@@ -6,7 +6,7 @@ inputs:
   dummy_input: h
 resources:
   cpus-per-task: 1
-  mem-per-cpu: 3072
+  mem-per-cpu: 3072M
   gres: "gpu:1"
 backend:
   type: TransientGCP

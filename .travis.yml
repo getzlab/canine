@@ -1,0 +1,28 @@
+language: python
+dist: bionic
+# addons:
+#   apt:
+#     sources:
+#       -	docker-bionic
+#     packages:
+#       - docker
+services:
+  - docker
+  - ssh
+python:
+  - 3.7
+  - 3.8
+branches:
+  only:
+    - master
+install:
+  - pip install -e .
+  - pip install pyopenssl[security]
+  - pip install -r canine/test/requirements.txt
+  - pip install coveralls
+
+script:
+  - sudo -E bash -c ". /home/travis/virtualenv/python${TRAVIS_PYTHON_VERSION}/bin/activate && coverage run --source=canine --omit='canine/backends/dummy/controller.py,*canine/test/*.py,canine/localization/delocalization.py,canine/__main__.py,canine/xargs.py' -m unittest discover canine/test"
+
+after_success:
+  - coveralls
