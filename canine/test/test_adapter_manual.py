@@ -15,6 +15,49 @@ class TestUnit(unittest.TestCase):
     Runs tests on various utilities
     """
 
+    def test_arrays(self):
+        for test in range(15):
+            with self.subTest(test=test):
+                raw_inputs = {
+                    os.urandom(8).hex(): [os.urandom(8).hex() for _ in range(test+1)]
+                    for _ in range(test+1)
+                }
+                twodkeys = []
+                for i in range(test+1):
+                    twodkeys.append(os.urandom(8).hex())
+                    raw_inputs[twodkeys[-1]] =  [
+                        [os.urandom(8).hex() for x in range(y+1)]
+                        for y in range(test+1)
+                    ]
+                commkeys = []
+                for i in range(test+1):
+                    commkeys.append(os.urandom(8).hex())
+                    raw_inputs[commkeys[-1]] = [os.urandom(8).hex() for _ in range(test+1)]
+
+                inputs = ManualAdapter(common_inputs=commkeys).parse_inputs({k:v for k,v in raw_inputs.items()})
+
+                self.assertEqual(test+1, len(inputs))
+
+                for i, jid in enumerate(inputs):
+                    for k,v in inputs[jid].items():
+                        if k in twodkeys:
+                            self.assertIsInstance(v, list)
+                            self.assertListEqual(
+                                v,
+                                raw_inputs[k][i]
+                            )
+                        elif k in commkeys:
+                            self.assertIsInstance(v, list)
+                            self.assertListEqual(
+                                v,
+                                raw_inputs[k]
+                            )
+                        else:
+                            self.assertEqual(
+                                v,
+                                raw_inputs[k][i]
+                            )
+
     def test_regular(self):
         for test in range(15):
             with self.subTest(test=test):
