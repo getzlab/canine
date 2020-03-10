@@ -11,8 +11,5 @@ inputs:
     - 4
     - 5
 backend:
-  type: TransientGCP
-  name: slurm-canine-example
-  controller_type: n1-standard-2
-  worker_type: n1-standard-1
-  controller_disk_size: 50
+  type: Dummy
+  n_workers: 1

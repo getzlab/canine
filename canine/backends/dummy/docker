@@ -1,0 +1,70 @@
+#!/usr/bin/python3
+import sys
+import subprocess
+import json
+import re
+import os
+import socket
+
+if __name__ == '__main__':
+    if (sys.argv[0] == 'docker' or sys.argv[0] == __file__) and sys.argv[1] == 'run' and ('-v' in sys.argv or '--volume' in sys.argv or '--mount' in sys.argv):
+        mounts = {
+            mount['Destination']:mount['Source']
+            for mount in json.loads(
+                subprocess.check_output('docker inspect {}'.format(socket.gethostname()), shell=True).decode()
+            )[0]['Mounts']
+            if mount['Type'] == 'bind'
+        }
+        for i, arg in enumerate(sys.argv):
+            if i+1 < len(sys.argv):
+                if arg in {'-v', '--volume'} and ':' in sys.argv[i+1]:
+                    elems = sys.argv[i+1].split(':')
+                    if len(elems) >= 2:
+                        remap = False
+                        for k, v in mounts.items():
+                            if elems[0].startswith(k):
+                                remap = True
+                                print(
+                                    'docker-remap: volume bind: {} -> {}'.format(
+                                        elems[0],
+                                        elems[0].replace(k, v, 1)
+                                    ),
+                                    file=sys.stderr
+                                )
+                                elems[0] = elems[0].replace(k, v, 1)
+                                sys.argv[i+1] = ':'.join(elems)
+                                break
+                        if (not remap) and os.path.isdir(elems[0]):
+                            print(
+                                "docker-remap: Warning: Bind-mount '{}' may not be visible on the docker host and you may experience undefined behavior. Procede with caution".format(elems[0]),
+                                file=sys.stderr
+                            )
+                elif arg == '--mount':
+                    elems = sys.argv[i+1].split(',')
+                    if 'Type=bind' in elems:
+                        for j, elem in enumerate(elems):
+                            if elem.startswith('Source='):
+                                _, src = elem.split('=')
+                                remap = False
+                                for k, v in mounts.items():
+                                    if src.startswith(k):
+                                        remap = True
+                                        print(
+                                            'docker-remap: mount bind: {} -> {}'.format(
+                                                src,
+                                                src.replace(k, v, 1)
+                                            ),
+                                            file=sys.stderr
+                                        )
+                                        elems[j] = 'Source={}'.format(src.replace(k, v, 1))
+                                        sys.argv[i+1] = ','.join(elems)
+                                        break
+                                if (not remap) and os.path.isdir(src):
+                                    print(
+                                        "docker-remap: Warning: Bind-mount '{}' may not be visible on the docker host and you may experience undefined behavior. Procede with caution".format(src),
+                                        file=sys.stderr
+                                    )
+                                break
+
+    sys.argv[0] = '/usr/bin/docker'
+    sys.exit(subprocess.run(sys.argv).returncode)

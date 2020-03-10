@@ -122,6 +122,10 @@ class NFSLocalizer(BatchedLocalizer):
                     if re.match(r"^/", v) is not None and self.same_volume(v) and \
                       re.match(r".*/outputs/\d+/.*", v) is None:
                         overrides[k] = None
+                        warnings.warn(
+                            "One or more inputs has been overriden to None (will be handled as a string)."
+                            " To avoid this behavior, explicitly override it with 'localize'"
+                        )
 
         overrides = {k:v.lower() if isinstance(v, str) else None for k,v in overrides.items()}
         with self.backend.transport() as transport:
@@ -301,7 +305,7 @@ class NFSLocalizer(BatchedLocalizer):
 
     def same_volume(self, *args):
         """
-        Check if *args are stored on the same NFS mount as the output directory.
+        Check if args are stored on the same NFS mount as the output directory.
         """
         vols = subprocess.check_output(
           "df {} | awk 'NR > 1 {{ print $1 }}'".format(
