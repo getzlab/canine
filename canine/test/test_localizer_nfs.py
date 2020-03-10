@@ -105,7 +105,7 @@ class TestIntegration(unittest.TestCase):
     Tests high-level features of the localizer
     """
 
-    # @with_timeout(30)
+    @with_timeout(30)
     def test_localize_delocalize(self):
         """
         This is the full integration test.
