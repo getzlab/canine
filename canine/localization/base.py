@@ -395,7 +395,7 @@ class AbstractLocalizer(abc.ABC):
                                 self.common_inputs.add(path)
                             else:
                                 seen.add(path)
-                    elif arg not in seen_forced and overrides[arg] == 'common':
+                    elif overrides[arg] == 'common':
                         seen_forced.add(arg)
                         self.common_inputs |= {*self.flatten_inputs(paths)}
             common_dests = {}
