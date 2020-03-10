@@ -46,12 +46,12 @@ class NFSLocalizer(BatchedLocalizer):
         self.backend = backend
         self.common = common
         self.common_inputs = set()
-        self.__sbcast = False
+        self._local_dir = None
+        # We don't normalize paths for this localizer. Use staging dir as given
+        self.staging_dir = staging_dir
+        self.local_dir = staging_dir
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
-        with self.backend.transport() as transport:
-            self.staging_dir = transport.normpath(staging_dir)
-            self.local_dir = staging_dir
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
