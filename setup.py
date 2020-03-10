@@ -19,6 +19,7 @@ setup(
     packages = [
         'canine',
         'canine.backends',
+        'canine.backends.dummy',
         'canine.adapters',
         'canine.localization'
     ],
@@ -26,7 +27,9 @@ setup(
         '':[
             'backends/slurm-gcp/*',
             'backends/slurm-gcp/scripts/*',
-            'backends/slurm-docker/src/*'
+            'backends/slurm-docker/src/*',
+            'backends/dummy/*',
+            'backends/dummy/conf/*'
         ],
     },
     entry_points={
