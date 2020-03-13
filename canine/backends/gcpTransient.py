@@ -59,6 +59,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             raise ValueError("No GCP project was provided and a project could not be auto-detected")
         if compute_zone is None:
             compute_zone = get_default_gcp_zone()
+            if compute_zone is None:
+                raise ValueError("No GCP zone was provided and a project could not be auto-detected")
         super().__init__('{}-controller.{}.{}'.format(
             name,
             compute_zone,

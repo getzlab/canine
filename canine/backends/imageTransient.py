@@ -89,6 +89,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
         if compute_zone is None:
             compute_zone = get_default_gcp_zone()
+            if compute_zone is None:
+                raise ValueError("No GCP zone was provided and a project could not be auto-detected")
 
         # make config dict
         self.config = {
