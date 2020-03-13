@@ -142,7 +142,7 @@ def make_interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.Bina
 def get_default_gcp_zone():
     try:
         response = requests.get(
-            'metadata.google.internal/computeMetadata/v1/instance/zone',
+            'http://metadata.google.internal/computeMetadata/v1/instance/zone',
             headers={
                 'Metadata-Flavor': 'Google'
             }
@@ -153,8 +153,8 @@ def get_default_gcp_zone():
         pass
     # not on GCE instance, check env
     try:
-        response = subprocess.run('gcloud config get-value compute/zone', shell=True, stdout=subprocess.PIPE)
-        if response.returncode == 0 and response.stdout.strip() != b'(unset)':
+        response = subprocess.run('gcloud config get-value compute/zone', shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if response.returncode == 0 and b'(unset)' not in response.stdout.strip():
             return response.stdout.strip().decode()
     except subprocess.CalledProcessError:
         pass

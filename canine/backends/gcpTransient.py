@@ -6,6 +6,7 @@ import subprocess
 import shutil
 import os
 import sys
+import warnings
 from .remote import RemoteSlurmBackend
 from ..utils import get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost
 # import paramiko
@@ -51,7 +52,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
-        **kwargs : typing.Any
+        external_compute_ips: bool = False, **kwargs : typing.Any
     ):
         self.project = project if project is not None else get_default_gcp_project()
         if self.project is None:
@@ -87,6 +88,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "default_users": getpass.getuser(),
           'gpu_count': 0,
           'slurm_version': '19.05-latest',
+          'external_compute_ips': external_compute_ips,
           **kwargs
         }
 
