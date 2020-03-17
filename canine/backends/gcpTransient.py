@@ -39,6 +39,10 @@ GPU_TYPES = {
     'nvidia-tesla-t4'
 }
 
+# Overhaul plan
+# Follow setup script to build new base GCP image
+# Update script to do base configuration and support mixed node topography
+
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
     Backend for transient slurm clusters which need to be deployed and configured
