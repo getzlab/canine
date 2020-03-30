@@ -213,6 +213,7 @@ class NFSLocalizer(BatchedLocalizer):
             line.rstrip()
             for line in [
                 '#!/bin/bash',
+                'set -e',
                 'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
                 'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
@@ -221,7 +222,7 @@ class NFSLocalizer(BatchedLocalizer):
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_ROOT',
             ] + exports + extra_tasks
-        ) + '\ncd $CANINE_JOB_ROOT\n'
+        ) + '\ncd $CANINE_JOB_ROOT\nunset -e\n'
         teardown_script = '\n'.join(
             line.rstrip()
             for line in [
