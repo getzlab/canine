@@ -91,7 +91,7 @@ class AbstractTransport(abc.ABC):
         pass
 
     @abc.abstractmethod
-    def stat(self, path: str) -> typing.Any:
+    def stat(self, path: str, follow_symlinks: bool = True) -> typing.Any:
         """
         Returns stat information
         """
@@ -494,5 +494,6 @@ class AbstractSlurmBackend(abc.ABC):
         overhead for uptime (ie: controller nodes).
         Note: Job cost estimates may not sum up to the total cluster cost if the
         cluster was not at full utilization.
+        All units are in hours
         """
         return 0, None

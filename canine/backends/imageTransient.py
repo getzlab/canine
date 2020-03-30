@@ -13,7 +13,14 @@ import googleapiclient.discovery as gd
 import googleapiclient.errors
 import pandas as pd
 
-gce = gd.build('compute', 'v1')
+try:
+    gce = gd.build('compute', 'v1')
+except gd._auth.google.auth.exceptions.GoogleAuthError:
+    print(
+        "Unable to load gcloud credentials. Transient Backends may not be available",
+        file=sys.stderr
+    )
+    gce = None
 
 def list_instances(zone: str, project: str) -> pd.DataFrame:
     """
@@ -361,6 +368,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         overhead for uptime (ie: controller nodes).
         Note: Job cost estimates may not sum up to the total cluster cost if the
         cluster was not at full utilization.
+        All units are in hours
         """
         cluster_cost = 0
         worker_cpu_cost = 0

@@ -60,6 +60,7 @@ class AbstractLocalizer(abc.ABC):
         self.staging_dir = staging_dir if staging_dir is not None else str(uuid4())
         self._local_dir = tempfile.TemporaryDirectory()
         self.local_dir = self._local_dir.name
+        # FIXME: This doesn't actually make sense. Unless we assume staging_dir == mount_path, then transport.normpath gives an inaccurate mount_path
         with self.backend.transport() as transport:
             self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
             # if transport.isdir(self.staging_dir) and not force:
@@ -464,10 +465,12 @@ class AbstractLocalizer(abc.ABC):
                                 'download',
                                 value
                             )
-                    elif mode is None:
+                    elif mode is None or mode == 'null':
                         # Do not reserve path here
                         # null override treats input as string
                         self.inputs[jobId][arg] = Localization(None, value)
+                    else:
+                        raise ValueError("Invalid override option [{}]".format(mode))
                 else:
                     if os.path.exists(value) or value.startswith('gs://'):
                         remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))

@@ -33,6 +33,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         nfs_image_project = "", action_on_stop = "delete", image_family = None, image = None,
         clust_frac = 0.01, user = os.environ["USER"], **kwargs
     ):
+        if user is None:
+            # IE: USER was not set
+            raise ValueError("USER not set in environment. Must explicitly pass user argument")
+
         if "image" not in kwargs:
             kwargs["image"] = image
 

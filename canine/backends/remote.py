@@ -8,6 +8,7 @@ import warnings
 import binascii
 import traceback
 import shlex
+import atexit
 from .base import AbstractSlurmBackend, AbstractTransport
 from ..utils import ArgumentHelper, make_interactive, check_call
 from agutil import StdOutAdapter
@@ -18,6 +19,7 @@ import logging
 logging.getLogger('paramiko').setLevel(logging.WARNING)
 
 SSH_AGENT_PATTERN = re.compile(r'SSH_AUTH_SOCK=(.+); export SSH_AUTH_SOCK')
+SSH_AGENT_PID = re.compile(r'SSH_AGENT_PID=(\d+); export SSH_AGENT_PID')
 
 class IgnoreKeyPolicy(paramiko.client.AutoAddPolicy):
     """
@@ -66,6 +68,11 @@ class RemoteTransport(AbstractTransport):
         handle.name = filename
         if 'w' in mode:
             handle.set_pipelined(True)
+        elif mode == 'r':
+            actual_read = handle.read
+            def read_decode(size=None, encoding=sys.getdefaultencoding()):
+                return actual_read(size=size).decode(encoding=encoding)
+            handle.read = read_decode
         return handle
 
     def listdir(self, path: str) -> typing.List[str]:
@@ -84,13 +91,25 @@ class RemoteTransport(AbstractTransport):
             raise paramiko.SSHException("Transport is not connected")
         return self.session.mkdir(path)
 
-    def stat(self, path: str) -> typing.Any:
+    def stat(self, path: str, follow_symlinks: bool = True) -> typing.Any:
         """
         Returns stat information
         """
         if self.session is None:
             raise paramiko.SSHException("Transport is not connected")
-        return self.session.stat(path)
+        if follow_symlinks:
+            return self.session.stat(path)
+        else:
+            try:
+                dirname = os.path.dirname(path)
+                if dirname == '':
+                    dirname = '.'
+                return {
+                    attr.filename: attr
+                    for attr in self.session.listdir_attr(dirname)
+                }[os.path.basename(path)]
+            except KeyError as e:
+                raise FileNotFoundError(path) from e
 
     def chmod(self, path: str, mode: int):
         """
@@ -159,13 +178,13 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
     """
 
     @staticmethod
-    def ssh_agent() -> typing.Optional[str]:
+    def ssh_agent(restart=True) -> typing.Optional[str]:
         """
         Ensures proper environment variables are set for the ssh agent
         Returns the current value of SSH_AUTH_SOCK or None, if the agent could
         not be located/started
         """
-        if 'SSH_AUTH_SOCK' not in os.environ:
+        if restart or 'SSH_AUTH_SOCK' not in os.environ:
             proc = subprocess.run(
                 'ssh-agent',
                 shell=True,
@@ -175,6 +194,9 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             if not match:
                 return None
             os.environ['SSH_AUTH_SOCK'] = match.group(1)
+            match = SSH_AGENT_PID.search(proc.stdout.decode())
+            if match:
+                atexit.register(lambda :os.kill(int(match.group(1)), 15))
         return os.environ['SSH_AUTH_SOCK']
 
     @staticmethod
@@ -248,7 +270,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
                 self.client.set_missing_host_key_policy(IgnoreKeyPolicy)
         if 'key_filename' in self.__sshkwargs and ('allow_agent' not in self.__sshkwargs or self.__sshkwargs['allow_agent']):
             try:
-                self.add_key_to_agent(self.__sshkwargs['key_filename'])
+                RemoteSlurmBackend.add_key_to_agent(self.__sshkwargs['key_filename'])
             except:
                 warnings.warn("Unable to add specified key file to ssh agent. Mojave users may be unable to authenticate")
 

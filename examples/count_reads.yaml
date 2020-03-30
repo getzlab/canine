@@ -5,7 +5,7 @@ script:
   - samtools view -@ $SLURM_CPUS_PER_TASK bam $chrom -c > $chrom.counts.txt
 resources:
   cpus-per-task: 1
-  mem-per-cpu: 3072
+  mem-per-cpu: 3072M
 inputs:
   bam: gs://cga-aarong-resources/test_data/canine.bam
   chrom:

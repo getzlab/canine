@@ -165,7 +165,7 @@ class LocalLocalizer(BatchedLocalizer):
         gs:// files are queued for later transfer
         local files are symlinked to the staging directory
         """
-        if self._has_localized:
+        if not self._has_localized:
             if src.startswith('gs://'):
                 self.gs_copy(
                     src,

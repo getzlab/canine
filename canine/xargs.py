@@ -51,7 +51,7 @@ class Xargs(Orchestrator):
         start_time = time.monotonic()
         with self.backend:
             print("Initializing pipeline workspace")
-            with tempfile.TemporaryDirectory() as tempdir:
+            with tempfile.TemporaryDirectory(dir=self.cwd) as tempdir:
                 for jid in range(self.n_jobs):
                     # By creating a local tempdir
                     # but using the backend to write the script
