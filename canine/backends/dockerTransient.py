@@ -17,47 +17,61 @@ import time
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost
 
+from requests.exceptions import ConnectionError as RConnectionError
+from urllib3.exceptions import ProtocolError
+
 import pandas as pd
 
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
-        nfs_compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
-        compute_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
+        nfs_startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
+        startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
+        shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
+        nfs_shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
         nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
-        action_on_stop = "delete", image_family = "slurm-gcp-docker", image = None,
+        nfs_image_project = "", action_on_stop = "delete", image_family = None, image = None,
         clust_frac = 0.01, user = os.environ["USER"], **kwargs
     ):
         if "image" not in kwargs:
             kwargs["image"] = image
 
-        # superclass constructor does something special with compute_script so
+        # superclass constructor does something special with startup|shutdown_script so
         # we need to pass it in
-        kwargs["compute_script"] = "{script} {worker_prefix}".format(
-          script = compute_script,
+        kwargs["startup_script"] = "{script} {worker_prefix}".format(
+          script = startup_script,
           worker_prefix = socket.gethostname()
         )
+        kwargs["shutdown_script"] = shutdown_script
         super().__init__(**{**kwargs, **{ "slurm_conf_path" : "" }})
+
+        # handle NFS startup/shutdown scripts
+        nfs_compute_script = {
+          "startup-script" : "{script} {nfsds:d} {nfsdt} {nfsimg} {nfsproj}".format(
+            script = nfs_startup_script,
+            nfsds = nfs_disk_size,
+            nfsdt = nfs_disk_type,
+            nfsimg = nfs_image,
+            nfsproj = nfs_image_project
+          ),
+          "shutdown_script" : nfs_shutdown_script
+        }
 
         self.config = {
           "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
           "nfs_compute_script" :
-            "--metadata startup-script=\"{script} {nfsds:d} {nfsdt} {nfsimg}\"".format(
-              script = nfs_compute_script,
-              nfsds = nfs_disk_size,
-              nfsdt = nfs_disk_type,
-              nfsimg = nfs_image
-            ),
+            "--metadata " + \
+            ",".join([ "{}=\"{}\"".format(k, v) for k, v in nfs_compute_script.items() if v is not None ]),
           "action_on_stop" : action_on_stop,
           "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
             else self.config["action_on_stop"],
-          "image_family" : image_family,
-          "image" : self.get_latest_image(image_family)["name"] if image is None else image,
+          "image_family" : image_family if image_family is not None else "slurm-gcp-docker-" + user,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           "user" : user,
-          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "image", "user", "action_on_stop" } }
+          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
+        self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
 
         # placeholder for Docker API
         self.dkr = None
@@ -66,7 +80,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.container = None
 
         # placeholder for node list (loaded from lookup table)
-        self.nodes = None
+        self.nodes = pd.DataFrame()
 
         self.NFS_server_ready = False
         self.NFS_ready = False
@@ -82,6 +96,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             image = self.dkr.images.get('broadinstitute/slurm_gcp_docker:latest')
         except docker.errors.ImageNotFound:
             raise Exception("You have not yet built or pulled the Slurm Docker image!")
+        except RConnectionError as e:
+            if isinstance(e.args[0], ProtocolError):
+                if isinstance(e.args[0].args[1], PermissionError):
+                    raise PermissionError("You do not have permission to run Docker!")
+        except Exception as e:
+            raise Exception("Problem starting Slurm Docker: {}: {}".format(
+              type(e).__name__, e 
+            ))
 
         #
         # start the NFS
@@ -175,8 +197,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def stop(self):
         # delete node configuration file
         try:
-            subprocess.check_call("rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle", shell = True)
-        except subprocess.CalledProcessError as e:
+            subprocess.check_call(
+              "rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle",
+              shell = True,
+              timeout = 10
+            )
+        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
             print("Couldn't delete node configuration file:", file = sys.stderr)
             print(e)
 
@@ -184,19 +210,22 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # shutdown nodes that are still running (except NFS)
         allnodes = self.nodes
 
-        # sometimes the Google API will spectacularly fail; in that case, we
-        # just try to shutdown everything in the node list, regardless of whether
-        # it exists.
-        try:
-            extant_nodes = self.list_instances_all_zones()
-            self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
-                           (allnodes["machine_type"] != "nfs")]
-        except:
-            self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
+        # if we're aborting before the NFS has even been started, there are no
+        # nodes to shutdown.
+        if not allnodes.empty:
+            # sometimes the Google API will spectacularly fail; in that case, we
+            # just try to shutdown everything in the node list, regardless of whether
+            # it exists.
+            try:
+                extant_nodes = self.list_instances_all_zones()
+                self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
+                               (allnodes["machine_type"] != "nfs")]
+            except:
+                self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
 
-        # superclass method will stop/delete/leave these running, depending on how
-        # self.config["action_on_stop"] is set
-        super().stop()
+            # superclass method will stop/delete/leave these running, depending on how
+            # self.config["action_on_stop"] is set
+            super().stop()
 
         #
         # stop the Docker
@@ -221,10 +250,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # how self.config["nfs_action_on_stop"] is set.
 
         # kill thread that auto-restarts NFS
-        self.NFS_monitor_lock.set()
+        if self.NFS_monitor_lock is not None:
+            self.NFS_monitor_lock.set()
 
-        self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
-        super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
+        if not allnodes.empty:
+            self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
+            super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
 
     def _get_container(self, container_name):
         def closure():
@@ -334,9 +365,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 # Python version of checks in docker_run.sh
 def ready_for_docker():
     #
-    # check if Slurm/Munge are already running
+    # check if Slurm/mysql/Munge are already running
     already_running = [["slurmctld", "A Slurm controller"],
                        ["slurmdbd", "The Slurm database daemon"],
+                       ["mysqld", "mysql"],
                        ["munged", "Munge"]]
 
     all_procs = { x.name() : x.pid for x in psutil.process_iter() }

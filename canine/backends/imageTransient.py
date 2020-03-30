@@ -55,8 +55,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         init_node_count: typing.Optional[int] = None, compute_zone: str = 'us-central1-a',
         worker_type: str = 'n1-highcpu-2', preemptible: bool = True,
         gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
-        compute_script_file: typing.Optional[str] = None,
-        compute_script: typing.Optional[str] = None,
+        startup_script_file: typing.Optional[str] = None,
+        startup_script: typing.Optional[str] = None,
+        shutdown_script_file: typing.Optional[str] = None,
+        shutdown_script: typing.Optional[str] = None,
         project: typing.Optional[str] = None,
         user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None,
         action_on_stop: str = "stop",
@@ -74,8 +76,18 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             if init_node_count > tot_node_count:
                 raise ValueError("init_node_count cannot exceed tot_node_count.")
 
-        if compute_script_file is not None and compute_script is not None:
-            raise ValueError("Cannot simultaneously specifiy compute_script_file and compute_script.")
+        if startup_script_file is not None and startup_script is not None:
+            raise ValueError("Cannot simultaneously specifiy startup_script_file and startup_script.")
+        if shutdown_script_file is not None and shutdown_script is not None:
+            raise ValueError("Cannot simultaneously specifiy shutdown_script_file and shutdown_script.")
+        compute_script = {
+          "startup-script" : startup_script,
+          "shutdown_script" : shutdown_script
+        }
+        compute_script_file = {
+          "startup-script" : startup_script_file,
+          "shutdown_script" : shutdown_script_file
+        }
 
         if slurm_conf_path is None:
             raise ValueError("Currently, path to slurm.conf must be explicitly specified.")
@@ -91,12 +103,16 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "preemptible" : "--preemptible" if preemptible else "",
             "gpu_type" : gpu_type,
             "gpu_count" : gpu_count,
+            # XXX: this assumes that we won't have any metadata besides
+            #      startup/shutdown scripts.
             "compute_script_file" :
-                "--metadata-from-file startup-script={}".format(compute_script_file)
-                if compute_script_file else "",
+                "--metadata-from-file " + \
+                ",".join([ "{}={}".format(k, v) for k, v in compute_script_file.items() if v is not None ])
+                if startup_script_file or shutdown_script_file else "",
             "compute_script" :
-                "--metadata startup-script=\"{}\"".format(compute_script)
-                if compute_script else "",
+                "--metadata " + \
+                ",".join([ "{}=\"{}\"".format(k, v) for k, v in compute_script.items() if v is not None ])
+                if startup_script or shutdown_script else "",
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else "root",
             "slurm_conf_path" : slurm_conf_path,
@@ -122,6 +138,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             self.init_nodes()
 
             return self
+        except KeyboardInterrupt:
+            print("\nCancelling cluster startup ...", file = sys.stderr)
+
+            self.stop()
         except Exception as e:
             print("ERROR: Could not initialize cluster; attempting to tear down.", file = sys.stderr)
 
@@ -298,7 +318,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                     # default behavior is to shut down
                     self._pzw(gce.instances().stop)(instance = node).execute()
             except googleapiclient.errors.HttpError as e:
-                if e.resp != 404:
+                if "status" in e.resp and e.resp["status"] != "404":
                     print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
                     print(e)
             except Exception as e:
