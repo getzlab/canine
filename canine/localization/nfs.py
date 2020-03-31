@@ -222,7 +222,7 @@ class NFSLocalizer(BatchedLocalizer):
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_ROOT',
             ] + exports + extra_tasks
-        ) + '\ncd $CANINE_JOB_ROOT\nunset -e\n'
+        ) + '\ncd $CANINE_JOB_ROOT\nset +e\n'
         teardown_script = '\n'.join(
             line.rstrip()
             for line in [
