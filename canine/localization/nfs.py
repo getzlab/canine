@@ -175,6 +175,7 @@ class NFSLocalizer(BatchedLocalizer):
                 job_vars.append(shlex.quote(key))
                 dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                 extra_tasks += [
+                    'gsutil ls {} > /dev/null'.format(dest.computepath),
                     'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
                     'mkfifo {}'.format(dest.computepath),
                     "gsutil {} cat {} > {} &".format(
