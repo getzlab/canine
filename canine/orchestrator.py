@@ -45,8 +45,11 @@ export CANINE_COMMON="{{CANINE_COMMON}}"
 export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
+$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh
+LOCALIZER_JOB_RC=$?
 {{pipeline_script}}
 CANINE_JOB_RC=$?
+[[ $LOCALIZER_JOB_RC != 0 ]] && CANINE_JOB_RC=$LOCALIZER_JOB_RC || CANINE_JOB_RC=$CANINE_JOB_RC
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
 exit $CANINE_JOB_RC
 """.format(version=version)
