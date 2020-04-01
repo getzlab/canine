@@ -56,7 +56,8 @@ setup(
         'google-api-python-client>=1.7.11',
         'docker>=4.1.0',
         'psutil>=5.6.7',
-        'port-for>=0.4'
+        'port-for>=0.4',
+        'tables>=3.6.1'
     ],
     classifiers = [
         "Development Status :: 4 - Beta",

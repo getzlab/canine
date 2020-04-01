@@ -8,7 +8,7 @@ from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
-from .utils import check_call
+from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered
 import yaml
 import numpy as np
 import pandas as pd
@@ -428,7 +428,7 @@ class Orchestrator(object):
                 if not transport.isdir(os.path.dirname(dest)):
                     transport.makedirs(os.path.dirname(dest))
                 with transport.open(dest, 'wb') as w:
-                    df.to_hdf(w, key = "results")
+                    pandas_write_hdf5_buffered(df, buf = w, key = "results")
         return df
 
     def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}) -> int:
@@ -471,7 +471,7 @@ class Orchestrator(object):
                 try:
                     # load in results and job spec dataframes
                     with transport.open(df_path) as r:
-                        r_df = pd.read_hdf(r)
+                        r_df = pandas_read_hdf5_buffered(key = "results", buf = r)
                     js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
 
                     if r_df.empty or \
