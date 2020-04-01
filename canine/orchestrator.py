@@ -422,11 +422,11 @@ class Orchestrator(object):
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
             with localizer.transport_context() as transport:
-                dest = localizer.reserve_path("results.k9df.pickle").controllerpath
+                dest = localizer.reserve_path("results.k9df.hdf5").controllerpath
                 if not transport.isdir(os.path.dirname(dest)):
                     transport.makedirs(os.path.dirname(dest))
                 with transport.open(dest, 'wb') as w:
-                    df.to_pickle(w, compression=None)
+                    df.to_hdf(w, key = "results")
         return df
 
     def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}) -> int:
@@ -455,7 +455,7 @@ class Orchestrator(object):
         Succeeded jobs are skipped. Failed jobs are reset and rerun
         """
         with localizer.transport_context() as transport:
-            df_path = localizer.reserve_path("results.k9df.pickle").controllerpath
+            df_path = localizer.reserve_path("results.k9df.hdf5").controllerpath
 
             #remove all output if specified
             if overwrite:
@@ -469,7 +469,7 @@ class Orchestrator(object):
                 try:
                     # load in results and job spec dataframes
                     with transport.open(df_path) as r:
-                        r_df = pd.read_pickle(r, compression=None)
+                        r_df = pd.read_hdf(r)
                     js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
 
                     if r_df.empty or \
@@ -533,8 +533,8 @@ class Orchestrator(object):
 
                     return np.count_nonzero(~fail_idx)
                 except (ValueError, OSError) as e:
-                    print(e)
-                    print("Overwriting output and aborting job avoidance.")
+                    print("Cannot recover preexisting task outputs: " + e, file = sys.stderr)
+                    print("Overwriting output and aborting job avoidance.", file = sys.stderr)
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
                     return 0
