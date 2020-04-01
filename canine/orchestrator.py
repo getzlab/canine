@@ -535,7 +535,7 @@ class Orchestrator(object):
 
                     return np.count_nonzero(~fail_idx)
                 except (ValueError, OSError) as e:
-                    print("Cannot recover preexisting task outputs: " + e, file = sys.stderr)
+                    print("Cannot recover preexisting task outputs: " + str(e), file = sys.stderr)
                     print("Overwriting output and aborting job avoidance.", file = sys.stderr)
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
