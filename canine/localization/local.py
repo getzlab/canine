@@ -94,7 +94,7 @@ class BatchedLocalizer(AbstractLocalizer):
         3 phase task:
         1) Pre-scan inputs to determine proper localization strategy for all inputs
         2) Begin localizing job inputs. For each job, check the predetermined strategy
-        and set up the job's setup and teardown scripts
+        and set up the job's setup, localization, and teardown scripts
         3) Finally, finalize the localization. This may include broadcasting the
         staging directory or copying a batch of gsutil files
         Returns the remote staging directory, which is now ready for final startup
@@ -113,18 +113,29 @@ class BatchedLocalizer(AbstractLocalizer):
                     jobId,
                 ))
                 self.prepare_job_inputs(jobId, data, common_dests, overrides, transport=transport)
-                # Now localize job setup and teardown scripts
-                setup_script, teardown_script = self.job_setup_teardown(jobId, patterns)
-                # Setup:
+
+                # Now localize job setup, localization, and teardown scripts
+                setup_script, localization_script, teardown_script = self.job_setup_teardown(jobId, patterns)
+
+                # Setup: 
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(setup_script)
                 os.chmod(script_path.localpath, 0o775)
+
+                # Localization: 
+                script_path = self.reserve_path('jobs', jobId, 'localization.sh')
+                with open(script_path.localpath, 'w') as w:
+                    w.write(localization_script)
+                os.chmod(script_path.localpath, 0o775)
+
                 # Teardown:
                 script_path = self.reserve_path('jobs', jobId, 'teardown.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(teardown_script)
                 os.chmod(script_path.localpath, 0o775)
+
+            # copy delocalization script
             os.symlink(
                 os.path.join(
                     os.path.dirname(__file__),

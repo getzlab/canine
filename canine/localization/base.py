@@ -483,14 +483,18 @@ class AbstractLocalizer(abc.ABC):
                         value
                     )
 
-    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str]:
+    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
         """
-        Returns a tuple of (setup script, teardown script) for the given job id.
+        Returns a tuple of (setup script, localization script, teardown script) for the given job id.
         Must call after pre-scanning inputs
         """
+
+		# generate job variable, exports, and localization_tasks arrays
+		# - job variables and exports are set when setup.sh is _sourced_
+		# - localization tasks are run when localization.sh is _run_
         job_vars = []
         exports = []
-        extra_tasks = [
+        localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
         compute_env = self.environment('compute')
@@ -498,7 +502,7 @@ class AbstractLocalizer(abc.ABC):
             if val.type == 'stream':
                 job_vars.append(shlex.quote(key))
                 dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                extra_tasks += [
+                localization_tasks += [
                     'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
                     'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
                     'mkfifo {}'.format(dest.computepath),
@@ -515,7 +519,7 @@ class AbstractLocalizer(abc.ABC):
             elif val.type == 'download':
                 job_vars.append(shlex.quote(key))
                 dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                extra_tasks += [
+                localization_tasks += [
                     "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
@@ -534,11 +538,12 @@ class AbstractLocalizer(abc.ABC):
                 ))
             else:
                 print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
+
+        # generate setup script
         setup_script = '\n'.join(
             line.rstrip()
             for line in [
                 '#!/bin/bash',
-                'set -e',
                 'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
                 'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
@@ -546,8 +551,16 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_ROOT',
-            ] + exports + extra_tasks
-        ) + '\ncd $CANINE_JOB_ROOT\nset +e\n'
+            ] + exports
+        ) + '\ncd $CANINE_JOB_ROOT\n'
+
+        # generate localization script
+        localization_script = '\n'.join([
+          "#!/bin/bash",
+          "set -e"
+        ] + localization_tasks) + "\nset +e"
+
+        # generate teardown script
         teardown_script = '\n'.join(
             line.rstrip()
             for line in [
@@ -565,7 +578,7 @@ class AbstractLocalizer(abc.ABC):
                 ),
             ]
         )
-        return setup_script, teardown_script
+        return setup_script, localization_script, teardown_script
 
     @abc.abstractmethod
     def __enter__(self):
@@ -602,7 +615,7 @@ class AbstractLocalizer(abc.ABC):
         3 phase task:
         1) Pre-scan inputs to determine proper localization strategy for all inputs
         2) Begin localizing job inputs. For each job, check the predetermined strategy
-        and set up the job's setup and teardown scripts
+        and set up the job's setup, localization, and teardown scripts
         3) Finally, finalize the localization. This may include broadcasting the
         staging directory or copying a batch of gsutil files
         Returns the remote staging directory, which is now ready for final startup
