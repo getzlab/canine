@@ -470,7 +470,7 @@ class Orchestrator(object):
             if transport.exists(df_path):
                 try:
                     # load in results and job spec dataframes
-                    with transport.open(df_path) as r:
+                    with transport.open(df_path, mode = "rb") as r:
                         r_df = pandas_read_hdf5_buffered(key = "results", buf = r)
                     js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
 
