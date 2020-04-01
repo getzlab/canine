@@ -12,6 +12,7 @@ import google.auth
 import paramiko
 import shutil
 import time
+import pandas as pd
 
 class ArgumentHelper(dict):
     """
@@ -274,3 +275,28 @@ def gcp_hourly_cost(mtype: str, preemptible: bool = False, ssd_size: int = 0, hd
     )
 
 # rmtree_retry removed in favor of AbstractTransport.rmtree
+
+def pandas_write_hdf5_buffered(df: pd.DataFrame, key: str, buf: io.BufferedWriter):
+    """
+	Write a Pandas dataframe in HDF5 format to a buffer.
+    """
+    with pd.HDFStore(
+      "/dev/null",
+      mode = "w",
+      driver = "H5FD_CORE",
+      driver_core_backing_store = 0
+    ) as store:
+        store["results"] = df
+        buf.write(store._handle.get_file_image())
+
+def pandas_read_hdf5_buffered(key: str, buf: io.BufferedReader) -> pd.DataFrame:
+    """
+	Read a Pandas dataframe in HDF5 format from a buffer.
+    """
+    return pd.HDFStore(
+      "/dev/zeros",
+      mode = "r",
+      driver = "H5FD_CORE",
+      driver_core_backing_store = 0,
+      driver_core_image = buf.read()
+    )[key]
