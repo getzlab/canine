@@ -412,6 +412,8 @@ class Orchestrator(object):
                     # that don't receive any transformation with transformed columns
                     df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
             except:
+                df = pd.DataFrame()
+                print("Error generating output dataframe; see stack trace for details.", file = sys.stderr)
                 traceback.print_exc()
 
 
