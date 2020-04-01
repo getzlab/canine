@@ -293,10 +293,11 @@ def pandas_read_hdf5_buffered(key: str, buf: io.BufferedReader) -> pd.DataFrame:
     """
 	Read a Pandas dataframe in HDF5 format from a buffer.
     """
-    return pd.HDFStore(
-      "/dev/zeros",
+    with pd.HDFStore(
+      "dummy_hdf5",
       mode = "r",
       driver = "H5FD_CORE",
       driver_core_backing_store = 0,
       driver_core_image = buf.read()
-    )[key]
+    ) as store:
+        return store[key]
