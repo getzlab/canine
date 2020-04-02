@@ -59,7 +59,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
     def __init__(
         self, *, image: str, worker_prefix: str = 'slurm-canine', tot_node_count: int = 50,
-        init_node_count: typing.Optional[int] = None, compute_zone: str = 'us-central1-a',
+        init_node_count: typing.Optional[int] = None, compute_zone: typing.Optional[str] = None,
         worker_type: str = 'n1-highcpu-2', preemptible: bool = True,
         gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script_file: typing.Optional[str] = None,
@@ -87,6 +87,11 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         if slurm_conf_path is None:
             raise ValueError("Currently, path to slurm.conf must be explicitly specified.")
 
+        if compute_zone is None:
+            compute_zone = get_default_gcp_zone()
+            if compute_zone is None:
+                raise ValueError("No GCP zone was provided and a project could not be auto-detected")
+
         # make config dict
         self.config = {
             "image" : image,
@@ -109,6 +114,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "slurm_conf_path" : slurm_conf_path,
             "action_on_stop" : action_on_stop
         }
+
+        if self.config['project'] is None:
+            raise ValueError("No GCP project was provided and a project could not be auto-detected")
 
         # this backend resets itself on startup; no need for the orchestrator
         # to do this.
