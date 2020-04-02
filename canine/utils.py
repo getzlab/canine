@@ -7,12 +7,13 @@ import warnings
 from collections import namedtuple
 import functools
 import shlex
-from subprocess import CalledProcessError
+import subprocess
 import google.auth
 import paramiko
 import shutil
 import time
 import pandas as pd
+import requests
 
 class ArgumentHelper(dict):
     """
@@ -139,6 +140,28 @@ def make_interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.Bina
     stderr.seek(0,0)
     return channel.recv_exit_status(), stdout, stderr
 
+def get_default_gcp_zone():
+    try:
+        response = requests.get(
+            'http://metadata.google.internal/computeMetadata/v1/instance/zone',
+            headers={
+                'Metadata-Flavor': 'Google'
+            }
+        )
+        if response.status_code == 200:
+            return os.path.basename(response.text)
+    except requests.exceptions.ConnectionError:
+        pass
+    # not on GCE instance, check env
+    try:
+        response = subprocess.run('gcloud config get-value compute/zone', shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if response.returncode == 0 and b'(unset)' not in response.stdout.strip():
+            return response.stdout.strip().decode()
+    except subprocess.CalledProcessError:
+        pass
+    # gcloud config not happy, just return default
+    return 'us-central1-a'
+
 __DEFAULT_GCP_PROJECT__ = None
 
 def get_default_gcp_project():
@@ -168,7 +191,7 @@ def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None
         if stderr is not None:
             sys.stderr.write(stderr.read().decode())
             sys.stderr.flush()
-        raise CalledProcessError(rc, cmd)
+        raise subprocess.CalledProcessError(rc, cmd)
 
 predefined_mtypes = {
     # cost / CPU in each of the predefined tracks
