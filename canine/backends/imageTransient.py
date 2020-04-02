@@ -7,7 +7,7 @@ import os
 import sys
 
 from .local import LocalSlurmBackend
-from ..utils import get_default_gcp_project, gcp_hourly_cost
+from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost
 
 import googleapiclient.discovery as gd
 import googleapiclient.errors
