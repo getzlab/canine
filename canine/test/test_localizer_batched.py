@@ -292,7 +292,7 @@ class TestIntegration(unittest.TestCase):
                             'string-incommon': Localization(None, os.urandom(8).hex()), # no localization. Setup teardown exports as string
                         }
 
-                        setup_text, teardown_text = localizer.job_setup_teardown(
+                        setup_text, localization_text, teardown_text = localizer.job_setup_teardown(
                             jobId=str(jid),
                             patterns=output_patterns
                         )
@@ -329,7 +329,7 @@ class TestIntegration(unittest.TestCase):
                                             src=src,
                                             dest=path
                                         ),
-                                        setup_text
+                                        localization_text
                                     )
                                 elif value.type == 'download':
                                     src = path
@@ -341,7 +341,7 @@ class TestIntegration(unittest.TestCase):
                                             src=src,
                                             dest=path
                                         ),
-                                        setup_text
+                                        localization_text
                                     )
                                 if isinstance(path, PathType):
                                     path = path.computepath
