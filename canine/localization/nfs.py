@@ -245,7 +245,7 @@ class NFSLocalizer(BatchedLocalizer):
         localization_script = '\n'.join([
           "#!/bin/bash",
           "set -e"
-        ] + localization_tasks) + "\nset +e"
+        ] + localization_tasks) + "\nset +e\n"
 
         # generate teardown script
         teardown_script = '\n'.join(
