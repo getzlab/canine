@@ -383,6 +383,28 @@ class Orchestrator(object):
             try:
                 acct = self.backend.sacct(job=batch_id)
 
+                # we cannot assume that all outputs were properly delocalized, i.e.
+                # self.job_spec.keys() == outputs.keys()
+                #
+                # this could happen if a preemptible job runs out of preemption
+                # attempts, so delocalization.py never gets a chance to run
+    
+                # sanity check: outputs cannot contain more keys than inputs
+                if outputs.keys() - self.job_spec.keys():
+                    raise ValueError("{} job outputs discovered, but only {} job(s) specified!".format(
+                      len(outputs), len(self.job_spec)
+                    ))
+
+                # for jobs that failed to delocalize any outputs, pad the outputs
+                # dict with blanks
+                missing_outputs = self.job_spec.keys() - outputs.keys()
+                if missing_outputs:
+                    print("WARNING: {}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
+                      len(missing_outputs), len(self.job_spec)
+                    ), file = sys.stderr)
+                    outputs = { **outputs, **{ k : {} for k in missing_outputs } }
+
+                # make the output dataframe
                 df = pd.DataFrame.from_dict(
                     data={
                         job_id: {
