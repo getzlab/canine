@@ -305,10 +305,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
         If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal
         """
-        # try:
-        #     interactive = interactive and os.isatty(sys.stdout.fileno())
-        # except:
-        #     interactive = False
+
         if interactive:
             # Interactive commands are kind of shit using the docker API, so we outsource them
             return LocalSlurmBackend.invoke(
