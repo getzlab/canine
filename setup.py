@@ -19,6 +19,7 @@ setup(
     packages = [
         'canine',
         'canine.backends',
+        'canine.backends.dummy',
         'canine.adapters',
         'canine.localization'
     ],
@@ -26,7 +27,9 @@ setup(
         '':[
             'backends/slurm-gcp/*',
             'backends/slurm-gcp/scripts/*',
-            'backends/slurm-docker/src/*'
+            'backends/slurm-docker/src/*',
+            'backends/dummy/*',
+            'backends/dummy/conf/*'
         ],
     },
     entry_points={
@@ -36,7 +39,7 @@ setup(
             'canine-xargs = canine.__main__:xargs'
         ]
     },
-    description = 'A dalmatian-based job manager to schedule tasks using SLURM',
+    description = 'A modular, high-performance computing solution to run jobs using SLURM',
     url = 'https://github.com/broadinstitute/canine',
     author = 'Aaron Graubert - Broad Institute - Cancer Genome Computational Analysis',
     author_email = 'aarong@broadinstitute.org',
