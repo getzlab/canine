@@ -5,7 +5,7 @@ import sys
 import subprocess
 import shutil
 from .base import AbstractSlurmBackend, AbstractTransport
-from ..utils import ArgumentHelper, check_call
+from ..utils import ArgumentHelper, check_call, isatty
 from agutil import StdOutAdapter
 import pandas as pd
 
@@ -118,9 +118,13 @@ class LocalSlurmBackend(AbstractSlurmBackend):
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
         If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal.
         """
+        stdinFD = None
+        if not isatty(sys.stdout, sys.stdin):
+            interactive = False
+        if interactive:
+            stdinFD = os.dup(sys.stdin.fileno())
         stdout = StdOutAdapter(interactive)
         stderr = StdOutAdapter(interactive)
-        stdinFD = os.dup(sys.stdin.fileno())
         proc = subprocess.Popen(
             command,
             shell=True,
@@ -133,7 +137,8 @@ class LocalSlurmBackend(AbstractSlurmBackend):
         proc.wait()
         stdout.kill()
         stderr.kill()
-        os.close(stdinFD)
+        if stdinFD is not None:
+            os.close(stdinFD)
         return (
             proc.returncode,
             io.BytesIO(stdout.buffer),

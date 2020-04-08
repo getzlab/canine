@@ -101,7 +101,8 @@ class Orchestrator(object):
             },
             'localization': {
                 'strategy': 'Batched'
-            }
+            },
+            'outputs': {}
         }
         for key, value in DEFAULTS.items():
             if key not in cfg:

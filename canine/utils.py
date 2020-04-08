@@ -14,6 +14,18 @@ import shutil
 import time
 import requests
 
+def isatty(*streams: typing.IO) -> bool:
+    """
+    Returns true if all of the provided streams are ttys
+    """
+    for stream in streams:
+        try:
+            if not (hasattr(stream, 'fileno') and os.isatty(stream.fileno())):
+                return False
+        except io.UnsupportedOperation:
+            return False
+    return True
+
 class ArgumentHelper(dict):
     """
     Helper class for setting arguments to slurm commands
@@ -81,13 +93,19 @@ class ArgumentHelper(dict):
     @property
     def commandline(self) -> str:
         """Expands the arguments to command line form"""
-        return '{short_prespace}{short_flags}{long_flags}{params}'.format(
+        return '{short_prespace}{short_flags}{short_params}{long_flags}{params}'.format(
             short_prespace=' -' if len([f for f in self.flags if len(f) == 1]) else '',
             short_flags=''.join(flag for flag in self.flags if len(flag)==1),
+            short_params=''.join(
+                ' -{}={}'.format(self.translate(key), shlex.quote(value))
+                for key, value in self.params.items()
+                if len(key) == 1
+            ),
             long_flags=''.join(' --{}'.format(self.translate(flag)) for flag in self.flags if len(flag) > 1),
             params=''.join(
                 ' --{}={}'.format(self.translate(key), shlex.quote(value))
                 for key, value in self.params.items()
+                if len(key) > 1
             )
         )
 

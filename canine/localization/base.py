@@ -17,6 +17,7 @@ from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBacken
 from ..utils import get_default_gcp_project, check_call
 from hound.client import _getblob_bucket
 from agutil import status_bar
+import pandas as pd
 
 Localization = namedtuple("Localization", ['type', 'path'])
 # types: stream, download, None
@@ -340,10 +341,33 @@ class AbstractLocalizer(abc.ABC):
             os.path.join(self.environment('compute')['CANINE_ROOT'], *(str(component) for component in args))
         )
 
+    def build_manifest(self, transport: typing.Optional[AbstractTransport] = None) -> pd.DataFrame:
+        """
+        Returns the job output manifest from this pipeline.
+        Builds the manifest if it does not exist
+        """
+        with self.transport_context() as transport:
+            output_dir = transport.normpath(self.environment('controller')['CANINE_OUTPUT'])
+            if not transport.isfile(os.path.join(output_dir, '.canine_pipeline_manifest.tsv')):
+                script_path = self.backend.pack_batch_script(
+                    'export CANINE_OUTPUTS={}'.format(output_dir),
+                    'cat <(echo "jobId\tfield\tpath") $CANINE_OUTPUTS/*/.canine_job_manifest > $CANINE_OUTPUTS/.canine_pipeline_manifest.tsv',
+                    'rm -f $CANINE_OUTPUTS/*/.canine_job_manifest',
+                    script_path=os.path.join(output_dir, 'manifest.sh')
+                )
+                check_call(
+                    script_path,
+                    *self.backend.invoke(os.path.abspath(script_path))
+                )
+                transport.remove(script_path)
+            with transport.open(os.path.join(output_dir, '.canine_pipeline_manifest.tsv'), 'r') as r:
+                return pd.read_csv(r, sep='\t', dtype='str').set_index(['jobId', 'field'])
+
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output') -> typing.Dict[str, typing.Dict[str, str]]:
         """
         Delocalizes output from all jobs
         """
+        self.build_manifest()
         self.receivetree(
             self.environment('controller')['CANINE_OUTPUT'],
             output_dir,
