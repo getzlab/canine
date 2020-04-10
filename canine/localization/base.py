@@ -20,7 +20,7 @@ from agutil import status_bar
 import pandas as pd
 
 Localization = namedtuple("Localization", ['type', 'path'])
-# types: stream, download, None
+# types: stream, download, local, None
 # indicates what kind of action needs to be taken during job startup
 
 PathType = namedtuple(
@@ -37,13 +37,18 @@ class AbstractLocalizer(abc.ABC):
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
         common: bool = True, staging_dir: str = None, mount_path: str = None,
-        project: typing.Optional[str] = None, **kwargs
+        project: typing.Optional[str] = None, temporary_disk_type: str = 'standard',
+        local_download_dir: typing.Optional[str] = None, **kwargs
     ):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
         the localizer's entire life cycle.
-        If staging_dir is not provided, a random directory is chosen
+        If staging_dir is not provided, a random directory is chosen.
+        local_download_dir: Where `local` overrides should be saved. Default: /mnt/canine-local-downloads/(random id).
+        temporary_disk_type: "standard" or "ssd". Default "standard".
+        NOTE: If temporary_disk_type is explicitly "None", disks will not be created. Files will be downloaded
+        to local_download_dir without mounting a disk there. The directory will not be created in that case
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -71,6 +76,10 @@ class AbstractLocalizer(abc.ABC):
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
+        self.local_download_size = {} # {jobId: size}
+        self.disk_key = os.urandom(4).hex()
+        self.local_download_dir = local_download_dir if local_download_dir is not None else '/mnt/canine-local-downloads/{}'.format(self.disk_key)
+        self.temporary_disk_type = temporary_disk_type
 
     def get_requester_pays(self, path: str) -> bool:
         """
@@ -91,6 +100,19 @@ class AbstractLocalizer(abc.ABC):
             except subprocess.CalledProcessError:
                 pass
         return bucket in self.requester_pays and self.requester_pays[bucket]
+
+    def get_object_size(self, path: str) -> int:
+        """
+        Returns the total number of bytes of the given gsutil object.
+        If a directory is given, this will return the total space used by all objects in the directory
+        """
+        cmd = 'gsutil {} du -s {}'.format(
+            '-u {}'.format(self.project) if self.get_requester_pays(path) else '',
+            path
+        )
+        rc, sout, serr = self.backend.invoke(cmd)
+        check_call(cmd, rc, sout, serr)
+        return int(sout.read().split()[0])
 
     @contextmanager
     def transport_context(self, transport: typing.Optional[AbstractTransport] = None) -> typing.ContextManager[AbstractTransport]:
@@ -462,7 +484,7 @@ class AbstractLocalizer(abc.ABC):
                                 'stream',
                                 value
                             )
-                    elif mode in ['localize', 'symlink']:
+                    elif mode in {'localize', 'symlink'}:
                         self.inputs[jobId][arg] = Localization(
                             None,
                             self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
@@ -472,7 +494,7 @@ class AbstractLocalizer(abc.ABC):
                             self.inputs[jobId][arg].path,
                             transport=transport
                         )
-                    elif mode == 'delayed':
+                    elif mode in {'delayed', 'local'}:
                         if not value.startswith('gs://'):
                             print("Ignoring 'delayed' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
                             self.inputs[jobId][arg] = Localization(
@@ -483,6 +505,12 @@ class AbstractLocalizer(abc.ABC):
                                 value,
                                 self.inputs[jobId][arg].path,
                                 transport=transport
+                            )
+                        elif mode == 'local':
+                            self.local_download_size[jobId] = self.local_download_size.get(jobId, 0) + self.get_object_size(value)
+                            self.inputs[jobId][arg] = Localization(
+                                'local',
+                                value
                             )
                         else:
                             self.inputs[jobId][arg] = Localization(
@@ -517,6 +545,43 @@ class AbstractLocalizer(abc.ABC):
         extra_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
+        local_download_size = self.local_download_size.get(jobId, 0)
+        disk_name = None
+        if local_download_size > 0 and self.temporary_disk_type is not None:
+            local_download_size = max(
+                10,
+                1+int(local_download_size / 1022611260) # bytes -> gib with 5% safety margin
+            )
+            print("DBG: LDS", local_download_size)
+            if local_download_size > 65535:
+                raise ValueError("Cannot provision {} GB disk for job {}".format(local_download_size, jobId))
+            disk_name = 'canine-{}-{}-{}'.format(self.disk_key, os.urandom(4).hex(), jobId)
+            device_name = 'cn{}{}'.format(os.urandom(2).hex(), jobId)
+            extra_tasks += [
+                'export CANINE_LOCAL_DISK_SIZE={}GB'.format(local_download_size),
+                'export CANINE_LOCAL_DISK_TYPE={}'.format(self.temporary_disk_type),
+                'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)',
+                'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone))',
+                'gcloud compute disks create {} --size {} --type pd-{} --zone $CANINE_NODE_ZONE'.format(
+                    disk_name,
+                    local_download_size,
+                    self.temporary_disk_type
+                ),
+                'gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {} --device-name {}'.format(
+                    disk_name,
+                    device_name
+                ),
+                'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
+                'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
+                'sudo mkdir -p {}/{}'.format(self.local_download_dir, disk_name),
+                'sudo mount -o discard,defaults /dev/disk/by-id/google-{} {}/{}'.format(
+                    device_name,
+                    self.local_download_dir,
+                    disk_name
+                ),
+                'sudo chmod -R a+rwX {}'.format(self.local_download_dir)
+            ]
+            print('DBG:', extra_tasks)
         compute_env = self.environment('compute')
         for key, val in self.inputs[jobId].items():
             if val.type == 'stream':
@@ -535,9 +600,13 @@ class AbstractLocalizer(abc.ABC):
                     key,
                     dest.computepath
                 ))
-            elif val.type == 'download':
+            elif val.type in {'download', 'local'}:
                 job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
+                if val.type == 'download':
+                    dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
+                else:
+                    dest = PathType(None, None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
+                    print("Local download", key, val, dest)
                 extra_tasks += [
                     "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
@@ -585,7 +654,13 @@ class AbstractLocalizer(abc.ABC):
                         for name, pattern in patterns.items()
                     )
                 ),
-            ]
+            ] + (
+                [
+                    'sudo umount {}/{}'.format(self.local_download_dir, disk_name),
+                    'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
+                    'gcloud compute disks delete {} --zone $CANINE_NODE_ZONE'.format(disk_name)
+                ] if disk_name is not None else []
+            )
         )
         return setup_script, teardown_script
 

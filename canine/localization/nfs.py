@@ -30,7 +30,8 @@ class NFSLocalizer(BatchedLocalizer):
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
         common: bool = True, staging_dir: str = None, mount_path: str = None,
-        project: typing.Optional[str] = None, **kwargs
+        project: typing.Optional[str] = None, temporary_disk_type: str = 'standard',
+        local_download_dir: typing.Optional[str] = None,**kwargs
     ):
         """
         Initializes the Localizer using the given transport.
@@ -63,6 +64,10 @@ class NFSLocalizer(BatchedLocalizer):
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
+        self.local_download_size = {} # {jobId: size}
+        self.disk_key = os.urandom(4).hex()
+        self.local_download_dir = local_download_dir if local_download_dir is not None else '/mnt/canine-local-downloads/{}'.format(self.disk_key)
+        self.temporary_disk_type = temporary_disk_type
 
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
@@ -160,6 +165,7 @@ class NFSLocalizer(BatchedLocalizer):
             )
             return self.finalize_staging_dir(inputs)
 
+    # NOTE: Intentionally omitting local override implementation. #35 removes NFSLocalizer's implementation of job_setup_teardown
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str]:
         """
         Returns a tuple of (setup script, teardown script) for the given job id.
