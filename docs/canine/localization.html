@@ -74,6 +74,13 @@ Returns the absolute path of the remote staging directory on the controller node
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.BatchedLocalizer.get_object_size">
+<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.BatchedLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the total number of bytes of the given gsutil object.
+If a directory is given, this will return the total space used by all objects in the directory</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.BatchedLocalizer.get_requester_pays">
 <code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.BatchedLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns True if the requested gs:// object or bucket resides in a
@@ -216,6 +223,13 @@ Returns the absolute path of the remote staging directory on the controller node
 </dd></dl>
 
 <dl class="method">
+<dt id="canine.localization.LocalLocalizer.get_object_size">
+<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.LocalLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the total number of bytes of the given gsutil object.
+If a directory is given, this will return the total space used by all objects in the directory</p>
+</dd></dl>
+
+<dl class="method">
 <dt id="canine.localization.LocalLocalizer.get_requester_pays">
 <code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.LocalLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns True if the requested gs:// object or bucket resides in a
@@ -318,7 +332,7 @@ If None (default) is provided, a new transport is opened, and closed after the c
 
 <dl class="class">
 <dt id="canine.localization.RemoteLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">RemoteLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">RemoteLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">temporary_disk_type: str = 'standard'</em>, <em class="sig-param">local_download_dir: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Remote Only strategy:
 Staging dir is created remotely and files are copied in</p>
 <dl class="method">
@@ -347,6 +361,13 @@ Location must be one of {“local”, “controller”, “compute”}</p>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.RemoteLocalizer.get_object_size">
+<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.RemoteLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the total number of bytes of the given gsutil object.
+If a directory is given, this will return the total space used by all objects in the directory</p>
 </dd></dl>
 
 <dl class="method">
@@ -451,7 +472,7 @@ If None (default) is provided, a new transport is opened, and closed after the c
 
 <dl class="class">
 <dt id="canine.localization.NFSLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">NFSLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">NFSLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">temporary_disk_type: str = 'standard'</em>, <em class="sig-param">local_download_dir: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Similar to LocalLocalizer:
 Constructs the canine staging directory locally.
 Local inputs are symlinked into the staging directory.</p>
@@ -486,6 +507,13 @@ Location must be one of {“local”, “controller”, “compute”}</p>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
+</dd></dl>
+
+<dl class="method">
+<dt id="canine.localization.NFSLocalizer.get_object_size">
+<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.NFSLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the total number of bytes of the given gsutil object.
+If a directory is given, this will return the total space used by all objects in the directory</p>
 </dd></dl>
 
 <dl class="method">

@@ -552,7 +552,6 @@ class AbstractLocalizer(abc.ABC):
                 10,
                 1+int(local_download_size / 1022611260) # bytes -> gib with 5% safety margin
             )
-            print("DBG: LDS", local_download_size)
             if local_download_size > 65535:
                 raise ValueError("Cannot provision {} GB disk for job {}".format(local_download_size, jobId))
             disk_name = 'canine-{}-{}-{}'.format(self.disk_key, os.urandom(4).hex(), jobId)
@@ -562,6 +561,9 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_LOCAL_DISK_TYPE={}'.format(self.temporary_disk_type),
                 'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)',
                 'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone))',
+                'sudo mkdir -p {}/{}'.format(self.local_download_dir, disk_name),
+                'if [[ -z "$CANINE_NODE_NAME" ]]; then echo "Unable to provision disk (not running on GCE instance). Attempting download to directory on boot disk" > /dev/stderr; else',
+                'echo Provisioning and mounting temporary disk {}'.format(disk_name),
                 'gcloud compute disks create {} --size {} --type pd-{} --zone $CANINE_NODE_ZONE'.format(
                     disk_name,
                     local_download_size,
@@ -573,15 +575,15 @@ class AbstractLocalizer(abc.ABC):
                 ),
                 'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
                 'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
-                'sudo mkdir -p {}/{}'.format(self.local_download_dir, disk_name),
+
                 'sudo mount -o discard,defaults /dev/disk/by-id/google-{} {}/{}'.format(
                     device_name,
                     self.local_download_dir,
                     disk_name
                 ),
-                'sudo chmod -R a+rwX {}'.format(self.local_download_dir)
+                'sudo chmod -R a+rwX {}'.format(self.local_download_dir),
+                'fi'
             ]
-            print('DBG:', extra_tasks)
         compute_env = self.environment('compute')
         for key, val in self.inputs[jobId].items():
             if val.type == 'stream':
@@ -605,8 +607,8 @@ class AbstractLocalizer(abc.ABC):
                 if val.type == 'download':
                     dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                 else:
+                    # Local and controller paths not needed on this object
                     dest = PathType(None, None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
-                    print("Local download", key, val, dest)
                 extra_tasks += [
                     "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
