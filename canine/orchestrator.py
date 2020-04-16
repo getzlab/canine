@@ -13,7 +13,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.8.0'
+version = '0.8.1'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -101,7 +101,8 @@ class Orchestrator(object):
             },
             'localization': {
                 'strategy': 'Batched'
-            }
+            },
+            'outputs': {}
         }
         for key, value in DEFAULTS.items():
             if key not in cfg:

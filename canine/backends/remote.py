@@ -10,7 +10,7 @@ import traceback
 import shlex
 import atexit
 from .base import AbstractSlurmBackend, AbstractTransport
-from ..utils import ArgumentHelper, make_interactive, check_call
+from ..utils import ArgumentHelper, make_interactive, check_call, isatty
 from agutil import StdOutAdapter
 import pandas as pd
 import paramiko
@@ -323,6 +323,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
         EX: backend.invoke('stty -echo && python', True) would invoke an interactive python session without your input also appearing in stdout
         """
         self.early_rekey()
+        interactive = interactive and isatty(sys.stdout, sys.stdin)
         raw_stdin, raw_stdout, raw_stderr = self._invoke(command, pty=interactive)
         try:
             if interactive:

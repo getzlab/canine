@@ -7,11 +7,24 @@ import warnings
 from collections import namedtuple
 import functools
 import shlex
-from subprocess import CalledProcessError
+import subprocess
 import google.auth
 import paramiko
 import shutil
 import time
+import requests
+
+def isatty(*streams: typing.IO) -> bool:
+    """
+    Returns true if all of the provided streams are ttys
+    """
+    for stream in streams:
+        try:
+            if not (hasattr(stream, 'fileno') and os.isatty(stream.fileno())):
+                return False
+        except io.UnsupportedOperation:
+            return False
+    return True
 
 class ArgumentHelper(dict):
     """
@@ -80,13 +93,19 @@ class ArgumentHelper(dict):
     @property
     def commandline(self) -> str:
         """Expands the arguments to command line form"""
-        return '{short_prespace}{short_flags}{long_flags}{params}'.format(
+        return '{short_prespace}{short_flags}{short_params}{long_flags}{params}'.format(
             short_prespace=' -' if len([f for f in self.flags if len(f) == 1]) else '',
             short_flags=''.join(flag for flag in self.flags if len(flag)==1),
+            short_params=''.join(
+                ' -{}={}'.format(self.translate(key), shlex.quote(value))
+                for key, value in self.params.items()
+                if len(key) == 1
+            ),
             long_flags=''.join(' --{}'.format(self.translate(flag)) for flag in self.flags if len(flag) > 1),
             params=''.join(
                 ' --{}={}'.format(self.translate(key), shlex.quote(value))
                 for key, value in self.params.items()
+                if len(key) > 1
             )
         )
 
@@ -138,6 +157,28 @@ def make_interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.Bina
     stderr.seek(0,0)
     return channel.recv_exit_status(), stdout, stderr
 
+def get_default_gcp_zone():
+    try:
+        response = requests.get(
+            'http://metadata.google.internal/computeMetadata/v1/instance/zone',
+            headers={
+                'Metadata-Flavor': 'Google'
+            }
+        )
+        if response.status_code == 200:
+            return os.path.basename(response.text)
+    except requests.exceptions.ConnectionError:
+        pass
+    # not on GCE instance, check env
+    try:
+        response = subprocess.run('gcloud config get-value compute/zone', shell=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        if response.returncode == 0 and b'(unset)' not in response.stdout.strip():
+            return response.stdout.strip().decode()
+    except subprocess.CalledProcessError:
+        pass
+    # gcloud config not happy, just return default
+    return 'us-central1-a'
+
 __DEFAULT_GCP_PROJECT__ = None
 
 def get_default_gcp_project():
@@ -167,7 +208,7 @@ def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None
         if stderr is not None:
             sys.stderr.write(stderr.read().decode())
             sys.stderr.flush()
-        raise CalledProcessError(rc, cmd)
+        raise subprocess.CalledProcessError(rc, cmd)
 
 predefined_mtypes = {
     # cost / CPU in each of the predefined tracks

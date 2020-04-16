@@ -9,7 +9,7 @@ import shutil
 from ..base import AbstractSlurmBackend
 from ..local import LocalSlurmBackend
 from ..remote import IgnoreKeyPolicy, RemoteTransport, RemoteSlurmBackend
-from ...utils import ArgumentHelper, check_call
+from ...utils import ArgumentHelper, check_call, isatty
 import docker
 import paramiko
 import port_for
@@ -164,7 +164,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
     def __init__(
         self, n_workers: int, network: str = 'canine_dummy_slurm',
         cpus: typing.Optional[int] = None, memory: typing.Optional[int] = None,
-        compute_script: str = "", controller_script: str = "",
+        compute_script: str = "", controller_script: str = "", debug: bool = False,
         image: str = "gcr.io/broad-cga-aarong-gtex/slurmind", staging_dir: typing.Optional[str] = None, **kwargs
     ):
         """
@@ -173,6 +173,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Memory is in GiB.
         If staging dir is provided, th
         """
+        self.debug = debug
         if int(n_workers) < 1:
             raise ValueError("n_workers must be at least 1 worker")
         super().__init__(**kwargs)
@@ -304,11 +305,16 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
         If interactive is True, stdin, stdout, and stderr should all be connected live to the user's terminal
         """
+
         if interactive:
             # Interactive commands are kind of shit using the docker API, so we outsource them
             return LocalSlurmBackend.invoke(
                 self,
-                'docker exec -it {} {}'.format(self.controller.short_id, command),
+                'docker exec -i{} {} {}'.format(
+                    't' if isatty(sys.stdout, sys.stdin) else '',
+                    self.controller.short_id,
+                    command
+                ),
                 interactive=True
             )
         result = DummySlurmBackend.exec_run(
@@ -327,9 +333,18 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Kills all running containers
         """
         print("Cleaning up Slurm Cluster", self.controller.short_id)
-        for container in DummySlurmBackend.stop_containers(self.workers + [self.controller]):
+        containers = self.workers
+        if not self.debug:
+            containers.append(self.controller)
+        else:
+            print("Debug mode enabled. Controller (", self.controller.short_id, ") will remain running", file=sys.stderr)
+        for container in DummySlurmBackend.stop_containers(containers):
             print("Stopped", container.short_id)
-        self.bind_path.cleanup()
+        if not self.debug:
+            self.bind_path.cleanup()
+        else:
+            import atexit
+            atexit.register(self.bind_path.cleanup)
         self.bind_path = None
         self.port = None
 

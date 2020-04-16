@@ -1,6 +1,6 @@
 # Canine
 
-A Dalmatian-based job manager to schedule tasks using SLURM
+A modular, high-performance computing solution to run jobs using SLURM
 
 ---
 
@@ -17,84 +17,163 @@ Canine may be used in any of the following ways:
 * Using the [Canine API](https://broadinstitute.github.io/canine/) to execute custom
 workflows in Slurm, which could not be configured as a pipeline object
 
-### Configuration
+## Anatomy of a pipeline
 
-Canine uses a YAML file to specify the job configuration.
-See `pipeline_options.md` for a detailed description of pipeline configuration
+Canine can be natively configured to suit a vast range of setups.
+Canine is modularized into three main components which can be mixed and matched as needed: Adapters, Backends, and Localizers.
+A pipeline specifies which Adapter, Backend, and Localizer to use, along with any configuration options for each.
 
-```yaml
-name: (str, optional) The name for this job {--name}
-script: (str) The script to run {--script}
-inputs: # Inputs to the script
-  varname: value {--input varname:value}
-  varname: # {--input varname:value1 --input varname:value2}
-    - value1
-    - value2
-resources: # slurm resources
-  varname: value {--resources varname:value}
-adapter: # Job input adapter configuration
-  type: [One of: Manual (default), Firecloud] The adapter to map inputs into actual job inputs {--adapter type:value}
-  # Other Keyword arguments to provide to adapter
-  # Manual Args:
-  product: (bool, default false) Whether adapter should take the product of all inputs rather than iterating {--adapter product:value}
-  # FireCloud Args:
-  workspace: (namespace)/(workspace) {--adapter workspace:ws/ns}
-  entityType: [One of: sample, pair, participant, *_set] The entity type to use {--adapter entityType:type}
-  entityName: (str) The entity to use {--adapter entityName:name}
-  entityExpression: (str, optional) The expression to map the input entity to multiple sub-entities {--adapter entityExpression:expr}
-  write_to_workspace: (bool, default True) If outputs should be written back to the workspace {--adapter write-to-workspace:value}
-backend: # SLURM backend configuration
-  type: [One of: Local (default), Remote, TransientGCP] The backend to use when interfacing with SLURM {--backend type:value}
-  # Other keyword arguments to provide to the backend for initialization
-  argname: argvalue {--backend argname:argvalue}
-localization: # Localization options
-  common: (bool, default True) Files (gs:// or otherwise) which are shared by multiple tasks will be downloaded only once {--localization common:value}
-  staging_dir: (str, default tempdir) Directory in which files for this job should be staged. For Remote backends, this should be set within the NFS share.
-   {--localization staging-dir:path}
-  strategy: [One of: Batched, Local, Remote] Strategy for staging inputs {--localization strategy:mode}
-  transfer_bucket: (str, default null) Transfer directories via the given bucket instead of directly over SFTP. Bucket transfer generally faster
-  overrides: # Override localization handling for specific inputs
-    varname: [One of: Stream, Localize, Common, Delayed, null] Localization handling {--localization overrides:varname:mode}
-    # Stream: The input variable will be streamed to a FIFO pipe which is passed to the job
-    # Localize: The input variable will be downloaded for the job. If it's a local path, it will be copied to the job's staging directory
-    # Common: The input variable will be downloaded to the common directory. If it's a local path, it will be copied to the common directory
-    #   If the input variable resolves to multiple values during the setup phase, each unique value will be copied to the common directory
-    # Delayed: Same as Localize, except the file is downloaded during job setup, on the compute node. Delayed handling is ignored for local filepaths
-    # null: The input variable will be treated as a regular string and no localization will take place
-outputs: # Required output files
-  outputName: pattern {--output outputName:pattern}
+### Adapters
+
+The pipeline adapter is responsible for converting the provided list of inputs into an input specification for each job.
+
+#### Choosing an Adapter
+
+This is a list of available adapters. For more details, see [pipeline_options.md](https://github.com/broadinstitute/canine/blob/master/pipeline_options.md)
+
+* `Manual`: (Default) This is the primary input adapter responsible for determining the number of jobs and the inputs for each job, based on the raw inputs provided by the user.
+    * Inputs which have a single constant value will have the same value for all jobs
+    * Inputs which have a 1D list of values will have one of those values in each job. By Default, all list inputs must have the same length, and there will be one job per element. The nth job will have the nth value of each input
+    * There are extra configuration options which can change how inputs are combined or how lists are interpreted
+* `Firecloud`/`Terra`: Choose this adapter if you are using data hosted in a FireCloud or Terra workspace.
+Your inputs will be interpreted as entity expressions, similar to how FireCloud and Terra workflows interpret inputs. This adapter can also be configured to post results back to your workspace, if you choose. **Warning:** Reading from Workspace buckets is convenient, but you may encounter issues if your Slurm cluster is not logged in using your credentials
+
+### Backends
+
+The pipeline backend is responsible for interfacing with the Slurm controller.
+There are many different backends available depending on where SLURM is running (or for creating a Slurm cluster for you).
+
+#### Choosing a Backend
+
+This is a list of available backends. For more details, see [pipeline_options.md](https://github.com/broadinstitute/canine/blob/master/pipeline_options.md)
+
+* `Local`: (Default) Choose this backend if you will be running Canine from the Slurm controller and your cluster is fully configured.
+This backend will run Slurm commands through the local shell
+* `Remote`: Choose this backend if you have a fully configured SLURM cluster, but you will be running Canine elsewhere.
+This backend uses SSH and SFTP to interact with the Slurm controller
+* `GCPTransient`: Choose this backend if you do not have a Slurm cluster.
+This backend will create a cluster to your specifications in Google Cloud and then use SSH and SFTP to interact with the controller. The cluster will be deleted after Canine has finished
+* `ImageTransient`: Choose this backend if you do not have a Slurm cluster, but want more control over its startup than `GCPTransient`.
+This backend assumes that the current system has Slurm installed and has an NFS mount set up.
+It then creates worker nodes from a Google Compute Image that you have setup and configured.
+* `DockerTransient`: Choose this backend if you want the same control as `ImageTransient` but do not want to set up a Google Compute Image.
+The Slurm daemons run inside docker containers on the worker nodes.
+The Slurm controller daemon runs inside a docker container on the local filesystem
+* `Dummy`: Choose this backend for developing or testing pipelines.
+This backend simulates a Slurm cluster by running the controller and workers as docker containers on the local system. **This backend does not provision any cloud resources.**
+It runs entirely through the local docker daemon.
+
+### Localizers
+
+The pipeline localizer is responsible for staging the pipeline on the SLURM controller and for transferring inputs/outputs as needed.
+There are four different localizers to accommodate different needs.
+
+#### Choosing a Localizer
+
+This is a list of available localizers. For more details, see [pipeline_options.md](https://github.com/broadinstitute/canine/blob/master/pipeline_options.md)
+
+* `Batched`: (Default) This localizer is suitable for most situations.
+It stages the canine pipeline workspace locally in a temporary directory, copying or symlinking local files into it before broadcasting the workspace directory structure over to the Slurm controller.
+Files stored in Google Cloud Storage are downloaded at the end, directly onto the Slurm Controller (using credentials stored on the controller).
+* `Local`: Choose this localizer if you have files in Google Cloud Storage which need to be localized but you are unable to save suitable credentials to the Slurm controller.
+This is very similar to the `Batched` localizer, except that Google Cloud Storage files are staged locally and broadcast to the Slurm Controller along with the rest of the pipeline files
+* `Remote`: Choose this localizer for small pipelines with few local files.
+This localizer stages the pipeline directory directly on the Slurm controller using SFTP. It is often less efficient than the bulk directory copy used by the `Batched` and `Local` localizers (especially if you provide a `transfer_bucket` to them) but can outperform other localizers for small pipelines which consist entirely of files from Google Cloud Storage.
+* `NFS`: Choose this backend if the current system has an active NFS mount to the Slurm controller.
+The canine pipeline will be staged locally, within the NFS mount point, allowing NFS to take care of transferring the pipeline directory to the controller.
+
+
+### Examples
+
+There are a few examples in the `examples/` directory which can be run out-of-the box.
+To run one of these pipelines, follow any of the following instructions:
+
+##### Command Line
+
+```
+$ canine examples/example_pipeline.yaml
 ```
 
-Canine is designed to support a large variety of Slurm setups, including creating
-a temporary Slurm cluster exclusively for itself. The options supported in pipelines
-should allow users to run Slurm jobs in most common setups. For more complicated
-workflows, you may need to use Canine's [Python API](https://broadinstitute.github.io/canine/)
-to gain more granular control.
+#### Python (using filepath)
+```python
+import canine
+orchestrator = canine.Orchestrator('examples/example_pipeline.yaml')
+results = orchestrator.run_pipeline()
+```
 
----
+#### Python (using dictionary)
+```python
+import canine
+import yaml
 
-# Overview
+with open('examples/example_pipeline.yaml') as r:
+  config = yaml.load(r)
 
-* The user's chosen adapter maps script and raw inputs to actual task inputs
-* The Localizer uses the chosen transport backend to stage inputs on the SLURM controller
-* The adapter then uses the chosen SLURM backend to dispatch jobs
-* After jobs complete, Localizer identifies outputs and moves them out of the staging directory into the output directory
-* If using the Firecloud adapter, outputs are then written back to Firecloud
+orchestrator = canine.Orchestrator(config)
+results = orchestrator.run_pipeline()
+```
 
-## Job Environment Variables
+### Other pipeline components
 
-In addition to all variables present during [SLURM batch jobs](https://slurm.schedmd.com/sbatch.html#lbAI)
-and all variables provided based on config inputs, Canine also exports the following
-variables to all jobs:
-* `CANINE`: The current canine version
-* `CANINE_BACKEND`: The name of the current backend type
-* `CANINE_ADAPTER`: The name of the current adapter type
-* `CANINE_ROOT`: The path to the staging directory
-* `CANINE_COMMON`: The path to the directory where common files are localized
-* `CANINE_OUTPUT`: The path to the directory where job outputs will be staged during delocalization
-* `CANINE_JOBS`: The path to the directory which contains subdirectories for each job's inputs and workspace
-* `CANINE_JOB_VARS`: A colon separated list of the names of all variables generated by job inputs
-* `CANINE_JOB_INPUTS`: The path to the directory where job inputs are localized
-* `CANINE_JOB_ROOT`: The path to the working directory for the job. Equal to CWD at the start of the job. Output files should be written here
-* `CANINE_JOB_SETUP`: The path to the setup script which ran during job start
-* `CANINE_JOB_TEARDOWN`: The path the the teardown script which will run after the job
+Hopefully you've run an example or two and have a better understanding of what a pipeline looks like.
+This section will describe the other parts of a pipeline configuration not covered already
+
+#### inputs
+
+Inputs describe both the number of jobs and the inputs to each job.
+The `inputs` section of the pipeline should be a dictionary.
+Each key is a string, mapping the name of the input to either a string or list of strings.
+As described above, the adapter is responsible for parsing the raw, user-provided inputs into the set of inputs for each job that will be run.
+
+* Raw inputs which were lists of 2 or more dimensions are interpreted by the adapter as if the user wished to provide one of the nested lists to each job. The array is flattened to 2 dimensions, and interpreted as if it were a regular list input (with one element passed to each job). The contents of these arrays are handled using the above localization rules
+* Raw inputs which were lists of any dimensions, but marked as `common` in the overrides are flattened to 1 dimension, and the whole list is provided as an input to each job. The contents of the array are handled as `common` files (see below)
+
+#### script
+
+The pipeline script is the heart of the pipeline. This is the actual bash script which will be run. The `script` key can either be a filepath to a bash script to run, or a list of strings, each of which is a command to run.
+Either way, the script gets executed by each job of the pipeline.
+
+### overrides
+
+Localization overrides, defined in `localization.overrides` allow the user to change the localizer's default handling for a specific input.
+The overrides section should be a dictionary mapping input names, to a string describing the desired handling, as follows:
+
+* Default rules (no override):
+    * Strings which exist as a local filepath are treated as files and will be localized to the Slurm controller
+    * Strings which start with `gs://` are interpreted to be files/directories within Google Cloud Storage and will be localized to the Slurm controller
+    * Any file or Google Storage object which appears as an input to multiple jobs is considered `common` and will be localized once to a common directory, visible to all jobs
+    * If any input to any arbitrary job is a list, the contents of the list are interpreted using the same rules
+* `Common`: Inputs marked as common will be considered common to all jobs and localized once, to a directory which is visible to all jobs. Inputs marked as common which cannot be interpreted as a filepath or a Google Cloud Storage object are ignored and treated as strings
+* `Stream`: Inputs marked as `Stream` will be streamed into a FIFO pipe, and the path to the pipe will be exported to the job. The `Stream` override is ignored for inputs which are not Google Cloud Storage objects, causing those inputs to be localized under default rules. Jobs which are requeued due to node failure will always restart the stream
+* `Delayed`: Inputs marked as `Delayed` will be downloaded by the job once it starts, instead of upfront during localization. The `Delayed` override is ignored for inputs which are not Google Cloud Storage objects, causing those inputs to be localized under default rules. Jobs which are requeued due to node failures will only re-download delayed inputs if the job failed before the download completed
+* `Localize`: Inputs marked as `Localize` will be treated as files and localized to job-specific input directories. This can be used to force files which would be handled as common, to be localized for each job. The `Localize` override is ignored for inputs which are not valid filepaths or Google Cloud Storage objects, causing those inputs to be treated as strings
+* `Null` or `None`: Inputs marked this way are treated as strings, and no localization will be applied.
+
+#### outputs
+
+The outputs section defines a mapping of output names to file patterns which should be grabbed for output. File patterns may be raw filenames or globs, and may include shell variables (including job inputs).
+These patterns are always relative to each job's initial cwd (`$CANINE_JOB_ROOT`). Patterns _may_ match files above the workspace directory, but this is not recommended.
+By default, `stdout` and `stderr` are included in the outputs, which will grab the job's stdout/err streams.
+You may override this behavior by providing your own pattern for `stdout` or `stderr`.
+**Warning:** the outputs `stdout` and `stderr` have special handling, which expects their patterns to match exactly one file.
+If you provide a custom pattern for `stdout` or `stderr` and matches more than one file, the output dataframe will only show the first filename matched
+
+All files which match a provided output pattern will be delocalized from the Slurm controller back to the current system in the following directory structure:
+```
+output_dir/
+  {job id}/
+    stdout
+    stderr
+    {other output names}/
+      {matched files/directories}
+```
+
+#### resources
+
+The `resources` section allows you to define additional arguments to `sbatch` to control the resource allocation or other scheduling parameters. The `resource` dictionary is converted to commandline arguments as follows:
+
+* Single-letter keys are converted to short (`-x`) options.
+* Multi-letter keys are converted to long (`--xx`) options.
+* Keys with a value of `True` are converted to flags (no value)
+* keys with any other value are converted to paramters (`--key=val`)
+* Underscores in keys are converted to hyphens (`foo_bar` becomes `--foo-bar`)

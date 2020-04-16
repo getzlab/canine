@@ -12,6 +12,7 @@ from .local import BatchedLocalizer
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project
 from agutil import status_bar
+import pandas as pd
 
 
 class NFSLocalizer(BatchedLocalizer):
@@ -158,8 +159,9 @@ class NFSLocalizer(BatchedLocalizer):
         NFSLocalizer does not delocalize files. Data is copied from output dir
         """
         if output_dir is not None:
-            warnings.warn("output_dir has no bearing on NFSLocalizer. outputs are available in {}/outputs".format(self.staging_dir))
-        output_dir = os.path.join(self.staging_dir, 'outputs')
+            warnings.warn("output_dir has no bearing on NFSLocalizer. outputs are available in {}/outputs".format(self.local_dir))
+        self.build_manifest()
+        output_dir = os.path.join(self.local_dir, 'outputs')
         output_files = {}
         for jobId in os.listdir(output_dir):
             start_dir = os.path.join(output_dir, jobId)

@@ -6,8 +6,9 @@ import subprocess
 import shutil
 import os
 import sys
+import warnings
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost
+from ..utils import get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost
 # import paramiko
 import yaml
 import pandas as pd
@@ -46,14 +47,20 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
 
     def __init__(
-        self, name: str = 'slurm-canine', *, max_node_count: int = 10, compute_zone: str = 'us-central1-a',
+        self, name: str = 'slurm-canine', *, max_node_count: int = 10, compute_zone: typing.Optional[str] = None,
         controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1', preemptible: bool = True,
         worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
-        **kwargs : typing.Any
+        external_compute_ips: bool = False, **kwargs : typing.Any
     ):
         self.project = project if project is not None else get_default_gcp_project()
+        if self.project is None:
+            raise ValueError("No GCP project was provided and a project could not be auto-detected")
+        if compute_zone is None:
+            compute_zone = get_default_gcp_zone()
+            if compute_zone is None:
+                raise ValueError("No GCP zone was provided and a project could not be auto-detected")
         super().__init__('{}-controller.{}.{}'.format(
             name,
             compute_zone,
@@ -84,6 +91,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "default_users": getpass.getuser(),
           'gpu_count': 0,
           'slurm_version': '19.05-latest',
+          'external_compute_ips': external_compute_ips,
           **kwargs
         }
 
