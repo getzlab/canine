@@ -24,6 +24,11 @@ def setUpModule():
     warnings.simplefilter('ignore', ResourceWarning)
     BACKEND = DummySlurmBackend(n_workers=1, staging_dir=STAGING_DIR)
     BACKEND.__enter__()
+    with BACKEND.transport() as transport:
+        if not transport.isdir(BACKEND.bind_path.name):
+            if not transport.isdir(os.path.dirname(BACKEND.bind_path.name)):
+                transport.makedirs(os.path.dirname(BACKEND.bind_path.name))
+                transport.mklink('/mnt/nfs', BACKEND.bind_path.name)
 
 def tearDownModule():
     BACKEND.__exit__()
@@ -50,6 +55,8 @@ def patch_localizer(loc):
     loc.localize_file = localize_file
 
     return loc
+
+
 
 @unittest.skip("DummyBackend currently incompatible with NFSLocalizer.localize_file; No unit tests worth running")
 class TestUnit(unittest.TestCase):
@@ -98,97 +105,6 @@ class TestIntegration(unittest.TestCase):
     Tests high-level features of the localizer
     """
 
-    @with_timeout(10)
-    def test_setup_teardown(self):
-        with tempfile.TemporaryDirectory() as tempdir:
-            test_file = makefile(os.path.join(tempdir, 'testfile'))
-            if os.path.isdir(os.path.join(BACKEND.bind_path.name, 'canine')):
-                shutil.rmtree(os.path.join(BACKEND.bind_path.name, 'canine'))
-            os.mkdir(os.path.join(BACKEND.bind_path.name, 'canine'))
-            with patch_localizer(NFSLocalizer(BACKEND, staging_dir=os.path.join(BACKEND.bind_path.name, 'canine'), mount_path='/mnt/nfs/canine')) as localizer:
-                common_gs = localizer.reserve_path('common', 'bar')
-                common_file = localizer.reserve_path('common', os.path.basename(os.path.abspath(test_file)))
-
-                output_patterns = {'stdout': '../stdout', 'stderr': '../stderr', 'output-glob': '*.txt', 'output-file': 'file.tar.gz'}
-
-                for jid in range(15):
-                    with self.subTest(jid=jid):
-                        localizer.inputs[str(jid)] = {
-                            'gs-common': Localization(None, common_gs), # already 'localized'
-                            'gs-incommon': Localization(None, localizer.reserve_path('jobs', str(jid), 'inputs', os.urandom(8).hex())), # already 'localized'
-                            'gs-stream': Localization('stream', 'gs://foo/'+os.urandom(8).hex()), # check for extra tasks in setup_teardown
-                            'gs-download': Localization('download', 'gs://foo/'+os.urandom(8).hex()), # check for extra tasks in setup_teardown
-                            'file-common': Localization(None, common_file), # already 'localized'
-                            'file-incommon': Localization(None, localizer.reserve_path('jobs', str(jid), 'inputs', os.urandom(8).hex())), # already 'localized'
-                            'string-common': Localization(None, 'hey!'), # no localization. Setup teardown exports as string
-                            'string-incommon': Localization(None, os.urandom(8).hex()), # no localization. Setup teardown exports as string
-                        }
-
-                        setup_text, teardown_text = localizer.job_setup_teardown(
-                            jobId=str(jid),
-                            patterns=output_patterns
-                        )
-                        self.assertRegex(
-                            setup_text,
-                            r'export CANINE_JOB_VARS=(\w+-\w+:?)+'
-                        )
-                        self.assertIn(
-                            'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(localizer.environment('compute')['CANINE_JOBS'], str(jid), 'inputs')),
-                            setup_text
-                        )
-                        self.assertIn(
-                            'export CANINE_JOB_ROOT="{}"'.format(os.path.join(localizer.environment('compute')['CANINE_JOBS'], str(jid), 'workspace')),
-                            setup_text
-                        )
-                        self.assertIn(
-                            'export CANINE_JOB_SETUP="{}"'.format(os.path.join(localizer.environment('compute')['CANINE_JOBS'], str(jid), 'setup.sh')),
-                            setup_text
-                        )
-                        self.assertIn(
-                            'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(localizer.environment('compute')['CANINE_JOBS'], str(jid), 'teardown.sh')),
-                            setup_text
-                        )
-                        for arg, value in localizer.inputs[str(jid)].items():
-                            with self.subTest(arg=arg, value=value.path):
-                                path = value.path
-                                if value.type == 'stream':
-                                    src = path
-                                    path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).computepath
-                                    self.assertIn(
-                                        'if [[ -e {dest} ]]; then rm {dest}; fi\n'
-                                        'mkfifo {dest}\n'
-                                        'gsutil  cat {src} > {dest} &'.format(
-                                            src=src,
-                                            dest=path
-                                        ),
-                                        setup_text
-                                    )
-                                elif value.type == 'download':
-                                    src = path
-                                    path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).computepath
-                                    self.assertIn(
-                                        'if [[ ! -e {dest}.fin ]]; then gsutil  '
-                                        '-o GSUtil:check_hashes=if_fast_else_skip'
-                                        ' cp {src} {dest} && touch {dest}.fin'.format(
-                                            src=src,
-                                            dest=path
-                                        ),
-                                        setup_text
-                                    )
-                                if isinstance(path, PathType):
-                                    path = path.computepath
-                                self.assertRegex(
-                                    setup_text,
-                                    r'export {}=[\'"]?{}[\'"]?'.format(arg, path)
-                                )
-                        for name, pattern in output_patterns.items():
-                            with self.subTest(output=name, pattern=pattern):
-                                self.assertTrue(
-                                    ('-p {} {}'.format(name, pattern) in teardown_text) or
-                                    ("-p {} '{}'".format(name, pattern) in teardown_text) or
-                                    ('-p {} "{}"'.format(name, pattern) in teardown_text)
-                                )
-
     @with_timeout(30)
     def test_localize_delocalize(self):
         """
@@ -202,7 +118,7 @@ class TestIntegration(unittest.TestCase):
             if os.path.isdir(os.path.join(BACKEND.bind_path.name, 'canine')):
                 shutil.rmtree(os.path.join(BACKEND.bind_path.name, 'canine'))
             os.mkdir(os.path.join(BACKEND.bind_path.name, 'canine'))
-            with patch_localizer(NFSLocalizer(BACKEND, staging_dir=os.path.join(BACKEND.bind_path.name, 'canine'), mount_path='/mnt/nfs/canine')) as localizer:
+            with patch_localizer(NFSLocalizer(BACKEND, staging_dir=os.path.join(BACKEND.bind_path.name, 'canine'))) as localizer:
                 inputs = {
                     str(jid): {
                         # no gs:// files; We don't want to actually download anything

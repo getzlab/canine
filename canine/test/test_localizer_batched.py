@@ -52,33 +52,22 @@ class TestUnit(unittest.TestCase):
 
     def test_environment(self):
         local = self.localizer.environment('local')
-        controller = self.localizer.environment('controller')
-        compute = self.localizer.environment('compute')
+        remote = self.localizer.environment('remote')
 
         self.assertIsInstance(local, dict)
-        self.assertIsInstance(controller, dict)
-        self.assertIsInstance(compute, dict)
+        self.assertIsInstance(remote, dict)
 
-        self.assertEqual(len({*controller} ^ {*local}), 0)
-        self.assertEqual(len({*controller} ^ {*compute}), 0)
+        self.assertEqual(len({*remote} ^ {*local}), 0)
 
         self.assertTrue('CANINE_ROOT' in local)
         self.assertTrue('CANINE_COMMON' in local)
         self.assertTrue('CANINE_JOBS' in local)
         self.assertTrue('CANINE_OUTPUT' in local)
 
-
-        with self.localizer.transport_context() as transport:
-            for key in controller:
-                self.assertEqual(
-                    transport.normpath(controller[key]),
-                    transport.normpath(compute[key])
-                )
-
         for key in local:
             self.assertEqual(
                 os.path.relpath(local[key], local['CANINE_ROOT']),
-                os.path.relpath(controller[key], controller['CANINE_ROOT'])
+                os.path.relpath(remote[key], remote['CANINE_ROOT'])
             )
 
     def test_send_recv_tree(self):
@@ -111,23 +100,18 @@ class TestUnit(unittest.TestCase):
                         self.assertListEqual(sorted(lfilenames), sorted(rfilenames))
 
     def test_reserve_path(self):
-        with self.localizer.transport_context() as transport:
-            for i in range(10):
-                components = [
-                    ''.join(chunk)
-                    for chunk in agutil.clump(os.urandom(8).hex(), 2)
-                ]
-                with self.subTest(path=os.path.join(*components)):
-                    path = self.localizer.reserve_path(*components)
-                    self.assertEqual(
-                        transport.normpath(path.controllerpath),
-                        transport.normpath(path.computepath)
-                    )
+        for i in range(10):
+            components = [
+                ''.join(chunk)
+                for chunk in agutil.clump(os.urandom(8).hex(), 2)
+            ]
+            with self.subTest(path=os.path.join(*components)):
+                path = self.localizer.reserve_path(*components)
 
-                    self.assertEqual(
-                        os.path.relpath(path.localpath, self.localizer.local_dir),
-                        os.path.relpath(path.controllerpath, self.localizer.staging_dir)
-                    )
+                self.assertEqual(
+                    os.path.relpath(path.localpath, self.localizer.local_dir),
+                    os.path.relpath(path.remotepath, self.localizer.staging_dir)
+                )
 
     def test_localize_file(self):
         # NOTE: This test unit will need to be repeated for all localizers
@@ -144,7 +128,7 @@ class TestUnit(unittest.TestCase):
             self.assertTrue(os.path.isdir(os.path.join(self.localizer.local_dir, 'dirc')))
             self.assertFalse(os.path.isdir(os.path.join(self.localizer.local_dir, 'dirc', 'dird')))
             self.assertIn(
-                (os.path.dirname(__file__), os.path.join(self.localizer.reserve_path('dirc', 'dird').controllerpath, os.path.basename(os.path.dirname(__file__)))),
+                (os.path.dirname(__file__), os.path.join(self.localizer.reserve_path('dirc', 'dird').remotepath, os.path.basename(os.path.dirname(__file__)))),
                 self.localizer.queued_batch
             )
 
@@ -301,19 +285,19 @@ class TestIntegration(unittest.TestCase):
                             r'export CANINE_JOB_VARS=(\w+-\w+:?)+'
                         )
                         self.assertIn(
-                            'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(localizer.environment('compute')['CANINE_JOBS'], str(jid), 'inputs')),
+                            'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(localizer.environment('remote')['CANINE_JOBS'], str(jid), 'inputs')),
                             setup_text
                         )
                         self.assertIn(
-                            'export CANINE_JOB_ROOT="{}"'.format(os.path.join(localizer.environment('compute')['CANINE_JOBS'], str(jid), 'workspace')),
+                            'export CANINE_JOB_ROOT="{}"'.format(os.path.join(localizer.environment('remote')['CANINE_JOBS'], str(jid), 'workspace')),
                             setup_text
                         )
                         self.assertIn(
-                            'export CANINE_JOB_SETUP="{}"'.format(os.path.join(localizer.environment('compute')['CANINE_JOBS'], str(jid), 'setup.sh')),
+                            'export CANINE_JOB_SETUP="{}"'.format(os.path.join(localizer.environment('remote')['CANINE_JOBS'], str(jid), 'setup.sh')),
                             setup_text
                         )
                         self.assertIn(
-                            'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(localizer.environment('compute')['CANINE_JOBS'], str(jid), 'teardown.sh')),
+                            'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(localizer.environment('remote')['CANINE_JOBS'], str(jid), 'teardown.sh')),
                             setup_text
                         )
                         for arg, value in localizer.inputs[str(jid)].items():
@@ -321,7 +305,7 @@ class TestIntegration(unittest.TestCase):
                                 path = value.path
                                 if value.type == 'stream':
                                     src = path
-                                    path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).computepath
+                                    path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).remotepath
                                     self.assertIn(
                                         'if [[ -e {dest} ]]; then rm {dest}; fi\n'
                                         'mkfifo {dest}\n'
@@ -333,7 +317,7 @@ class TestIntegration(unittest.TestCase):
                                     )
                                 elif value.type == 'download':
                                     src = path
-                                    path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).computepath
+                                    path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).remotepath
                                     self.assertIn(
                                         'if [[ ! -e {dest}.fin ]]; then gsutil  '
                                         '-o GSUtil:check_hashes=if_fast_else_skip'
@@ -344,7 +328,7 @@ class TestIntegration(unittest.TestCase):
                                         setup_text
                                     )
                                 if isinstance(path, PathType):
-                                    path = path.computepath
+                                    path = path.remotepath
                                 self.assertRegex(
                                     setup_text,
                                     r'export {}=[\'"]?{}[\'"]?'.format(arg, path)
