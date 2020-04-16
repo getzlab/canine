@@ -332,7 +332,7 @@ class AbstractLocalizer(abc.ABC):
         Builds the manifest if it does not exist
         """
         with self.transport_context() as transport:
-            output_dir = transport.normpath(self.environment('controller')['CANINE_OUTPUT'])
+            output_dir = transport.normpath(self.environment('remote')['CANINE_OUTPUT'])
             if not transport.isfile(os.path.join(output_dir, '.canine_pipeline_manifest.tsv')):
                 script_path = self.backend.pack_batch_script(
                     'export CANINE_OUTPUTS={}'.format(output_dir),
