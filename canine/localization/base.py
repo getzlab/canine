@@ -32,7 +32,7 @@ class AbstractLocalizer(abc.ABC):
     """
     Base class for localization.
     """
-    requester_pays = {}
+
 
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
@@ -63,6 +63,7 @@ class AbstractLocalizer(abc.ABC):
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
+        self.requester_pays = {}
 
     def get_requester_pays(self, path: str) -> bool:
         """
@@ -73,15 +74,28 @@ class AbstractLocalizer(abc.ABC):
             path = path[5:]
         bucket = path.split('/')[0]
         if bucket not in self.requester_pays:
-            command = 'gsutil ls gs://{}'.format(path)
-            try:
-                # We check on the remote host because scope differences may cause
-                # a requester pays bucket owned by this account to require -u on the controller
-                # better safe than sorry
+            command = 'gsutil requesterpays get gs://{}'.format(bucket)
+            # We check on the remote host because scope differences may cause
+            # a requester pays bucket owned by this account to require -u on the controller
+            # better safe than sorry
+            rc, sout, serr = self.backend.invoke(command)
+            text = serr.read()
+            if rc == 0 or b'BucketNotFoundException: 404' not in text:
+                self.requester_pays[bucket] = (
+                    b'requester pays bucket but no user project provided' in text
+                    or 'gs://{}: Enabled'.format(bucket).encode() in sout.read()
+                )
+            else:
+                # Try again ls-ing the object itself
+                # sometimes permissions can disallow bucket inspection
+                # but allow object inspection
+                command = 'gsutil ls gs://{}'.format(path)
                 rc, sout, serr = self.backend.invoke(command)
-                self.requester_pays[bucket] = len([line for line in serr.readlines() if b'requester pays bucket but no user project provided' in line]) >= 1
-            except subprocess.CalledProcessError:
-                pass
+                text = serr.read()
+                self.requester_pays[bucket] = b'requester pays bucket but no user project provided' in text
+            if rc == 1 and b'BucketNotFoundException: 404' in text:
+                print(text.decode(), file=sys.stderr)
+                raise subprocess.CalledProcessError(rc, command)
         return bucket in self.requester_pays and self.requester_pays[bucket]
 
     @contextmanager

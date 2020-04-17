@@ -56,6 +56,7 @@ class NFSLocalizer(BatchedLocalizer):
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
+        self.requester_pays = {}
 
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
