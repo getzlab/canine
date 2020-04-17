@@ -79,13 +79,22 @@ class RemoteLocalizer(AbstractLocalizer):
                     )
                 )
                 self.prepare_job_inputs(jobId, data, common_dests, overrides, transport=transport)
-                # Now localize job setup and teardown scripts
-                setup_script, teardown_script = self.job_setup_teardown(jobId, patterns)
+
+                # Now localize job setup, localization, and teardown scripts
+                setup_script, localization_script, teardown_script = self.job_setup_teardown(jobId, patterns)
+
                 # Setup:
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
                 with transport.open(script_path.remotepath, 'w') as w:
                     w.write(setup_script)
                 transport.chmod(script_path.remotepath, 0o775)
+
+                # Localization:
+                script_path = self.reserve_path('jobs', jobId, 'localization.sh')
+                with transport.open(script_path.remotepath, 'w') as w:
+                    w.write(localization_script)
+                transport.chmod(script_path.remotepath, 0o775)
+
                 # Teardown:
                 script_path = self.reserve_path('jobs', jobId, 'teardown.sh')
                 with transport.open(script_path.remotepath, 'w') as w:
