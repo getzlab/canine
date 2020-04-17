@@ -13,3 +13,5 @@ inputs:
 backend:
   type: Dummy
   n_workers: 1
+localization:
+  staging_dir: /mnt/nfs/canine
