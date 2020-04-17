@@ -137,13 +137,13 @@ class NFSLocalizer(BatchedLocalizer):
                 # Now localize job setup, localization, and teardown scripts
                 setup_script, localization_script, teardown_script = self.job_setup_teardown(jobId, patterns)
 
-                # Setup: 
+                # Setup:
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(setup_script)
                 os.chmod(script_path.localpath, 0o775)
 
-                # Localization: 
+                # Localization:
                 script_path = self.reserve_path('jobs', jobId, 'localization.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(localization_script)
@@ -165,106 +165,6 @@ class NFSLocalizer(BatchedLocalizer):
             )
             return self.finalize_staging_dir(inputs)
 
-<<<<<<< HEAD
-    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
-        """
-        Returns a tuple of (setup script, localization script, teardown script) for the given job id.
-        Must call after pre-scanning inputs
-        """
-
-		# generate job variable, exports, and localization_tasks arrays
-		# - job variables and exports are set when setup.sh is _sourced_
-		# - localization tasks are run when localization.sh is _run_
-        job_vars = []
-        exports = []
-        localization_tasks = [
-            'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
-        ]
-        compute_env = self.environment('compute')
-        for key, val in self.inputs[jobId].items():
-            if val.type == 'stream':
-                job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                localization_tasks += [
-                    'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
-                    'mkfifo {}'.format(dest.computepath),
-                    "gsutil {} cat {} > {} &".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.computepath
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.computepath
-                ))
-            elif val.type == 'download':
-                job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                localization_tasks += [
-                    "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.computepath
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.computepath
-                ))
-            elif val.type is None:
-                job_vars.append(shlex.quote(key))
-                exports.append('export {}={}'.format(
-                    key,
-                    shlex.quote(val.path.computepath if isinstance(val.path, PathType) else val.path)
-                ))
-            else:
-                print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
-
-        # generate setup script
-        setup_script = '\n'.join(
-            line.rstrip()
-            for line in [
-                '#!/bin/bash',
-                'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
-                'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
-                'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
-                'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
-                'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
-                'mkdir -p $CANINE_JOB_INPUTS',
-                'mkdir -p $CANINE_JOB_ROOT',
-            ] + exports
-        ) + '\ncd $CANINE_JOB_ROOT\n'
-
-        # generate localization script
-        localization_script = '\n'.join([
-          "#!/bin/bash",
-          "set -e"
-        ] + localization_tasks) + "\nset +e\n"
-
-        # generate teardown script
-        teardown_script = '\n'.join(
-            line.rstrip()
-            for line in [
-                '#!/bin/bash',
-                'if [[ -d {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
-                # 'mv ../stderr ../stdout .',
-                'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3}; else python {0} {1} {2} {3}; fi'.format(
-                    os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
-                    compute_env['CANINE_OUTPUT'],
-                    jobId,
-                    ' '.join(
-                        '-p {} {}'.format(name, shlex.quote(pattern))
-                        for name, pattern in patterns.items()
-                    )
-                ),
-            ]
-        )
-        return setup_script, localization_script, teardown_script
-
-=======
->>>>>>> master
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: typing.Optional[str] = None) -> typing.Dict[str, typing.Dict[str, str]]:
         """
         Delocalizes output from all jobs.
