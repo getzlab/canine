@@ -8,12 +8,12 @@ from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
-from .utils import check_call
+from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered
 import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.8.1'
+version = '0.9.0'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -416,6 +416,8 @@ class Orchestrator(object):
                     # that don't receive any transformation with transformed columns
                     df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
             except:
+                df = pd.DataFrame()
+                print("Error generating output dataframe; see stack trace for details.", file = sys.stderr)
                 traceback.print_exc()
 
 
@@ -426,11 +428,11 @@ class Orchestrator(object):
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
             with localizer.transport_context() as transport:
-                dest = localizer.reserve_path("results.k9df.pickle").remotepath
+                dest = localizer.reserve_path("results.k9df.hdf5").remotepath
                 if not transport.isdir(os.path.dirname(dest)):
                     transport.makedirs(os.path.dirname(dest))
                 with transport.open(dest, 'wb') as w:
-                    df.to_pickle(w, compression=None)
+                    pandas_write_hdf5_buffered(df, buf = w, key = "results")
         return df
 
     def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}) -> int:
@@ -459,7 +461,7 @@ class Orchestrator(object):
         Succeeded jobs are skipped. Failed jobs are reset and rerun
         """
         with localizer.transport_context() as transport:
-            df_path = localizer.reserve_path("results.k9df.pickle").remotepath
+            df_path = localizer.reserve_path("results.k9df.hdf5").remotepath
 
             #remove all output if specified
             if overwrite:
@@ -472,8 +474,8 @@ class Orchestrator(object):
             if transport.exists(df_path):
                 try:
                     # load in results and job spec dataframes
-                    with transport.open(df_path) as r:
-                        r_df = pd.read_pickle(r, compression=None)
+                    with transport.open(df_path, mode = "rb") as r:
+                        r_df = pandas_read_hdf5_buffered(key = "results", buf = r)
                     js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
 
                     if r_df.empty or \
@@ -537,8 +539,8 @@ class Orchestrator(object):
 
                     return np.count_nonzero(~fail_idx)
                 except (ValueError, OSError) as e:
-                    print(e)
-                    print("Overwriting output and aborting job avoidance.")
+                    print("Cannot recover preexisting task outputs: " + str(e), file = sys.stderr)
+                    print("Overwriting output and aborting job avoidance.", file = sys.stderr)
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
                     return 0
