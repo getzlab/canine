@@ -19,14 +19,14 @@ class RemoteLocalizer(AbstractLocalizer):
         May take any setup action required
         """
         with self.backend.transport() as transport:
-            if not transport.isdir(self.environment('controller')['CANINE_ROOT']):
-                transport.makedirs(self.environment('controller')['CANINE_ROOT'])
-            if not transport.isdir(self.environment('controller')['CANINE_COMMON']):
-                transport.makedirs(self.environment('controller')['CANINE_COMMON'])
-            if not transport.isdir(self.environment('controller')['CANINE_JOBS']):
-                transport.makedirs(self.environment('controller')['CANINE_JOBS'])
-            if not transport.isdir(self.environment('controller')['CANINE_OUTPUT']):
-                transport.makedirs(self.environment('controller')['CANINE_OUTPUT'])
+            if not transport.isdir(self.environment('remote')['CANINE_ROOT']):
+                transport.makedirs(self.environment('remote')['CANINE_ROOT'])
+            if not transport.isdir(self.environment('remote')['CANINE_COMMON']):
+                transport.makedirs(self.environment('remote')['CANINE_COMMON'])
+            if not transport.isdir(self.environment('remote')['CANINE_JOBS']):
+                transport.makedirs(self.environment('remote')['CANINE_JOBS'])
+            if not transport.isdir(self.environment('remote')['CANINE_OUTPUT']):
+                transport.makedirs(self.environment('remote')['CANINE_OUTPUT'])
         return self
 
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
@@ -37,19 +37,19 @@ class RemoteLocalizer(AbstractLocalizer):
         if src.startswith('gs://'):
             self.gs_copy(
                 src,
-                dest.controllerpath,
+                dest.remotepath,
                 'remote'
             )
         elif os.path.exists(src):
             with self.transport_context(transport) as transport:
-                if not transport.isdir(os.path.dirname(dest.controllerpath)):
-                    transport.makedirs(os.path.dirname(dest.controllerpath))
+                if not transport.isdir(os.path.dirname(dest.remotepath)):
+                    transport.makedirs(os.path.dirname(dest.remotepath))
                 if os.path.isfile(src):
-                    transport.send(src, dest.controllerpath)
+                    transport.send(src, dest.remotepath)
                 else:
                     self.sendtree(
                         src,
-                        dest.controllerpath,
+                        dest.remotepath,
                         transport
                     )
 
@@ -74,7 +74,7 @@ class RemoteLocalizer(AbstractLocalizer):
             for jobId, data in inputs.items():
                 transport.makedirs(
                     os.path.join(
-                        self.environment('controller')['CANINE_JOBS'],
+                        self.environment('remote')['CANINE_JOBS'],
                         jobId
                     )
                 )
@@ -83,30 +83,28 @@ class RemoteLocalizer(AbstractLocalizer):
                 # Now localize job setup, localization, and teardown scripts
                 setup_script, localization_script, teardown_script = self.job_setup_teardown(jobId, patterns)
 
-                # Setup: 
+                # Setup:
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
-                with transport.open(script_path.controllerpath, 'w') as w:
+                with transport.open(script_path.remotepath, 'w') as w:
                     w.write(setup_script)
-                transport.chmod(script_path.controllerpath, 0o775)
+                transport.chmod(script_path.remotepath, 0o775)
 
-                # Localization: 
+                # Localization:
                 script_path = self.reserve_path('jobs', jobId, 'localization.sh')
-                with transport.open(script_path.controllerpath, 'w') as w:
+                with transport.open(script_path.remotepath, 'w') as w:
                     w.write(localization_script)
-                transport.chmod(script_path.controllerpath, 0o775)
+                transport.chmod(script_path.remotepath, 0o775)
 
                 # Teardown:
                 script_path = self.reserve_path('jobs', jobId, 'teardown.sh')
-                with transport.open(script_path.controllerpath, 'w') as w:
+                with transport.open(script_path.remotepath, 'w') as w:
                     w.write(teardown_script)
-                transport.chmod(script_path.controllerpath, 0o775)
-
-            # copy delocalization script
+                transport.chmod(script_path.remotepath, 0o775)
             transport.send(
                 os.path.join(
                     os.path.dirname(__file__),
                     'delocalization.py'
                 ),
-                os.path.join(self.environment('controller')['CANINE_ROOT'], 'delocalization.py')
+                os.path.join(self.environment('remote')['CANINE_ROOT'], 'delocalization.py')
             )
             return self.finalize_staging_dir(inputs.keys(), transport=transport)

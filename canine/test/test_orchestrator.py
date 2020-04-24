@@ -246,7 +246,7 @@ class TestIntegration(unittest.TestCase):
                 shell=True
             )
 
-    @with_timeout(180)
+    @with_timeout(300)
     def test_xargs(self):
         """
         Runs a quick test of the xargs orchestrator

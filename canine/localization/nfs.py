@@ -12,6 +12,7 @@ from .local import BatchedLocalizer
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project
 from agutil import status_bar
+import pandas as pd
 
 
 class NFSLocalizer(BatchedLocalizer):
@@ -28,15 +29,16 @@ class NFSLocalizer(BatchedLocalizer):
 
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
-        common: bool = True, staging_dir: str = None, mount_path: str = None,
+        common: bool = True, staging_dir: str = None,
         project: typing.Optional[str] = None, **kwargs
     ):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
         the localizer's entire life cycle.
-        Note: staging_dir refers to the directory on the LOCAL filesystem
-        Note: mount_path refers to the mounted directory on the REMOTE filesystem (both the controller and worker nodes)
+        Note: staging_dir refers to the NFS mount path on the local and remote filesystems
+        This localization strategy requires that {staging_dir} is a valid NFS mount shared between
+        the local system, the slurm controller, and all slurm compute nodes
         """
         if staging_dir is None:
             raise TypeError("staging_dir is a required argument for NFSLocalizer")
@@ -45,23 +47,16 @@ class NFSLocalizer(BatchedLocalizer):
         self.backend = backend
         self.common = common
         self.common_inputs = set()
-        self.__sbcast = False
-        if staging_dir == 'SBCAST':
-            # FIXME: This doesn't actually do anything yet
-            # If sbcast is true, then localization needs to use backend.sbcast to move files to the remote system
-            # Not sure at all how delocalization would work
-            self.__sbcast = True
-            staging_dir = None
-        self._local_dir = tempfile.TemporaryDirectory()
-        self.local_dir = os.path.realpath(os.path.abspath(staging_dir))
+        self._local_dir = None
+        # We don't normalize paths for this localizer. Use staging dir as given
+        self.staging_dir = staging_dir
+        self.local_dir = staging_dir
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
-        with self.backend.transport() as transport:
-            self.mount_path = transport.normpath(mount_path if mount_path is not None else staging_dir)
-        self.staging_dir = self.mount_path
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
+        self.requester_pays = {}
 
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
@@ -84,7 +79,7 @@ class NFSLocalizer(BatchedLocalizer):
                     os.makedirs(os.path.dirname(dest.localpath))
 
                 #
-                # check if self.mount_path, self.local_dir, and src all exist on the same NFS share
+                # check if self.mount_path, self.staging_dir, and src all exist on the same NFS share
                 # symlink if yes, copy if no
                 if self.same_volume(src):
                     os.symlink(src, dest.localpath)
@@ -142,13 +137,13 @@ class NFSLocalizer(BatchedLocalizer):
                 # Now localize job setup, localization, and teardown scripts
                 setup_script, localization_script, teardown_script = self.job_setup_teardown(jobId, patterns)
 
-                # Setup: 
+                # Setup:
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(setup_script)
                 os.chmod(script_path.localpath, 0o775)
 
-                # Localization: 
+                # Localization:
                 script_path = self.reserve_path('jobs', jobId, 'localization.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(localization_script)
@@ -170,103 +165,6 @@ class NFSLocalizer(BatchedLocalizer):
             )
             return self.finalize_staging_dir(inputs)
 
-    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
-        """
-        Returns a tuple of (setup script, localization script, teardown script) for the given job id.
-        Must call after pre-scanning inputs
-        """
-
-		# generate job variable, exports, and localization_tasks arrays
-		# - job variables and exports are set when setup.sh is _sourced_
-		# - localization tasks are run when localization.sh is _run_
-        job_vars = []
-        exports = []
-        localization_tasks = [
-            'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
-        ]
-        compute_env = self.environment('compute')
-        for key, val in self.inputs[jobId].items():
-            if val.type == 'stream':
-                job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                localization_tasks += [
-                    'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
-                    'mkfifo {}'.format(dest.computepath),
-                    "gsutil {} cat {} > {} &".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.computepath
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.computepath
-                ))
-            elif val.type == 'download':
-                job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                localization_tasks += [
-                    "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.computepath
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.computepath
-                ))
-            elif val.type is None:
-                job_vars.append(shlex.quote(key))
-                exports.append('export {}={}'.format(
-                    key,
-                    shlex.quote(val.path.computepath if isinstance(val.path, PathType) else val.path)
-                ))
-            else:
-                print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
-
-        # generate setup script
-        setup_script = '\n'.join(
-            line.rstrip()
-            for line in [
-                '#!/bin/bash',
-                'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
-                'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
-                'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
-                'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
-                'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
-                'mkdir -p $CANINE_JOB_INPUTS',
-                'mkdir -p $CANINE_JOB_ROOT',
-            ] + exports
-        ) + '\ncd $CANINE_JOB_ROOT\n'
-
-        # generate localization script
-        localization_script = '\n'.join([
-          "#!/bin/bash",
-          "set -e"
-        ] + localization_tasks) + "\nset +e\n"
-
-        # generate teardown script
-        teardown_script = '\n'.join(
-            line.rstrip()
-            for line in [
-                '#!/bin/bash',
-                'if [[ -d {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
-                # 'mv ../stderr ../stdout .',
-                'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3}; else python {0} {1} {2} {3}; fi'.format(
-                    os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
-                    compute_env['CANINE_OUTPUT'],
-                    jobId,
-                    ' '.join(
-                        '-p {} {}'.format(name, shlex.quote(pattern))
-                        for name, pattern in patterns.items()
-                    )
-                ),
-            ]
-        )
-        return setup_script, localization_script, teardown_script
-
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: typing.Optional[str] = None) -> typing.Dict[str, typing.Dict[str, str]]:
         """
         Delocalizes output from all jobs.
@@ -274,6 +172,7 @@ class NFSLocalizer(BatchedLocalizer):
         """
         if output_dir is not None:
             warnings.warn("output_dir has no bearing on NFSLocalizer. outputs are available in {}/outputs".format(self.local_dir))
+        self.build_manifest()
         output_dir = os.path.join(self.local_dir, 'outputs')
         output_files = {}
         for jobId in os.listdir(output_dir):
@@ -312,7 +211,7 @@ class NFSLocalizer(BatchedLocalizer):
         """
         vols = subprocess.check_output(
           "df {} | awk 'NR > 1 {{ print $1 }}'".format(
-            " ".join([shlex.quote(x) for x in [self.mount_path, self.local_dir, *args]])
+            " ".join([shlex.quote(x) for x in [self.staging_dir, *args]])
           ),
           shell = True
         )

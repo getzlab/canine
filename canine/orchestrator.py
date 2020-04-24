@@ -104,7 +104,8 @@ class Orchestrator(object):
             },
             'localization': {
                 'strategy': 'Batched'
-            }
+            },
+            'outputs': {}
         }
         for key, value in DEFAULTS.items():
             if key not in cfg:
@@ -262,7 +263,7 @@ class Orchestrator(object):
                 #
                 # submit job
                 print("Submitting batch job")
-                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('compute'))
+                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'))
                 print("Batch id:", batch_id)
 
                 #
@@ -311,7 +312,7 @@ class Orchestrator(object):
         )
         print("Job staged on SLURM controller in:", abs_staging_dir)
         print("Preparing pipeline script")
-        env = localizer.environment('compute')
+        env = localizer.environment('remote')
         root_dir = env['CANINE_ROOT']
         entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')
         if isinstance(self.script, str):
@@ -449,7 +450,7 @@ class Orchestrator(object):
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
             with localizer.transport_context() as transport:
-                dest = localizer.reserve_path("results.k9df.hdf5").controllerpath
+                dest = localizer.reserve_path("results.k9df.hdf5").remotepath
                 if not transport.isdir(os.path.dirname(dest)):
                     transport.makedirs(os.path.dirname(dest))
                 with transport.open(dest, 'wb') as w:
@@ -482,7 +483,7 @@ class Orchestrator(object):
         Succeeded jobs are skipped. Failed jobs are reset and rerun
         """
         with localizer.transport_context() as transport:
-            df_path = localizer.reserve_path("results.k9df.hdf5").controllerpath
+            df_path = localizer.reserve_path("results.k9df.hdf5").remotepath
 
             #remove all output if specified
             if overwrite:
@@ -548,14 +549,14 @@ class Orchestrator(object):
                     # remove output directories of failed jobs
                     for k in self.job_spec:
                         transport.rmtree(
-                            localizer.reserve_path('jobs', k).controllerpath
+                            localizer.reserve_path('jobs', k).remotepath
                         )
 
                     # we also have to remove the common inputs directory, so that
                     # the localizer can regenerate it
                     if len(self.job_spec) > 0:
                         transport.rmtree(
-                            localizer.reserve_path('common').controllerpath
+                            localizer.reserve_path('common').remotepath
                         )
 
                     return np.count_nonzero(~fail_idx)
