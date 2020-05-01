@@ -517,27 +517,33 @@ class AbstractLocalizer(abc.ABC):
 		# - localization tasks are run when localization.sh is _run_
         job_vars = []
         exports = []
+        docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
         compute_env = self.environment('remote')
+        stream_dir_ready = False
         for key, val in self.inputs[jobId].items():
             if val.type == 'stream':
                 job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
+                if not stream_dir_ready:
+                    exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
+                    docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
+                    stream_dir_ready = True
+                dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(val.path)))
                 localization_tasks += [
                     'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.remotepath),
-                    'mkfifo {}'.format(dest.remotepath),
+                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
+                    'mkfifo {}'.format(dest),
                     "gsutil {} cat {} > {} &".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
-                        dest.remotepath
+                        dest
                     )
                 ]
                 exports.append('export {}="{}"'.format(
                     key,
-                    dest.remotepath
+                    dest
                 ))
             elif val.type == 'download':
                 job_vars.append(shlex.quote(key))
@@ -575,7 +581,7 @@ class AbstractLocalizer(abc.ABC):
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_ROOT',
             ] + exports
-        ) + '\ncd $CANINE_JOB_ROOT\n'
+        ) + '\nexport CANINE_DOCKER_ARGS="{docker}"\ncd $CANINE_JOB_ROOT\n'.format(docker=' '.join(docker_args))
 
         # generate localization script
         localization_script = '\n'.join([
@@ -599,6 +605,7 @@ class AbstractLocalizer(abc.ABC):
                         for name, pattern in patterns.items()
                     )
                 ),
+                'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi'
             ]
         )
         return setup_script, localization_script, teardown_script
