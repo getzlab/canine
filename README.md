@@ -14,7 +14,7 @@ Canine may be used in any of the following ways:
 * Running a pipeline yaml file (ie: `$ canine examples/example_pipeline.yaml`)
 * Running a pipeline defined on the commandline (ie: `$ canine --backend type:TransientGCP --backend name:my-cluster (etc...)`)
 * Building and running a pipeline in python (ie: `>>> canine.Orchestrator(pipeline_dict).run_pipeline()`)
-* Using the [Canine API](https://broadinstitute.github.io/canine/) to execute custom
+* Using the [Canine API](https://getzlab.github.io/canine/) to execute custom
 workflows in Slurm, which could not be configured as a pipeline object
 
 ## Anatomy of a pipeline
@@ -29,7 +29,7 @@ The pipeline adapter is responsible for converting the provided list of inputs i
 
 #### Choosing an Adapter
 
-This is a list of available adapters. For more details, see [pipeline_options.md](https://github.com/broadinstitute/canine/blob/master/pipeline_options.md)
+This is a list of available adapters. For more details, see [pipeline_options.md](https://github.com/getzlab/canine/blob/master/pipeline_options.md)
 
 * `Manual`: (Default) This is the primary input adapter responsible for determining the number of jobs and the inputs for each job, based on the raw inputs provided by the user.
     * Inputs which have a single constant value will have the same value for all jobs
@@ -45,7 +45,7 @@ There are many different backends available depending on where SLURM is running 
 
 #### Choosing a Backend
 
-This is a list of available backends. For more details, see [pipeline_options.md](https://github.com/broadinstitute/canine/blob/master/pipeline_options.md)
+This is a list of available backends. For more details, see [pipeline_options.md](https://github.com/getzlab/canine/blob/master/pipeline_options.md)
 
 * `Local`: (Default) Choose this backend if you will be running Canine from the Slurm controller and your cluster is fully configured.
 This backend will run Slurm commands through the local shell
@@ -70,7 +70,7 @@ There are four different localizers to accommodate different needs.
 
 #### Choosing a Localizer
 
-This is a list of available localizers. For more details, see [pipeline_options.md](https://github.com/broadinstitute/canine/blob/master/pipeline_options.md)
+This is a list of available localizers. For more details, see [pipeline_options.md](https://github.com/getzlab/canine/blob/master/pipeline_options.md)
 
 * `Batched`: (Default) This localizer is suitable for most situations.
 It stages the canine pipeline workspace locally in a temporary directory, copying or symlinking local files into it before broadcasting the workspace directory structure over to the Slurm controller.
