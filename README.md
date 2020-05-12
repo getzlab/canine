@@ -133,6 +133,8 @@ As described above, the adapter is responsible for parsing the raw, user-provide
 The pipeline script is the heart of the pipeline. This is the actual bash script which will be run. The `script` key can either be a filepath to a bash script to run, or a list of strings, each of which is a command to run.
 Either way, the script gets executed by each job of the pipeline.
 
+**NOTE:** During setup, every job will configure a `$CANINE_DOCKER_ARGS` environment variable. We recommend that you expand this variable inside the argument list to `docker run` commands to enable the container to properly interact with the canine environment
+
 ### overrides
 
 Localization overrides, defined in `localization.overrides` allow the user to change the localizer's default handling for a specific input.
@@ -144,8 +146,10 @@ The overrides section should be a dictionary mapping input names, to a string de
     * Any file or Google Storage object which appears as an input to multiple jobs is considered `common` and will be localized once to a common directory, visible to all jobs
     * If any input to any arbitrary job is a list, the contents of the list are interpreted using the same rules
 * `Common`: Inputs marked as common will be considered common to all jobs and localized once, to a directory which is visible to all jobs. Inputs marked as common which cannot be interpreted as a filepath or a Google Cloud Storage object are ignored and treated as strings
-* `Stream`: Inputs marked as `Stream` will be streamed into a FIFO pipe, and the path to the pipe will be exported to the job. The `Stream` override is ignored for inputs which are not Google Cloud Storage objects, causing those inputs to be localized under default rules. Jobs which are requeued due to node failure will always restart the stream
+* `Stream`: Inputs marked as `Stream` will be streamed into a FIFO pipe, and the path to the pipe will be exported to the job. The `Stream` override is ignored for inputs which are not Google Cloud Storage objects, causing those inputs to be localized under default rules. Jobs which are requeued due to node failure will always restart the stream. Streams are created in a temporary directory on the local disk of the compute node
 * `Delayed`: Inputs marked as `Delayed` will be downloaded by the job once it starts, instead of upfront during localization. The `Delayed` override is ignored for inputs which are not Google Cloud Storage objects, causing those inputs to be localized under default rules. Jobs which are requeued due to node failures will only re-download delayed inputs if the job failed before the download completed
+* `Local`: Similar to `Delayed`. Inputs marked as `Local` will be downloaded by the job once it starts. The difference between `Delayed` and `Local` is that for `Local` files, a new disk is provisioned and mounted to the worker node and `Local` downloads are saved there. The disk is automatically sized
+to fit all files marked as `Local` plus a small safety margin. **Warning:** Do not create or unzip files in the local download directory. The local download disks are sized automatically to fit the size of the downloaded files and will likely run out of space if additional files are created or unpacked
 * `Localize`: Inputs marked as `Localize` will be treated as files and localized to job-specific input directories. This can be used to force files which would be handled as common, to be localized for each job. The `Localize` override is ignored for inputs which are not valid filepaths or Google Cloud Storage objects, causing those inputs to be treated as strings
 * `Null` or `None`: Inputs marked this way are treated as strings, and no localization will be applied.
 
