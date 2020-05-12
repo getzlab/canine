@@ -37,7 +37,7 @@
 <p>Contains code to stage job inputs on the slurm cluster and transfer job outputs back</p>
 <span class="target" id="module-canine.localization"></span><dl class="class">
 <dt id="canine.localization.BatchedLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">BatchedLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">BatchedLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Default localization strategy:
 Constructs the canine staging directory locally.
 Local inputs are symlinked into the staging directory.
@@ -62,7 +62,7 @@ Builds the manifest if it does not exist</p>
 <dt id="canine.localization.BatchedLocalizer.environment">
 <code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.environment" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns environment variables relative to the given location.
-Location must be one of {“local”, “controller”, “compute”}</p>
+Location must be one of {“local”, “remote”}</p>
 </dd></dl>
 
 <dl class="method">
@@ -110,8 +110,8 @@ but its parent does</p>
 
 <dl class="method">
 <dt id="canine.localization.BatchedLocalizer.job_setup_teardown">
-<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns a tuple of (setup script, teardown script) for the given job id.
+<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
 Must call after pre-scanning inputs</p>
 </dd></dl>
 
@@ -121,7 +121,7 @@ Must call after pre-scanning inputs</p>
 <dd><p>3 phase task:
 1) Pre-scan inputs to determine proper localization strategy for all inputs
 2) Begin localizing job inputs. For each job, check the predetermined strategy
-and set up the job’s setup and teardown scripts
+and set up the job’s setup, localization, and teardown scripts
 3) Finally, finalize the localization. This may include broadcasting the
 staging directory or copying a batch of gsutil files
 Returns the remote staging directory, which is now ready for final startup</p>
@@ -183,7 +183,7 @@ If None (default) is provided, a new transport is opened, and closed after the c
 
 <dl class="class">
 <dt id="canine.localization.LocalLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">LocalLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">LocalLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Similar to BatchedLocalizer:
 Constructs the canine staging directory locally.
 Local inputs are symlinked into the staging directory.
@@ -211,7 +211,7 @@ Builds the manifest if it does not exist</p>
 <dt id="canine.localization.LocalLocalizer.environment">
 <code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.environment" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns environment variables relative to the given location.
-Location must be one of {“local”, “controller”, “compute”}</p>
+Location must be one of {“local”, “remote”}</p>
 </dd></dl>
 
 <dl class="method">
@@ -259,8 +259,8 @@ but its parent does</p>
 
 <dl class="method">
 <dt id="canine.localization.LocalLocalizer.job_setup_teardown">
-<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns a tuple of (setup script, teardown script) for the given job id.
+<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
 Must call after pre-scanning inputs</p>
 </dd></dl>
 
@@ -270,7 +270,7 @@ Must call after pre-scanning inputs</p>
 <dd><p>3 phase task:
 1) Pre-scan inputs to determine proper localization strategy for all inputs
 2) Begin localizing job inputs. For each job, check the predetermined strategy
-and set up the job’s setup and teardown scripts
+and set up the job’s setup, localization, and teardown scripts
 3) Finally, finalize the localization. This may include broadcasting the
 staging directory or copying a batch of gsutil files
 Returns the remote staging directory, which is now ready for final startup</p>
@@ -332,7 +332,7 @@ If None (default) is provided, a new transport is opened, and closed after the c
 
 <dl class="class">
 <dt id="canine.localization.RemoteLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">RemoteLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">temporary_disk_type: str = 'standard'</em>, <em class="sig-param">local_download_dir: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">RemoteLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">temporary_disk_type: str = 'standard'</em>, <em class="sig-param">local_download_dir: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Remote Only strategy:
 Staging dir is created remotely and files are copied in</p>
 <dl class="method">
@@ -352,7 +352,7 @@ Builds the manifest if it does not exist</p>
 <dt id="canine.localization.RemoteLocalizer.environment">
 <code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.environment" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns environment variables relative to the given location.
-Location must be one of {“local”, “controller”, “compute”}</p>
+Location must be one of {“local”, “remote”}</p>
 </dd></dl>
 
 <dl class="method">
@@ -400,8 +400,8 @@ but its parent does</p>
 
 <dl class="method">
 <dt id="canine.localization.RemoteLocalizer.job_setup_teardown">
-<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns a tuple of (setup script, teardown script) for the given job id.
+<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
 Must call after pre-scanning inputs</p>
 </dd></dl>
 
@@ -472,7 +472,7 @@ If None (default) is provided, a new transport is opened, and closed after the c
 
 <dl class="class">
 <dt id="canine.localization.NFSLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">NFSLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">mount_path: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">temporary_disk_type: str = 'standard'</em>, <em class="sig-param">local_download_dir: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">NFSLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">temporary_disk_type: str = 'standard'</em>, <em class="sig-param">local_download_dir: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Similar to LocalLocalizer:
 Constructs the canine staging directory locally.
 Local inputs are symlinked into the staging directory.</p>
@@ -498,7 +498,7 @@ NFSLocalizer does not delocalize files. Data is copied from output dir</p>
 <dt id="canine.localization.NFSLocalizer.environment">
 <code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.NFSLocalizer.environment" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns environment variables relative to the given location.
-Location must be one of {“local”, “controller”, “compute”}</p>
+Location must be one of {“local”, “remote”}</p>
 </dd></dl>
 
 <dl class="method">
@@ -546,8 +546,8 @@ but its parent does</p>
 
 <dl class="method">
 <dt id="canine.localization.NFSLocalizer.job_setup_teardown">
-<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str]<a class="headerlink" href="#canine.localization.NFSLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns a tuple of (setup script, teardown script) for the given job id.
+<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str, str]<a class="headerlink" href="#canine.localization.NFSLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
 Must call after pre-scanning inputs</p>
 </dd></dl>
 
@@ -557,7 +557,7 @@ Must call after pre-scanning inputs</p>
 <dd><p>3 phase task:
 1) Pre-scan inputs to determine proper localization strategy for all inputs
 2) Begin localizing job inputs. For each job, check the predetermined strategy
-and set up the job’s setup and teardown scripts
+and set up the job’s setup, localization, and teardown scripts
 3) Finally, finalize the localization. This may include broadcasting the
 staging directory or copying a batch of gsutil files
 Returns the remote staging directory, which is now ready for final startup</p>

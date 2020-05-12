@@ -393,11 +393,9 @@ localized, and where jobs should be staged (default: create random directory in 
 This assumes that the controller and compute nodes are connected via NFS or other
 network filesystem and that the home folder is shared. Always set this such that
 the staging_dir is part of a shared volume. If no such share exists, set to `SBCAST`
-to use slurm's `sbcast` command to copy job inputs
-* `mount_path`: The directory where the `staging_dir` is mounted on compute nodes.
-If the `staging_dir` can be found at the same path on both the controller and compute
-nodes, leave this blank (for instance if `/home` is mounted to `/home`, as on the TransientGCP backend).
-(default: Same as `staging_dir`)
+to use slurm's `sbcast` command to copy job inputs.
+**Warning**: `mount_path` has been removed as an option. All localizers now assume that
+the controller and compute nodes have a shared NFS mounted at `staging_dir`
 * `project` : The Google Cloud Project to charge when interacting with requester pays buckets.
 If the `transfer_bucket` or any declared inputs are requester pays, this project will
 be billed for the charges

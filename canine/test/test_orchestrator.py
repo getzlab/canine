@@ -94,8 +94,11 @@ class TestUnit(unittest.TestCase):
                         'export CANINE_OUTPUT="/mnt/nfs/canine/outputs"\n'
                         'export CANINE_JOBS="/mnt/nfs/canine/jobs"\n'
                         'source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh\n'
+                        '$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh\n'
+                        'LOCALIZER_JOB_RC=$?\n'
                         '/mnt/nfs/canine/script.sh\n'
                         'CANINE_JOB_RC=$?\n'
+                        '[[ $LOCALIZER_JOB_RC != 0 ]] && CANINE_JOB_RC=$LOCALIZER_JOB_RC || CANINE_JOB_RC=$CANINE_JOB_RC\n'
                         'source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh\n'
                         'exit $CANINE_JOB_RC\n'.format(version=version)
                     )
@@ -243,7 +246,7 @@ class TestIntegration(unittest.TestCase):
                 shell=True
             )
 
-    @with_timeout(180)
+    @with_timeout(300)
     def test_xargs(self):
         """
         Runs a quick test of the xargs orchestrator

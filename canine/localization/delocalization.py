@@ -36,11 +36,6 @@ def main(output_dir, jobId, patterns, copy):
                     dest = os.path.join(jobdir, name)
                 else:
                     dest = os.path.join(jobdir, name, os.path.relpath(target))
-                manifest.write("{}\t{}\t{}\n".format(
-                    jobId,
-                    name,
-                    os.path.relpath(dest.strip(), output_dir)
-                ))
                 if not os.path.exists(dest):
                     if not os.path.isdir(os.path.dirname(dest)):
                         os.makedirs(os.path.dirname(dest))
@@ -48,10 +43,17 @@ def main(output_dir, jobId, patterns, copy):
                         # Same volume check catches outputs from outside the workspace
                         if copy or not same_volume(target, jobdir):
                             shutil.copyfile(os.path.abspath(target), dest)
+                        elif os.stat(target).st_dev == os.stat(os.path.dirname(dest)).st_dev:
+                            os.symlink(os.path.relpath(target, os.path.dirname(dest)), dest)
                         else:
                             os.symlink(os.path.abspath(target), dest)
                     else:
                         shutil.copytree(target, dest)
+                manifest.write("{}\t{}\t{}\n".format(
+                    jobId,
+                    name,
+                    os.path.relpath(dest.strip(), output_dir)
+                ))
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('canine-delocalizer')
