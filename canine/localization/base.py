@@ -560,12 +560,15 @@ class AbstractLocalizer(abc.ABC):
                 raise ValueError("Cannot provision {} GB disk for job {}".format(local_download_size, jobId))
             disk_name = 'canine-{}-{}-{}'.format(self.disk_key, os.urandom(4).hex(), jobId)
             device_name = 'cn{}{}'.format(os.urandom(2).hex(), jobId)
-            localization_tasks += [
+            exports += [
                 'export CANINE_LOCAL_DISK_SIZE={}GB'.format(local_download_size),
                 'export CANINE_LOCAL_DISK_TYPE={}'.format(self.temporary_disk_type),
                 'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)',
                 'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone))',
-                'sudo mkdir -p {}/{}'.format(self.local_download_dir, disk_name),
+                'export CANINE_LOCAL_DISK_DIR={}/{}'.format(self.local_download_dir, disk_name),
+            ]
+            localization_tasks += [
+                'sudo mkdir -p $CANINE_LOCAL_DISK_DIR',
                 'if [[ -z "$CANINE_NODE_NAME" ]]; then echo "Unable to provision disk (not running on GCE instance). Attempting download to directory on boot disk" > /dev/stderr; else',
                 'echo Provisioning and mounting temporary disk {}'.format(disk_name),
                 'gcloud compute disks create {} --size {} --type pd-{} --zone $CANINE_NODE_ZONE'.format(
@@ -580,16 +583,13 @@ class AbstractLocalizer(abc.ABC):
                 'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
                 'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
 
-                'sudo mount -o discard,defaults /dev/disk/by-id/google-{} {}/{}'.format(
+                'sudo mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
                     device_name,
-                    self.local_download_dir,
-                    disk_name
                 ),
                 'sudo chmod -R a+rwX {}'.format(self.local_download_dir),
-                'export CANINE_LOCAL_DISK_DIR={}/{}'.format(self.local_download_dir, disk_name),
                 'fi'
             ]
-            docker_args.append('-v {0}:{0}'.format(os.path.join(self.local_download_dir, disk_name)))
+            docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
         compute_env = self.environment('remote')
         stream_dir_ready = False
         for key, val in self.inputs[jobId].items():
@@ -620,7 +620,7 @@ class AbstractLocalizer(abc.ABC):
                     dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                 else:
                     # Local and controller paths not needed on this object
-                    dest = PathType(None, None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
+                    dest = PathType(None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
                 localization_tasks += [
                     "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
