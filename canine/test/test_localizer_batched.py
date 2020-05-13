@@ -5,6 +5,7 @@ import os
 import stat
 import warnings
 import time
+import random
 from contextlib import contextmanager
 from canine.backends.dummy import DummySlurmBackend
 from canine.localization.base import Localization, PathType
@@ -136,6 +137,182 @@ class TestIntegration(unittest.TestCase):
     """
     Tests high-level features of the localizer
     """
+
+    @with_timeout(10)
+    def test_local_download(self):
+        with BatchedLocalizer(BACKEND) as localizer:
+            localizer.get_object_size = unittest.mock.MagicMock(side_effect=lambda *a,**k:random.randint(1,100000000000))
+            inputs = {
+                str(jid): {
+                    'file': 'gs://foo/'+os.urandom(8).hex()
+                }
+                for jid in range(15)
+            }
+            overrides = {'file': 'local'}
+            with localizer.transport_context() as transport:
+                common_dests = localizer.pick_common_inputs(
+                    inputs,
+                    overrides,
+                    transport
+                )
+                for jobId, data in inputs.items():
+                    with self.subTest(jid=jobId):
+                        os.makedirs(os.path.join(
+                            localizer.environment('local')['CANINE_JOBS'],
+                            jobId,
+                        ))
+                        localizer.prepare_job_inputs(
+                            jobId,
+                            data,
+                            common_dests,
+                            overrides,
+                            transport=transport
+                        )
+                        self.assertTupleEqual(
+                            localizer.inputs[jobId]['file'],
+                            Localization('local', inputs[jobId]['file'])
+                        )
+
+                        setup_text, localization_text, teardown_text = localizer.job_setup_teardown(jobId, {})
+                        self.assertIn('export CANINE_LOCAL_DISK_DIR', setup_text)
+                        self.assertIn(
+                            '{} $CANINE_LOCAL_DISK_DIR/{}'.format(inputs[jobId]['file'], os.path.basename(inputs[jobId]['file'])),
+                            localization_text
+                        )
+                        self.assertIn('gcloud compute disks delete', teardown_text)
+
+    @with_timeout(10)
+    def test_array_inputs(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            common_file = makefile(os.path.join(tempdir, 'commfile'))
+            common_array = [
+                'string', common_file, 'gs://foo/bar'
+            ]
+            with BatchedLocalizer(BACKEND) as localizer:
+                localizer.localize_file = unittest.mock.MagicMock()
+                inputs = {
+                    str(jid): {
+                        'array-common': common_array,
+                        'array-incommon': [os.urandom(8).hex(), makefile(os.path.join(tempdir, os.urandom(8).hex())), 'gs://foo/'+os.urandom(8).hex()],
+                        'array-stream': ['gs://foo/'+os.urandom(8).hex(), 'gs://foo/'+os.urandom(8).hex()],
+                        'array-download': ['gs://foo/'+os.urandom(8).hex(), 'gs://foo/'+os.urandom(8).hex()]
+                    }
+                    for jid in range(15)
+                }
+                overrides = {
+                    'array-common': 'common',
+                    'array-stream': 'stream',
+                    'array-download': 'delayed'
+                }
+                with localizer.transport_context() as transport:
+                    common_dests = localizer.pick_common_inputs(
+                        inputs,
+                        overrides,
+                        transport
+                    )
+                    self.assertIn(common_file, common_dests)
+                    self.assertIn('gs://foo/bar', common_dests)
+
+                    for jobId, data in inputs.items():
+                        with self.subTest(jid=jobId):
+                            os.makedirs(os.path.join(
+                                localizer.environment('local')['CANINE_JOBS'],
+                                jobId,
+                            ))
+                            localizer.prepare_job_inputs(
+                                jobId,
+                                data,
+                                common_dests,
+                                overrides,
+                                transport=transport
+                            )
+
+                            with self.subTest(arg='array-common'):
+                                self.assertTupleEqual(
+                                    localizer.inputs[jobId]['array-common'],
+                                    Localization(
+                                        'array',
+                                        [
+                                            Localization(None, 'string'),
+                                            Localization(None, localizer.reserve_path('common', 'commfile')),
+                                            Localization(None, localizer.reserve_path('common', 'bar'))
+                                        ]
+                                    )
+                                )
+
+                                localizer.localize_file.assert_any_call(
+                                    common_file,
+                                    localizer.reserve_path('common', 'commfile'),
+                                    transport=transport
+                                )
+
+                                localizer.localize_file.assert_any_call(
+                                    'gs://foo/bar',
+                                    localizer.reserve_path('common', 'bar'),
+                                    transport=transport
+                                )
+
+                            with self.subTest(arg='array-incommon'):
+                                self.assertTupleEqual(
+                                    localizer.inputs[jobId]['array-incommon'],
+                                    Localization(
+                                        'array',
+                                        [
+                                            Localization(None, inputs[jobId]['array-incommon'][0]),
+                                            Localization(None, localizer.reserve_path('jobs', jobId, 'inputs', os.path.basename(inputs[jobId]['array-incommon'][1]))),
+                                            Localization(None, localizer.reserve_path('jobs', jobId, 'inputs', os.path.basename(inputs[jobId]['array-incommon'][2]))),
+                                        ]
+                                    )
+                                )
+
+                                localizer.localize_file.assert_any_call(
+                                    inputs[jobId]['array-incommon'][1],
+                                    localizer.reserve_path('jobs', jobId, 'inputs', os.path.basename(inputs[jobId]['array-incommon'][1])),
+                                    transport=transport
+                                )
+
+                                localizer.localize_file.assert_any_call(
+                                    inputs[jobId]['array-incommon'][2],
+                                    localizer.reserve_path('jobs', jobId, 'inputs', os.path.basename(inputs[jobId]['array-incommon'][2])),
+                                    transport=transport
+                                )
+
+                            with self.subTest(arg='array-stream'):
+                                self.assertTupleEqual(
+                                    localizer.inputs[jobId]['array-stream'],
+                                    Localization(
+                                        'array',
+                                        [
+                                            Localization('stream', inputs[jobId]['array-stream'][0]),
+                                            Localization('stream', inputs[jobId]['array-stream'][1]),
+                                        ]
+                                    )
+                                )
+
+
+                            with self.subTest(arg='array-download'):
+                                self.assertTupleEqual(
+                                    localizer.inputs[jobId]['array-download'],
+                                    Localization(
+                                        'array',
+                                        [
+                                            Localization('download', inputs[jobId]['array-download'][0]),
+                                            Localization('download', inputs[jobId]['array-download'][1]),
+                                        ]
+                                    )
+                                )
+
+                            setup_text, localization_text, teardown_text = localizer.job_setup_teardown(jobId, {})
+                            self.assertIn(
+                                "export array-common='{}'".format(
+                                    '\t'.join([
+                                        'string',
+                                        localizer.reserve_path('common', 'commfile').remotepath,
+                                        localizer.reserve_path('common', 'bar').remotepath
+                                    ])
+                                ),
+                                setup_text
+                            )
 
     @with_timeout(10)
     def test_common_inputs(self):

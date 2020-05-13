@@ -28,19 +28,6 @@ PathType = namedtuple(
     ['localpath', 'remotepath']
 )
 
-JobConf = namedtuple(
-    'JobConf',
-    [
-        'docker_args',
-        'stream_dir_ready',
-        'local_disk_name',
-        'job_vars',
-        'setup',
-        'localization',
-        'teardown'
-    ]
-)
-
 class AbstractLocalizer(abc.ABC):
     """
     Base class for localization.
@@ -518,10 +505,13 @@ class AbstractLocalizer(abc.ABC):
                 print("Ignoring 'delayed' override for", input_name, "with value", input_value, "and localizing now", file=sys.stderr)
             elif mode == 'local':
                 if input_value.startswith('gs://'):
+                    self.local_download_size[jobId] = self.local_download_size.get(jobId, 0) + self.get_object_size(input_value)
                     return Localization('local', input_value)
-                print("Ignoring 'local' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
+                print("Ignoring 'local' override for", input_name, "with value", input_value, "and localizing now", file=sys.stderr)
             elif mode is None or mode == 'null':
                 return Localization(None, input_value)
+            else:
+                print("Unrecognized localization override:", mode)
         # At this point, no overrides have taken place, so handle by default
         if os.path.exists(input_value) or input_value.startswith('gs://'):
             remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(input_value)))
@@ -555,19 +545,19 @@ class AbstractLocalizer(abc.ABC):
                     transport
                 )
 
-    def final_localization(self, jobId: str, request: Localization, conf: JobConf) -> str:
+    def final_localization(self, jobId: str, request: Localization, job_conf: typing.Dict[str, typing.Any]) -> str:
         """
         Modifies job conf as final localization commands are processed
         Exported variable values are not added to conf and must be added manually, later
         """
         if request.type == 'stream':
-            if not job_conf.stream_dir_ready:
-                job_conf.setup.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
-                job_conf.docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
-                job_conf.teardown.append('if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi')
-                job_conf.stream_dir_ready = True
+            if not job_conf['stream_dir_ready']:
+                job_conf['setup'].append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
+                job_conf['docker_args'].append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
+                job_conf['teardown'].append('if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi')
+                job_conf['stream_dir_ready'] = True
             dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(request.path)))
-            job_conf.localization += [
+            job_conf['localization'] += [
                 'gsutil ls {} > /dev/null'.format(shlex.quote(request.path)),
                 'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
                 'mkfifo {}'.format(dest),
@@ -583,8 +573,8 @@ class AbstractLocalizer(abc.ABC):
                 dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(request.path)))
             else:
                 # Local and controller paths not needed on this object
-                dest = PathType(None, os.path.join('$CANINE_LOCAL_DISK_DIR', os.path.basename(val.path)))
-            job_conf.localization += [
+                dest = PathType(None, os.path.join('$CANINE_LOCAL_DISK_DIR', os.path.basename(request.path)))
+            job_conf['localization'] += [
                 "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                     '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(request.path) else '',
                     shlex.quote(request.path),
@@ -593,7 +583,7 @@ class AbstractLocalizer(abc.ABC):
             ]
             return dest.remotepath
         elif request.type == None:
-            return [], shlex.quote(request.path.computepath if isinstance(request.path, PathType) else request.path)
+            return shlex.quote(request.path.remotepath if isinstance(request.path, PathType) else request.path)
         raise TypeError("request type '{}' not supported at this stage".format(request.type))
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
@@ -606,15 +596,15 @@ class AbstractLocalizer(abc.ABC):
 		# - job variables and exports are set when setup.sh is _sourced_
 		# - localization tasks are run when localization.sh is _run_
 
-        job_conf = JobConf(
-            ['-v $CANINE_ROOT:$CANINE_ROOT'], # Docker args
-            False, # is stream configured
-            None, # Job local disk name
-            [], # Job variables
-            [], # setup tasks
-            ['if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'], # localization tasks
-            [], #teardown tasks
-        )
+        job_conf = {
+            'docker_args': ['-v $CANINE_ROOT:$CANINE_ROOT'], # Docker args
+            'stream_dir_ready': False, # is stream configured
+            'local_disk_name': None, # Job local disk name
+            'job_vars': [], # Job variables
+            'setup': [], # setup tasks
+            'localization': ['if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'], # localization tasks
+            'teardown': [], #teardown tasks
+        }
 
         local_download_size = self.local_download_size.get(jobId, 0)
         if local_download_size > 0 and self.temporary_disk_type is not None:
@@ -624,29 +614,29 @@ class AbstractLocalizer(abc.ABC):
             )
             if local_download_size > 65535:
                 raise ValueError("Cannot provision {} GB disk for job {}".format(local_download_size, jobId))
-            job_conf.local_disk_name = 'canine-{}-{}-{}'.format(self.disk_key, os.urandom(4).hex(), jobId)
+            job_conf['local_disk_name'] = 'canine-{}-{}-{}'.format(self.disk_key, os.urandom(4).hex(), jobId)
             device_name = 'cn{}{}'.format(os.urandom(2).hex(), jobId)
-            job_conf.setup += [
+            job_conf['setup'] += [
                 'export CANINE_LOCAL_DISK_SIZE={}GB'.format(local_download_size),
                 'export CANINE_LOCAL_DISK_TYPE={}'.format(self.temporary_disk_type),
                 'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)',
                 'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone))',
-                'export CANINE_LOCAL_DISK_DIR={}/{}'.format(self.local_download_dir, job_conf.local_disk_name),
+                'export CANINE_LOCAL_DISK_DIR={}/{}'.format(self.local_download_dir, job_conf['local_disk_name']),
             ]
-            job_conf.localization += [
+            job_conf['localization'] += [
                 'sudo mkdir -p $CANINE_LOCAL_DISK_DIR',
                 'if [[ -z "$CANINE_NODE_NAME" ]]; then echo "Unable to provision disk (not running on GCE instance). Attempting download to directory on boot disk" > /dev/stderr; else',
-                'echo Provisioning and mounting temporary disk {}'.format(job_conf.local_disk_name),
+                'echo Provisioning and mounting temporary disk {}'.format(job_conf['local_disk_name']),
                 'gcloud compute disks create {} --size {} --type pd-{} --zone $CANINE_NODE_ZONE'.format(
-                    job_conf.local_disk_name,
+                    job_conf['local_disk_name'],
                     local_download_size,
                     self.temporary_disk_type
                 ),
                 'gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {} --device-name {}'.format(
-                    job_conf.local_disk_name,
+                    job_conf['local_disk_name'],
                     device_name
                 ),
-                'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(job_conf.local_disk_name),
+                'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(job_conf['local_disk_name']),
                 'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
 
                 'sudo mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
@@ -655,19 +645,19 @@ class AbstractLocalizer(abc.ABC):
                 'sudo chmod -R a+rwX {}'.format(self.local_download_dir),
                 'fi'
             ]
-            job_conf.teardown += [
-                'sudo umount {}/{}'.format(self.local_download_dir, job_conf.local_disk_name),
-                'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(job_conf.local_disk_name),
-                'gcloud compute disks delete {} --zone $CANINE_NODE_ZONE'.format(job_conf.local_disk_name)
+            job_conf['teardown'] += [
+                'sudo umount {}/{}'.format(self.local_download_dir, job_conf['local_disk_name']),
+                'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(job_conf['local_disk_name']),
+                'gcloud compute disks delete {} --zone $CANINE_NODE_ZONE'.format(job_conf['local_disk_name'])
             ]
-            job_conf.docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+            job_conf['docker_args'].append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
         compute_env = self.environment('remote')
         stream_dir_ready = False
         for key, val in self.inputs[jobId].items():
-            job_conf.job_vars.append(shlex.quote(key))
+            job_conf['job_vars'].append(shlex.quote(key))
             if val.type == 'array':
                 # Hack: the array elements are exposed here as the Localization arg's .path attr
-                job_conf.setup.append(
+                job_conf['setup'].append(
                     # Should we manually quote here instead of using shlex?
                     # Wondering if the quoting might break some directives which embed environment variables in the path
                     'export {}={}'.format(key, shlex.quote('\t'.join(
@@ -676,28 +666,28 @@ class AbstractLocalizer(abc.ABC):
                     )))
                 )
             else:
-                job_conf.setup.append(
+                job_conf['setup'].append(
                     'export {}={}'.format(key, self.final_localization(jobId, val, job_conf))
                 )
         setup_script = '\n'.join(
             line.rstrip()
             for line in [
                 '#!/bin/bash',
-                'export CANINE_JOB_VARS={}'.format(':'.join(job_conf.job_vars)),
+                'export CANINE_JOB_VARS={}'.format(':'.join(job_conf['job_vars'])),
                 'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_ROOT',
-            ] + job_conf.setup
-        ) + '\nexport CANINE_DOCKER_ARGS="{docker}"\ncd $CANINE_JOB_ROOT\n'.format(docker=' '.join(job_conf.docker_args))
+            ] + job_conf['setup']
+        ) + '\nexport CANINE_DOCKER_ARGS="{docker}"\ncd $CANINE_JOB_ROOT\n'.format(docker=' '.join(job_conf['docker_args']))
 
         # generate localization script
         localization_script = '\n'.join([
           "#!/bin/bash",
           "set -e"
-        ] + job_conf.localization) + "\nset +e\n"
+        ] + job_conf['localization']) + "\nset +e\n"
 
         # generate teardown script
         teardown_script = '\n'.join(
@@ -715,7 +705,7 @@ class AbstractLocalizer(abc.ABC):
                         for name, pattern in patterns.items()
                     )
                 ),
-            ] + job_conf.teardown
+            ] + job_conf['teardown']
         )
         return setup_script, localization_script, teardown_script
 
