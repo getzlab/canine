@@ -558,7 +558,10 @@ class AbstractLocalizer(abc.ABC):
                 job_conf['stream_dir_ready'] = True
             dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(request.path)))
             job_conf['localization'] += [
-                'gsutil ls {} > /dev/null'.format(shlex.quote(request.path)),
+                'gsutil {} ls {} > /dev/null'.format(
+                    '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(request.path) else '',
+                    shlex.quote(request.path)
+                ),
                 'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
                 'mkfifo {}'.format(dest),
                 "gsutil {} cat {} > {} &".format(
@@ -615,7 +618,7 @@ class AbstractLocalizer(abc.ABC):
             if local_download_size > 65535:
                 raise ValueError("Cannot provision {} GB disk for job {}".format(local_download_size, jobId))
             job_conf['local_disk_name'] = 'canine-{}-{}-{}'.format(self.disk_key, os.urandom(4).hex(), jobId)
-            device_name = 'cn{}{}'.format(os.urandom(2).hex(), jobId)
+            device_name = 'k9{}{}'.format(os.urandom(2).hex(), jobId)
             job_conf['setup'] += [
                 'export CANINE_LOCAL_DISK_SIZE={}GB'.format(local_download_size),
                 'export CANINE_LOCAL_DISK_TYPE={}'.format(self.temporary_disk_type),

@@ -164,7 +164,6 @@ class Orchestrator(object):
             **{arg:val for arg,val in adapter.items() if arg != 'type'}
         )
         self.job_spec = self.adapter.parse_inputs(self.raw_inputs)
-        print(self.job_spec)
 
         #
         # backend
