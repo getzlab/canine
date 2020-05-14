@@ -661,9 +661,7 @@ class AbstractLocalizer(abc.ABC):
             if val.type == 'array':
                 # Hack: the array elements are exposed here as the Localization arg's .path attr
                 job_conf['setup'].append(
-                    # Should we manually quote here instead of using shlex?
-                    # Wondering if the quoting might break some directives which embed environment variables in the path
-                    'export {}={}'.format(key, shlex.quote('\t'.join(
+                    'export {}="{}"'.format(key, ('\t'.join(
                         self.final_localization(jobId, request, job_conf)
                         for request in val.path
                     )))

@@ -187,7 +187,8 @@ class ManualAdapter(AbstractAdapter):
             }
             for i, job in enumerate(generator)
         }
-        assert len(self.__spec) == self._job_length, "Failed to predict input length"
+        if len(self.__spec) != self._job_length:
+            raise ValueError("Nested arrays present with uneven inputs")
         if self.alias is not None:
             if isinstance(self.alias, list):
                 assert len(self.alias) == self._job_length, "Number of job aliases does not match number of jobs"
