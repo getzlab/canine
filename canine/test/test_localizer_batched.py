@@ -304,7 +304,7 @@ class TestIntegration(unittest.TestCase):
 
                             setup_text, localization_text, teardown_text = localizer.job_setup_teardown(jobId, {})
                             self.assertIn(
-                                "export array-common='{}'".format(
+                                'export array-common="{}"'.format(
                                     '\t'.join([
                                         'string',
                                         localizer.reserve_path('common', 'commfile').remotepath,
