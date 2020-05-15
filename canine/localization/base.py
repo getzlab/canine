@@ -571,9 +571,11 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
+                'export CANINE_JOB_LOCALIZATION="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'localization.sh')),
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_ROOT',
+                'chmod 755 $CANINE_JOB_LOCALIZATION',
             ] + exports
         ) + '\ncd $CANINE_JOB_ROOT\n'
 
