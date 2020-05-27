@@ -61,7 +61,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "user" : user,
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
-        self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
+        try:
+            self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
+        except:
+            print("Cound not find image with {} image family, fall back to 'slurm-gcp-docker'".format(self.config["image_family"]))
+            self.config["image_family"] = "slurm-gcp-docker"
+            self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
 
         # placeholder for Docker API
         self.dkr = None
