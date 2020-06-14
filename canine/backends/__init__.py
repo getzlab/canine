@@ -10,7 +10,7 @@ from .remote import RemoteTransport, RemoteSlurmBackend
 from .dummy import DummyTransport, DummySlurmBackend
 from .gcpTransient import TransientGCPSlurmBackend
 from .imageTransient import TransientImageSlurmBackend
-from .dockerTransient import DockerTransientImageSlurmBackend
+from .dockerTransient import DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
 
 __all__ = [
     'LocalSlurmBackend',
@@ -21,5 +21,6 @@ __all__ = [
     'DummyTransport',
     'TransientGCPSlurmBackend',
     'TransientImageSlurmBackend',
-    'DockerTransientImageSlurmBackend'
+    'DockerTransientImageSlurmBackend',
+    'LocalDockerSlurmBackend'
 ]

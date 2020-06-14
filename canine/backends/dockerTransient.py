@@ -340,6 +340,12 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
 # }}}
 
+class LocalDockerSlurmBackend(DockerTransientImageSlurmBackend):
+    def __enter__(self):
+        return self
+    def __exit__(self, *args):
+        pass
+
 # Python version of checks in docker_run.sh
 def ready_for_docker():
     #
