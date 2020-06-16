@@ -342,6 +342,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
 class LocalDockerSlurmBackend(DockerTransientImageSlurmBackend):
     def __enter__(self):
+        self.dkr = docker.from_env()
+        self.container = self._get_container(self.config["cluster_name"])
         return self
     def __exit__(self, *args):
         pass
