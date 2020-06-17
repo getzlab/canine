@@ -67,8 +67,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         }
         try:
             self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
-        except:
-            print("Cound not find image with {} image family, fall back to 'slurm-gcp-docker'".format(self.config["image_family"]))
+        except Exception as err:
+            print("Cound not find image with {} image family [{}], fall back to 'slurm-gcp-docker'".format(self.config["image_family"]), err)
             self.config["image_family"] = "slurm-gcp-docker"
             self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
 
