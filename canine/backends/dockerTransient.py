@@ -19,6 +19,10 @@ from ..utils import get_default_gcp_project, gcp_hourly_cost
 
 import pandas as pd
 
+from threading import Lock
+
+gce_lock = Lock()
+
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
@@ -311,7 +315,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def get_latest_image(self, image_family = None):
         image_family = self.config["image_family"] if image_family is None else image_family
-        return gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
+        with gce_lock: # I had issues without the lock
+            ans = gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
+        return ans
 
     def invoke(self, command, interactive = False):
         if self.container is not None and self.container().status == "running":
