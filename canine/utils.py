@@ -319,6 +319,7 @@ def gcp_hourly_cost(mtype: str, preemptible: bool = False, ssd_size: int = 0, hd
 
 from threading import Lock
 write_lock = Lock()
+read_lock = Lock()
 
 def pandas_write_hdf5_buffered(df: pd.DataFrame, key: str, buf: io.BufferedWriter):
     """
@@ -342,11 +343,13 @@ def pandas_read_hdf5_buffered(key: str, buf: io.BufferedReader) -> pd.DataFrame:
     """
 	Read a Pandas dataframe in HDF5 format from a buffer.
     """
-    with pd.HDFStore(
-      "dummy_hdf5",
-      mode = "r",
-      driver = "H5FD_CORE",
-      driver_core_backing_store = 0,
-      driver_core_image = buf.read()
-    ) as store:
-        return store[key]
+    ## Without this lock, job avoidance breaks when starting two jobs simultaneously!!
+    with read_lock:
+        with pd.HDFStore(
+          "dummy_hdf5",
+          mode = "r",
+          driver = "H5FD_CORE",
+          driver_core_backing_store = 0,
+          driver_core_image = buf.read()
+        ) as store:
+            return store[key]
