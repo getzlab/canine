@@ -10,7 +10,7 @@ import io
 import datetime
 import sys
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost
+from ..utils import get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost, get_gcp_username
 
 import googleapiclient.discovery as gd
 import googleapiclient.errors
@@ -84,7 +84,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             key=lambda img:datetime.datetime.strptime(img['creationTimestamp'], TIMESTAMP_FORMAT),
             reverse=True
         )[0]
-        key = hashlib.md5((worker_image['name']+worker_image['labelFingerprint']).encode()).hexdigest()[:6]
+        key = hashlib.md5((project+get_gcp_username()+worker_image['name']+worker_image['labelFingerprint']).encode()).hexdigest()[:6]
         personalized_image_name = 'canine-tgcp-{}'.format(key)
         print(crayons.green("Checking for personalized version of latest base image...", bold=True))
         try:
@@ -130,8 +130,11 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 }
             ).execute()
             print(crayons.green("Starting personalizer instance...", bold=True))
-            time.sleep(45)
+            time.sleep(30)
             try:
+                print(crayons.green("Waiting for personalizer to start...", bold=True))
+                while subprocess.run('gcloud compute ssh canine-tgcp-worker-personalizer --zone us-central1-a -- ls', shell=True).returncode != 0:
+                    time.sleep(15)
                 print(crayons.green("Running personalization script...", bold=True))
                 subprocess.check_call(
                     'gcloud compute ssh canine-tgcp-worker-personalizer --zone us-central1-a -- bash /opt/canine/personalize_worker.sh',
@@ -379,47 +382,41 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         cluster_cost = 0
         worker_cpu_cost = 0
         job_cost = None
-        if node_uptime is not None:
-            worker_info = {
-                'mtype': self.config['compute_machine_type'],
-                'preemptible': self.config['preemptible_bursting']
-            }
-            if self.config['compute_disk_type'] == 'pd-ssd':
-                worker_info['ssd_size'] = self.config['compute_disk_size_gb']
-            else:
-                worker_info['hdd_size'] = self.config['compute_disk_size_gb']
-            if 'gpu_type' in self.config and 'gpu_count' in self.config and self.config['gpu_count'] > 0:
-                worker_info['gpu_type'] = self.config['gpu_type']
-                worker_info['gpu_count'] = self.config['gpu_count']
-            worker_hourly_cost = gcp_hourly_cost(**worker_info)
-            cluster_cost += node_uptime * worker_hourly_cost
-            mtype_prefix = self.config['compute_machine_type'][:3]
-            if mtype_prefix in {'f1-', 'g1-'}:
-                ncpus = 1
-            elif mtype_prefix == 'cus': # n1-custom-X
-                ncpus = int(self.config['compute_machine_type'].split('-')[1])
-            else:
-                ncpus = int(self.config['compute_machine_type'].split('-')[2])
-            # Approximates the cost burden / CPU hour of the VM
-            worker_cpu_cost = worker_hourly_cost / ncpus
+        # if node_uptime is not None:
+        #     worker_info = {
+        #         'mtype': self.config['compute_machine_type'],
+        #         'preemptible': self.config['preemptible_bursting']
+        #     }
+        #     if self.config['compute_disk_type'] == 'pd-ssd':
+        #         worker_info['ssd_size'] = self.config['compute_disk_size_gb']
+        #     else:
+        #         worker_info['hdd_size'] = self.config['compute_disk_size_gb']
+        #     if 'gpu_type' in self.config and 'gpu_count' in self.config and self.config['gpu_count'] > 0:
+        #         worker_info['gpu_type'] = self.config['gpu_type']
+        #         worker_info['gpu_count'] = self.config['gpu_count']
+        #     worker_hourly_cost = gcp_hourly_cost(**worker_info)
+        #     cluster_cost += node_uptime * worker_hourly_cost
+        #     mtype_prefix = self.config['compute_machine_type'][:3]
+        #     if mtype_prefix in {'f1-', 'g1-'}:
+        #         ncpus = 1
+        #     elif mtype_prefix == 'cus': # n1-custom-X
+        #         ncpus = int(self.config['compute_machine_type'].split('-')[1])
+        #     else:
+        #         ncpus = int(self.config['compute_machine_type'].split('-')[2])
+        #     # Approximates the cost burden / CPU hour of the VM
+        #     worker_cpu_cost = worker_hourly_cost / ncpus
         if clock_uptime is not None:
             controller_info = {
-                'mtype': self.config['controller_machine_type'],
+                'mtype': self.controller_type,
                 'preemptible': False,
+                'hdd_size': self.controller_disk_size
             }
-            if self.config['controller_disk_type'] == 'pd-ssd':
-                controller_info['ssd_size'] = self.config['controller_disk_size_gb']
-            else:
-                controller_info['hdd_size'] = self.config['controller_disk_size_gb']
-            if 'controller_secondary_disk_size_gb' in self.config:
-                if 'hdd_size' in controller_info:
-                    controller_info['hdd_size'] += self.config['controller_secondary_disk_size_gb']
-                elif self.config['controller_secondary_disk_size_gb'] > 0:
-                    controller_info['hdd_size'] = self.config['controller_secondary_disk_size_gb']
+            if 'sec' in self.config and self.config['sec'] != '-':
+                controller_info['hdd_size'] += int(self.config['sec'])
             cluster_cost += clock_uptime * gcp_hourly_cost(**controller_info)
-        if job_cpu_time is not None:
-            job_cost = {
-                job_id: worker_cpu_cost * cpu_time
-                for job_id, cpu_time in job_cpu_time.items()
-            }
+        # if job_cpu_time is not None:
+        #     job_cost = {
+        #         job_id: worker_cpu_cost * cpu_time
+        #         for job_id, cpu_time in job_cpu_time.items()
+        #     }
         return cluster_cost, job_cost

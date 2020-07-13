@@ -9,6 +9,7 @@ import functools
 import shlex
 from subprocess import CalledProcessError
 import google.auth
+from google.auth.transport.requests import AuthorizedSession
 import paramiko
 import shutil
 import time
@@ -154,6 +155,28 @@ def get_default_gcp_project():
             stacklevel=1
         )
     return __DEFAULT_GCP_PROJECT__
+
+__DEFAULT_GCP_USER__ = None
+
+def get_gcp_username():
+    """
+    Returns the current application-default username
+    """
+    global __DEFAULT_GCP_USER__
+    try:
+        if __DEFAULT_GCP_USER__ is None:
+            creds, _ = google.auth.default()
+            __DEFAULT_GCP_USER__ = AuthorizedSession(
+                google.auth.default()[0]
+            ).get(
+                "https://www.googleapis.com/oauth2/v1/tokeninfo"
+            ).json()['email']
+    except:
+        warnings.warn(
+            "Unable to load gcloud credentials. Some features may not function properly",
+            stacklevel=1
+        )
+    return __DEFAULT_GCP_USER__
 
 def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None, stderr: typing.Optional[typing.BinaryIO] = None):
     """

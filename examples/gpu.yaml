@@ -8,6 +8,7 @@ resources:
   cpus-per-task: 1
   mem-per-cpu: 3072M
   gres: "gpu:1"
+  partition: n1-standard
 backend:
   type: TransientGCP
   name: canine-gpu
@@ -17,6 +18,8 @@ backend:
   compute_disk_size: 30
   gpu_type: nvidia-tesla-p4
   gpu_count: 1
+  preemptible: false
+  external_ip: true
 localization:
   overrides:
     dummy_input: null
