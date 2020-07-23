@@ -69,7 +69,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             io.BytesIO(proc.stdout),
             index_col=0
         )
-        return df['EMAIL']['Compute Engine default service account']
+        df = df[~df['DISABLED']]
+        return df['EMAIL']['Compute Engine default service account'] if 'Compute Engine default service account' in df.index else df['EMAIL']['Compute']
 
     @staticmethod
     def personalize_worker_image(project: typing.Optional[str] = None):
