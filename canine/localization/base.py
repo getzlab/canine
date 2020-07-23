@@ -17,32 +17,38 @@ from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBacken
 from ..utils import get_default_gcp_project, check_call
 from hound.client import _getblob_bucket
 from agutil import status_bar
+import pandas as pd
 
 Localization = namedtuple("Localization", ['type', 'path'])
-# types: stream, download, None
+# types: stream, download, local, None
 # indicates what kind of action needs to be taken during job startup
 
 PathType = namedtuple(
     'PathType',
-    ['localpath', 'controllerpath', 'computepath']
+    ['localpath', 'remotepath']
 )
 
 class AbstractLocalizer(abc.ABC):
     """
     Base class for localization.
     """
-    requester_pays = {}
+
 
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
-        common: bool = True, staging_dir: str = None, mount_path: str = None,
-        project: typing.Optional[str] = None, **kwargs
+        common: bool = True, staging_dir: str = None,
+        project: typing.Optional[str] = None, temporary_disk_type: str = 'standard',
+        local_download_dir: typing.Optional[str] = None, **kwargs
     ):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
         the localizer's entire life cycle.
-        If staging_dir is not provided, a random directory is chosen
+        If staging_dir is not provided, a random directory is chosen.
+        local_download_dir: Where `local` overrides should be saved. Default: /mnt/canine-local-downloads/(random id).
+        temporary_disk_type: "standard" or "ssd". Default "standard".
+        NOTE: If temporary_disk_type is explicitly "None", disks will not be created. Files will be downloaded
+        to local_download_dir without mounting a disk there. The directory will not be created in that case
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -50,19 +56,11 @@ class AbstractLocalizer(abc.ABC):
         self.backend = backend
         self.common = common
         self.common_inputs = set()
-        self.__sbcast = False
-        if staging_dir == 'SBCAST':
-            # FIXME: This doesn't actually do anything yet
-            # If sbcast is true, then localization needs to use backend.sbcast to move files to the remote system
-            # Not sure at all how delocalization would work
-            self.__sbcast = True
-            staging_dir = None
-        self.staging_dir = staging_dir if staging_dir is not None else str(uuid4())
         self._local_dir = tempfile.TemporaryDirectory()
         self.local_dir = self._local_dir.name
         # FIXME: This doesn't actually make sense. Unless we assume staging_dir == mount_path, then transport.normpath gives an inaccurate mount_path
         with self.backend.transport() as transport:
-            self.mount_path = transport.normpath(mount_path if mount_path is not None else self.staging_dir)
+            self.staging_dir = transport.normpath(staging_dir if staging_dir is not None else str(uuid4()))
             # if transport.isdir(self.staging_dir) and not force:
             #     raise FileExistsError("{} already exists. Supply force=True to override".format(
             #         self.staging_dir
@@ -70,6 +68,11 @@ class AbstractLocalizer(abc.ABC):
         self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
+        self.local_download_size = {} # {jobId: size}
+        self.disk_key = os.urandom(4).hex()
+        self.local_download_dir = local_download_dir if local_download_dir is not None else '/mnt/canine-local-downloads/{}'.format(self.disk_key)
+        self.temporary_disk_type = temporary_disk_type
+        self.requester_pays = {}
 
     def get_requester_pays(self, path: str) -> bool:
         """
@@ -80,16 +83,42 @@ class AbstractLocalizer(abc.ABC):
             path = path[5:]
         bucket = path.split('/')[0]
         if bucket not in self.requester_pays:
-            command = 'gsutil ls gs://{}'.format(path)
-            try:
-                # We check on the remote host because scope differences may cause
-                # a requester pays bucket owned by this account to require -u on the controller
-                # better safe than sorry
+            command = 'gsutil requesterpays get gs://{}'.format(bucket)
+            # We check on the remote host because scope differences may cause
+            # a requester pays bucket owned by this account to require -u on the controller
+            # better safe than sorry
+            rc, sout, serr = self.backend.invoke(command)
+            text = serr.read()
+            if rc == 0 or b'BucketNotFoundException: 404' not in text:
+                self.requester_pays[bucket] = (
+                    b'requester pays bucket but no user project provided' in text
+                    or 'gs://{}: Enabled'.format(bucket).encode() in sout.read()
+                )
+            else:
+                # Try again ls-ing the object itself
+                # sometimes permissions can disallow bucket inspection
+                # but allow object inspection
+                command = 'gsutil ls gs://{}'.format(path)
                 rc, sout, serr = self.backend.invoke(command)
-                self.requester_pays[bucket] = len([line for line in serr.readlines() if b'requester pays bucket but no user project provided' in line]) >= 1
-            except subprocess.CalledProcessError:
-                pass
+                text = serr.read()
+                self.requester_pays[bucket] = b'requester pays bucket but no user project provided' in text
+            if rc == 1 and b'BucketNotFoundException: 404' in text:
+                print(text.decode(), file=sys.stderr)
+                raise subprocess.CalledProcessError(rc, command)
         return bucket in self.requester_pays and self.requester_pays[bucket]
+
+    def get_object_size(self, path: str) -> int:
+        """
+        Returns the total number of bytes of the given gsutil object.
+        If a directory is given, this will return the total space used by all objects in the directory
+        """
+        cmd = 'gsutil {} du -s {}'.format(
+            '-u {}'.format(self.project) if self.get_requester_pays(path) else '',
+            path
+        )
+        rc, sout, serr = self.backend.invoke(cmd)
+        check_call(cmd, rc, sout, serr)
+        return int(sout.read().split()[0])
 
     @contextmanager
     def transport_context(self, transport: typing.Optional[AbstractTransport] = None) -> typing.ContextManager[AbstractTransport]:
@@ -106,10 +135,10 @@ class AbstractLocalizer(abc.ABC):
     def environment(self, location: str) -> typing.Dict[str, str]:
         """
         Returns environment variables relative to the given location.
-        Location must be one of {"local", "controller", "compute"}
+        Location must be one of {"local", "remote"}
         """
-        if location not in {"local", "controller", "compute"}:
-            raise ValueError('location must be one of {"local", "controller", "compute"}')
+        if location not in {"local", "remote"}:
+            raise ValueError('location must be one of {"local", "remote"}')
         if location == 'local':
             return {
                 'CANINE_ROOT': self.local_dir,
@@ -117,20 +146,14 @@ class AbstractLocalizer(abc.ABC):
                 'CANINE_OUTPUT': os.path.join(self.local_dir, 'outputs'), #outputs/jobid/outputname/...files...
                 'CANINE_JOBS': os.path.join(self.local_dir, 'jobs'),
             }
-        elif location == "controller":
+        elif location == "remote":
             return {
                 'CANINE_ROOT': self.staging_dir,
                 'CANINE_COMMON': os.path.join(self.staging_dir, 'common'),
                 'CANINE_OUTPUT': os.path.join(self.staging_dir, 'outputs'), #outputs/jobid/outputname/...files...
                 'CANINE_JOBS': os.path.join(self.staging_dir, 'jobs'),
             }
-        elif location == "compute":
-            return {
-                'CANINE_ROOT': self.mount_path,
-                'CANINE_COMMON': os.path.join(self.mount_path, 'common'),
-                'CANINE_OUTPUT': os.path.join(self.mount_path, 'outputs'),
-                'CANINE_JOBS': os.path.join(self.mount_path, 'jobs'),
-            }
+
     def gs_dircp(self, src: str, dest: str, context: str, transport: typing.Optional[AbstractTransport] = None):
         """
         gs_copy for directories
@@ -336,16 +359,38 @@ class AbstractLocalizer(abc.ABC):
         """
         return PathType(
             os.path.join(self.environment('local')['CANINE_ROOT'], *(str(component) for component in args)),
-            os.path.join(self.environment('controller')['CANINE_ROOT'], *(str(component) for component in args)),
-            os.path.join(self.environment('compute')['CANINE_ROOT'], *(str(component) for component in args))
+            os.path.join(self.environment('remote')['CANINE_ROOT'], *(str(component) for component in args)),
         )
+
+    def build_manifest(self, transport: typing.Optional[AbstractTransport] = None) -> pd.DataFrame:
+        """
+        Returns the job output manifest from this pipeline.
+        Builds the manifest if it does not exist
+        """
+        with self.transport_context() as transport:
+            output_dir = transport.normpath(self.environment('remote')['CANINE_OUTPUT'])
+            if not transport.isfile(os.path.join(output_dir, '.canine_pipeline_manifest.tsv')):
+                script_path = self.backend.pack_batch_script(
+                    'export CANINE_OUTPUTS={}'.format(output_dir),
+                    'cat <(echo "jobId\tfield\tpath") $CANINE_OUTPUTS/*/.canine_job_manifest > $CANINE_OUTPUTS/.canine_pipeline_manifest.tsv',
+                    'rm -f $CANINE_OUTPUTS/*/.canine_job_manifest',
+                    script_path=os.path.join(output_dir, 'manifest.sh')
+                )
+                check_call(
+                    script_path,
+                    *self.backend.invoke(os.path.abspath(script_path))
+                )
+                transport.remove(script_path)
+            with transport.open(os.path.join(output_dir, '.canine_pipeline_manifest.tsv'), 'r') as r:
+                return pd.read_csv(r, sep='\t', dtype='str').set_index(['jobId', 'field'])
 
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: str = 'canine_output') -> typing.Dict[str, typing.Dict[str, str]]:
         """
         Delocalizes output from all jobs
         """
+        self.build_manifest()
         self.receivetree(
-            self.environment('controller')['CANINE_OUTPUT'],
+            self.environment('remote')['CANINE_OUTPUT'],
             output_dir,
             exist_okay=True
         )
@@ -395,7 +440,7 @@ class AbstractLocalizer(abc.ABC):
         (such as those dropped during transfer for being empty).
         Returns the absolute path of the remote staging directory on the controller node.
         """
-        controller_env = self.environment('controller')
+        controller_env = self.environment('remote')
         with self.transport_context(transport) as transport:
             if not transport.isdir(controller_env['CANINE_COMMON']):
                 transport.mkdir(controller_env['CANINE_COMMON'])
@@ -403,7 +448,7 @@ class AbstractLocalizer(abc.ABC):
                 transport.mkdir(controller_env['CANINE_JOBS'])
             if len(jobs) and not transport.isdir(controller_env['CANINE_OUTPUT']):
                 transport.mkdir(controller_env['CANINE_OUTPUT'])
-            return transport.normpath(self.staging_dir)
+            return self.staging_dir
 
     def prepare_job_inputs(self, jobId: str, job_inputs: typing.Dict[str, str], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None):
         """
@@ -438,7 +483,7 @@ class AbstractLocalizer(abc.ABC):
                                 'stream',
                                 value
                             )
-                    elif mode in ['localize', 'symlink']:
+                    elif mode in {'localize', 'symlink'}:
                         self.inputs[jobId][arg] = Localization(
                             None,
                             self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
@@ -448,7 +493,7 @@ class AbstractLocalizer(abc.ABC):
                             self.inputs[jobId][arg].path,
                             transport=transport
                         )
-                    elif mode == 'delayed':
+                    elif mode in {'delayed', 'local'}:
                         if not value.startswith('gs://'):
                             print("Ignoring 'delayed' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
                             self.inputs[jobId][arg] = Localization(
@@ -459,6 +504,12 @@ class AbstractLocalizer(abc.ABC):
                                 value,
                                 self.inputs[jobId][arg].path,
                                 transport=transport
+                            )
+                        elif mode == 'local':
+                            self.local_download_size[jobId] = self.local_download_size.get(jobId, 0) + self.get_object_size(value)
+                            self.inputs[jobId][arg] = Localization(
+                                'local',
+                                value
                             )
                         else:
                             self.inputs[jobId][arg] = Localization(
@@ -483,56 +534,114 @@ class AbstractLocalizer(abc.ABC):
                         value
                     )
 
-    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str]:
+    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
         """
-        Returns a tuple of (setup script, teardown script) for the given job id.
+        Returns a tuple of (setup script, localization script, teardown script) for the given job id.
         Must call after pre-scanning inputs
         """
+
+		# generate job variable, exports, and localization_tasks arrays
+		# - job variables and exports are set when setup.sh is _sourced_
+		# - localization tasks are run when localization.sh is _run_
         job_vars = []
         exports = []
-        extra_tasks = [
+        docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
+        localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
-        compute_env = self.environment('compute')
+        local_download_size = self.local_download_size.get(jobId, 0)
+        disk_name = None
+        if local_download_size > 0 and self.temporary_disk_type is not None:
+            local_download_size = max(
+                10,
+                1+int(local_download_size / 1022611260) # bytes -> gib with 5% safety margin
+            )
+            if local_download_size > 65535:
+                raise ValueError("Cannot provision {} GB disk for job {}".format(local_download_size, jobId))
+            disk_name = 'canine-{}-{}-{}'.format(self.disk_key, os.urandom(4).hex(), jobId)
+            device_name = 'cn{}{}'.format(os.urandom(2).hex(), jobId)
+            exports += [
+                'export CANINE_LOCAL_DISK_SIZE={}GB'.format(local_download_size),
+                'export CANINE_LOCAL_DISK_TYPE={}'.format(self.temporary_disk_type),
+                'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)',
+                'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone))',
+                'export CANINE_LOCAL_DISK_DIR={}/{}'.format(self.local_download_dir, disk_name),
+            ]
+            localization_tasks += [
+                'sudo mkdir -p $CANINE_LOCAL_DISK_DIR',
+                'if [[ -z "$CANINE_NODE_NAME" ]]; then echo "Unable to provision disk (not running on GCE instance). Attempting download to directory on boot disk" > /dev/stderr; else',
+                'echo Provisioning and mounting temporary disk {}'.format(disk_name),
+                'gcloud compute disks create {} --size {} --type pd-{} --zone $CANINE_NODE_ZONE'.format(
+                    disk_name,
+                    local_download_size,
+                    self.temporary_disk_type
+                ),
+                'gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {} --device-name {}'.format(
+                    disk_name,
+                    device_name
+                ),
+                'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
+                'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
+
+                'sudo mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
+                    device_name,
+                ),
+                'sudo chmod -R a+rwX {}'.format(self.local_download_dir),
+                'fi'
+            ]
+            docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+        compute_env = self.environment('remote')
+        stream_dir_ready = False
         for key, val in self.inputs[jobId].items():
             if val.type == 'stream':
                 job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                extra_tasks += [
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest.computepath),
-                    'mkfifo {}'.format(dest.computepath),
+                if not stream_dir_ready:
+                    exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
+                    docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
+                    stream_dir_ready = True
+                dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(val.path)))
+                localization_tasks += [
+                    'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
+                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
+                    'mkfifo {}'.format(dest),
                     "gsutil {} cat {} > {} &".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
-                        dest.computepath
+                        dest
                     )
                 ]
                 exports.append('export {}="{}"'.format(
                     key,
-                    dest.computepath
+                    dest
                 ))
-            elif val.type == 'download':
+            elif val.type in {'download', 'local'}:
                 job_vars.append(shlex.quote(key))
-                dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                extra_tasks += [
+                if val.type == 'download':
+                    dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
+                else:
+                    # Local and controller paths not needed on this object
+                    dest = PathType(None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
+                localization_tasks += [
                     "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
                         '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                         shlex.quote(val.path),
-                        dest.computepath
+                        dest.remotepath
                     )
                 ]
                 exports.append('export {}="{}"'.format(
                     key,
-                    dest.computepath
+                    dest.remotepath
                 ))
             elif val.type is None:
                 job_vars.append(shlex.quote(key))
                 exports.append('export {}={}'.format(
                     key,
-                    shlex.quote(val.path.computepath if isinstance(val.path, PathType) else val.path)
+                    shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path)
                 ))
             else:
                 print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
+
+        # generate setup script
         setup_script = '\n'.join(
             line.rstrip()
             for line in [
@@ -541,11 +650,21 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
+                'export CANINE_JOB_LOCALIZATION="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'localization.sh')),
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_ROOT',
-            ] + exports + extra_tasks
-        ) + '\ncd $CANINE_JOB_ROOT\n'
+                'chmod 755 $CANINE_JOB_LOCALIZATION',
+            ] + exports
+        ) + '\nexport CANINE_DOCKER_ARGS="{docker}"\ncd $CANINE_JOB_ROOT\n'.format(docker=' '.join(docker_args))
+
+        # generate localization script
+        localization_script = '\n'.join([
+          "#!/bin/bash",
+          "set -e"
+        ] + localization_tasks) + "\nset +e\n"
+
+        # generate teardown script
         teardown_script = '\n'.join(
             line.rstrip()
             for line in [
@@ -561,9 +680,16 @@ class AbstractLocalizer(abc.ABC):
                         for name, pattern in patterns.items()
                     )
                 ),
-            ]
+                'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi'
+            ] + (
+                [
+                    'sudo umount {}/{}'.format(self.local_download_dir, disk_name),
+                    'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
+                    'gcloud compute disks delete {} --zone $CANINE_NODE_ZONE'.format(disk_name)
+                ] if disk_name is not None else []
+            )
         )
-        return setup_script, teardown_script
+        return setup_script, localization_script, teardown_script
 
     @abc.abstractmethod
     def __enter__(self):
@@ -600,7 +726,7 @@ class AbstractLocalizer(abc.ABC):
         3 phase task:
         1) Pre-scan inputs to determine proper localization strategy for all inputs
         2) Begin localizing job inputs. For each job, check the predetermined strategy
-        and set up the job's setup and teardown scripts
+        and set up the job's setup, localization, and teardown scripts
         3) Finally, finalize the localization. This may include broadcasting the
         staging directory or copying a batch of gsutil files
         Returns the remote staging directory, which is now ready for final startup

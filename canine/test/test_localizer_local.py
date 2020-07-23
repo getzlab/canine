@@ -64,7 +64,7 @@ class TestUnit(unittest.TestCase):
             self.assertTrue(os.path.isdir(os.path.join(self.localizer.local_dir, 'dirc')))
             self.assertFalse(os.path.isdir(os.path.join(self.localizer.local_dir, 'dirc', 'dird')))
             self.assertIn(
-                (os.path.dirname(__file__), os.path.join(self.localizer.reserve_path('dirc', 'dird').controllerpath, os.path.basename(os.path.dirname(__file__)))),
+                (os.path.dirname(__file__), os.path.join(self.localizer.reserve_path('dirc', 'dird').remotepath, os.path.basename(os.path.dirname(__file__)))),
                 self.localizer.queued_batch
             )
 

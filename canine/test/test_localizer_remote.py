@@ -64,7 +64,7 @@ class TestUnit(unittest.TestCase):
             self.assertTrue(transport.isdir(os.path.join(self.localizer.staging_dir, 'dirc')))
             self.assertTrue(transport.isdir(os.path.join(self.localizer.staging_dir, 'dirc', 'test')))
 
-            for (ldirpath, ldirnames, lfilenames), (rdirpath, rdirnames, rfilenames) in zip(os.walk(os.path.dirname(__file__)), transport.walk(self.localizer.reserve_path('dirc', 'test').controllerpath)):
+            for (ldirpath, ldirnames, lfilenames), (rdirpath, rdirnames, rfilenames) in zip(os.walk(os.path.dirname(__file__)), transport.walk(self.localizer.reserve_path('dirc', 'test').remotepath)):
                 with self.subTest(dirname=ldirpath):
                     self.assertEqual(os.path.basename(ldirpath), os.path.basename(rdirpath))
                     self.assertListEqual(sorted(ldirnames), sorted(rdirnames))

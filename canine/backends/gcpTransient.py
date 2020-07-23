@@ -9,8 +9,9 @@ import hashlib
 import io
 import datetime
 import sys
+import warnings
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost, get_gcp_username
+from ..utils import get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost, get_gcp_username
 
 import googleapiclient.discovery as gd
 import googleapiclient.errors
@@ -187,9 +188,15 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         controller_type: str = 'n1-standard-4', preemptible: bool = True, external_ip: bool = False,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
-        **kwargs : typing.Any
+        external_compute_ips: bool = False, **kwargs : typing.Any
     ):
         self.project = project if project is not None else get_default_gcp_project()
+        if self.project is None:
+            raise ValueError("No GCP project was provided and a project could not be auto-detected")
+        if compute_zone is None:
+            compute_zone = get_default_gcp_zone()
+            if compute_zone is None:
+                raise ValueError("No GCP zone was provided and a project could not be auto-detected")
         super().__init__('{}-controller.{}.{}'.format(
             name,
             compute_zone,

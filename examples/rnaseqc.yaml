@@ -1,6 +1,6 @@
 name: RNA-SeQC
 script:
-  - sudo docker run --rm -v $CANINE_ROOT:$CANINE_ROOT -v $CANINE_JOB_ROOT:/output gcr.io/broad-cga-aarong-gtex/rnaseqc rnaseqc $genes_gtf $bam_file output --coverage -vv
+  - sudo docker run --rm $CANINE_DOCKER_ARGS gcr.io/broad-cga-aarong-gtex/rnaseqc rnaseqc $genes_gtf $bam_file $CANINE_JOB_ROOT --coverage -vv
 resources:
   cpus-per-task: 1
   mem-per-cpu: 3072M
