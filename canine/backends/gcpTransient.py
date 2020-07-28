@@ -50,8 +50,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
 
     @staticmethod
     def get_controller_image() -> str:
-        # Global base images stored in broad-cga-aarong-gtex
-        controller_images = gce.images().list(project='broad-cga-aarong-gtex', filter='family = canine-tgcp-controller').execute()
+        # Global base images stored in broad-getzlab-wolfws-202007
+        controller_images = gce.images().list(project='broad-getzlab-wolfws-202007', filter='family = canine-tgcp-controller').execute()
         if 'items' not in controller_images or len(controller_images['items']) < 1:
             raise ValueError("No public controller images found")
         return sorted(
@@ -84,8 +84,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         if project is None:
             project = get_default_gcp_project()
         print(crayons.green("Checking current base images...", bold=True))
-        # Global base images stored in broad-cga-aarong-gtex
-        worker_images = gce.images().list(project='broad-cga-aarong-gtex', filter='family = canine-tgcp-worker').execute()
+        # Global base images stored in broad-getzlab-wolfws-202007
+        worker_images = gce.images().list(project='broad-getzlab-wolfws-202007', filter='family = canine-tgcp-worker').execute()
         if 'items' not in worker_images or len(worker_images['items']) < 1:
             raise ValueError("No public worker images found")
         worker_image = sorted(
