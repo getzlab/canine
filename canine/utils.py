@@ -207,7 +207,6 @@ def get_gcp_username():
     global __DEFAULT_GCP_USER__
     try:
         if __DEFAULT_GCP_USER__ is None:
-            creds, _ = google.auth.default()
             __DEFAULT_GCP_USER__ = AuthorizedSession(
                 google.auth.default()[0]
             ).get(
