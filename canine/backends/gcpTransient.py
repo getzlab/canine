@@ -49,7 +49,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
 
     @staticmethod
-    def get_controller_image():
+    def get_controller_image() -> str:
+        # Global base images stored in broad-cga-aarong-gtex
         controller_images = gce.images().list(project='broad-cga-aarong-gtex', filter='family = canine-tgcp-controller').execute()
         if 'items' not in controller_images or len(controller_images['items']) < 1:
             raise ValueError("No public controller images found")
@@ -60,9 +61,9 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         )[0]['selfLink']
 
     @staticmethod
-    def get_compute_service_account():
+    def get_compute_service_account(project: str) -> str:
         proc = subprocess.run(
-            'gcloud iam service-accounts list',
+            'gcloud iam service-accounts list --project {}'.format(project),
             shell=True,
             stdout=subprocess.PIPE
         )
@@ -74,10 +75,16 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         return df['EMAIL']['Compute Engine default service account'] if 'Compute Engine default service account' in df.index else df['EMAIL']['Compute']
 
     @staticmethod
-    def personalize_worker_image(project: typing.Optional[str] = None):
+    def personalize_worker_image(project: typing.Optional[str] = None) -> typing.Tuple[str, str]:
+        """
+        Checks for a personalized image for thhe latest base worker image.
+        Generates the image if needed.
+        Returns a tuple containing thhe image name, and image family
+        """
         if project is None:
             project = get_default_gcp_project()
         print(crayons.green("Checking current base images...", bold=True))
+        # Global base images stored in broad-cga-aarong-gtex
         worker_images = gce.images().list(project='broad-cga-aarong-gtex', filter='family = canine-tgcp-worker').execute()
         if 'items' not in worker_images or len(worker_images['items']) < 1:
             raise ValueError("No public worker images found")
@@ -86,12 +93,17 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             key=lambda img:datetime.datetime.strptime(img['creationTimestamp'], TIMESTAMP_FORMAT),
             reverse=True
         )[0]
-        key = hashlib.md5((project+get_gcp_username()+worker_image['name']+worker_image['labelFingerprint']).encode()).hexdigest()[:6]
+        username = get_gcp_username()
+        key = hashlib.md5((project+username+worker_image['name']+worker_image['labelFingerprint']).encode()).hexdigest()[:6]
         personalized_image_name = 'canine-tgcp-{}'.format(key)
+        personalized_family = 'canine-tgcp-personalized-{}'.format(
+            hashlib.md5((project+username).encode()).hexdigest()[:6]
+        )
+        instance_name = 'canine-tgcp-personalizer-{}'.format(key)
         print(crayons.green("Checking for personalized version of latest base image...", bold=True))
         try:
             gce.images().get(project=project, image=personalized_image_name).execute()
-            return personalized_image_name
+            return personalized_image_name, personalized_family
         except googleapiclient.errors.HttpError as e:
             if e.args[0]['status'] != '404':
                 raise
@@ -103,7 +115,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 zone='us-central1-a',
                 body={
                     'description': 'Temporary instance to personalize the Canine TGCP worker image',
-                    'name': 'canine-tgcp-worker-personalizer',
+                    'name': instance_name,
                     'machineType': 'zones/us-central1-a/machineTypes/f1-micro',
                     'disks': [
                         {
@@ -135,18 +147,18 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             time.sleep(30)
             try:
                 print(crayons.green("Waiting for personalizer to start...", bold=True))
-                while subprocess.run('gcloud compute ssh canine-tgcp-worker-personalizer --zone us-central1-a -- ls', shell=True).returncode != 0:
+                while subprocess.run('gcloud compute ssh {} --zone us-central1-a  --project {} -- ls'.format(instance_name, project), shell=True).returncode != 0:
                     time.sleep(15)
                 print(crayons.green("Running personalization script...", bold=True))
                 subprocess.check_call(
-                    'gcloud compute ssh canine-tgcp-worker-personalizer --zone us-central1-a -- bash /opt/canine/personalize_worker.sh',
+                    'gcloud compute ssh {} --zone us-central1-a  --project {} -- bash /opt/canine/personalize_worker.sh'.format(instance_name, project),
                     shell=True
                 )
                 time.sleep(10)
                 # Running from CLI is easier, because it will block until stopped
                 print(crayons.green("Stopping instance...", bold=True))
                 subprocess.check_call(
-                    'gcloud compute instances stop canine-tgcp-worker-personalizer --zone us-central1-a',
+                    'gcloud compute instances stop {} --zone us-central1-a --project {} '.format(instance_name, project),
                     shell=True
                 )
                 print(crayons.green("Generating image...", bold=True))
@@ -165,22 +177,33 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                     ' --description "{description}" --source-disk-zone {zone}'
                     ' --source-disk {instance} --family {family}'.format(
                         name=personalized_image_name,
-                        description='Personalized version of the Canine TransientGCP worker image',
-                        instance='canine-tgcp-worker-personalizer',
-                        family='canine-tgcp-worker-personalized',
+                        description='Personalized version of the Canine TransientGCP worker image for {}'.format(username),
+                        instance=instance_name,
+                        family=personalized_family,
                         project=project,
                         zone='us-central1-a'
                     ),
                     shell=True
                 )
                 time.sleep(10)
+                return personalized_image_name, personalized_family
             finally:
                 print(crayons.green("Deleting instance...", bold=True))
-                gce.instances().delete(
-                    project=project,
-                    zone='us-central1-a',
-                    instance='canine-tgcp-worker-personalizer'
-                ).execute()
+                try:
+                    gce.instances().delete(
+                        project=project,
+                        zone='us-central1-a',
+                        instance=instance_name
+                    ).execute()
+                except:
+                    subprocess.check_call(
+                        'gcloud compute instances delete --project {} --zone {} {} --quiet'.format(
+                            project,
+                            'us-central1-a',
+                            instance_name
+                        ),
+                        shell=True
+                    )
 
 
     def __init__(
@@ -236,7 +259,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         Set up the NFS server and SLURM cluster
         Use default VPC
         """
-        TransientGCPSlurmBackend.personalize_worker_image(self.project)
+        image, family = TransientGCPSlurmBackend.personalize_worker_image(self.project)
         disks = [
             {
                 'boot': True,
@@ -253,7 +276,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         if self.config['sec'] != '-':
             print(crayons.red("Secondary disks currently not supported", bold=True))
         try:
-            gce.instances().insert(
+            result = gce.instances().insert(
                 project=self.project,
                 zone=self.zone,
                 body={
@@ -298,12 +321,16 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                             {
                                 'key': 'canine_conf_user',
                                 'value': getpass.getuser()
+                            },
+                            {
+                                'key': 'canine_conf_family',
+                                'value': family
                             }
                         ]
                     },
                     'serviceAccounts': [
                         {
-                            'email': TransientGCPSlurmBackend.get_compute_service_account(),
+                            'email': TransientGCPSlurmBackend.get_compute_service_account(self.project),
                             'scopes': [
                                 'https://www.googleapis.com/auth/compute',
                                 'https://www.googleapis.com/auth/cloud-platform'
@@ -349,18 +376,31 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             'gcloud compute config-ssh --remove',
             shell=True
         )
-        instances = gce.instances().list(
-            project=self.project,
-            zone=self.zone,
-            filter='labels.k9cluster = "{}"'.format(self.config['cluster_name'])
-        ).execute()['items']
-        for instance in instances:
-            print(crayons.red("Deleting instance:"), instance['name'])
-            gce.instances().delete(
+        try:
+            instances = gce.instances().list(
                 project=self.project,
                 zone=self.zone,
-                instance=instance['name']
-            ).execute()
+                filter='labels.k9cluster = "{}"'.format(self.config['cluster_name'])
+            ).execute()['items']
+            for instance in instances:
+                print(crayons.red("Deleting instance:"), instance['name'])
+                try:
+                    gce.instances().delete(
+                        project=self.project,
+                        zone=self.zone,
+                        instance=instance['name']
+                    ).execute()
+                except:
+                    subprocess.check_call(
+                        'gcloud compute instances delete --project {} --zone {} {} --quiet'.format(
+                            self.project,
+                            self.zone,
+                            instance['name']
+                        ),
+                        shell=True
+                    )
+        except KeyError:
+            pass
 
     def __exit__(self, *args):
         """
