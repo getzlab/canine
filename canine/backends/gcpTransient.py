@@ -254,6 +254,38 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         )
 
     def __enter__(self):
+        try:
+            self.start()
+            print(crayons.green("Starting controller instance...", bold=True))
+            time.sleep(45)
+            subprocess.check_call(
+                'gcloud compute config-ssh --project {}'.format(self.project),
+                shell=True
+            )
+            subprocess.check_call(
+                'gcloud compute os-login ssh-keys add --key-file '
+                '~/.ssh/google_compute_engine.pub --project {} >/dev/null'.format(
+                    self.project
+                ),
+                shell=True
+            )
+            self.load_config_args()
+            print(crayons.green("Connecting to controller instance...", bold=True))
+            time.sleep(45) # Key propagation time
+            super().__enter__()
+            print("Waiting for slurm to initialize")
+            rc, sout, serr = self.invoke("which sinfo")
+            while rc != 0:
+                time.sleep(10)
+                rc, sout, serr = self.invoke("which sinfo")
+            # time.sleep(60)
+            print("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
+            return self
+        except:
+            self.stop()
+            raise
+
+    def start(self):
         """
         Create NFS server
         Set up the NFS server and SLURM cluster
@@ -339,31 +371,6 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                     ]
                 }
             ).execute()
-            print(crayons.green("Starting controller instance...", bold=True))
-            time.sleep(45)
-            subprocess.check_call(
-                'gcloud compute config-ssh --project {}'.format(self.project),
-                shell=True
-            )
-            subprocess.check_call(
-                'gcloud compute os-login ssh-keys add --key-file '
-                '~/.ssh/google_compute_engine.pub --project {} >/dev/null'.format(
-                    self.project
-                ),
-                shell=True
-            )
-            self.load_config_args()
-            print(crayons.green("Connecting to controller instance...", bold=True))
-            time.sleep(45) # Key propagation time
-            super().__enter__()
-            print("Waiting for slurm to initialize")
-            rc, sout, serr = self.invoke("which sinfo")
-            while rc != 0:
-                time.sleep(10)
-                rc, sout, serr = self.invoke("which sinfo")
-            # time.sleep(60)
-            print("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
-            return self
         except:
             self.stop()
             raise
