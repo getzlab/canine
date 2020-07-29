@@ -12,6 +12,6 @@ if __name__ == '__main__':
     )
     backend.start()
     print("Your cluster is now ready for the workshop. Please run")
-    print("gcloud compute ssh wolf-workshop-{}-controller --project broad-getzlab-wolfws-202007 \\")
+    print("gcloud compute ssh wolf-workshop-{}-controller --project broad-getzlab-wolfws-202007 \\".format(user))
     print("  --zone us-central1-a")
     print("to log in to the cluster.")
