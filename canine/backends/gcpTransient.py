@@ -121,7 +121,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                         {
                             'boot': True,
                             'initializeParams': {
-                                'diskSizeGb': '30',
+                                'diskSizeGb': '40',
                                 'diskType': 'zones/us-central1-a/diskTypes/pd-standard',
                                 'sourceImage': worker_image['selfLink']
                             },
