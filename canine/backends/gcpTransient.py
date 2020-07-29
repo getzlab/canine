@@ -208,7 +208,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
 
     def __init__(
         self, name: str = 'slurm-canine', *, nodes_per_tier: int = 10, compute_zone: str = 'us-central1-a',
-        controller_type: str = 'n1-standard-4', preemptible: bool = True, external_ip: bool = False,
+        controller_type: str = 'n1-standard-4', preemptible: bool = True, external_ip: bool = True,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
         external_compute_ips: bool = False, **kwargs : typing.Any
