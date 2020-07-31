@@ -89,11 +89,11 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             raise ValueError("Cannot simultaneously specifiy shutdown_script_file and shutdown_script.")
         compute_script = {
           "startup-script" : startup_script,
-          "shutdown_script" : shutdown_script
+          "shutdown-script" : shutdown_script
         }
         compute_script_file = {
           "startup-script" : startup_script_file,
-          "shutdown_script" : shutdown_script_file
+          "shutdown-script" : shutdown_script_file
         }
 
         if slurm_conf_path is None:
