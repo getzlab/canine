@@ -541,7 +541,10 @@ class AbstractLocalizer(abc.ABC):
         # - job variables and exports are set when setup.sh is _sourced_
         # - localization tasks are run when localization.sh is _run_
         job_vars = []
-        exports = []
+        exports = [
+            'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)',
+            'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone))'
+        ]
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
@@ -560,8 +563,6 @@ class AbstractLocalizer(abc.ABC):
             exports += [
                 'export CANINE_LOCAL_DISK_SIZE={}GB'.format(local_download_size),
                 'export CANINE_LOCAL_DISK_TYPE={}'.format(self.temporary_disk_type),
-                'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)',
-                'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone))',
                 'export CANINE_LOCAL_DISK_DIR={}/{}'.format(self.local_download_dir, disk_name),
             ]
             localization_tasks += [
