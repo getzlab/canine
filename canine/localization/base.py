@@ -28,6 +28,10 @@ PathType = namedtuple(
     ['localpath', 'remotepath']
 )
 
+class OverrideValueError(ValueError):
+    def __init__(self, arg, value):
+        super().__init__("Ignoring 'stream' override for {} with value {} and localizing now".format(arg, value))
+
 class AbstractLocalizer(abc.ABC):
     """
     Base class for localization.
@@ -466,9 +470,17 @@ class AbstractLocalizer(abc.ABC):
                     # No localization needed, already copied
                     self.inputs[jobId][arg] = Localization(None, common_dests[value])
                 elif mode is not False:
-                    if mode == 'stream':
-                        if not value.startswith('gs://'):
-                            print("Ignoring 'stream' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
+                    try:
+                        if mode == 'stream':
+                            if not value.startswith('gs://'):
+                                raise OverrideValueError(arg, value)
+
+                            self.inputs[jobId][arg] = Localization(
+                                'stream',
+                                value
+                            )
+
+                        elif mode in ['localize', 'symlink']:
                             self.inputs[jobId][arg] = Localization(
                                 None,
                                 self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
@@ -478,12 +490,25 @@ class AbstractLocalizer(abc.ABC):
                                 self.inputs[jobId][arg].path,
                                 transport=transport
                             )
-                        else:
+
+                        elif mode == 'delayed':
+                            if not value.startswith('gs://'):
+                                raise OverrideValueError(arg, value)
+
                             self.inputs[jobId][arg] = Localization(
-                                'stream',
+                                'download',
                                 value
                             )
-                    elif mode in {'localize', 'symlink'}:
+
+                        elif mode is None or mode == 'null':
+                            # Do not reserve path here
+                            # null override treats input as string
+                            self.inputs[jobId][arg] = Localization(None, value)
+
+                        else:
+                            raise ValueError("Invalid override option [{}]".format(mode))
+                    except OverrideValueError as e:
+                        print(e.args[0], file = sys.stderr)
                         self.inputs[jobId][arg] = Localization(
                             None,
                             self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
@@ -493,35 +518,7 @@ class AbstractLocalizer(abc.ABC):
                             self.inputs[jobId][arg].path,
                             transport=transport
                         )
-                    elif mode in {'delayed', 'local'}:
-                        if not value.startswith('gs://'):
-                            print("Ignoring 'delayed' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
-                            self.inputs[jobId][arg] = Localization(
-                                None,
-                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                            )
-                            self.localize_file(
-                                value,
-                                self.inputs[jobId][arg].path,
-                                transport=transport
-                            )
-                        elif mode == 'local':
-                            self.local_download_size[jobId] = self.local_download_size.get(jobId, 0) + self.get_object_size(value)
-                            self.inputs[jobId][arg] = Localization(
-                                'local',
-                                value
-                            )
-                        else:
-                            self.inputs[jobId][arg] = Localization(
-                                'download',
-                                value
-                            )
-                    elif mode is None or mode == 'null':
-                        # Do not reserve path here
-                        # null override treats input as string
-                        self.inputs[jobId][arg] = Localization(None, value)
-                    else:
-                        raise ValueError("Invalid override option [{}]".format(mode))
+
                 else:
                     if os.path.exists(value) or value.startswith('gs://'):
                         remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
@@ -540,9 +537,9 @@ class AbstractLocalizer(abc.ABC):
         Must call after pre-scanning inputs
         """
 
-		# generate job variable, exports, and localization_tasks arrays
-		# - job variables and exports are set when setup.sh is _sourced_
-		# - localization tasks are run when localization.sh is _run_
+        # generate job variable, exports, and localization_tasks arrays
+        # - job variables and exports are set when setup.sh is _sourced_
+        # - localization tasks are run when localization.sh is _run_
         job_vars = []
         exports = []
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
