@@ -333,6 +333,7 @@ class DummySlurmBackend(AbstractSlurmBackend):
         Kills all running containers
         """
         print("Cleaning up Slurm Cluster", self.controller.short_id)
+        self.invoke('chmod -R a+rwX /mnt/nfs')
         containers = self.workers
         if not self.debug:
             containers.append(self.controller)

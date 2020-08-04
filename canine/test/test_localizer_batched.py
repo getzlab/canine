@@ -305,7 +305,7 @@ class TestIntegration(unittest.TestCase):
                                 path = value.path
                                 if value.type == 'stream':
                                     src = path
-                                    path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).remotepath
+                                    path = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(src)))
                                     self.assertIn(
                                         'if [[ -e {dest} ]]; then rm {dest}; fi\n'
                                         'mkfifo {dest}\n'
@@ -329,6 +329,8 @@ class TestIntegration(unittest.TestCase):
                                     )
                                 if isinstance(path, PathType):
                                     path = path.remotepath
+                                if '$' in path:
+                                    path = path.replace('$', '\\$')
                                 self.assertRegex(
                                     setup_text,
                                     r'export {}=[\'"]?{}[\'"]?'.format(arg, path)

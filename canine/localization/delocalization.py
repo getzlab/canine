@@ -3,11 +3,27 @@ import argparse
 import glob
 import os
 import shutil
+import subprocess
+import shlex
 
 """
 This is not actually part of the canine package
 This is helper code which is run in the backend
 """
+
+def same_volume(a, b):
+    """
+    From NFSLocalizer
+    Check if file a and b exist on same device
+    """
+    vols = subprocess.check_output(
+      "df {} {} | awk 'NR > 1 {{ print $1 }}'".format(
+        a,
+        b
+      ),
+      shell = True
+    )
+    return len(set(vols.decode("utf-8").rstrip().split("\n"))) == 1
 
 def main(output_dir, jobId, patterns, copy):
     jobdir = os.path.join(output_dir, str(jobId))
@@ -24,7 +40,8 @@ def main(output_dir, jobId, patterns, copy):
                     if not os.path.isdir(os.path.dirname(dest)):
                         os.makedirs(os.path.dirname(dest))
                     if os.path.isfile(target):
-                        if copy:
+                        # Same volume check catches outputs from outside the workspace
+                        if copy or not same_volume(target, jobdir):
                             shutil.copyfile(os.path.abspath(target), dest)
                         elif os.stat(target).st_dev == os.stat(os.path.dirname(dest)).st_dev:
                             os.symlink(os.path.relpath(target, os.path.dirname(dest)), dest)

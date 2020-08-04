@@ -40,8 +40,8 @@ setup(
         ]
     },
     description = 'A modular, high-performance computing solution to run jobs using SLURM',
-    url = 'https://github.com/broadinstitute/canine',
-    author = 'Aaron Graubert - Broad Institute - Cancer Genome Computational Analysis',
+    url = 'https://github.com/getzlab/canine',
+    author = 'Aaron Graubert - Broad Institute - Cancer Genome Computational Analysis - Getz Lab',
     author_email = 'aarong@broadinstitute.org',
     long_description = long_description,
     long_description_content_type = 'text/markdown',

@@ -211,6 +211,18 @@ and also buffered in a ByteStream for later reading
 Returns (exit status, Stdout buffer, Stderr bufer)</p>
 </dd></dl>
 
+<dl class="function">
+<dt id="canine.utils.pandas_read_hdf5_buffered">
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">pandas_read_hdf5_buffered</code><span class="sig-paren">(</span><em class="sig-param">key: str</em>, <em class="sig-param">buf: _io.BufferedReader</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.utils.pandas_read_hdf5_buffered" title="Permalink to this definition">¶</a></dt>
+<dd><p>Read a Pandas dataframe in HDF5 format from a buffer.</p>
+</dd></dl>
+
+<dl class="function">
+<dt id="canine.utils.pandas_write_hdf5_buffered">
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">pandas_write_hdf5_buffered</code><span class="sig-paren">(</span><em class="sig-param">df: pandas.core.frame.DataFrame</em>, <em class="sig-param">key: str</em>, <em class="sig-param">buf: _io.BufferedWriter</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.pandas_write_hdf5_buffered" title="Permalink to this definition">¶</a></dt>
+<dd><p>Write a Pandas dataframe in HDF5 format to a buffer.</p>
+</dd></dl>
+
 </div>
 
 

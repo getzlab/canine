@@ -125,6 +125,7 @@ def main(network, nodes, cpus, mem):
     time.sleep(3)
     subprocess.check_call('sacctmgr --immediate add cluster local_slurm', shell=True)
     subprocess.check_call('slurmctld -vvvvv', shell=True)
+    subprocess.check_call('chmod -R 777 /mnt/nfs/clust_conf', shell=True)
     subprocess.check_call('touch /mnt/nfs/controller.ready', shell=True)
 
     # Now become bash
