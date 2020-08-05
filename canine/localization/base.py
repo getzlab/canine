@@ -29,8 +29,8 @@ PathType = namedtuple(
 )
 
 class OverrideValueError(ValueError):
-    def __init__(self, arg, value):
-        super().__init__("Ignoring 'stream' override for {} with value {} and localizing now".format(arg, value))
+    def __init__(self, override, arg, value):
+        super().__init__("'{}' override is invalid for input {} with value {}".format(arg, value))
 
 class AbstractLocalizer(abc.ABC):
     """
@@ -473,7 +473,7 @@ class AbstractLocalizer(abc.ABC):
                     try:
                         if mode == 'stream':
                             if not value.startswith('gs://'):
-                                raise OverrideValueError(arg, value)
+                                raise OverrideValueError(mode, arg, value)
 
                             self.inputs[jobId][arg] = Localization(
                                 'stream',
@@ -493,7 +493,7 @@ class AbstractLocalizer(abc.ABC):
 
                         elif mode == 'delayed':
                             if not value.startswith('gs://'):
-                                raise OverrideValueError(arg, value)
+                                raise OverrideValueError(mode, arg, value)
 
                             self.inputs[jobId][arg] = Localization(
                                 'download',
