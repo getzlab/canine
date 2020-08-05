@@ -529,14 +529,25 @@ class AbstractLocalizer(abc.ABC):
                         )
 
                 else:
+                    # if no overrides were given, see if we can immediately
+                    # localize this file
                     if os.path.exists(value) or value.startswith('gs://'):
                         remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                         self.localize_file(value, remote_path, transport=transport)
                         value = remote_path
+
+                    # autodetect if this is a path on a read-only disk 
+                    loc_type = "ro_disk" if value.startswith('rodisk://') else None
+
                     self.inputs[jobId][arg] = Localization(
-                        None,
-                        # value will either be a PathType, if localized above,
-                        # or an unchanged string if not handled
+                        # localization type will either be:
+                        # * None, indicating no special processing in localization.sh
+                        # * ro_disk, indicating that this is a path on a read-only disk
+                        loc_type,
+
+                        # value will either be a:
+                        # * PathType, if localized above
+                        # * an unchanged string if not handled
                         value
                     )
 
