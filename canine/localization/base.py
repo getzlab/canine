@@ -646,6 +646,8 @@ class AbstractLocalizer(abc.ABC):
             elif val.type == 'ro_disk':
                 assert val.path.startswith("rodisk://")
 
+                job_vars.append(shlex.quote(key))
+
                 dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
                 disk = dgrp[1]
                 file = dgrp[2]
@@ -661,6 +663,10 @@ class AbstractLocalizer(abc.ABC):
                   "ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}".format(file = file, path = dest.remotepath)
                 ]
                 docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+                exports.append('export {}="{}"'.format(
+                    key,
+                    dest.remotepath
+                ))
 
             elif val.type is None:
                 job_vars.append(shlex.quote(key))
