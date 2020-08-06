@@ -679,7 +679,7 @@ class AbstractLocalizer(abc.ABC):
                   # within container
                   "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR".format(disk_name = disk),
                   # on host (so that other dockers can access it)
-                  "if [[ -f /.dockerenv ]]; then sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR'; fi".format(disk_name = disk),
+                  "if [[ -f /.dockerenv ]]; then sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR; fi".format(disk_name = disk),
                   "fi",
 
                   # symlink into the canine directory
