@@ -667,10 +667,19 @@ class AbstractLocalizer(abc.ABC):
 
                 localization_tasks += [
                   "export CANINE_LOCAL_DISK_DIR=/mnt/ro_disks/{}".format(disk),
-                  "[ ! -d $CANINE_LOCAL_DISK_DIR ] && sudo mkdir -p $CANINE_LOCAL_DISK_DIR",
-                  "[ ! -e /dev/disk/by-id/google-{} ] && \\".format(disk),
+                  "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
+
+                  # attach the disk if it's not already
+                  "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
                   "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro".format(disk_name = disk),
-                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR".format(disk_name = disk),
+                  "fi",
+
+                  # mount the disk if it's not already
+                  "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
+                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR".format(disk_name = disk),
+                  "fi",
+
+                  # symlink into the canine directory
                   "ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}".format(file = file, path = dest.remotepath)
                 ]
                 docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
