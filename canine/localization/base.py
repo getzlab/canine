@@ -671,7 +671,7 @@ class AbstractLocalizer(abc.ABC):
 
                   # attach the disk if it's not already
                   "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
-                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro".format(disk_name = disk),
+                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro || true".format(disk_name = disk),
                   "fi",
 
                   # mount the disk if it's not already
