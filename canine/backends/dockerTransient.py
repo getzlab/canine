@@ -58,7 +58,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             nfsimg = nfs_image,
             nfsproj = nfs_image_project
           ),
-          "shutdown_script" : nfs_shutdown_script
+          "shutdown-script" : nfs_shutdown_script
         }
 
         self.config = {
