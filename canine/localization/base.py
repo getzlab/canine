@@ -670,7 +670,7 @@ class AbstractLocalizer(abc.ABC):
                   "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
 
                   # attach the disk if it's not already
-                  "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
+                  'if ! gcloud compute instances describe $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --format "value(disks[].deviceName)" | grep -q {}; then'.format(disk),
                   "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro".format(disk_name = disk),
                   "fi",
 
