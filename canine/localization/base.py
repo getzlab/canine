@@ -666,7 +666,7 @@ class AbstractLocalizer(abc.ABC):
                 dest = self.reserve_path('jobs', jobId, 'inputs', file)
 
                 localization_tasks += [
-                  "export CANINE_LOCAL_DISK_DIR=/mnt/ro_disks/{}".format(disk),
+                  "export CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk),
                   "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
 
                   # attach the disk if it's not already
@@ -676,7 +676,10 @@ class AbstractLocalizer(abc.ABC):
 
                   # mount the disk if it's not already
                   "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
+                  # within container
                   "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR".format(disk_name = disk),
+                  # on host (so that other dockers can access it)
+                  "if [[ -f /.dockerenv ]]; then sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR'; fi".format(disk_name = disk),
                   "fi",
 
                   # symlink into the canine directory
