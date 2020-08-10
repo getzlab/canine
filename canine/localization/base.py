@@ -537,7 +537,7 @@ class AbstractLocalizer(abc.ABC):
                         value = remote_path
 
                     # autodetect if this is a path on a read-only disk 
-                    loc_type = "ro_disk" if value.startswith('rodisk://') else None
+                    loc_type = "ro_disk" if isinstance(value, str) and value.startswith('rodisk://') else None
 
                     self.inputs[jobId][arg] = Localization(
                         # localization type will either be:
