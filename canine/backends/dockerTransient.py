@@ -275,6 +275,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # TODO: use API for this
         nfs_inst = instances.loc[instances["name"] == nfs_nodename].squeeze()
         if nfs_inst.empty:
+            print("Creating NFS server " + nfs_nodename)
             subprocess.check_call(
                 """gcloud compute instances create {nfs_nodename} \
                    --image {image} --machine-type n1-standard-4 --zone {compute_zone} \
