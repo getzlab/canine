@@ -351,11 +351,11 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
           for x in zone_dict["items"]
         ], axis = 0).reset_index(drop = True)
 
-    def wait_for_cluster_ready(self, elastic = False):
+    def wait_for_cluster_ready(self, elastic = False, timeout = 0):
         """
         Blocks until the main partition is marked as up
         """
-        super().wait_for_cluster_ready(elastic = elastic)
+        super().wait_for_cluster_ready(elastic = elastic, timeout = timeout)
 
     # a handy wrapper to automatically add this instance's project and zone to
     # GCP API calls

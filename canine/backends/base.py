@@ -351,11 +351,6 @@ class AbstractSlurmBackend(abc.ABC):
         """
         command = 'sinfo'+ArgumentHelper(*slurmopts, **slurmparams).commandline
         status, stdout, stderr = self.invoke(command)
-        while status != 0 and SLURM_PARTITION_RECON in stderr.read():
-            print("Slurm controller not ready. Retrying in 10s...", file=sys.stderr)
-            time.sleep(10)
-            status, stdout, stderr = self.invoke(command)
-        stderr.seek(0,0)
         check_call(command, status, stdout, stderr)
         df = pd.read_fwf(
             stdout,
@@ -461,10 +456,24 @@ class AbstractSlurmBackend(abc.ABC):
             transport.chmod(script_path, 0o775)
         return script_path
 
-    def wait_for_cluster_ready(self, elastic: bool = True):
+    def wait_for_cluster_ready(self, elastic: bool = True, timeout = 0):
         """
-        Blocks until the main partition is marked as up
+        Blocks until the main partition is marked as up.
+        An optional timeout command will only block until this many seconds
+        (default: block forever)
         """
+
+        status, stdout, stderr = self.invoke("sinfo")
+        n_iter = 0
+        while status != 0 and SLURM_PARTITION_RECON in stderr.read():
+            print("Slurm controller not ready. Retrying in 10s...", file=sys.stderr)
+            time.sleep(10)
+            status, stdout, stderr = self.invoke("sinfo")
+            n_iter += 1
+
+            if timeout > 0 and n_iter*10 >= timeout:
+                raise TimeoutError("Timed out waiting for Slurm cluster to come online after {} seconds.".format(timeout))
+
         df = self.sinfo()
         default = df.index[df.index.str.contains(r"\*$")]
 

@@ -127,6 +127,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         #
         # create the Slurm container if it's not already present
+        print("Starting Slurm controller ...")
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
             # FIXME: gcloud is cloud-provider specific. how can we make this more generic?
             gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
@@ -148,6 +149,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 self.container().start()
 
         # TODO: should we restart slurmctld in the container here?
+
+        #
+        # wait until the container is fully started, or error out if it failed
+        # to start
+        self.wait_for_cluster_ready(elastic = True, timeout = 60)
 
         #
         # save the configuration to disk so that Slurm knows how to configure
