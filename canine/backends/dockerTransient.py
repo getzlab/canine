@@ -394,8 +394,9 @@ def ready_for_docker():
         subprocess.check_call(
           "mountpoint -q /mnt/nfs".format(proc),
           shell = True,
-          executable = '/bin/bash'
+          executable = '/bin/bash',
+          timeout = 10
         )
-    except subprocess.CalledProcessError:
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
         # TODO: add the repo URL
         raise Exception("NFS did not successfully mount. Please report this bug as a GitHub issue.")
