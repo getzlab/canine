@@ -345,9 +345,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           nps = nfs_prov_script, nnn = nfs_nodename
         ), shell = True)
 
-        # make sure config files start from a clean slate
-        subprocess.check_call("sudo rm -rf /mnt/nfs/clust_conf", shell = True)
-
         self.NFS_ready = True
 
     def get_latest_image(self, image_family = None):
