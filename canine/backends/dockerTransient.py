@@ -153,7 +153,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # wait until the container is fully started, or error out if it failed
         # to start
-        self.wait_for_cluster_ready(elastic = True, timeout = 60)
+        self.wait_for_container_to_be_ready(timeout = 60)
 
         #
         # save the configuration to disk so that Slurm knows how to configure
@@ -373,6 +373,15 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 print("Error querying NFS server status; retrying in 60s ...", file = sys.stderr)
 
             time.sleep(60)
+
+    def wait_for_container_to_be_ready(self, timeout = 3000):
+        print("Waiting up to {} seconds for Slurm controller to start ...".format(timeout))
+        (rc, _, _) = self.invoke(
+          "timeout {} bash -c 'while [ ! -f /.started ]; do sleep 1; done'".format(timeout),
+          interactive = True
+        )
+        if rc == 124:
+            raise TimeoutError("Slurm controller did not start within {} seconds!".format(timeout))
 
 # }}}
 
