@@ -671,19 +671,31 @@ class AbstractLocalizer(abc.ABC):
 
                   # attach the disk if it's not already
                   "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
+                  # we can run into a race condition here if other tasks are
+                  # attempting to mount the same disk simultaneously, so we
+                  # force a 0 exit
                   "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro || true".format(disk_name = disk),
                   "fi",
 
                   # mount the disk if it's not already
+                  # as before, we can run into a race condition here, so we again
+                  # force a zero exit
                   "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
                   # within container
-                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR".format(disk_name = disk),
+                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR || true".format(disk_name = disk),
                   # on host (so that other dockers can access it)
-                  "if [[ -f /.dockerenv ]]; then sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR; fi".format(disk_name = disk),
+                  "if [[ -f /.dockerenv ]]; then",
+                  "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR || true".format(disk_name = disk),
+                  "fi",
                   "fi",
 
+                  # because we forced zero exits for the previous commands,
+                  # we need to verify that the mount actually exists
+                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; exit 1; }",
+
                   # symlink into the canine directory
-                  "ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}".format(file = file, path = dest.remotepath)
+                  # note it might already exist if we are retrying this task
+                  "if [[ ! -L ${{CANINE_LOCAL_DISK_DIR}}/{file} ]]; then ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}; fi".format(file = file, path = dest.remotepath),
                 ]
                 docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
                 exports.append('export {}="{}"'.format(
