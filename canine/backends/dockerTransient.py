@@ -22,6 +22,10 @@ from urllib3.exceptions import ProtocolError
 
 import pandas as pd
 
+from threading import Lock
+
+gce_lock = Lock()
+
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
@@ -349,7 +353,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def get_latest_image(self, image_family = None):
         image_family = self.config["image_family"] if image_family is None else image_family
-        return gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
+        with gce_lock: # I had issues without the lock
+            ans = gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
+        return ans
 
     def invoke(self, command, interactive = False):
         if self.container is not None and self.container().status == "running":
@@ -381,6 +387,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             raise TimeoutError("Slurm controller did not start within {} seconds!".format(timeout))
 
 # }}}
+
+class LocalDockerSlurmBackend(DockerTransientImageSlurmBackend):
+    def __enter__(self):
+        self.dkr = docker.from_env()
+        self.container = self._get_container(self.config["cluster_name"])
+        return self
+    def __exit__(self, *args):
+        pass
 
 # Python version of checks in docker_run.sh
 def ready_for_docker():
