@@ -57,6 +57,7 @@ setup(
         'docker>=4.1.0',
         'psutil>=5.6.7',
         'port-for>=0.4',
+        'crayons>=0.3.0',
         'tables>=3.6.1'
     ],
     classifiers = [

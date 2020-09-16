@@ -96,6 +96,7 @@ def main(network, nodes, cpus, mem):
     subprocess.check_call('service ssh start', shell=True)
     if not os.path.isdir('/mnt/nfs/clust_conf/slurm/'):
         os.makedirs('/mnt/nfs/clust_conf/slurm/')
+    os.chmod('/mnt/nfs', 0o755)
     slurm_conf = read_conf('/conf_templates/slurm.conf')
     slurm_conf.settings['CONTROLLER HOSTNAME'] = socket.gethostname()
     slurm_conf.settings['CONTROLLER ADDRESS'] = get_docker_ip(

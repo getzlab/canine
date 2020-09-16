@@ -5,33 +5,29 @@ import time
 import subprocess
 import shutil
 import os
+import hashlib
+import io
+import datetime
 import sys
 import warnings
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost
-# import paramiko
-import yaml
-import pandas as pd
+from ..utils import get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost, get_gcp_username
 
-PARAMIKO_PEM_KEY = os.path.expanduser('~/.ssh/canine_pem_key')
-GPU_SCRIPT = ' && '.join([
-    # 'sudo yum install -y kernel-devel-$(uname -r) kernel-headers-$(uname -r)',
-    # 'wget http://developer.download.nvidia.com/compute/cuda/repos/rhel7/x86_64/cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
-    # 'sudo yum install -y cuda-repo-rhel7-10.1.168-1.x86_64.rpm',
-    # 'sudo yum -y updateinfo',
-    # 'sudo yum install -y cuda',
-    # 'wget http://developer.download.nvidia.com/compute/machine-learning/repos/rhel7/x86_64/nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
-    # 'sudo yum install -y nvidia-machine-learning-repo-rhel7-1.0.0-1.x86_64.rpm',
-    # 'sudo yum -y updateinfo',
-    # 'sudo yum install -y cuda-10-0 libcudnn7 libcudnn7-devel libnvinfer5',
-    # 'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.repo | sudo tee /etc/yum.repos.d/nvidia-docker.repo',
-    # 'sudo yum -y updateinfo',
-    # 'sudo yum install -y nvidia-docker2'
-    'curl -s -L https://nvidia.github.io/nvidia-docker/gpgkey | sudo apt-key add -',
-    'curl -s -L https://nvidia.github.io/nvidia-docker/$(. /etc/os-release;echo $ID$VERSION_ID)/nvidia-docker.list | sudo tee /etc/apt/sources.list.d/nvidia-docker.list',
-    'sudo apt-get update',
-    'sudo apt-get install -y nvidia-container-toolkit nvidia-docker2'
-])
+import googleapiclient.discovery as gd
+import googleapiclient.errors
+import pandas as pd
+import yaml
+import crayons
+
+try:
+    gce = gd.build('compute', 'v1')
+except gd._auth.google.auth.exceptions.GoogleAuthError:
+    print(
+        "Unable to load gcloud credentials. Transient Backends may not be available",
+        file=sys.stderr
+    )
+    gce = None
+
 GPU_TYPES = {
     'nvidia-tesla-k80',
     'nvidia-tesla-p100',
@@ -40,16 +36,179 @@ GPU_TYPES = {
     'nvidia-tesla-t4'
 }
 
+TIMESTAMP_FORMAT = '%Y-%m-%dT%H:%M:%S.%f%z'
+
+# Overhaul plan
+# Follow setup script to build new base GCP image
+# Update script to do base configuration and support mixed node topography
+
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
     Backend for transient slurm clusters which need to be deployed and configured
-    on GCP before they're ready for use
+    on GCP before they're ready for use.
     """
 
+    @staticmethod
+    def get_controller_image() -> str:
+        # Global base images stored in broad-cga-aarong-gtex
+        controller_images = gce.images().list(project='broad-cga-aarong-gtex', filter='family = canine-tgcp-controller').execute()
+        if 'items' not in controller_images or len(controller_images['items']) < 1:
+            raise ValueError("No public controller images found")
+        return sorted(
+            controller_images['items'],
+            key=lambda img:datetime.datetime.strptime(img['creationTimestamp'], TIMESTAMP_FORMAT),
+            reverse=True
+        )[0]['selfLink']
+
+    @staticmethod
+    def get_compute_service_account(project: str) -> str:
+        proc = subprocess.run(
+            'gcloud iam service-accounts list --project {}'.format(project),
+            shell=True,
+            stdout=subprocess.PIPE
+        )
+        df = pd.read_fwf(
+            io.BytesIO(proc.stdout),
+            index_col=0
+        )
+        df = df[~df['DISABLED']]
+        return df['EMAIL']['Compute Engine default service account'] if 'Compute Engine default service account' in df.index else df['EMAIL']['Compute']
+
+    @staticmethod
+    def personalize_worker_image(project: typing.Optional[str] = None) -> typing.Tuple[str, str]:
+        """
+        Checks for a personalized image for thhe latest base worker image.
+        Generates the image if needed.
+        Returns a tuple containing thhe image name, and image family
+        """
+        if project is None:
+            project = get_default_gcp_project()
+        print(crayons.green("Checking current base images...", bold=True))
+        # Global base images stored in broad-cga-aarong-gtex
+        worker_images = gce.images().list(project='broad-cga-aarong-gtex', filter='family = canine-tgcp-worker').execute()
+        if 'items' not in worker_images or len(worker_images['items']) < 1:
+            raise ValueError("No public worker images found")
+        worker_image = sorted(
+            worker_images['items'],
+            key=lambda img:datetime.datetime.strptime(img['creationTimestamp'], TIMESTAMP_FORMAT),
+            reverse=True
+        )[0]
+        username = get_gcp_username()
+        key = hashlib.md5((project+username+worker_image['name']+worker_image['labelFingerprint']).encode()).hexdigest()[:6]
+        personalized_image_name = 'canine-tgcp-{}'.format(key)
+        personalized_family = 'canine-tgcp-personalized-{}'.format(
+            hashlib.md5((project+username).encode()).hexdigest()[:6]
+        )
+        instance_name = 'canine-tgcp-personalizer-{}'.format(key)
+        print(crayons.green("Checking for personalized version of latest base image...", bold=True))
+        try:
+            gce.images().get(project=project, image=personalized_image_name).execute()
+            return personalized_image_name, personalized_family
+        except googleapiclient.errors.HttpError as e:
+            if e.args[0]['status'] != '404':
+                raise
+            print("No personalized image found, or the template image has been updated")
+            print("Please wait while the new worker image is personalized")
+            print("This may take a few minutes...")
+            gce.instances().insert(
+                project=project,
+                zone='us-central1-a',
+                body={
+                    'description': 'Temporary instance to personalize the Canine TGCP worker image',
+                    'name': instance_name,
+                    'machineType': 'zones/us-central1-a/machineTypes/f1-micro',
+                    'disks': [
+                        {
+                            'boot': True,
+                            'initializeParams': {
+                                'diskSizeGb': '30',
+                                'diskType': 'zones/us-central1-a/diskTypes/pd-standard',
+                                'sourceImage': worker_image['selfLink']
+                            },
+                            'autoDelete': True
+                        }
+                    ],
+                    "canIpForward": False,
+                    "networkInterfaces": [
+                        {
+                            'subnetwork': 'regions/us-central1/subnetworks/default',
+                            'accessConfigs': [
+                                {
+                                    'name': 'External NAT',
+                                    'type': 'ONE_TO_ONE_NAT',
+                                    'networkTier': 'STANDARD'
+                                }
+                            ]
+                        }
+                    ]
+                }
+            ).execute()
+            print(crayons.green("Starting personalizer instance...", bold=True))
+            time.sleep(30)
+            try:
+                print(crayons.green("Waiting for personalizer to start...", bold=True))
+                while subprocess.run('gcloud compute ssh {} --zone us-central1-a  --project {} -- ls'.format(instance_name, project), shell=True).returncode != 0:
+                    time.sleep(15)
+                print(crayons.green("Running personalization script...", bold=True))
+                subprocess.check_call(
+                    'gcloud compute ssh {} --zone us-central1-a  --project {} -- bash /opt/canine/personalize_worker.sh'.format(instance_name, project),
+                    shell=True
+                )
+                time.sleep(10)
+                # Running from CLI is easier, because it will block until stopped
+                print(crayons.green("Stopping instance...", bold=True))
+                subprocess.check_call(
+                    'gcloud compute instances stop {} --zone us-central1-a --project {} '.format(instance_name, project),
+                    shell=True
+                )
+                print(crayons.green("Generating image...", bold=True))
+                # gce.images().insert(
+                #     project=project,
+                #     body={
+                #         'name': personalized_image_name,
+                #         'description': 'Personalized version of the Canine TransientGCP worker image',
+                #         'sourceDisk': 'zones/us-central1-a/disks/canine-tgcp-worker-personalizer',
+                #         'family': 'canine-tgcp-worker-personalized'
+                #     }
+                # ).execute()
+                # Again, CLI is better here because blocking
+                subprocess.check_call(
+                    'gcloud compute images create {name} --project {project}'
+                    ' --description "{description}" --source-disk-zone {zone}'
+                    ' --source-disk {instance} --family {family}'.format(
+                        name=personalized_image_name,
+                        description='Personalized version of the Canine TransientGCP worker image for {}'.format(username),
+                        instance=instance_name,
+                        family=personalized_family,
+                        project=project,
+                        zone='us-central1-a'
+                    ),
+                    shell=True
+                )
+                time.sleep(10)
+                return personalized_image_name, personalized_family
+            finally:
+                print(crayons.green("Deleting instance...", bold=True))
+                try:
+                    gce.instances().delete(
+                        project=project,
+                        zone='us-central1-a',
+                        instance=instance_name
+                    ).execute()
+                except:
+                    subprocess.check_call(
+                        'gcloud compute instances delete --project {} --zone {} {} --quiet'.format(
+                            project,
+                            'us-central1-a',
+                            instance_name
+                        ),
+                        shell=True
+                    )
+
+
     def __init__(
-        self, name: str = 'slurm-canine', *, max_node_count: int = 10, compute_zone: typing.Optional[str] = None,
-        controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1', preemptible: bool = True,
-        worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
+        self, name: str = 'slurm-canine', *, nodes_per_tier: int = 10, compute_zone: str = 'us-central1-a',
+        controller_type: str = 'n1-standard-4', preemptible: bool = True, external_ip: bool = False,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
         external_compute_ips: bool = False, **kwargs : typing.Any
@@ -64,85 +223,29 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         super().__init__('{}-controller.{}.{}'.format(
             name,
             compute_zone,
-            self.project
+            self.project,
+            **kwargs
         ))
+        self.zone = compute_zone
+        self.controller_type = controller_type
+        self.controller_disk_size = controller_disk_size
+
         self.config = {
-          "cluster_name": name,
-          "static_node_count": 0,
-          "max_node_count": int(max_node_count),
-          "zone": compute_zone,
-          "region": compute_zone[:-2],
-          "cidr": "10.10.0.0/16",
-          "controller_machine_type": controller_type,
-          "compute_machine_type": worker_type,
-          "compute_disk_type": "pd-standard",
-          "compute_disk_size_gb": int(compute_disk_size),
-          "controller_disk_type": "pd-ssd",
-          "controller_disk_size_gb": int(controller_disk_size),
-          "controller_secondary_disk": secondary_disk_size > 0,
-          "external_compute_ips": True,
-          "login_machine_type": login_type,
-          "login_node_count": int(login_count),
-          "login_disk_size_gb": 10,
-          "preemptible_bursting": preemptible,
-          "private_google_access": True,
-          "vpc_net": "default",
-          "vpc_subnet": "default",
-          "default_users": getpass.getuser(),
-          'gpu_count': 0,
-          'slurm_version': '19.05-latest',
-          'external_compute_ips': external_compute_ips,
-          **kwargs
+            'n_workers': nodes_per_tier,
+            'cluster_name': name,
+            'gpus': '0:0',
+            'sec': str(secondary_disk_size) if secondary_disk_size > 0 else '-',
+            'ip': '+' if external_ip else '-',
+            'preempt': '+' if preemptible else '-',
+            'worker_start': compute_script,
+            'controller_start': controller_script,
         }
 
         if gpu_type is not None and gpu_count > 0:
             if gpu_type not in GPU_TYPES:
                 raise ValueError("gpu_type must be one of {}".format(GPU_TYPES))
-            self.config['gpu_type'] = gpu_type
-            self.config['gpu_count'] = gpu_count
+            self.config['gpus'] = '{}:{}'.format(gpu_type, gpu_count)
 
-        if secondary_disk_size > 0:
-            self.config['controller_secondary_disk_type'] = 'pd-standard'
-            self.config['controller_secondary_disk_size_gb'] = secondary_disk_size
-
-        self.startup_script = """
-        sudo apt-get install -y apt-utils lvm2 cgroup-bin cgroup-tools libcgroup-dev htop gcc python-dev python-setuptools wget docker.io
-        sudo groupadd docker
-        sudo usermod -aG docker {0}
-        sudo usermod -aG sudo {0}
-        sudo systemctl enable docker.service
-        sudo systemctl start docker.service
-        sudo chown root:docker /var/run/docker.sock
-        sudo bash -c "echo {0}$'\\t'ALL='(ALL:ALL)'$'\\t'NOPASSWD:$'\\t'ALL >> /etc/sudoers"
-        sudo sed -e 's/GRUB_CMDLINE_LINUX="\\?\\([^"]*\\)"\\?/GRUB_CMDLINE_LINUX="\\1 cgroup_enable=memory swapaccount=1"/' < /etc/default/grub > grub.tmp
-        sudo mv grub.tmp /etc/default/grub
-        sudo grub2-mkconfig -o /etc/grub2.cfg
-        curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-        sudo python get-pip.py
-        sudo pip uninstall -y crcmod
-        sudo pip install --no-cache-dir -U crcmod
-        {1}
-        {2}
-        """.format(
-            getpass.getuser(),
-            GPU_SCRIPT if self.config['gpu_count'] > 0 else '',
-            compute_script
-        )
-
-        self.controller_script = """
-        sudo dd if=/dev/zero of=/swapfile count=4096 bs=1MiB
-        sudo chmod 700 /swapfile
-        sudo mkswap /swapfile
-        sudo swapon /swapfile
-        sudo apt-get install -y gcc python-dev python-setuptools htop
-        curl https://bootstrap.pypa.io/get-pip.py -o get-pip.py
-        sudo python get-pip.py
-        sudo pip uninstall -y crcmod
-        sudo pip install --no-cache-dir -U crcmod
-        {0}
-        """.format(
-            controller_script
-        )
 
         subprocess.check_call(
             'touch ~/.ssh/google_compute_known_hosts',
@@ -156,55 +259,88 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         Set up the NFS server and SLURM cluster
         Use default VPC
         """
-        # Idea: Allow the final deployment step to run in a Popen
-        # cluster.run then polls the object to make sure the deployment has finished
-        # allows copytree to begin while deployment still in progress
-
-        # User may also provide an NFS server IP
-
-        # 1) create NFS: (n1-highcpu-16 [16CPU, 14GB, 4GB SW], SSD w/ user GB)
-        # 2) SCP setup script to NFS
-        # 3) SSH into NFS, run script
+        image, family = TransientGCPSlurmBackend.personalize_worker_image(self.project)
+        disks = [
+            {
+                'boot': True,
+                'initializeParams': {
+                    'diskSizeGb': str(self.controller_disk_size),
+                    'diskType': 'zones/{}/diskTypes/pd-standard'.format(
+                        self.zone
+                    ),
+                    'sourceImage': TransientGCPSlurmBackend.get_controller_image()
+                },
+                'autoDelete': True
+            }
+        ]
+        if self.config['sec'] != '-':
+            print(crayons.red("Secondary disks currently not supported", bold=True))
         try:
-            with tempfile.TemporaryDirectory() as tempdir:
-                shutil.copytree(
-                    os.path.join(
-                        os.path.dirname(__file__),
-                        'slurm-gcp'
+            result = gce.instances().insert(
+                project=self.project,
+                zone=self.zone,
+                body={
+                    'description': 'Canine TransientGCPSlurmBackend controller instance',
+                    'name': '{}-controller'.format(self.config['cluster_name']),
+                    'machineType': 'zones/{}/machineTypes/{}'.format(
+                        self.zone,
+                        self.controller_type
                     ),
-                    tempdir+'/slurm'
-                )
-                with open(os.path.join(tempdir, 'slurm', 'scripts', 'custom-compute-install'), 'w') as w:
-                    w.write(self.startup_script)
-                with open(os.path.join(tempdir, 'slurm', 'scripts', 'custom-controller-install'), 'w') as w:
-                    w.write(self.controller_script)
-                with open(os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml'), 'w') as w:
-                    yaml.dump(
+                    'disks': disks,
+                    "canIpForward": False,
+                    "networkInterfaces": [
                         {
-                            "imports": [
-                              {
-                                "path": 'slurm.jinja'
-                              }
-                            ],
-                            "resources": [
-                              {
-                                "name": "slurm-cluster",
-                                "type": "slurm.jinja",
-                                "properties": self.config
-                              }
+                            'subnetwork': 'regions/{}/subnetworks/default'.format(
+                                self.zone[:-2]
+                            ),
+                            'accessConfigs': [
+                                {
+                                    'name': 'External NAT',
+                                    'type': 'ONE_TO_ONE_NAT',
+                                    'networkTier': 'STANDARD'
+                                }
                             ]
-                        },
-                        w
-                    )
-                subprocess.check_call(
-                    'gcloud deployment-manager deployments create {} --config {} --project {}'.format(
-                        self.config['cluster_name'],
-                        os.path.join(tempdir, 'slurm', 'slurm-cluster.yaml'),
-                        self.project
-                    ),
-                    shell=True,
-                    executable='/bin/bash'
-                )
+                        }
+                    ],
+                    'labels': {
+                        'k9cluster': self.config['cluster_name'],
+                        'canine': 'tgcp-controller'
+                    },
+                    'metadata': {
+                        'items': [
+                            {
+                                'key': 'canine_conf_{}'.format(k),
+                                'value': v
+                            }
+                            for k,v in self.config.items()
+                        ] + [
+                            {
+                                'key': 'startup-script',
+                                'value': "#!/bin/bash\npython3 /apps/slurm/scripts/controller_start.py > /apps/slurm/controller_start.stdout 2> /apps/slurm/controller_start.stderr"
+                            },
+                            {
+                                'key': 'canine_conf_user',
+                                'value': getpass.getuser()
+                            },
+                            {
+                                'key': 'canine_conf_family',
+                                'value': family
+                            }
+                        ]
+                    },
+                    'serviceAccounts': [
+                        {
+                            'email': TransientGCPSlurmBackend.get_compute_service_account(self.project),
+                            'scopes': [
+                                'https://www.googleapis.com/auth/compute',
+                                'https://www.googleapis.com/auth/cloud-platform'
+                            ]
+                        }
+                    ]
+                }
+            ).execute()
+            print(crayons.green("Starting controller instance...", bold=True))
+            time.sleep(45)
             subprocess.check_call(
                 'gcloud compute config-ssh --project {}'.format(self.project),
                 shell=True
@@ -217,14 +353,15 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 shell=True
             )
             self.load_config_args()
-            time.sleep(30) # Key propagation time
+            print(crayons.green("Connecting to controller instance...", bold=True))
+            time.sleep(45) # Key propagation time
             super().__enter__()
             print("Waiting for slurm to initialize")
             rc, sout, serr = self.invoke("which sinfo")
             while rc != 0:
                 time.sleep(10)
                 rc, sout, serr = self.invoke("which sinfo")
-            time.sleep(60)
+            # time.sleep(60)
             print("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
             return self
         except:
@@ -239,33 +376,31 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             'gcloud compute config-ssh --remove',
             shell=True
         )
-        subprocess.check_call(
-            'gcloud deployment-manager deployments delete {} --project {} -q'.format(
-                self.config['cluster_name'],
-                self.project
-            ),
-            shell=True,
-            executable='/bin/bash'
-        )
-        subprocess.run(
-            "gcloud compute images delete --project {0} --quiet "
-            "$(gcloud compute images list --project {0} --filter family:{1}-compute-image-family| awk 'NR>1 {{print $1}}')".format(
-                self.project,
-                self.config['cluster_name']
-            ),
-            shell=True,
-            executable='/bin/bash'
-        )
-        subprocess.run(
-            "gcloud compute instances delete --project {0} --quiet "
-            "--zone {1} $(gcloud compute instances list --project {0} --filter name:{2}-compute | awk 'NR>1 {{print $1}}')".format(
-                self.project,
-                self.config['zone'],
-                self.config['cluster_name']
-            ),
-            shell=True,
-            executable='/bin/bash'
-        )
+        try:
+            instances = gce.instances().list(
+                project=self.project,
+                zone=self.zone,
+                filter='labels.k9cluster = "{}"'.format(self.config['cluster_name'])
+            ).execute()['items']
+            for instance in instances:
+                print(crayons.red("Deleting instance:"), instance['name'])
+                try:
+                    gce.instances().delete(
+                        project=self.project,
+                        zone=self.zone,
+                        instance=instance['name']
+                    ).execute()
+                except:
+                    subprocess.check_call(
+                        'gcloud compute instances delete --project {} --zone {} {} --quiet'.format(
+                            self.project,
+                            self.zone,
+                            instance['name']
+                        ),
+                        shell=True
+                    )
+        except KeyError:
+            pass
 
     def __exit__(self, *args):
         """
@@ -295,47 +430,41 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         cluster_cost = 0
         worker_cpu_cost = 0
         job_cost = None
-        if node_uptime is not None:
-            worker_info = {
-                'mtype': self.config['compute_machine_type'],
-                'preemptible': self.config['preemptible_bursting']
-            }
-            if self.config['compute_disk_type'] == 'pd-ssd':
-                worker_info['ssd_size'] = self.config['compute_disk_size_gb']
-            else:
-                worker_info['hdd_size'] = self.config['compute_disk_size_gb']
-            if 'gpu_type' in self.config and 'gpu_count' in self.config and self.config['gpu_count'] > 0:
-                worker_info['gpu_type'] = self.config['gpu_type']
-                worker_info['gpu_count'] = self.config['gpu_count']
-            worker_hourly_cost = gcp_hourly_cost(**worker_info)
-            cluster_cost += node_uptime * worker_hourly_cost
-            mtype_prefix = self.config['compute_machine_type'][:3]
-            if mtype_prefix in {'f1-', 'g1-'}:
-                ncpus = 1
-            elif mtype_prefix == 'cus': # n1-custom-X
-                ncpus = int(self.config['compute_machine_type'].split('-')[1])
-            else:
-                ncpus = int(self.config['compute_machine_type'].split('-')[2])
-            # Approximates the cost burden / CPU hour of the VM
-            worker_cpu_cost = worker_hourly_cost / ncpus
+        # if node_uptime is not None:
+        #     worker_info = {
+        #         'mtype': self.config['compute_machine_type'],
+        #         'preemptible': self.config['preemptible_bursting']
+        #     }
+        #     if self.config['compute_disk_type'] == 'pd-ssd':
+        #         worker_info['ssd_size'] = self.config['compute_disk_size_gb']
+        #     else:
+        #         worker_info['hdd_size'] = self.config['compute_disk_size_gb']
+        #     if 'gpu_type' in self.config and 'gpu_count' in self.config and self.config['gpu_count'] > 0:
+        #         worker_info['gpu_type'] = self.config['gpu_type']
+        #         worker_info['gpu_count'] = self.config['gpu_count']
+        #     worker_hourly_cost = gcp_hourly_cost(**worker_info)
+        #     cluster_cost += node_uptime * worker_hourly_cost
+        #     mtype_prefix = self.config['compute_machine_type'][:3]
+        #     if mtype_prefix in {'f1-', 'g1-'}:
+        #         ncpus = 1
+        #     elif mtype_prefix == 'cus': # n1-custom-X
+        #         ncpus = int(self.config['compute_machine_type'].split('-')[1])
+        #     else:
+        #         ncpus = int(self.config['compute_machine_type'].split('-')[2])
+        #     # Approximates the cost burden / CPU hour of the VM
+        #     worker_cpu_cost = worker_hourly_cost / ncpus
         if clock_uptime is not None:
             controller_info = {
-                'mtype': self.config['controller_machine_type'],
+                'mtype': self.controller_type,
                 'preemptible': False,
+                'hdd_size': self.controller_disk_size
             }
-            if self.config['controller_disk_type'] == 'pd-ssd':
-                controller_info['ssd_size'] = self.config['controller_disk_size_gb']
-            else:
-                controller_info['hdd_size'] = self.config['controller_disk_size_gb']
-            if 'controller_secondary_disk_size_gb' in self.config:
-                if 'hdd_size' in controller_info:
-                    controller_info['hdd_size'] += self.config['controller_secondary_disk_size_gb']
-                elif self.config['controller_secondary_disk_size_gb'] > 0:
-                    controller_info['hdd_size'] = self.config['controller_secondary_disk_size_gb']
+            if 'sec' in self.config and self.config['sec'] != '-':
+                controller_info['hdd_size'] += int(self.config['sec'])
             cluster_cost += clock_uptime * gcp_hourly_cost(**controller_info)
-        if job_cpu_time is not None:
-            job_cost = {
-                job_id: worker_cpu_cost * cpu_time
-                for job_id, cpu_time in job_cpu_time.items()
-            }
+        # if job_cpu_time is not None:
+        #     job_cost = {
+        #         job_id: worker_cpu_cost * cpu_time
+        #         for job_id, cpu_time in job_cpu_time.items()
+        #     }
         return cluster_cost, job_cost
