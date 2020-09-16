@@ -15,7 +15,7 @@ import threading
 import time
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
-from ..utils import get_default_gcp_project, gcp_hourly_cost
+from ..utils import get_default_gcp_project, gcp_hourly_cost, isatty
 
 from requests.exceptions import ConnectionError as RConnectionError
 from urllib3.exceptions import ProtocolError
@@ -358,11 +358,18 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         return ans
 
     def invoke(self, command, interactive = False):
+        if not isatty(sys.stdout, sys.stdin):
+            interactive = False
+
+        # re-purpose LocalSlurmBackend's invoke
+        local_invoke = super(TransientImageSlurmBackend, self).invoke
         if self.container is not None and self.container().status == "running":
-            return_code, (stdout, stderr) = self.container().exec_run(
-              command, demux = True, tty = interactive, stdin = interactive
+            cmd = "docker exec {ti_flag} {container} {command}".format(
+              ti_flag = "-ti" if interactive else "",
+              container = self.config["cluster_name"],
+              command = command
             )
-            return (return_code, io.BytesIO(stdout), io.BytesIO(stderr))
+            return local_invoke(cmd, interactive)
         else:
             return (1, io.BytesIO(), io.BytesIO(b"Container is not running!"))
 

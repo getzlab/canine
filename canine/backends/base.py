@@ -387,10 +387,12 @@ class AbstractSlurmBackend(abc.ABC):
         )
         status, stdout, stderr = self.invoke(command)
         check_call(command, status, stdout, stderr)
-        result = batch_job_pattern.search(stdout.read().decode())
+        out = stdout.read().decode()
+        err = stderr.read().decode()
+        result = batch_job_pattern.search(out)
         if result:
             return result.group(1)
-        raise ValueError("Command output did not match pattern")
+        raise ValueError("Command\n  {command}\noutput did not match sbatch return pattern.\nstdout: {stdout}\nstderr: {stderr}\nexit code: {exitcode}".format(command = command, stdout = out, stderr = err, exitcode = status))
 
     def scancel(self, jobID: str, *slurmopts: str, **slurmparams: typing.Any):
         """
