@@ -289,7 +289,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             subprocess.check_call(
                 """gcloud compute instances create {nfs_nodename} \
                    --image {image} --machine-type n1-standard-4 --zone {compute_zone} \
-                   {nfs_compute_script} {preemptible} \
+                   {nfs_compute_script} \
                    --tags caninetransientimage
                 """.format(nfs_nodename = nfs_nodename, **self.config),
                 shell = True
