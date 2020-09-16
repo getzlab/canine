@@ -10,6 +10,7 @@ import traceback
 import shutil
 import warnings
 import crayons
+import re
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
@@ -20,13 +21,17 @@ from agutil import status_bar
 import pandas as pd
 
 Localization = namedtuple("Localization", ['type', 'path'])
-# types: stream, download, local, None
+# types: stream, download, ro_disk, None
 # indicates what kind of action needs to be taken during job startup
 
 PathType = namedtuple(
     'PathType',
     ['localpath', 'remotepath']
 )
+
+class OverrideValueError(ValueError):
+    def __init__(self, override, arg, value):
+        super().__init__("'{}' override is invalid for input {} with value {}".format(arg, value))
 
 class AbstractLocalizer(abc.ABC):
     """
@@ -466,9 +471,17 @@ class AbstractLocalizer(abc.ABC):
                     # No localization needed, already copied
                     self.inputs[jobId][arg] = Localization(None, common_dests[value])
                 elif mode is not False:
-                    if mode == 'stream':
-                        if not value.startswith('gs://'):
-                            print("Ignoring 'stream' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
+                    try:
+                        if mode == 'stream':
+                            if not value.startswith('gs://'):
+                                raise OverrideValueError(mode, arg, value)
+
+                            self.inputs[jobId][arg] = Localization(
+                                'stream',
+                                value
+                            )
+
+                        elif mode in ['localize', 'symlink']:
                             self.inputs[jobId][arg] = Localization(
                                 None,
                                 self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
@@ -478,12 +491,33 @@ class AbstractLocalizer(abc.ABC):
                                 self.inputs[jobId][arg].path,
                                 transport=transport
                             )
-                        else:
+
+                        elif mode == 'delayed':
+                            if not value.startswith('gs://'):
+                                raise OverrideValueError(mode, arg, value)
+
                             self.inputs[jobId][arg] = Localization(
-                                'stream',
+                                'download',
                                 value
                             )
-                    elif mode in {'localize', 'symlink'}:
+
+                        elif mode == "ro_disk":
+                            if not value.startswith('rodisk://'):
+                                raise OverrideValueError(mode, arg, value)
+                            self.inputs[jobId][arg] = Localization(
+                                'ro_disk',
+                                value
+                            )
+
+                        elif mode is None or mode == 'null':
+                            # Do not reserve path here
+                            # null override treats input as string
+                            self.inputs[jobId][arg] = Localization(None, value)
+
+                        else:
+                            raise ValueError("Invalid override option [{}]".format(mode))
+                    except OverrideValueError as e:
+                        print(e.args[0], file = sys.stderr)
                         self.inputs[jobId][arg] = Localization(
                             None,
                             self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
@@ -493,44 +527,27 @@ class AbstractLocalizer(abc.ABC):
                             self.inputs[jobId][arg].path,
                             transport=transport
                         )
-                    elif mode in {'delayed', 'local'}:
-                        if not value.startswith('gs://'):
-                            print("Ignoring 'delayed' override for", arg, "with value", value, "and localizing now", file=sys.stderr)
-                            self.inputs[jobId][arg] = Localization(
-                                None,
-                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                            )
-                            self.localize_file(
-                                value,
-                                self.inputs[jobId][arg].path,
-                                transport=transport
-                            )
-                        elif mode == 'local':
-                            self.local_download_size[jobId] = self.local_download_size.get(jobId, 0) + self.get_object_size(value)
-                            self.inputs[jobId][arg] = Localization(
-                                'local',
-                                value
-                            )
-                        else:
-                            self.inputs[jobId][arg] = Localization(
-                                'download',
-                                value
-                            )
-                    elif mode is None or mode == 'null':
-                        # Do not reserve path here
-                        # null override treats input as string
-                        self.inputs[jobId][arg] = Localization(None, value)
-                    else:
-                        raise ValueError("Invalid override option [{}]".format(mode))
+
                 else:
+                    # if no overrides were given, see if we can immediately
+                    # localize this file
                     if os.path.exists(value) or value.startswith('gs://'):
                         remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
                         self.localize_file(value, remote_path, transport=transport)
                         value = remote_path
+
+                    # autodetect if this is a path on a read-only disk 
+                    loc_type = "ro_disk" if isinstance(value, str) and value.startswith('rodisk://') else None
+
                     self.inputs[jobId][arg] = Localization(
-                        None,
-                        # value will either be a PathType, if localized above,
-                        # or an unchanged string if not handled
+                        # localization type will either be:
+                        # * None, indicating no special processing in localization.sh
+                        # * ro_disk, indicating that this is a path on a read-only disk
+                        loc_type,
+
+                        # value will either be a:
+                        # * PathType, if localized above
+                        # * an unchanged string if not handled
                         value
                     )
 
@@ -540,15 +557,19 @@ class AbstractLocalizer(abc.ABC):
         Must call after pre-scanning inputs
         """
 
-		# generate job variable, exports, and localization_tasks arrays
-		# - job variables and exports are set when setup.sh is _sourced_
-		# - localization tasks are run when localization.sh is _run_
+        # generate job variable, exports, and localization_tasks arrays
+        # - job variables and exports are set when setup.sh is _sourced_
+        # - localization tasks are run when localization.sh is _run_
         job_vars = []
-        exports = []
+        exports = [
+            'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2> /dev/null)',
+            'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone 2> /dev/null))'
+        ]
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
+
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
         if local_download_size > 0 and self.temporary_disk_type is not None:
@@ -563,8 +584,6 @@ class AbstractLocalizer(abc.ABC):
             exports += [
                 'export CANINE_LOCAL_DISK_SIZE={}GB'.format(local_download_size),
                 'export CANINE_LOCAL_DISK_TYPE={}'.format(self.temporary_disk_type),
-                'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name)',
-                'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone))',
                 'export CANINE_LOCAL_DISK_DIR={}/{}'.format(self.local_download_dir, disk_name),
             ]
             localization_tasks += [
@@ -590,6 +609,7 @@ class AbstractLocalizer(abc.ABC):
                 'fi'
             ]
             docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+
         compute_env = self.environment('remote')
         stream_dir_ready = False
         for key, val in self.inputs[jobId].items():
@@ -614,6 +634,7 @@ class AbstractLocalizer(abc.ABC):
                     key,
                     dest
                 ))
+
             elif val.type in {'download', 'local'}:
                 job_vars.append(shlex.quote(key))
                 if val.type == 'download':
@@ -632,6 +653,44 @@ class AbstractLocalizer(abc.ABC):
                     key,
                     dest.remotepath
                 ))
+
+            elif val.type == 'ro_disk':
+                assert val.path.startswith("rodisk://")
+
+                job_vars.append(shlex.quote(key))
+
+                dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
+                disk = dgrp[1]
+                file = dgrp[2]
+
+                dest = self.reserve_path('jobs', jobId, 'inputs', file)
+
+                localization_tasks += [
+                  "export CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk),
+                  "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
+
+                  # attach the disk if it's not already
+                  "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
+                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro || true".format(disk_name = disk),
+                  "fi",
+
+                  # mount the disk if it's not already
+                  "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
+                  # within container
+                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR".format(disk_name = disk),
+                  # on host (so that other dockers can access it)
+                  "if [[ -f /.dockerenv ]]; then sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR; fi".format(disk_name = disk),
+                  "fi",
+
+                  # symlink into the canine directory
+                  "ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}".format(file = file, path = dest.remotepath)
+                ]
+                docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+                exports.append('export {}="{}"'.format(
+                    key,
+                    dest.remotepath
+                ))
+
             elif val.type is None:
                 job_vars.append(shlex.quote(key))
                 exports.append('export {}={}'.format(
@@ -656,7 +715,7 @@ class AbstractLocalizer(abc.ABC):
                 'mkdir -p $CANINE_JOB_ROOT',
                 'chmod 755 $CANINE_JOB_LOCALIZATION',
             ] + exports
-        ) + '\nexport CANINE_DOCKER_ARGS="{docker}"\ncd $CANINE_JOB_ROOT\n'.format(docker=' '.join(docker_args))
+        ) + '\nexport CANINE_DOCKER_ARGS="{docker}"\ncd $CANINE_JOB_ROOT\n'.format(docker=' '.join(set(docker_args)))
 
         # generate localization script
         localization_script = '\n'.join([
