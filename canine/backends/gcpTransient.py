@@ -8,7 +8,7 @@ import os
 import sys
 import warnings
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost
+from ..utils import get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost, canine_logging
 # import paramiko
 import yaml
 import pandas as pd
@@ -219,13 +219,13 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             self.load_config_args()
             time.sleep(30) # Key propagation time
             super().__enter__()
-            print("Waiting for slurm to initialize")
+            canine_logging.info("Waiting for slurm to initialize")
             rc, sout, serr = self.invoke("which sinfo")
             while rc != 0:
                 time.sleep(10)
                 rc, sout, serr = self.invoke("which sinfo")
             time.sleep(60)
-            print("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
+            canine_logging.info("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
             return self
         except:
             self.stop()

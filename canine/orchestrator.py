@@ -8,7 +8,7 @@ from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
-from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered
+from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered, canine_logging
 import yaml
 import numpy as np
 import pandas as pd
@@ -211,13 +211,13 @@ class Orchestrator(object):
         elif len(self.job_spec) > 4000000:
             raise ValueError("Cannot exceed 4000000 jobs in one pipeline")
 
-        print("Preparing pipeline of", len(self.job_spec), "jobs")
-        print("Connecting to backend...")
+        canine_logging.print("Preparing pipeline of", len(self.job_spec), "jobs")
+        canine_logging.print("Connecting to backend...")
         if isinstance(self.backend, RemoteSlurmBackend):
             self.backend.load_config_args()
         start_time = time.monotonic()
         with self.backend:
-            print("Initializing pipeline workspace")
+            canine_logging.print("Initializing pipeline workspace")
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
@@ -228,7 +228,7 @@ class Orchestrator(object):
                     localizer.clean_on_exit = False
                     return self.job_spec
 
-                print("Waiting for cluster to finish startup...")
+                canine_logging.print("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
 
                 # perform hard reset of cluster; some backends do this own their
@@ -237,22 +237,22 @@ class Orchestrator(object):
                 if self.backend.hard_reset_on_orch_init and self._slurmconf_path:
                     active_jobs = self.backend.squeue('all')
                     if len(active_jobs):
-                        print("There are active jobs. Skipping slurmctld restart")
+                        canine_logging.print("There are active jobs. Skipping slurmctld restart")
                     else:
                         try:
-                            print("Stopping slurmctld")
+                            canine_logging.print("Stopping slurmctld")
                             rc, stdout, stderr = self.backend.invoke(
                                 'sudo pkill slurmctld',
                                 True
                             )
                             check_call('sudo pkill slurmctld', rc, stdout, stderr)
-                            print("Loading configurations", self._slurmconf_path)
+                            canine_logging.print("Loading configurations", self._slurmconf_path)
                             rc, stdout, stderr = self.backend.invoke(
                                 'sudo slurmctld -c -f {}'.format(self._slurmconf_path),
                                 True
                             )
                             check_call('sudo slurmctld -c -f {}'.format(self._slurmconf_path), rc, stdout, stderr)
-                            print("Restarting slurmctl")
+                            canine_logging.print("Restarting slurmctl")
                             rc, stdout, stderr = self.backend.invoke(
                                 'sudo slurmctld reconfigure',
                                 True
@@ -260,13 +260,13 @@ class Orchestrator(object):
                             check_call('sudo slurmctld reconfigure', rc, stdout, stderr)
                         except CalledProcessError:
                             traceback.print_exc()
-                            print("Slurmctld restart failed")
+                            canine_logging.error("Slurmctld restart failed")
 
                 #
                 # submit job
-                print("Submitting batch job")
+                canine_logging.print("Submitting batch job")
                 batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'))
-                print("Batch id:", batch_id)
+                canine_logging.print("Batch id:", batch_id)
 
                 #
                 # wait for jobs to finish
@@ -277,24 +277,24 @@ class Orchestrator(object):
                 try:
                     completed_jobs, cpu_time, uptime, prev_acct = self.wait_for_jobs_to_finish(batch_id)
                 except:
-                    print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
+                    canine_logging.error("Encountered unhandled exception. Cancelling batch job")
                     self.backend.scancel(batch_id)
                     localizer.clean_on_exit = False
                     raise
                 finally:
                     # Check if fully job-avoided so we still delocalize
                     if batch_id == -2 or len(completed_jobs):
-                        print("Delocalizing outputs")
+                        canine_logging.print("Delocalizing outputs")
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
 
-                print("Parsing output data")
+                canine_logging.print("Parsing output data")
                 self.adapter.parse_outputs(outputs)
 
                 df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
 
         try:
             runtime = time.monotonic() - start_time
-            print("Estimated total cluster cost:", self.backend.estimate_cost(
+            canine_logging.print("Estimated total cluster cost:", self.backend.estimate_cost(
                 runtime/3600,
                 node_uptime=sum(uptime.values())/120
             )[0])
@@ -306,14 +306,14 @@ class Orchestrator(object):
             return df
 
     def localize_inputs_and_script(self, localizer) -> str:
-        print("Localizing inputs...")
+        canine_logging.print("Localizing inputs...")
         abs_staging_dir = localizer.localize(
             self.job_spec,
             self.raw_outputs,
             self.localizer_overrides
         )
-        print("Job staged on SLURM controller in:", abs_staging_dir)
-        print("Preparing pipeline script")
+        canine_logging.print("Job staged on SLURM controller in:", abs_staging_dir)
+        canine_logging.print("Preparing pipeline script")
         env = localizer.environment('remote')
         root_dir = env['CANINE_ROOT']
         entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')
@@ -405,9 +405,9 @@ class Orchestrator(object):
                 # dict with blanks
                 missing_outputs = self.job_spec.keys() - outputs.keys()
                 if missing_outputs:
-                    print("WARNING: {}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
+                    canine_logging.error("WARNING: {}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
                       len(missing_outputs), len(self.job_spec)
-                    ), file = sys.stderr)
+                    ))
                     outputs = { **outputs, **{ k : {} for k in missing_outputs } }
 
                 # make the output dataframe
@@ -441,7 +441,7 @@ class Orchestrator(object):
                     df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
             except:
                 df = pd.DataFrame()
-                print("Error generating output dataframe; see stack trace for details.", file = sys.stderr)
+                canine_logging.error("Error generating output dataframe; see stack trace for details.")
                 traceback.print_exc()
 
 
@@ -563,8 +563,8 @@ class Orchestrator(object):
 
                     return np.count_nonzero(~fail_idx)
                 except (ValueError, OSError) as e:
-                    print("Cannot recover preexisting task outputs: " + str(e), file = sys.stderr)
-                    print("Overwriting output and aborting job avoidance.", file = sys.stderr)
+                    canine_logging.warning("Cannot recover preexisting task outputs: " + str(e))
+                    canine_logging.warning("Overwriting output and aborting job avoidance.")
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
                     return 0

@@ -10,7 +10,7 @@ import traceback
 import shlex
 import atexit
 from .base import AbstractSlurmBackend, AbstractTransport
-from ..utils import ArgumentHelper, make_interactive, check_call, isatty
+from ..utils import ArgumentHelper, make_interactive, check_call, isatty, canine_logging
 from agutil import StdOutAdapter
 import pandas as pd
 import paramiko
@@ -284,7 +284,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             return self.client.exec_command(command, get_pty=pty)
         except paramiko.ssh_exception.SSHException as e:
             if e.args == ('Key-exchange timed out waiting for key negotiation',):
-                print("Rekey timeout. Restarting client. Open transports may be interrupted")
+                canine_logging.print("Rekey timeout. Restarting client. Open transports may be interrupted")
                 reinit = []
                 for t in self.__transports:
                     if t.session is not None:
@@ -333,7 +333,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
             self.early_rekey()
             return raw_stdout.channel.recv_exit_status(), stdout, stderr
         except KeyboardInterrupt:
-            print("Warning: Command will continue running on remote server as Paramiko has no way to interrupt commands", file=sys.stderr)
+            canine_logging.warning("Warning: Command will continue running on remote server as Paramiko has no way to interrupt commands")
             raise
 
     def interactive_login(self) -> int:
