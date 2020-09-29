@@ -538,7 +538,10 @@ class Orchestrator(object):
                     js_df = js_df.sort_values(sort_cols.index.tolist())
 
                     if not r_df["inputs"].equals(js_df):
-                        raise ValueError("Cannot job avoid; values of input parameters do not match!")
+                        raise ValueError("Cannot job avoid; values of input parameters do not match!\n" + \
+                            "\u21B3saved:\n" + str(r_df["inputs"].to_dict()) + "\n" + \
+                            "\u21B3job:\n" + str(js_df.to_dict()) + "\n"
+                        )
 
                     # if all is well, figure out which jobs need to be re-run
                     fail_idx = r_df[("job", "slurm_state")] == "FAILED"
