@@ -378,7 +378,6 @@ class AbstractLocalizer(abc.ABC):
                 script_path = self.backend.pack_batch_script(
                     'export CANINE_OUTPUTS={}'.format(output_dir),
                     'cat <(echo "jobId\tfield\tpath") $CANINE_OUTPUTS/*/.canine_job_manifest > $CANINE_OUTPUTS/.canine_pipeline_manifest.tsv',
-                    'rm -f $CANINE_OUTPUTS/*/.canine_job_manifest',
                     script_path=os.path.join(output_dir, 'manifest.sh')
                 )
                 check_call(
