@@ -4,12 +4,11 @@ import time
 import sys
 import warnings
 import traceback
-import hashlib
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
-from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered, sha1_base32
+from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered
 import yaml
 import numpy as np
 import pandas as pd
@@ -165,25 +164,11 @@ class Orchestrator(object):
         self.backend = BACKENDS[self._backend_type](**backend)
 
         #
-        # hashes for job avoidance
-        script_hash = sha1_base32(bytearray("".join(self.script), "utf-8"), 4)
-        #input_hash = sha1_base32(, 4)
-
-        #
         # localizer
         self.localizer_args = config['localization'] if 'localization' in config else {}
         if self.localizer_args['strategy'] not in LOCALIZERS:
             raise ValueError("Unknown localization strategy '{}'".format(self.localizer_args))
         self._localizer_type = LOCALIZERS[self.localizer_args['strategy']]
-
-        # input_hash and script_hash can be overridden by explicitly passing them to config["localization"]
-        self.localizer_args = {
-          "script_hash" : script_hash,
-          "input_hash" : "xxxxx",
-          "hash_output_directory" : True,
-          **self.localizer_args
-        }
-
         self.localizer_overrides = {}
         if 'overrides' in self.localizer_args:
             self.localizer_overrides = {**self.localizer_args['overrides']}

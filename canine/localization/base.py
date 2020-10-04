@@ -14,7 +14,6 @@ import re
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
-from datetime import datetime
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
 from ..utils import get_default_gcp_project, check_call
 from hound.client import _getblob_bucket
@@ -44,10 +43,7 @@ class AbstractLocalizer(abc.ABC):
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
         common: bool = True, staging_dir: str = None,
         project: typing.Optional[str] = None, temporary_disk_type: str = 'standard',
-        local_download_dir: typing.Optional[str] = None,
-        input_hash: typing.Optional[str] = None, script_hash: typing.Optional[str] = None,
-        hash_output_directory: bool = False,
-        **kwargs
+        local_download_dir: typing.Optional[str] = None, **kwargs
     ):
         """
         Initializes the Localizer using the given transport.
@@ -69,13 +65,6 @@ class AbstractLocalizer(abc.ABC):
         self.local_dir = self._local_dir.name
         # FIXME: This doesn't actually make sense. Unless we assume staging_dir == mount_path, then transport.normpath gives an inaccurate mount_path
         with self.backend.transport() as transport:
-            # add current date, script hash, and input hash to directory name, if requested
-            if staging_dir is not None and hash_output_directory:
-                date = datetime.now().strftime("%Y%m%d%H%M%S")
-                staging_dir += ":" + date
-                staging_dir += "_" + script_hash if script_hash is not None else ""
-                staging_dir += "_" + input_hash if input_hash is not None else ""
-
             self.staging_dir = transport.normpath(staging_dir if staging_dir is not None else str(uuid4()))
             # if transport.isdir(self.staging_dir) and not force:
             #     raise FileExistsError("{} already exists. Supply force=True to override".format(
