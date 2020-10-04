@@ -12,8 +12,10 @@ import google.auth
 import paramiko
 import shutil
 import time
+import numpy as np
 import pandas as pd
 import requests
+import hashlib
 
 def isatty(*streams: typing.IO) -> bool:
     """
@@ -353,3 +355,21 @@ def pandas_read_hdf5_buffered(key: str, buf: io.BufferedReader) -> pd.DataFrame:
           driver_core_image = buf.read()
         ) as store:
             return store[key]
+
+def base32(buf: bytes):
+    """
+    Convert a byte array into a base32 encoded string
+    """
+    table = np.array(list("abcdefghijklmnopqrstuvwxyz012345"))
+
+    bits = np.unpackbits(np.frombuffer(buf, dtype = np.uint8))
+    bits = np.pad(bits, (0, 5 - (len(bits) % 5)), constant_values = 0).reshape(-1, 5)
+    return "".join(table[np.ravel(bits@2**np.c_[4:-1:-1])])
+
+def sha1_base32(buf: bytes, n: int = None):
+    """
+    Return a base32 representation of the first n bytes of SHA1(buf).
+    If n = None, the entire buffer will be encoded.
+    """
+
+    return base32(hashlib.sha1(buf).digest()[slice(0, n)])
