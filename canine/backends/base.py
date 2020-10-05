@@ -177,6 +177,13 @@ class AbstractTransport(abc.ABC):
         except FileNotFoundError:
             return False
 
+    @abc.abstractmethod
+    def glob(self, path: str) -> typing.List[str]:
+        """
+        Returns an array matching the glob pattern, or an empty list if no match.
+        """
+        pass
+
     def makedirs(self, path: str, exist_okay: bool = False):
         """
         Recursively build the requested directory structure
