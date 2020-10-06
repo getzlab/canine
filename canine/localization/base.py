@@ -739,6 +739,7 @@ class AbstractLocalizer(abc.ABC):
             line.rstrip()
             for line in [
                 '#!/bin/bash',
+                'set -e',
                 'if [[ -d {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
                 # 'mv ../stderr ../stdout .',
                 'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3}; else python {0} {1} {2} {3}; fi'.format(

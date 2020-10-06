@@ -49,10 +49,19 @@ export CANINE_JOBS="{{CANINE_JOBS}}"
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh
 LOCALIZER_JOB_RC=$?
-{{pipeline_script}}
-CANINE_JOB_RC=$?
-[[ $LOCALIZER_JOB_RC != 0 ]] && CANINE_JOB_RC=$LOCALIZER_JOB_RC || CANINE_JOB_RC=$CANINE_JOB_RC
-source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
+if [ $LOCALIZER_JOB_RC -eq 0 ]; then
+  {{pipeline_script}}
+  CANINE_JOB_RC=$?
+  echo -n $CANINE_JOB_RC > ../.job_exit_code
+  echo -n 0 > ../.localizer_exit_code
+else
+  echo "Localization failure!" > /dev/stderr
+  echo -n "DNR" > ../.job_exit_code
+  echo -n $LOCALIZER_JOB_RC > ../.localizer_exit_code
+  CANINE_JOB_RC=$LOCALIZER_JOB_RC
+fi
+$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
+echo -n $? > ../.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=version)
 
