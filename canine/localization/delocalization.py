@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import shlex
+import sys
 
 """
 This is not actually part of the canine package
@@ -49,6 +50,21 @@ def main(output_dir, jobId, patterns, copy):
                             os.symlink(os.path.abspath(target), dest)
                     else:
                         shutil.copytree(target, dest)
+
+                # compute checksum
+                if name not in {'stdout', 'stderr'}:
+                    try:
+                        subprocess.check_call(
+                          "sha1sum {target} | awk '{{ print $1 }}' > {output}".format(
+                            target = target,
+                            output = os.path.join(jobdir, name, os.path.dirname(os.path.relpath(target)), "." + os.path.basename(target) + ".sha1")
+                          ),
+                          shell = True
+                        )
+                    except subprocess.CalledProcessError:
+                        print("Error computing checksum for {}!".format(target), file = sys.stderr)
+
+                # write job manifest
                 manifest.write("{}\t{}\t{}\n".format(
                     jobId,
                     name,
