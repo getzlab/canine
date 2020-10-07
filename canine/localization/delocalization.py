@@ -65,9 +65,10 @@ def main(output_dir, jobId, patterns, copy):
                         print("Error computing checksum for {}!".format(target), file = sys.stderr)
 
                 # write job manifest
-                manifest.write("{}\t{}\t{}\n".format(
+                manifest.write("{}\t{}\t{}\t{}\n".format(
                     jobId,
                     name,
+                    pattern,
                     os.path.relpath(dest.strip(), output_dir)
                 ))
 
