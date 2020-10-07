@@ -32,11 +32,15 @@ def main(output_dir, jobId, patterns, copy):
         os.makedirs(jobdir)
     with open(os.path.join(jobdir, '.canine_job_manifest'), 'w') as manifest:
         for name, pattern in patterns:
+            n_matched = 0
             for target in glob.iglob(pattern):
+                # construct output file path
                 if name in {'stdout', 'stderr'}:
                     dest = os.path.join(jobdir, name)
                 else:
                     dest = os.path.join(jobdir, name, os.path.relpath(target))
+
+                # populate output directory
                 if not os.path.exists(dest):
                     if not os.path.isdir(os.path.dirname(dest)):
                         os.makedirs(os.path.dirname(dest))
@@ -70,6 +74,18 @@ def main(output_dir, jobId, patterns, copy):
                     name,
                     pattern,
                     os.path.relpath(dest.strip(), output_dir)
+                ))
+
+                n_matched += 1
+
+            # warn if no files matched; make log in manifest
+            if n_matched == 0:
+                print('WARNING: output name "{0}" (pattern "{1}") not found.'.format(name,  pattern), file = sys.stderr)
+                manifest.write("{}\t{}\t{}\t{}\n".format(
+                    jobId,
+                    name,
+                    pattern,
+                    "//not_found"
                 ))
 
 if __name__ == '__main__':
