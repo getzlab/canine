@@ -351,7 +351,7 @@ class Orchestrator(object):
 
     def wait_for_jobs_to_finish(self, batch_id):
         completed_jobs = []
-        cpu_time = {}
+        preempted_cpu_time = {}
         uptime = {}
         prev_acct = None
 
@@ -365,22 +365,29 @@ class Orchestrator(object):
             acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
             for jid in [*waiting_jobs]:
                 if jid in acct.index:
+                    # check if job has restarted since last update due to preemption;
+                    # if yes, accumulate the CPU time used in the last attempt
                     if prev_acct is not None and jid in prev_acct.index and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
-                        # Job has restarted since last update:
-                        if jid in cpu_time:
-                            cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
+                        if jid in preempted_cpu_time:
+                            preempted_cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
                         else:
-                            cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
+                            preempted_cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
+
+                    # job has completed
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                         job = jid.split('_')[1]
 #                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
+
+            # track node uptime
             for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
                 if node in uptime:
                     uptime[node] += 1
                 else:
                     uptime[node] = 1
+
+            # store this iteration of sacct for next polling interval
             if prev_acct is None:
                 prev_acct = acct
             else:
@@ -389,9 +396,9 @@ class Orchestrator(object):
                     prev_acct.loc[[idx for idx in prev_acct.index if idx not in acct.index]]
                 ])
 
-        return completed_jobs, cpu_time, uptime, prev_acct
+        return completed_jobs, preempted_cpu_time, uptime, prev_acct
 
-    def make_output_DF(self, batch_id, outputs, cpu_time, prev_acct, localizer = None) -> pd.DataFrame:
+    def make_output_DF(self, batch_id, outputs, preempted_cpu_time, prev_acct, localizer = None) -> pd.DataFrame:
         df = pd.DataFrame()
 
         if batch_id != -2:
@@ -426,7 +433,7 @@ class Orchestrator(object):
                             ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
                             ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
                             ('job', 'cpu_seconds'): (prev_acct['CPUTimeRAW'][batch_id+'_'+str(array_id)] + (
-                                cpu_time[batch_id+'_'+str(array_id)] if batch_id+'_'+str(array_id) in cpu_time else 0
+                                preempted_cpu_time[batch_id+'_'+str(array_id)] if batch_id+'_'+str(array_id) in preempted_cpu_time else 0
                             )) if prev_acct is not None else -1,
                             **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
                             **{
