@@ -1,3 +1,4 @@
+import copy
 import typing
 import os
 import time
@@ -524,94 +525,86 @@ class Orchestrator(object):
         Detects jobs which have previously been run in this staging directory.
         Succeeded jobs are skipped. Failed jobs are reset and rerun
         """
-        with localizer.transport_context() as transport:
-            df_path = localizer.reserve_path("results.k9df.hdf5").remotepath
+        old_job_spec = copy.deepcopy(self.job_spec)
+        n_avoided = 0
 
+        with localizer.transport_context() as transport:
             #remove all output if specified
             if overwrite:
                 if transport.isdir(localizer.staging_dir):
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
-                return 0
+                return n_avoided, old_job_spec
 
-            # check for preexisting jobs' output
-            if transport.exists(df_path):
+            # check for preexisting jobs' outputs
+            if transport.exists(localizer.staging_dir):
                 try:
-                    # load in results and job spec dataframes
-                    with transport.open(df_path, mode = "rb") as r:
-                        r_df = pandas_read_hdf5_buffered(key = "results", buf = r)
-                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
+                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id") 
+                    js_df["failed"] = False
+                    js_df["output_ok"] = False
+                    jobs_dir = localizer.environment("local")["CANINE_JOBS"]
+                    output_dir = localizer.environment("local")["CANINE_OUTPUT"]
 
-                    if r_df.empty or \
-                       "inputs" not in r_df or \
-                       ("outputs" not in r_df and len(self.raw_outputs) > 0):
-                        raise ValueError("Could not recover previous job results!")
+                    # if everything succeeded, with matching outputs, we're done
+                    # TODO
 
-                    # check if jobs are compatible: they must have identical inputs and index,
-                    # and output columns must be matching
-                    if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
-                            js_df.columns.isin(r_df["inputs"].columns).all()):
-                        r_df_set = set(r_df["inputs"].columns)
-                        js_df_set = set(js_df.columns)
-                        raise ValueError(
-                          "Cannot job avoid; sets of input parameters do not match! Parameters unique to:\n" + \
-                          "\u21B3saved: " + ", ".join(r_df_set - js_df_set) + "\n" + \
-                          "\u21B3job: " + ", ".join(js_df_set - r_df_set)
+                    # check for failed shards 
+                    for i in js_df.index:
+                        for e in [".job_exit_code", ".localizer_exit_code", ".teardown_exit_code"]:
+                            exit_code = os.path.join(jobs_dir, i, e)
+                            if transport.isfile(exit_code):
+                                with transport.open(exit_code, "r") as ec:
+                                    js_df.at[i, "failed"] = (ec.read() != "0") | js_df.at[i, "failed"]
+                            else:
+                                js_df.at[i, "failed"] = True
+                                break
+
+                    # check for matching outputs
+                    # name and pattern must both match
+                    for i in js_df.loc[~js_df["failed"]].index:
+                        o_df = pd.read_csv(
+                          os.path.join(output_dir, i, ".canine_job_manifest"),
+                          header = None,
+                          names = ["shard", "output", "pattern", "path"],
+                          sep = "\t"
                         )
 
-                    output_temp = pd.Series(index = self.raw_outputs.keys())
-                    if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
-                            output_temp.index.isin(r_df["outputs"].columns).all()):
-                        r_df_set = set(r_df["outputs"].columns)
-                        o_df_set = set(output_temp.index)
-                        raise ValueError(
-                          "Cannot job avoid; sets of output parameters do not match! Parameters unique to:\n" + \
-                          "\u21B3saved: " + ", ".join(r_df_set - o_df_set) + "\n" + \
-                          "\u21B3job: " + ", ".join(o_df_set - r_df_set)
-                        )
+                        if o_df.set_index("output").loc[:, "pattern"].to_dict() == self.raw_outputs:
+                            js_df.at[i, "output_ok"] = True
 
-                    # check that values of inputs are the same
-                    # we have to sort because the order of jobs might differ for the same
-                    # inputs
-                    sort_cols = r_df.columns.to_series()["inputs"]
-                    r_df = r_df.sort_values(sort_cols.tolist())
-                    js_df = js_df.sort_values(sort_cols.index.tolist())
+                    # shards that both succeeded and have matching outputs can be noop'd
+                    # in the job spec
+                    js_df["noop"] = ~js_df["failed"] & js_df["output_ok"]
 
-                    if not r_df["inputs"].equals(js_df):
-                        raise ValueError("Cannot job avoid; values of input parameters do not match!")
+                    # shards that succeeded but don't have matching outputs must have their
+                    # delocalizer rerun
+                    js_df["re_deloc"] = ~js_df["failed"] & ~js_df["output_ok"]
 
-                    # if all is well, figure out which jobs need to be re-run
-                    fail_idx = r_df[("job", "slurm_state")] == "FAILED"
-                    self.df_avoided = r_df.loc[~fail_idx]
+                    # either way, these jobs will be noop'd; deloc. only jobs will be
+                    # submitted separately
+                    for i in js_df.index[js_df["noop"] | js_df["re_deloc"]]:
+                        self.job_spec[i] = None
 
-                    # remove jobs that don't need to be re-run from job_spec
-                    for k in r_df.index[~fail_idx]:
-                        self.job_spec.pop(k, None)
-
-                    # remove output directories of failed jobs
-                    for k in self.job_spec:
+                    # shards that failed must have their output directories purged
+                    for k in js_df.index[js_df["failed"]]:
                         transport.rmtree(
                             localizer.reserve_path('jobs', k).remotepath
                         )
 
-                    # we also have to remove the common inputs directory, so that
-                    # the localizer can regenerate it
-                    if len(self.job_spec) > 0:
-                        transport.rmtree(
-                            localizer.reserve_path('common').remotepath
-                        )
+                    # if we are re-running any jobs, we also have to remove the common
+                    # inputs directory, so that the localizer can regenerate it
+                    # I don't think we need this anymore, since the localizer checks for noops
+            #		if (~js_df["noop"]).any():
+            #			transport.rmtree(
+            #				localizer.reserve_path('common').remotepath
+            #			)
 
-                    return np.count_nonzero(~fail_idx)
+                    n_avoided += (js_df["noop"] | js_df["re_deloc"]).sum()
                 except (ValueError, OSError) as e:
                     print("Cannot recover preexisting task outputs: " + str(e), file = sys.stderr)
                     print("Overwriting output and aborting job avoidance.", file = sys.stderr)
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
-                    return 0
+                    return 0, old_job_spec
 
-            # if the output directory exists but there's no output dataframe, assume
-            # it's corrupted and remove it
-            elif transport.isdir(localizer.staging_dir):
-                transport.rmtree(localizer.staging_dir)
-                transport.makedirs(localizer.staging_dir)
-        return 0
+        return n_avoided, old_job_spec
