@@ -284,7 +284,7 @@ class Orchestrator(object):
                 uptime = {}
                 prev_acct = None
                 try:
-                    completed_jobs, cpu_time, uptime, prev_acct = self.wait_for_jobs_to_finish(batch_id)
+                    completed_jobs, uptime, acct = self.wait_for_jobs_to_finish(batch_id)
                 except:
                     print("Encountered unhandled exception. Cancelling batch job", file=sys.stderr)
                     self.backend.scancel(batch_id)
@@ -299,7 +299,7 @@ class Orchestrator(object):
                 print("Parsing output data")
                 self.adapter.parse_outputs(outputs)
 
-                df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
+                df = self.make_output_DF(batch_id, outputs, acct, localizer)
 
         try:
             runtime = time.monotonic() - start_time
@@ -350,10 +350,18 @@ class Orchestrator(object):
         return entrypoint_path
 
     def wait_for_jobs_to_finish(self, batch_id):
+        def grouper(g):
+            g = g.sort_values("Submit")
+            final = g.iloc[-1]
+            final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
+            final.at["Submit"] = g.loc[:, "Submit"].iloc[0]
+            final["n_preempted"] = len(g) - 1
+
+            return final
+
+        acct = None
         completed_jobs = []
-        #preempted_cpu_time = {}
         uptime = {}
-        prev_acct = None
 
         waiting_jobs = {
             '{}_{}'.format(batch_id, i)
@@ -362,17 +370,16 @@ class Orchestrator(object):
 
         while len(waiting_jobs):
             time.sleep(30)
-            acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
-            for jid in [*waiting_jobs]:
-                if jid in acct.index:
-#                    # check if job has restarted since last update due to preemption;
-#                    # if yes, accumulate the CPU time used in the last attempt
-#                    if prev_acct is not None and jid in prev_acct.index and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
-#                        if jid in preempted_cpu_time:
-#                            preempted_cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
-#                        else:
-#                            preempted_cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
+            acct = self.backend.sacct(
+              "D",
+              job = batch_id,
+              format = "JobId,State,ExitCode,CPUTimeRAW,Submit"
+            ).astype({'CPUTimeRAW': int, "Submit" : np.datetime64})
+            acct = acct.loc[~acct.index.str.endswith("batch")]
+            acct = acct.groupby(acct.index).apply(grouper)
 
+            for jid in [*waiting_jobs]:
+                if jid in acct.index: 
                     # job has completed
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
                         job = jid.split('_')[1]
@@ -386,26 +393,17 @@ class Orchestrator(object):
                     uptime[node] += 1
                 else:
                     uptime[node] = 1
-#
-#            # store this iteration of sacct for next polling interval
-#            if prev_acct is None:
-#                prev_acct = acct
-#            else:
-#                prev_acct = pd.concat([
-#                    acct,
-#                    #prev_acct.loc[[idx for idx in prev_acct.index if idx not in acct.index]]
-#                    prev_acct.loc[~prev_acct.index.isin(acct.index)]
-#                ])
 
-        return completed_jobs, preempted_cpu_time, uptime, prev_acct
+            # save dataframe for each shard
+            # TODO
 
-    def make_output_DF(self, batch_id, outputs, preempted_cpu_time, prev_acct, localizer = None) -> pd.DataFrame:
+        return completed_jobs, uptime, acct
+
+    def make_output_DF(self, batch_id, outputs, acct, localizer = None) -> pd.DataFrame:
         df = pd.DataFrame()
 
         if batch_id != -2:
             try:
-                acct = self.backend.sacct(job=batch_id, "D")
-
                 # we cannot assume that all outputs were properly delocalized, i.e.
                 # self.job_spec.keys() == outputs.keys()
                 #
@@ -433,9 +431,9 @@ class Orchestrator(object):
                         job_id: {
                             ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
                             ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
-                            ('job', 'cpu_seconds'): (prev_acct['CPUTimeRAW'][batch_id+'_'+str(array_id)] + (
-                                preempted_cpu_time[batch_id+'_'+str(array_id)] if batch_id+'_'+str(array_id) in preempted_cpu_time else 0
-                            )) if prev_acct is not None else -1,
+                            ('job', 'cpu_seconds'): acct['CPUTimeRAW'][batch_id+'_'+str(array_id)],
+                            ('job', 'submit_time'): acct['Submit'][batch_id+'_'+str(array_id)],
+                            ('job', 'n_preempted'): acct['n_preempted'][batch_id+'_'+str(array_id)],
                             **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
                             **{
                                 ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
