@@ -72,6 +72,10 @@ class RemoteLocalizer(AbstractLocalizer):
             else:
                 common_dests = {}
             for jobId, data in inputs.items():
+                # noop; this shard has been avoided
+                if data is None:
+                    continue
+
                 transport.makedirs(
                     os.path.join(
                         self.environment('remote')['CANINE_JOBS'],

@@ -423,6 +423,10 @@ class AbstractLocalizer(abc.ABC):
             self.common_inputs = set()
             seen = set()
             for jobId, values in inputs.items():
+                # noop; this shard was avoided
+                if values is None:
+                    continue
+
                 for arg, path in values.items():
                     if path in seen and (arg not in overrides or overrides[arg] == 'common'):
                         self.common_inputs.add(path)

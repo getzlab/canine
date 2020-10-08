@@ -364,8 +364,9 @@ class Orchestrator(object):
         uptime = {}
 
         waiting_jobs = {
-            '{}_{}'.format(batch_id, i)
-            for i in range(len(self.job_spec))
+            '{}_{}'.format(batch_id, k)
+            for k, v in self.job_spec.items() if v is not None
+            # exclude noop'd jobs from waiting set
         }
 
         save_acct = False
@@ -388,14 +389,13 @@ class Orchestrator(object):
                     job = jid.split('_')[1]
 
                     # job has completed
-                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
+                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'} or self.job_spec[job] is None:
 #                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
 
-                    # save sacct info for each shard
-                    # TODO: skip for noop jobs (there will be a special flag in the job_spec)
-                    if save_acct:
+                    # save sacct info for each shard if it's not a noop (None)
+                    if save_acct and self.job_spec[job] is not None:
                         with localizer.transport_context() as transport:
                             with transport.open(os.path.join(jobs_dir, job, ".sacct"), 'w') as w:
                                 acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
@@ -491,6 +491,7 @@ class Orchestrator(object):
 
         batch_id = self.backend.sbatch(
             entrypoint_path,
+            "H", # submit in "held" state to allow for noop'd jobs to be cancelled
             **{
                 'requeue': True,
                 'job_name': self.name,
@@ -501,6 +502,17 @@ class Orchestrator(object):
                 **Orchestrator.stringify(extra_sbatch_args)
             }
         )
+
+        # cancel noop'd jobs
+        for k, v in self.job_spec.items():
+            if v is None:
+                self.backend.scancel(batch_id + "_" + k)
+
+        # release the batch
+        # TODO: should scontrol be added to the backend class? AFAIK this is the
+        # only place it's used
+        status, stdout, stderr = self.backend.invoke("scontrol release " + batch_id)
+        check_call("scontrol release", status, stdout, stderr)
 
         return batch_id
 

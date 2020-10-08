@@ -96,6 +96,10 @@ class BatchedLocalizer(AbstractLocalizer):
             else:
                 common_dests = {}
             for jobId, data in inputs.items():
+                # noop; this shard has been avoided
+                if data is None:
+                    continue
+
                 os.makedirs(os.path.join(
                     self.environment('local')['CANINE_JOBS'],
                     jobId,
