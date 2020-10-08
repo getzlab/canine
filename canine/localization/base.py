@@ -664,8 +664,8 @@ class AbstractLocalizer(abc.ABC):
 
                 dest = self.reserve_path('jobs', jobId, 'inputs', file)
 
+                exports += ["export CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk)]
                 localization_tasks += [
-                  "export CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk),
                   "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
 
                   # attach the disk if it's not already
