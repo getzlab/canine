@@ -484,9 +484,12 @@ class Orchestrator(object):
                     pandas_write_hdf5_buffered(df, buf = w, key = "results")
         return df
 
-    def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}) -> int:
+    def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}, job_spec = None) -> int:
+        if job_spec is None:
+            job_spec = self.job_spec
+
         # this job was avoided
-        if len(self.job_spec) == 0:
+        if len(job_spec) == 0:
             return -2
 
         batch_id = self.backend.sbatch(
@@ -495,7 +498,7 @@ class Orchestrator(object):
             **{
                 'requeue': True,
                 'job_name': self.name,
-                'array': "0-{}".format(len(self.job_spec)-1),
+                'array': "0-{}".format(len(job_spec)-1),
                 'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
                 'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
                 **self.resources,
@@ -504,7 +507,7 @@ class Orchestrator(object):
         )
 
         # cancel noop'd jobs
-        for k, v in self.job_spec.items():
+        for k, v in job_spec.items():
             if v is None:
                 self.backend.scancel(batch_id + "_" + k)
 
