@@ -349,7 +349,7 @@ class Orchestrator(object):
 
         return entrypoint_path
 
-    def wait_for_jobs_to_finish(self, batch_id):
+    def wait_for_jobs_to_finish(self, batch_id, localizer = None):
         def grouper(g):
             g = g.sort_values("Submit")
             final = g.iloc[-1]
@@ -368,6 +368,11 @@ class Orchestrator(object):
             for i in range(len(self.job_spec))
         }
 
+        save_acct = False
+        if isinstance(localizer, AbstractLocalizer):
+            save_acct = True
+            jobs_dir = localizer.environment("local")["CANINE_JOBS"]
+
         while len(waiting_jobs):
             time.sleep(30)
             acct = self.backend.sacct(
@@ -380,12 +385,20 @@ class Orchestrator(object):
 
             for jid in [*waiting_jobs]:
                 if jid in acct.index: 
+                    job = jid.split('_')[1]
+
                     # job has completed
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
-                        job = jid.split('_')[1]
 #                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
+
+                    # save sacct info for each shard
+                    # TODO: skip for noop jobs (there will be a special flag in the job_spec)
+                    if save_acct:
+                        with localizer.transport_context() as transport:
+                            with transport.open(os.path.join(jobs_dir, job, ".sacct"), 'w') as w:
+                                acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
 
             # track node uptime
             for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
@@ -393,9 +406,6 @@ class Orchestrator(object):
                     uptime[node] += 1
                 else:
                     uptime[node] = 1
-
-            # save dataframe for each shard
-            # TODO
 
         return completed_jobs, uptime, acct
 
