@@ -351,7 +351,7 @@ class Orchestrator(object):
 
     def wait_for_jobs_to_finish(self, batch_id):
         completed_jobs = []
-        preempted_cpu_time = {}
+        #preempted_cpu_time = {}
         uptime = {}
         prev_acct = None
 
@@ -365,13 +365,13 @@ class Orchestrator(object):
             acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
             for jid in [*waiting_jobs]:
                 if jid in acct.index:
-                    # check if job has restarted since last update due to preemption;
-                    # if yes, accumulate the CPU time used in the last attempt
-                    if prev_acct is not None and jid in prev_acct.index and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
-                        if jid in preempted_cpu_time:
-                            preempted_cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
-                        else:
-                            preempted_cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
+#                    # check if job has restarted since last update due to preemption;
+#                    # if yes, accumulate the CPU time used in the last attempt
+#                    if prev_acct is not None and jid in prev_acct.index and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
+#                        if jid in preempted_cpu_time:
+#                            preempted_cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
+#                        else:
+#                            preempted_cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
 
                     # job has completed
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
@@ -386,15 +386,16 @@ class Orchestrator(object):
                     uptime[node] += 1
                 else:
                     uptime[node] = 1
-
-            # store this iteration of sacct for next polling interval
-            if prev_acct is None:
-                prev_acct = acct
-            else:
-                prev_acct = pd.concat([
-                    acct,
-                    prev_acct.loc[[idx for idx in prev_acct.index if idx not in acct.index]]
-                ])
+#
+#            # store this iteration of sacct for next polling interval
+#            if prev_acct is None:
+#                prev_acct = acct
+#            else:
+#                prev_acct = pd.concat([
+#                    acct,
+#                    #prev_acct.loc[[idx for idx in prev_acct.index if idx not in acct.index]]
+#                    prev_acct.loc[~prev_acct.index.isin(acct.index)]
+#                ])
 
         return completed_jobs, preempted_cpu_time, uptime, prev_acct
 
@@ -403,7 +404,7 @@ class Orchestrator(object):
 
         if batch_id != -2:
             try:
-                acct = self.backend.sacct(job=batch_id)
+                acct = self.backend.sacct(job=batch_id, "D")
 
                 # we cannot assume that all outputs were properly delocalized, i.e.
                 # self.job_spec.keys() == outputs.keys()
