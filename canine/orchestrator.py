@@ -231,7 +231,7 @@ class Orchestrator(object):
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
-                self.job_avoid(localizer)
+                n_avoided, original_job_spec = self.job_avoid(localizer)
                 entrypoint_path = self.localize_inputs_and_script(localizer)
 
                 if dry_run:
@@ -300,7 +300,7 @@ class Orchestrator(object):
                 print("Parsing output data")
                 self.adapter.parse_outputs(outputs)
 
-                df = self.make_output_DF(batch_id, outputs, acct, localizer)
+                df = self.make_output_DF(batch_id, original_job_spec, outputs, acct, localizer)
 
         try:
             runtime = time.monotonic() - start_time
@@ -410,7 +410,7 @@ class Orchestrator(object):
 
         return completed_jobs, uptime, acct
 
-    def make_output_DF(self, batch_id, outputs, acct, localizer = None) -> pd.DataFrame:
+    def make_output_DF(self, batch_id, job_spec, outputs, acct, localizer = None) -> pd.DataFrame:
         df = pd.DataFrame()
 
         if batch_id != -2:
@@ -422,17 +422,17 @@ class Orchestrator(object):
                 # attempts, so delocalization.py never gets a chance to run
     
                 # sanity check: outputs cannot contain more keys than inputs
-                if outputs.keys() - self.job_spec.keys():
+                if outputs.keys() - job_spec.keys():
                     raise ValueError("{} job outputs discovered, but only {} job(s) specified!".format(
-                      len(outputs), len(self.job_spec)
+                      len(outputs), len(job_spec)
                     ))
 
                 # for jobs that failed to delocalize any outputs, pad the outputs
                 # dict with blanks
-                missing_outputs = self.job_spec.keys() - outputs.keys()
+                missing_outputs = job_spec.keys() - outputs.keys()
                 if missing_outputs:
                     print("WARNING: {}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
-                      len(missing_outputs), len(self.job_spec)
+                      len(missing_outputs), len(job_spec)
                     ), file = sys.stderr)
                     outputs = { **outputs, **{ k : {} for k in missing_outputs } }
 
@@ -445,13 +445,13 @@ class Orchestrator(object):
                             ('job', 'cpu_seconds'): acct['CPUTimeRAW'][batch_id+'_'+str(array_id)],
                             ('job', 'submit_time'): acct['Submit'][batch_id+'_'+str(array_id)],
                             ('job', 'n_preempted'): acct['n_preempted'][batch_id+'_'+str(array_id)],
-                            **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
+                            **{ ('inputs', key) : val for key, val in job_spec[job_id].items() },
                             **{
                                 ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
                                 for key, val in outputs[job_id].items()
                             }
                         }
-                        for array_id, job_id in enumerate(self.job_spec)
+                        for array_id, job_id in enumerate(job_spec)
                     },
                     orient = "index"
                 ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int})
