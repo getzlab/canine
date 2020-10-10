@@ -126,6 +126,38 @@ class Orchestrator(object):
                 cfg[key] = {**value, **cfg[key]}
         return cfg
 
+    @staticmethod
+    def load_acct_from_disk(job_spec, localizer, batch_id):
+        """
+        Read in accounting information saved to disk, and convert to format
+        equivalent to backend.sacct().
+        Used for retrieving accounting information for avoided jobs.
+        """
+
+        jobs_dir = localizer.environment("local")["CANINE_JOBS"]
+        acct = {}
+
+        with localizer.transport_context() as tr:
+            for j in job_spec.keys():
+                sacct_path = os.path.join(jobs_dir, j, ".sacct")
+                jid = batch_id + "_" + j
+                if tr.exists(sacct_path):
+                    with tr.open(sacct_path, "r") as f:
+                        acct[jid] = pd.read_csv(
+                          f,
+                          header = None,
+                          sep = "\t",
+                          names = [
+                            "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"
+                          ]
+                        ).astype({
+                          'CPUTimeRAW': int,
+                          "Submit" : np.datetime64
+                        })
+                else:
+                    acct[jid] = pd.DataFrame({ "State" : np.nan }, index = [0])
+
+        return pd.concat(acct).droplevel(1).rename_axis("JobID")
 
     def __init__(self, config: typing.Union[
       str,
@@ -292,6 +324,10 @@ class Orchestrator(object):
                     localizer.clean_on_exit = False
                     raise
                 finally:
+                    # if some jobs were avoided, read the Slurm accounting info from disk
+                    if n_avoided != 0:
+                        acct = Orchestrator.load_acct_from_disk(original_job_spec, localizer, batch_id)
+
                     # Check if fully job-avoided so we still delocalize
                     if batch_id == -2 or len(completed_jobs):
                         print("Delocalizing outputs")
