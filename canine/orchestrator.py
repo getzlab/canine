@@ -416,9 +416,11 @@ class Orchestrator(object):
             acct = self.backend.sacct(
               "D",
               job = batch_id,
-              format = "JobId,State,ExitCode,CPUTimeRAW,Submit"
+              format = "JobId,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
             ).astype({'CPUTimeRAW': int, "Submit" : np.datetime64})
             acct = acct.loc[~acct.index.str.endswith("batch")]
+            acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
+            acct = acct.drop(columns = ["ResvCPURAW"])
             acct = acct.groupby(acct.index).apply(grouper)
 
             for jid in [*waiting_jobs]:
