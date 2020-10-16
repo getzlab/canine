@@ -697,7 +697,8 @@ class AbstractLocalizer(abc.ABC):
                   # note it might already exist if we are retrying this task
                   "if [[ ! -L {path} ]]; then ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}; fi".format(file = file, path = dest.remotepath),
                 ]
-                docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+                # Removed, this is actually '-v :'
+                #docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
                 exports.append('export {}="{}"'.format(
                     key,
                     dest.remotepath
