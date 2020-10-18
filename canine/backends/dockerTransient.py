@@ -111,6 +111,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             if isinstance(e.args[0], ProtocolError):
                 if isinstance(e.args[0].args[1], PermissionError):
                     raise PermissionError("You do not have permission to run Docker!")
+                elif isinstance(e.args[0].args[1], ConnectionRefusedError):
+                    raise ConnectionRefusedError("The Docker daemon does not appear to be running on this machine. Please start it.")
+            raise Exception("Unknown problem connecting to the Docker daemon")
         except Exception as e:
             raise Exception("Problem starting Slurm Docker: {}: {}".format(
               type(e).__name__, e 
