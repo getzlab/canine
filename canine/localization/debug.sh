@@ -12,11 +12,13 @@ sed -n '/^export/p' setup.sh >> $CMD_TMP
 echo "./localization.sh" >> $CMD_TMP
 
 # run script to get into Docker
-if grep -q "^#WOLF_DOCKERIZED_TASK"; then
+if grep -q "^#WOLF_DOCKERIZED_TASK" ../../script.sh; then
 	sed -n '3,/^docker run/p' ../../script.sh | sed -e '$s/ - <<.*$//' -e '$s/-i/-ti/' >> $CMD_TMP
+else
+	# TODO: enter Slurm docker if no Docker is specified, and we used the Docker
+	# backend
+	echo "bash -i" >> $CMD_TMP
 fi
-# TODO: enter Slurm docker if no Docker is specified, and we used the Docker
-# backend
 
 bash $CMD_TMP
 rm $CMD_TMP
