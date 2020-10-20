@@ -100,6 +100,8 @@ class RemoteLocalizer(AbstractLocalizer):
                 with transport.open(script_path.remotepath, 'w') as w:
                     w.write(teardown_script)
                 transport.chmod(script_path.remotepath, 0o775)
+
+            # send delocalization script
             transport.send(
                 os.path.join(
                     os.path.dirname(__file__),
@@ -107,4 +109,14 @@ class RemoteLocalizer(AbstractLocalizer):
                 ),
                 os.path.join(self.environment('remote')['CANINE_ROOT'], 'delocalization.py')
             )
+
+            # send debug script
+            transport.send(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    'debug.sh'
+                ),
+                os.path.join(self.environment('remote')['CANINE_ROOT'], 'debug.sh')
+            )
+
             return self.finalize_staging_dir(inputs.keys(), transport=transport)
