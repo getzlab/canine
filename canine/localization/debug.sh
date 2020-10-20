@@ -20,5 +20,11 @@ else
 	echo "bash -i" >> $CMD_TMP
 fi
 
+# if workspace and inputs directories don't exist, create them
+cat <<"EOF" >> $CMD_TMP
+[ ! -d $CANINE_JOB_INPUTS ] && mkdir -p $CANINE_JOB_INPUTS || :
+[ ! -d $CANINE_JOB_ROOT ] && mkdir -p $CANINE_JOB_ROOT || :
+EOF
+
 bash $CMD_TMP
 rm $CMD_TMP
