@@ -418,8 +418,8 @@ class Orchestrator(object):
             acct = self.backend.sacct(
               "D",
               job = batch_id,
-              format = "JobId,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
-            ).astype({'CPUTimeRAW': int, "Submit" : np.datetime64})
+              format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
+            ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
             acct = acct.loc[~acct.index.str.endswith("batch")]
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
             acct = acct.drop(columns = ["ResvCPURAW"])
