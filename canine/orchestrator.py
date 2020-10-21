@@ -142,10 +142,10 @@ class Orchestrator(object):
 
         #
         # inputs/resources
-        for k, v in config["inputs"].items():
-            if v is None:
-                config["inputs"].pop(k)
-                print('WARNING: input "{}" was specified as None, ignoring.'.format(k))
+        inputs_to_void = { k for k, v in config["inputs"].items() if v is None }
+        for k in inputs_to_void:
+            print('WARNING: input "{}" was specified as None, ignoring.'.format(k)) 
+        config["inputs"] = { k : config["inputs"][k] for k in config["inputs"].keys() - inputs_to_void }
         self.raw_inputs = Orchestrator.stringify(config['inputs']) if 'inputs' in config else {}
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
 
