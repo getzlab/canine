@@ -4,6 +4,7 @@ import sys
 import select
 import io
 import warnings
+import logging
 from collections import namedtuple
 import functools
 import shlex
@@ -353,3 +354,55 @@ def pandas_read_hdf5_buffered(key: str, buf: io.BufferedReader) -> pd.DataFrame:
           driver_core_image = buf.read()
         ) as store:
             return store[key]
+
+## Hook for get external logging module
+
+CANINE_GET_LOGGER_HOOK = None
+
+class canine_logging:
+
+    @staticmethod
+    def set_get_logger_hook(func):
+        global CANINE_GET_LOGGER_HOOK
+        CANINE_GET_LOGGER_HOOK = func
+
+    @staticmethod
+    def info(msg):
+        if not CANINE_GET_LOGGER_HOOK:
+            return print(msg)
+        else:
+            return CANINE_GET_LOGGER_HOOK().info(msg)
+
+    @staticmethod
+    def warning(msg):
+        if not CANINE_GET_LOGGER_HOOK:
+            return print(msg, file=sys.stderr)
+        else:
+            return CANINE_GET_LOGGER_HOOK().warning(msg)
+
+    @staticmethod
+    def debug(msg):
+        if not CANINE_GET_LOGGER_HOOK:
+            return print(msg)
+        else:
+            return CANINE_GET_LOGGER_HOOK().debug(msg)
+
+    @staticmethod
+    def error(msg):
+        if not CANINE_GET_LOGGER_HOOK:
+            return print(msg, file=sys.stderr)
+        else:
+            return CANINE_GET_LOGGER_HOOK().error(msg)
+    
+    @staticmethod
+    def print(*args, type="info", **kwargs):
+        "print-like logging function"
+        ## kwargs will be passed to print, but won't be used if logging hook is enabled
+        if not CANINE_GET_LOGGER_HOOK:
+            return print(*args, **kwargs)
+        args = [str(x) for x in args]
+        msg = " ".join(args)
+        return getattr(CANINE_GET_LOGGER_HOOK(), type)(msg)
+    
+# Redirect warnings to logging
+logging.captureWarnings(True)

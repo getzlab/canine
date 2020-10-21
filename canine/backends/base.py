@@ -8,7 +8,7 @@ import stat
 import sys
 from contextlib import ExitStack
 from uuid import uuid4 as uuid
-from ..utils import ArgumentHelper, check_call
+from ..utils import ArgumentHelper, check_call, canine_logging
 import pandas as pd
 
 SLURM_PARTITION_RECON = b'slurm_load_partitions: Unable to contact slurm controller (connect failure)'
@@ -468,7 +468,7 @@ class AbstractSlurmBackend(abc.ABC):
         status, stdout, stderr = self.invoke("sinfo")
         n_iter = 0
         while status != 0 and SLURM_PARTITION_RECON in stderr.read():
-            print("Slurm controller not ready. Retrying in 10s...", file=sys.stderr)
+            canine_logging.warning("Slurm controller not ready. Retrying in 10s...")
             time.sleep(10)
             status, stdout, stderr = self.invoke("sinfo")
             n_iter += 1
