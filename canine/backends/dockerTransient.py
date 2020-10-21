@@ -367,18 +367,25 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             ans = gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
         return ans
 
-    def invoke(self, command, interactive = False):
+    def invoke(self, command, interactive = False, bypass_docker = False):
+        """
+        Set bypass_docker to True to execute the command directly on the host,
+        rather than in the controller container. Useful for debugging.
+        """
         if not isatty(sys.stdout, sys.stdin):
             interactive = False
 
         # re-purpose LocalSlurmBackend's invoke
         local_invoke = super(TransientImageSlurmBackend, self).invoke
         if self.container is not None and self.container().status == "running":
-            cmd = "docker exec {ti_flag} {container} {command}".format(
-              ti_flag = "-ti" if interactive else "",
-              container = self.config["cluster_name"],
-              command = command
-            )
+            if not bypass_docker:
+                cmd = "docker exec {ti_flag} {container} {command}".format(
+                  ti_flag = "-ti" if interactive else "",
+                  container = self.config["cluster_name"],
+                  command = command
+                )
+            else:
+                cmd = command
             return local_invoke(cmd, interactive)
         else:
             return (1, io.BytesIO(), io.BytesIO(b"Container is not running!"))
