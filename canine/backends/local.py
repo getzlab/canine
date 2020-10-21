@@ -112,7 +112,7 @@ class LocalSlurmBackend(AbstractSlurmBackend):
     SLURM backend for interacting with a local slurm node
     """
 
-    def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
+    def invoke(self, command: str, interactive: bool = False, **kwargs) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
         Invoke an arbitrary command on the Slurm controller node
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).

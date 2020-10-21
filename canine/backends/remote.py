@@ -314,7 +314,7 @@ class RemoteSlurmBackend(AbstractSlurmBackend):
                 for t in reinit:
                     t.__enter__()
 
-    def invoke(self, command: str, interactive: bool = False) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
+    def invoke(self, command: str, interactive: bool = False, **kwargs) -> typing.Tuple[int, typing.BinaryIO, typing.BinaryIO]:
         """
         Invoke an arbitrary command in the slurm console
         Returns a tuple containing (exit status, byte stream of standard out from the command, byte stream of stderr from the command).
