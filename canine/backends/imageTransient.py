@@ -157,7 +157,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
             self.stop()
         except Exception as e:
-            canine_logging.error("ERROR: Could not initialize cluster; attempting to tear down.")
+            canine_logging.error("Could not initialize cluster; attempting to tear down.")
 
             self.stop()
             raise e
@@ -215,7 +215,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             ex_nodes = nodenames.index[nodenames["is_ex_node"]]
 
             if not ex_nodes.empty:
-                canine_logging.warning("WARNING: the following nodes already exist outside of Canine and Canine will not touch these nodes: \n - {}".format("\n - ".join(ex_nodes)))
+                canine_logging.warning("The following nodes already exist outside of Canine and Canine will not touch these nodes: \n - {}".format("\n - ".join(ex_nodes)))
 
             # ERROR if any instance types (Canine or external) are incongruous
             # with given definition
@@ -223,7 +223,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                                (instances.loc[:, "machineType"] != self.config["worker_type"])
 
             if typemismatch_idx.any():
-                canine_logging.error("ERROR: nodes that already exist do not match specified machine type ({worker_type}), which will result in Slurm bitmap corruption.".format(**self.config))
+                canine_logging.error("Nodes that already exist do not match specified machine type ({worker_type}), which will result in Slurm bitmap corruption.".format(**self.config))
                 canine_logging.error(instances.drop(columns = "selfLink").loc[typemismatch_idx].to_string(index = False))
 
                 raise RuntimeError('Preexisting cluster nodes do not match specified machine type for new nodes')
@@ -234,7 +234,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                                (instances.loc[:, "zone"] != self.config["compute_zone"])
 
             if zonemismatch_idx.any():
-                canine_logging.warning("WARNING: nodes that already exist do not match specified compute zone ({compute_zone}), which may result in degraded performance or egress charges.".format(**self.config))
+                canine_logging.warning("Nodes that already exist do not match specified compute zone ({compute_zone}), which may result in degraded performance or egress charges.".format(**self.config))
                 canine_logging.warning(instances.drop(columns = "selfLink").loc[zonemismatch_idx].to_string(index = False))
 
         self.nodes = nodenames.loc[~nodenames["is_ex_node"]]
@@ -282,7 +282,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             try:
                 self._pzw(gce.instances().stop)(instance = node).execute()
             except Exception as e:
-                canine_logging.warning("WARNING: couldn't shutdown instance {}".format(node))
+                canine_logging.warning("Couldn't shutdown instance {}".format(node))
                 canine_logging.warning(e)
 
     def stop(self, action_on_stop = None, kill_straggling_jobs = True):
@@ -325,10 +325,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                     self._pzw(gce.instances().stop)(instance = node).execute()
             except googleapiclient.errors.HttpError as e:
                 if "status" in e.resp and e.resp["status"] != "404":
-                    canine_logging.error("WARNING: couldn't shutdown instance {}".format(node))
+                    canine_logging.error("Couldn't shutdown instance {}".format(node))
                     canine_logging.error(e)
             except Exception as e:
-                canine_logging.error("WARNING: couldn't shutdown instance {}".format(node))
+                canine_logging.error("Couldn't shutdown instance {}".format(node))
                 canine_logging.error(e)
 
     def list_instances_all_zones(self):

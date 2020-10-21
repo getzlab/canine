@@ -405,7 +405,7 @@ class Orchestrator(object):
                 # dict with blanks
                 missing_outputs = self.job_spec.keys() - outputs.keys()
                 if missing_outputs:
-                    canine_logging.error("WARNING: {}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
+                    canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
                       len(missing_outputs), len(self.job_spec)
                     ))
                     outputs = { **outputs, **{ k : {} for k in missing_outputs } }
