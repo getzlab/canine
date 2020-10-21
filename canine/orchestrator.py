@@ -184,8 +184,10 @@ class Orchestrator(object):
 
         #
         # inputs/resources
-        if None in config["inputs"].values():
-            raise ValueError("One or more inputs is None!")
+        for k, v in config["inputs"].items():
+            if v is None:
+                config["inputs"].pop(k)
+                print('WARNING: input "{}" was specified as None, ignoring.'.format(k))
         self.raw_inputs = Orchestrator.stringify(config['inputs']) if 'inputs' in config else {}
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
 
