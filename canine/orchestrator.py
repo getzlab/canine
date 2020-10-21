@@ -212,12 +212,12 @@ class Orchestrator(object):
             raise ValueError("Cannot exceed 4000000 jobs in one pipeline")
 
         canine_logging.print("Preparing pipeline of", len(self.job_spec), "jobs")
-        canine_logging.print("Connecting to backend...")
+        canine_logging.info("Connecting to backend...")
         if isinstance(self.backend, RemoteSlurmBackend):
             self.backend.load_config_args()
         start_time = time.monotonic()
         with self.backend:
-            canine_logging.print("Initializing pipeline workspace")
+            canine_logging.info("Initializing pipeline workspace")
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
@@ -228,7 +228,7 @@ class Orchestrator(object):
                     localizer.clean_on_exit = False
                     return self.job_spec
 
-                canine_logging.print("Waiting for cluster to finish startup...")
+                canine_logging.info("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
 
                 # perform hard reset of cluster; some backends do this own their
@@ -237,10 +237,10 @@ class Orchestrator(object):
                 if self.backend.hard_reset_on_orch_init and self._slurmconf_path:
                     active_jobs = self.backend.squeue('all')
                     if len(active_jobs):
-                        canine_logging.print("There are active jobs. Skipping slurmctld restart")
+                        canine_logging.warning("There are active jobs. Skipping slurmctld restart")
                     else:
                         try:
-                            canine_logging.print("Stopping slurmctld")
+                            canine_logging.info("Stopping slurmctld")
                             rc, stdout, stderr = self.backend.invoke(
                                 'sudo pkill slurmctld',
                                 True
@@ -252,7 +252,7 @@ class Orchestrator(object):
                                 True
                             )
                             check_call('sudo slurmctld -c -f {}'.format(self._slurmconf_path), rc, stdout, stderr)
-                            canine_logging.print("Restarting slurmctl")
+                            canine_logging.info("Restarting slurmctl")
                             rc, stdout, stderr = self.backend.invoke(
                                 'sudo slurmctld reconfigure',
                                 True
@@ -264,7 +264,7 @@ class Orchestrator(object):
 
                 #
                 # submit job
-                canine_logging.print("Submitting batch job")
+                canine_logging.info("Submitting batch job")
                 batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'))
                 canine_logging.print("Batch id:", batch_id)
 
@@ -284,10 +284,10 @@ class Orchestrator(object):
                 finally:
                     # Check if fully job-avoided so we still delocalize
                     if batch_id == -2 or len(completed_jobs):
-                        canine_logging.print("Delocalizing outputs")
+                        canine_logging.info("Delocalizing outputs")
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
 
-                canine_logging.print("Parsing output data")
+                canine_logging.info("Parsing output data")
                 self.adapter.parse_outputs(outputs)
 
                 df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
@@ -306,14 +306,14 @@ class Orchestrator(object):
             return df
 
     def localize_inputs_and_script(self, localizer) -> str:
-        canine_logging.print("Localizing inputs...")
+        canine_logging.info("Localizing inputs...")
         abs_staging_dir = localizer.localize(
             self.job_spec,
             self.raw_outputs,
             self.localizer_overrides
         )
         canine_logging.print("Job staged on SLURM controller in:", abs_staging_dir)
-        canine_logging.print("Preparing pipeline script")
+        canine_logging.info("Preparing pipeline script")
         env = localizer.environment('remote')
         root_dir = env['CANINE_ROOT']
         entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')

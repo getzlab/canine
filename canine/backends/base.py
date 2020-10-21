@@ -468,7 +468,7 @@ class AbstractSlurmBackend(abc.ABC):
         status, stdout, stderr = self.invoke("sinfo")
         n_iter = 0
         while status != 0 and SLURM_PARTITION_RECON in stderr.read():
-            canine_logging.print("Slurm controller not ready. Retrying in 10s...", file=sys.stderr)
+            canine_logging.warning("Slurm controller not ready. Retrying in 10s...")
             time.sleep(10)
             status, stdout, stderr = self.invoke("sinfo")
             n_iter += 1
