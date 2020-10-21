@@ -7,7 +7,7 @@ import os
 import sys
 
 from .local import LocalSlurmBackend
-from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost
+from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, canine_logging
 
 import googleapiclient.discovery as gd
 import googleapiclient.errors
@@ -16,9 +16,8 @@ import pandas as pd
 try:
     gce = gd.build('compute', 'v1')
 except gd._auth.google.auth.exceptions.GoogleAuthError:
-    print(
-        "Unable to load gcloud credentials. Transient Backends may not be available",
-        file=sys.stderr
+    canine_logging.warning(
+        "Unable to load gcloud credentials. Transient Backends may not be available"
     )
     gce = None
 
@@ -154,11 +153,11 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
             return self
         except KeyboardInterrupt:
-            print("\nCancelling cluster startup ...", file = sys.stderr)
+            canine_logging.warning("\nCancelling cluster startup ...")
 
             self.stop()
         except Exception as e:
-            print("ERROR: Could not initialize cluster; attempting to tear down.", file = sys.stderr)
+            canine_logging.error("Could not initialize cluster; attempting to tear down.")
 
             self.stop()
             raise e
@@ -170,7 +169,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         #
         # check if Slurm is already running locally; start (with hard reset) if not
 
-        print("Checking for running Slurm controller ... ", end = "", flush = True)
+        canine_logging.print("Checking for running Slurm controller ... ", end = "", flush = True)
 
         subprocess.check_call(
             """sudo -E -u {user} bash -c 'pgrep slurmctld || slurmctld -c -f {slurm_conf_path} &&
@@ -184,12 +183,12 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         subprocess.check_call("pgrep slurmctld && pgrep slurmdbd && pgrep munged", shell = True,
                               stdout = subprocess.DEVNULL)
 
-        print("done", flush = True)
+        canine_logging.print("done", flush = True)
 
     def init_nodes(self):
         #
         # create/start worker nodes
-        print("Checking for preexisting cluster nodes ... ", end = "", flush = True)
+        canine_logging.print("Checking for preexisting cluster nodes ... ", end = "", flush = True)
 
         nodenames = pd.DataFrame(index = [
                       self.config["worker_prefix"] + str(x) for x in
@@ -208,7 +207,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         instances = instances.merge(nodenames, left_on = "name", right_index = True,
                       how = "right")
 
-        print("done", flush = True)
+        canine_logging.print("done", flush = True)
 
         # handle nodes that will not be created
         if (nodenames["is_ex_node"] | nodenames["is_k9_node"]).any():
@@ -216,10 +215,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             ex_nodes = nodenames.index[nodenames["is_ex_node"]]
 
             if not ex_nodes.empty:
-                print("WARNING: the following nodes already exist outside of Canine:\n - ",
-                  file = sys.stderr, end = "")
-                print("\n - ".join(ex_nodes), file = sys.stderr)
-                print("Canine will not touch these nodes.")
+                canine_logging.warning("The following nodes already exist outside of Canine and Canine will not touch these nodes: \n - {}".format("\n - ".join(ex_nodes)))
 
             # ERROR if any instance types (Canine or external) are incongruous
             # with given definition
@@ -227,10 +223,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                                (instances.loc[:, "machineType"] != self.config["worker_type"])
 
             if typemismatch_idx.any():
-                print("ERROR: nodes that already exist do not match specified machine type ({worker_type}):".format(**self.config), file = sys.stderr)
-                print(instances.drop(columns = "selfLink").loc[typemismatch_idx] \
-                  .to_string(index = False), file = sys.stderr)
-                print("This will result in Slurm bitmap corruption.", file = sys.stderr)
+                canine_logging.error("Nodes that already exist do not match specified machine type ({worker_type}), which will result in Slurm bitmap corruption.".format(**self.config))
+                canine_logging.error(instances.drop(columns = "selfLink").loc[typemismatch_idx].to_string(index = False))
 
                 raise RuntimeError('Preexisting cluster nodes do not match specified machine type for new nodes')
 
@@ -240,11 +234,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                                (instances.loc[:, "zone"] != self.config["compute_zone"])
 
             if zonemismatch_idx.any():
-                print("WARNING: nodes that already exist do not match specified compute zone ({compute_zone}):".format(**self.config), file = sys.stderr)
-                print(instances.drop(columns = "selfLink").loc[zonemismatch_idx] \
-                  .to_string(index = False), file = sys.stderr)
-                print("This may result in degraded performance or egress charges.",
-                  file = sys.stderr)
+                canine_logging.warning("Nodes that already exist do not match specified compute zone ({compute_zone}), which may result in degraded performance or egress charges.".format(**self.config))
+                canine_logging.warning(instances.drop(columns = "selfLink").loc[zonemismatch_idx].to_string(index = False))
 
         self.nodes = nodenames.loc[~nodenames["is_ex_node"]]
 
@@ -256,7 +247,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         if (~self.nodes["is_k9_node"]).any():
             nodes_to_create = self.nodes.index[~self.nodes["is_k9_node"]].values
 
-            print("Creating {0:d} worker nodes ... ".format(nodes_to_create.shape[0]),
+            canine_logging.print("Creating {0:d} worker nodes ... ".format(nodes_to_create.shape[0]),
                   end = "", flush = True)
             subprocess.check_call(
                 """gcloud compute instances create {workers} \
@@ -266,7 +257,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 """.format(**self.config, workers = " ".join(nodes_to_create)),
                 shell = True
             )
-            print("done", flush = True)
+            canine_logging.print("done", flush = True)
 
         # start nodes previously created by Canine
 
@@ -275,14 +266,14 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
         # TODO: use API to start these
         if instances_to_start.shape[0] > 0:
-            print("Starting {0:d} preexisting worker nodes ... ".format(instances_to_start.shape[0]),
+            canine_logging.print("Starting {0:d} preexisting worker nodes ... ".format(instances_to_start.shape[0]),
                   end = "", flush = True)
             subprocess.check_call(
                 """gcloud compute instances start {workers} --zone {compute_zone} \
                 """.format(**self.config, workers = " ".join(instances_to_start.values)),
                 shell = True
             )
-            print("done", flush = True)
+            canine_logging.print("done", flush = True)
 
         #
         # shut down nodes exceeding init_node_count
@@ -291,8 +282,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             try:
                 self._pzw(gce.instances().stop)(instance = node).execute()
             except Exception as e:
-                print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
-                print(e)
+                canine_logging.warning("Couldn't shutdown instance {}".format(node))
+                canine_logging.warning(e)
 
     def stop(self, action_on_stop = None, kill_straggling_jobs = True):
         """
@@ -308,17 +299,17 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 self.scancel(jobID = "", user = self.config["user"])
 
                 # wait for jobs to finish
-                print("Terminating all jobs ... ", end = "", flush = True)
+                canine_logging.print("Terminating all jobs ... ", end = "", flush = True)
                 tot_time = 0
                 while True:
                     if self.squeue().empty or tot_time > 60:
                         break
                     tot_time += 1
                     time.sleep(1)
-                print("done")
+                canine_logging.print("done")
             except Exception as e:
-                print("Error terminating all jobs!", file = sys.stderr)
-                print(e, file = sys.stderr)
+                canine_logging.error("Error terminating all jobs!")
+                canine_logging.error(e)
 
         #
         # stop, delete, or leave running compute nodes
@@ -334,11 +325,11 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                     self._pzw(gce.instances().stop)(instance = node).execute()
             except googleapiclient.errors.HttpError as e:
                 if "status" in e.resp and e.resp["status"] != "404":
-                    print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
-                    print(e)
+                    canine_logging.error("Couldn't shutdown instance {}".format(node))
+                    canine_logging.error(e)
             except Exception as e:
-                print("WARNING: couldn't shutdown instance {}".format(node), file = sys.stderr)
-                print(e)
+                canine_logging.error("Couldn't shutdown instance {}".format(node))
+                canine_logging.error(e)
 
     def list_instances_all_zones(self):
         """
