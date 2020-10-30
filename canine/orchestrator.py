@@ -419,6 +419,7 @@ class Orchestrator(object):
               format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
             ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
             acct = acct.loc[~acct.index.str.endswith("batch")]
+            acct.loc[acct["ResvCPURAW"].isna(), "ResvCPURAW"] = 0
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
             acct = acct.drop(columns = ["ResvCPURAW"])
             acct = acct.groupby(acct.index).apply(grouper)
