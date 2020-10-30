@@ -15,7 +15,7 @@ from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
-from ..utils import get_default_gcp_project, check_call
+from ..utils import get_default_gcp_project, check_call, canine_logging
 from hound.client import _getblob_bucket
 from agutil import status_bar
 import pandas as pd
@@ -108,7 +108,7 @@ class AbstractLocalizer(abc.ABC):
                 text = serr.read()
                 self.requester_pays[bucket] = b'requester pays bucket but no user project provided' in text
             if rc == 1 and b'BucketNotFoundException: 404' in text:
-                print(text.decode(), file=sys.stderr)
+                canine_logging.error(text.decode())
                 raise subprocess.CalledProcessError(rc, command)
         return bucket in self.requester_pays and self.requester_pays[bucket]
 
@@ -226,7 +226,7 @@ class AbstractLocalizer(abc.ABC):
             }
             if len([blob for blob in blobs if blob == '/'.join(components[1:])]) == 0:
                 # This is a directory
-                print("Copying directory:", gs_obj)
+                canine_logging.print("Copying directory:", gs_obj)
                 return self.gs_dircp(src, os.path.dirname(dest), context)
         except:
             # If there is an exception, or the above condition is false
@@ -251,7 +251,7 @@ class AbstractLocalizer(abc.ABC):
         """
         if isinstance(self.backend, LocalSlurmBackend):
             if exist_okay:
-                print("exist_okay not supported by LocalSlurmBackend", file=sys.stderr)
+                canine_logging.warning("exist_okay not supported by LocalSlurmBackend")
             return shutil.copytree(src, dest)
         with self.transport_context(transport) as transport:
             if not os.path.isdir(src):
@@ -260,7 +260,7 @@ class AbstractLocalizer(abc.ABC):
                 raise ValueError("Destination already exists: "+dest)
             dest = transport.normpath(dest)
             if self.transfer_bucket is not None:
-                print("Transferring through bucket", self.transfer_bucket)
+                canine_logging.print("Transferring through bucket", self.transfer_bucket)
                 path = os.path.join(str(uuid4()), os.path.basename(dest))
                 self.gs_dircp(
                     src,
@@ -278,12 +278,12 @@ class AbstractLocalizer(abc.ABC):
                         transport=transport
                     )
                 except:
-                    print(
+                    canine_logging.print(
                         crayons.red("ERROR:", bold=True),
                         "Failed to download the data on the remote system."
                         "Your files are still saved in",
                         'gs://{}/{}'.format(self.transfer_bucket, path),
-                        file=sys.stderr
+                        file=sys.stderr, type = "error"
                     )
                     raise
                 cmd = "gsutil -m {} rm -r gs://{}/{}".format(
@@ -291,13 +291,13 @@ class AbstractLocalizer(abc.ABC):
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
-                print(cmd)
+                canine_logging.info(cmd)
                 subprocess.check_call(
                     cmd,
                     shell=True
                 )
             else:
-                print("Transferring directly over SFTP")
+                canine_logging.info("Transferring directly over SFTP")
                 transport.sendtree(src, dest)
 
     def receivetree(self, src: str, dest: str, transport: typing.Optional[AbstractTransport] = None, exist_okay=False):
@@ -307,7 +307,7 @@ class AbstractLocalizer(abc.ABC):
         """
         if isinstance(self.backend, LocalSlurmBackend):
             if exist_okay:
-                print("exist_okay not supported by LocalSlurmBackend", file=sys.stderr)
+                canine_logging.warning("exist_okay not supported by LocalSlurmBackend")
             return shutil.copytree(src, dest)
         with self.transport_context(transport) as transport:
             if not transport.isdir(src):
@@ -316,7 +316,7 @@ class AbstractLocalizer(abc.ABC):
                 raise ValueError("Destination already exists: "+dest)
             dest = os.path.abspath(dest)
             if self.transfer_bucket is not None:
-                print("Transferring through bucket", self.transfer_bucket)
+                canine_logging.print("Transferring through bucket", self.transfer_bucket)
                 path = os.path.join(str(uuid4()), os.path.basename(dest))
                 self.gs_dircp(
                     src,
@@ -334,12 +334,12 @@ class AbstractLocalizer(abc.ABC):
                         transport=transport
                     )
                 except:
-                    print(
+                    canine_logging.print(
                         crayons.red("ERROR:", bold=True),
                         "Failed to download the data on the local system."
                         "Your files are still saved in",
                         'gs://{}/{}'.format(self.transfer_bucket, path),
-                        file=sys.stderr
+                        file=sys.stderr, type="error"
                     )
                     raise
                 cmd = "gsutil -m {} rm -r gs://{}/{}".format(
@@ -347,13 +347,13 @@ class AbstractLocalizer(abc.ABC):
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
-                print(cmd)
+                canine_logging.info(cmd)
                 subprocess.check_call(
                     cmd,
                     shell=True
                 )
             else:
-                print("Transferring directly over SFTP")
+                canine_logging.info("Transferring directly over SFTP")
                 transport.receivetree(src, dest)
 
     def reserve_path(self, *args: typing.Any) -> PathType:
@@ -520,7 +520,7 @@ class AbstractLocalizer(abc.ABC):
                         else:
                             raise ValueError("Invalid override option [{}]".format(mode))
                     except OverrideValueError as e:
-                        print(e.args[0], file = sys.stderr)
+                        canine_logging.error(e.args[0])
                         self.inputs[jobId][arg] = Localization(
                             None,
                             self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
@@ -700,7 +700,8 @@ class AbstractLocalizer(abc.ABC):
                   # note it might already exist if we are retrying this task
                   "if [[ ! -L {path} ]]; then ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}; fi".format(file = file, path = dest.remotepath),
                 ]
-                docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+                # Removed, this is actually '-v :'
+                #docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
                 exports.append('export {}="{}"'.format(
                     key,
                     dest.remotepath
@@ -713,7 +714,9 @@ class AbstractLocalizer(abc.ABC):
                     shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path)
                 ))
             else:
-                print("Unknown localization command:", val.type, "skipping", key, val.path, file=sys.stderr)
+                canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
+                    file=sys.stderr, type="warning"
+                )
 
         # generate setup script
         setup_script = '\n'.join(

@@ -176,6 +176,16 @@ class NFSLocalizer(BatchedLocalizer):
                 ),
                 os.path.join(self.environment('local')['CANINE_ROOT'], 'delocalization.py')
             )
+
+            # copy debug script
+            shutil.copyfile(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    'debug.sh'
+                ),
+                os.path.join(self.environment('local')['CANINE_ROOT'], 'debug.sh')
+            )
+
             return self.finalize_staging_dir(inputs)
 
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: typing.Optional[str] = None) -> typing.Dict[str, typing.Dict[str, str]]:

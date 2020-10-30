@@ -127,7 +127,7 @@ class BatchedLocalizer(AbstractLocalizer):
                     w.write(teardown_script)
                 os.chmod(script_path.localpath, 0o775)
 
-            # copy delocalization script
+            # symlink delocalization script
             os.symlink(
                 os.path.join(
                     os.path.dirname(__file__),
@@ -135,6 +135,16 @@ class BatchedLocalizer(AbstractLocalizer):
                 ),
                 os.path.join(self.environment('local')['CANINE_ROOT'], 'delocalization.py')
             )
+
+            # symlink debug script
+            os.symlink(
+                os.path.join(
+                    os.path.dirname(__file__),
+                    'debug.sh'
+                ),
+                os.path.join(self.environment('local')['CANINE_ROOT'], 'debug.sh')
+            )
+
             self.sendtree(
                 self.local_dir,
                 self.staging_dir,
