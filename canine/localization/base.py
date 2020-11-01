@@ -377,8 +377,7 @@ class AbstractLocalizer(abc.ABC):
             if not transport.isfile(os.path.join(output_dir, '.canine_pipeline_manifest.tsv')):
                 script_path = self.backend.pack_batch_script(
                     'export CANINE_OUTPUTS={}'.format(output_dir),
-                    'cat <(echo "jobId\tfield\tpath") $CANINE_OUTPUTS/*/.canine_job_manifest > $CANINE_OUTPUTS/.canine_pipeline_manifest.tsv',
-                    'rm -f $CANINE_OUTPUTS/*/.canine_job_manifest',
+                    'cat <(echo "jobId\tfield\tpattern\tpath") $CANINE_OUTPUTS/*/.canine_job_manifest > $CANINE_OUTPUTS/.canine_pipeline_manifest.tsv',
                     script_path=os.path.join(output_dir, 'manifest.sh')
                 )
                 check_call(
@@ -424,6 +423,10 @@ class AbstractLocalizer(abc.ABC):
             self.common_inputs = set()
             seen = set()
             for jobId, values in inputs.items():
+                # noop; this shard was avoided
+                if values is None:
+                    continue
+
                 for arg, path in values.items():
                     if path in seen and (arg not in overrides or overrides[arg] == 'common'):
                         self.common_inputs.add(path)
@@ -665,8 +668,8 @@ class AbstractLocalizer(abc.ABC):
 
                 dest = self.reserve_path('jobs', jobId, 'inputs', file)
 
+                exports += ["export CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk)]
                 localization_tasks += [
-                  "export CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk),
                   "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
 
                   # attach the disk if it's not already
@@ -743,6 +746,7 @@ class AbstractLocalizer(abc.ABC):
             line.rstrip()
             for line in [
                 '#!/bin/bash',
+                'set -e',
                 'if [[ -d {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
                 # 'mv ../stderr ../stdout .',
                 'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3}; else python {0} {1} {2} {3}; fi'.format(

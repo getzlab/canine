@@ -1,3 +1,4 @@
+import copy
 import typing
 import os
 import time
@@ -13,7 +14,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.9.0'
+version = '0.10.0'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -49,10 +50,19 @@ export CANINE_JOBS="{{CANINE_JOBS}}"
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh
 LOCALIZER_JOB_RC=$?
-{{pipeline_script}}
-CANINE_JOB_RC=$?
-[[ $LOCALIZER_JOB_RC != 0 ]] && CANINE_JOB_RC=$LOCALIZER_JOB_RC || CANINE_JOB_RC=$CANINE_JOB_RC
-source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
+if [ $LOCALIZER_JOB_RC -eq 0 ]; then
+  {{pipeline_script}}
+  CANINE_JOB_RC=$?
+  echo -n $CANINE_JOB_RC > ../.job_exit_code
+  echo -n 0 > ../.localizer_exit_code
+else
+  echo "Localization failure!" > /dev/stderr
+  echo -n "DNR" > ../.job_exit_code
+  echo -n $LOCALIZER_JOB_RC > ../.localizer_exit_code
+  CANINE_JOB_RC=$LOCALIZER_JOB_RC
+fi
+$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
+echo -n $? > ../.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=version)
 
@@ -116,6 +126,38 @@ class Orchestrator(object):
                 cfg[key] = {**value, **cfg[key]}
         return cfg
 
+    @staticmethod
+    def load_acct_from_disk(job_spec, localizer, batch_id):
+        """
+        Read in accounting information saved to disk, and convert to format
+        equivalent to backend.sacct().
+        Used for retrieving accounting information for avoided jobs.
+        """
+
+        jobs_dir = localizer.environment("local")["CANINE_JOBS"]
+        acct = {}
+
+        with localizer.transport_context() as tr:
+            for j in job_spec.keys():
+                sacct_path = os.path.join(jobs_dir, j, ".sacct")
+                jid = batch_id + "_" + j
+                if tr.exists(sacct_path):
+                    with tr.open(sacct_path, "r") as f:
+                        acct[jid] = pd.read_csv(
+                          f,
+                          header = None,
+                          sep = "\t",
+                          names = [
+                            "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"
+                          ]
+                        ).astype({
+                          'CPUTimeRAW': int,
+                          "Submit" : np.datetime64
+                        })
+                else:
+                    acct[jid] = pd.DataFrame({ "State" : np.nan }, index = [0])
+
+        return pd.concat(acct).droplevel(1).rename_axis("JobID")
 
     def __init__(self, config: typing.Union[
       str,
@@ -225,7 +267,7 @@ class Orchestrator(object):
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
-                self.job_avoid(localizer)
+                n_avoided, original_job_spec = self.job_avoid(localizer)
                 entrypoint_path = self.localize_inputs_and_script(localizer)
 
                 if dry_run:
@@ -279,13 +321,17 @@ class Orchestrator(object):
                 uptime = {}
                 prev_acct = None
                 try:
-                    completed_jobs, cpu_time, uptime, prev_acct = self.wait_for_jobs_to_finish(batch_id)
+                    completed_jobs, uptime, acct = self.wait_for_jobs_to_finish(batch_id)
                 except:
                     canine_logging.error("Encountered unhandled exception. Cancelling batch job")
                     self.backend.scancel(batch_id)
                     localizer.clean_on_exit = False
                     raise
                 finally:
+                    # if some jobs were avoided, read the Slurm accounting info from disk
+                    if n_avoided != 0:
+                        acct = Orchestrator.load_acct_from_disk(original_job_spec, localizer, batch_id)
+
                     # Check if fully job-avoided so we still delocalize
                     if batch_id == -2 or len(completed_jobs):
                         canine_logging.info("Delocalizing outputs")
@@ -294,7 +340,7 @@ class Orchestrator(object):
                 canine_logging.info("Parsing output data")
                 self.adapter.parse_outputs(outputs)
 
-                df = self.make_output_DF(batch_id, outputs, cpu_time, prev_acct, localizer)
+                df = self.make_output_DF(batch_id, original_job_spec, outputs, acct, localizer)
 
         try:
             runtime = time.monotonic() - start_time
@@ -344,55 +390,74 @@ class Orchestrator(object):
 
         return entrypoint_path
 
-    def wait_for_jobs_to_finish(self, batch_id):
+    def wait_for_jobs_to_finish(self, batch_id, localizer = None):
+        def grouper(g):
+            g = g.sort_values("Submit")
+            final = g.iloc[-1]
+            final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
+            final.at["Submit"] = g.loc[:, "Submit"].iloc[0]
+            final["n_preempted"] = len(g) - 1
+
+            return final
+
+        acct = None
         completed_jobs = []
-        cpu_time = {}
         uptime = {}
-        prev_acct = None
 
         waiting_jobs = {
-            '{}_{}'.format(batch_id, i)
-            for i in range(len(self.job_spec))
+            '{}_{}'.format(batch_id, k)
+            for k, v in self.job_spec.items() if v is not None
+            # exclude noop'd jobs from waiting set
         }
+
+        save_acct = False
+        if isinstance(localizer, AbstractLocalizer):
+            save_acct = True
+            jobs_dir = localizer.environment("local")["CANINE_JOBS"]
 
         while len(waiting_jobs):
             time.sleep(30)
-            acct = self.backend.sacct(job=batch_id, format="JobId,State,ExitCode,CPUTimeRAW").astype({'CPUTimeRAW': int})
+            acct = self.backend.sacct(
+              "D",
+              job = batch_id,
+              format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
+            ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
+            acct = acct.loc[~acct.index.str.endswith("batch")]
+            acct.loc[acct["ResvCPURAW"].isna(), "ResvCPURAW"] = 0
+            acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
+            acct = acct.drop(columns = ["ResvCPURAW"])
+            acct = acct.groupby(acct.index).apply(grouper)
+
             for jid in [*waiting_jobs]:
-                if jid in acct.index:
-                    if prev_acct is not None and jid in prev_acct.index and prev_acct['CPUTimeRAW'][jid] > acct['CPUTimeRAW'][jid]:
-                        # Job has restarted since last update:
-                        if jid in cpu_time:
-                            cpu_time[jid] += prev_acct['CPUTimeRAW'][jid]
-                        else:
-                            cpu_time[jid] = prev_acct['CPUTimeRAW'][jid]
-                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'}:
-                        job = jid.split('_')[1]
+                if jid in acct.index: 
+                    job = jid.split('_')[1]
+
+                    # job has completed
+                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'} or self.job_spec[job] is None:
 #                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
+
+                    # save sacct info for each shard if it's not a noop (None)
+                    if save_acct and self.job_spec[job] is not None:
+                        with localizer.transport_context() as transport:
+                            with transport.open(os.path.join(jobs_dir, job, ".sacct"), 'w') as w:
+                                acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
+
+            # track node uptime
             for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
                 if node in uptime:
                     uptime[node] += 1
                 else:
                     uptime[node] = 1
-            if prev_acct is None:
-                prev_acct = acct
-            else:
-                prev_acct = pd.concat([
-                    acct,
-                    prev_acct.loc[[idx for idx in prev_acct.index if idx not in acct.index]]
-                ])
 
-        return completed_jobs, cpu_time, uptime, prev_acct
+        return completed_jobs, uptime, acct
 
-    def make_output_DF(self, batch_id, outputs, cpu_time, prev_acct, localizer = None) -> pd.DataFrame:
+    def make_output_DF(self, batch_id, job_spec, outputs, acct, localizer = None) -> pd.DataFrame:
         df = pd.DataFrame()
 
         if batch_id != -2:
             try:
-                acct = self.backend.sacct(job=batch_id)
-
                 # we cannot assume that all outputs were properly delocalized, i.e.
                 # self.job_spec.keys() == outputs.keys()
                 #
@@ -400,17 +465,17 @@ class Orchestrator(object):
                 # attempts, so delocalization.py never gets a chance to run
     
                 # sanity check: outputs cannot contain more keys than inputs
-                if outputs.keys() - self.job_spec.keys():
+                if outputs.keys() - job_spec.keys():
                     raise ValueError("{} job outputs discovered, but only {} job(s) specified!".format(
-                      len(outputs), len(self.job_spec)
+                      len(outputs), len(job_spec)
                     ))
 
                 # for jobs that failed to delocalize any outputs, pad the outputs
                 # dict with blanks
-                missing_outputs = self.job_spec.keys() - outputs.keys()
+                missing_outputs = job_spec.keys() - outputs.keys()
                 if missing_outputs:
                     canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
-                      len(missing_outputs), len(self.job_spec)
+                      len(missing_outputs), len(job_spec)
                     ))
                     outputs = { **outputs, **{ k : {} for k in missing_outputs } }
 
@@ -420,16 +485,16 @@ class Orchestrator(object):
                         job_id: {
                             ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
                             ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
-                            ('job', 'cpu_seconds'): (prev_acct['CPUTimeRAW'][batch_id+'_'+str(array_id)] + (
-                                cpu_time[batch_id+'_'+str(array_id)] if batch_id+'_'+str(array_id) in cpu_time else 0
-                            )) if prev_acct is not None else -1,
-                            **{ ('inputs', key) : val for key, val in self.job_spec[job_id].items() },
+                            ('job', 'cpu_seconds'): acct['CPUTimeRAW'][batch_id+'_'+str(array_id)],
+                            ('job', 'submit_time'): acct['Submit'][batch_id+'_'+str(array_id)],
+                            ('job', 'n_preempted'): acct['n_preempted'][batch_id+'_'+str(array_id)],
+                            **{ ('inputs', key) : val for key, val in job_spec[job_id].items() },
                             **{
                                 ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
                                 for key, val in outputs[job_id].items()
                             }
                         }
-                        for array_id, job_id in enumerate(self.job_spec)
+                        for array_id, job_id in enumerate(job_spec)
                     },
                     orient = "index"
                 ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int})
@@ -463,23 +528,38 @@ class Orchestrator(object):
                     pandas_write_hdf5_buffered(df, buf = w, key = "results")
         return df
 
-    def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}) -> int:
+    def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}, job_spec = None) -> int:
+        if job_spec is None:
+            job_spec = self.job_spec
+
         # this job was avoided
-        if len(self.job_spec) == 0:
+        if len(job_spec) == 0:
             return -2
 
         batch_id = self.backend.sbatch(
             entrypoint_path,
+            "H", # submit in "held" state to allow for noop'd jobs to be cancelled
             **{
                 'requeue': True,
                 'job_name': self.name,
-                'array': "0-{}".format(len(self.job_spec)-1),
+                'array': "0-{}".format(len(job_spec)-1),
                 'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
                 'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
                 **self.resources,
                 **Orchestrator.stringify(extra_sbatch_args)
             }
         )
+
+        # cancel noop'd jobs
+        for k, v in job_spec.items():
+            if v is None:
+                self.backend.scancel(batch_id + "_" + k)
+
+        # release the batch
+        # TODO: should scontrol be added to the backend class? AFAIK this is the
+        # only place it's used
+        status, stdout, stderr = self.backend.invoke("scontrol release " + batch_id)
+        check_call("scontrol release", status, stdout, stderr)
 
         return batch_id
 
@@ -488,94 +568,86 @@ class Orchestrator(object):
         Detects jobs which have previously been run in this staging directory.
         Succeeded jobs are skipped. Failed jobs are reset and rerun
         """
-        with localizer.transport_context() as transport:
-            df_path = localizer.reserve_path("results.k9df.hdf5").remotepath
+        old_job_spec = copy.deepcopy(self.job_spec)
+        n_avoided = 0
 
+        with localizer.transport_context() as transport:
             #remove all output if specified
             if overwrite:
                 if transport.isdir(localizer.staging_dir):
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
-                return 0
+                return n_avoided, old_job_spec
 
-            # check for preexisting jobs' output
-            if transport.exists(df_path):
+            # check for preexisting jobs' outputs
+            if transport.exists(localizer.staging_dir):
                 try:
-                    # load in results and job spec dataframes
-                    with transport.open(df_path, mode = "rb") as r:
-                        r_df = pandas_read_hdf5_buffered(key = "results", buf = r)
-                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
+                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id") 
+                    js_df["failed"] = False
+                    js_df["output_ok"] = False
+                    jobs_dir = localizer.environment("local")["CANINE_JOBS"]
+                    output_dir = localizer.environment("local")["CANINE_OUTPUT"]
 
-                    if r_df.empty or \
-                       "inputs" not in r_df or \
-                       ("outputs" not in r_df and len(self.raw_outputs) > 0):
-                        raise ValueError("Could not recover previous job results!")
+                    # if everything succeeded, with matching outputs, we're done
+                    # TODO
 
-                    # check if jobs are compatible: they must have identical inputs and index,
-                    # and output columns must be matching
-                    if not (r_df["inputs"].columns.isin(js_df.columns).all() and \
-                            js_df.columns.isin(r_df["inputs"].columns).all()):
-                        r_df_set = set(r_df["inputs"].columns)
-                        js_df_set = set(js_df.columns)
-                        raise ValueError(
-                          "Cannot job avoid; sets of input parameters do not match! Parameters unique to:\n" + \
-                          "\u21B3saved: " + ", ".join(r_df_set - js_df_set) + "\n" + \
-                          "\u21B3job: " + ", ".join(js_df_set - r_df_set)
+                    # check for failed shards 
+                    for i in js_df.index:
+                        for e in [".job_exit_code", ".localizer_exit_code", ".teardown_exit_code"]:
+                            exit_code = os.path.join(jobs_dir, i, e)
+                            if transport.isfile(exit_code):
+                                with transport.open(exit_code, "r") as ec:
+                                    js_df.at[i, "failed"] = (ec.read() != "0") | js_df.at[i, "failed"]
+                            else:
+                                js_df.at[i, "failed"] = True
+                                break
+
+                    # check for matching outputs
+                    # name and pattern must both match
+                    for i in js_df.loc[~js_df["failed"]].index:
+                        o_df = pd.read_csv(
+                          os.path.join(output_dir, i, ".canine_job_manifest"),
+                          header = None,
+                          names = ["shard", "output", "pattern", "path"],
+                          sep = "\t"
                         )
 
-                    output_temp = pd.Series(index = self.raw_outputs.keys())
-                    if not (r_df["outputs"].columns.isin(output_temp.index).all() and \
-                            output_temp.index.isin(r_df["outputs"].columns).all()):
-                        r_df_set = set(r_df["outputs"].columns)
-                        o_df_set = set(output_temp.index)
-                        raise ValueError(
-                          "Cannot job avoid; sets of output parameters do not match! Parameters unique to:\n" + \
-                          "\u21B3saved: " + ", ".join(r_df_set - o_df_set) + "\n" + \
-                          "\u21B3job: " + ", ".join(o_df_set - r_df_set)
-                        )
+                        if o_df.set_index("output").loc[:, "pattern"].to_dict() == self.raw_outputs:
+                            js_df.at[i, "output_ok"] = True
 
-                    # check that values of inputs are the same
-                    # we have to sort because the order of jobs might differ for the same
-                    # inputs
-                    sort_cols = r_df.columns.to_series()["inputs"]
-                    r_df = r_df.sort_values(sort_cols.tolist())
-                    js_df = js_df.sort_values(sort_cols.index.tolist())
+                    # shards that both succeeded and have matching outputs can be noop'd
+                    # in the job spec
+                    js_df["noop"] = ~js_df["failed"] & js_df["output_ok"]
 
-                    if not r_df["inputs"].equals(js_df):
-                        raise ValueError("Cannot job avoid; values of input parameters do not match!")
+                    # shards that succeeded but don't have matching outputs must have their
+                    # delocalizer rerun
+                    js_df["re_deloc"] = ~js_df["failed"] & ~js_df["output_ok"]
 
-                    # if all is well, figure out which jobs need to be re-run
-                    fail_idx = r_df[("job", "slurm_state")] == "FAILED"
-                    self.df_avoided = r_df.loc[~fail_idx]
+                    # either way, these jobs will be noop'd; deloc. only jobs will be
+                    # submitted separately
+                    for i in js_df.index[js_df["noop"] | js_df["re_deloc"]]:
+                        self.job_spec[i] = None
 
-                    # remove jobs that don't need to be re-run from job_spec
-                    for k in r_df.index[~fail_idx]:
-                        self.job_spec.pop(k, None)
-
-                    # remove output directories of failed jobs
-                    for k in self.job_spec:
+                    # shards that failed must have their output directories purged
+                    for k in js_df.index[js_df["failed"]]:
                         transport.rmtree(
                             localizer.reserve_path('jobs', k).remotepath
                         )
 
-                    # we also have to remove the common inputs directory, so that
-                    # the localizer can regenerate it
-                    if len(self.job_spec) > 0:
-                        transport.rmtree(
-                            localizer.reserve_path('common').remotepath
-                        )
+                    # if we are re-running any jobs, we also have to remove the common
+                    # inputs directory, so that the localizer can regenerate it
+                    # I don't think we need this anymore, since the localizer checks for noops
+            #		if (~js_df["noop"]).any():
+            #			transport.rmtree(
+            #				localizer.reserve_path('common').remotepath
+            #			)
 
-                    return np.count_nonzero(~fail_idx)
+                    n_avoided += (js_df["noop"] | js_df["re_deloc"]).sum()
                 except (ValueError, OSError) as e:
                     canine_logging.warning("Cannot recover preexisting task outputs: " + str(e))
                     canine_logging.warning("Overwriting output and aborting job avoidance.")
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
-                    return 0
+                    return 0, old_job_spec
 
-            # if the output directory exists but there's no output dataframe, assume
-            # it's corrupted and remove it
-            elif transport.isdir(localizer.staging_dir):
-                transport.rmtree(localizer.staging_dir)
-                transport.makedirs(localizer.staging_dir)
-        return 0
+        return n_avoided, old_job_spec

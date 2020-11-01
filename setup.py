@@ -48,6 +48,7 @@ setup(
     install_requires = [
         'paramiko>=2.5.0',
         'pandas>=0.24.1',
+        'numpy>=1.18.0',
         'google-auth>=1.6.3',
         'PyYAML>=5.1',
         'agutil>=4.1.0',

@@ -116,6 +116,10 @@ class NFSLocalizer(BatchedLocalizer):
         #      single input. It would make more sense to do this before the adapter
         #      converts raw inputs.
         for input_dict in inputs.values():
+            # noop; this shard was avoided
+            if input_dict is None:
+                continue
+
             for k, v in input_dict.items():
                 if k not in overrides:
                     if re.match(r"^/", v) is not None and self.same_volume(v) and \
@@ -133,6 +137,10 @@ class NFSLocalizer(BatchedLocalizer):
             else:
                 common_dests = {}
             for jobId, data in inputs.items():
+                # noop; this shard has been avoided
+                if data is None:
+                    continue
+
                 os.makedirs(os.path.join(
                     self.environment('local')['CANINE_JOBS'],
                     jobId,

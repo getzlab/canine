@@ -177,6 +177,13 @@ class AbstractTransport(abc.ABC):
         except FileNotFoundError:
             return False
 
+    @abc.abstractmethod
+    def glob(self, path: str) -> typing.List[str]:
+        """
+        Returns an array matching the glob pattern, or an empty list if no match.
+        """
+        pass
+
     def makedirs(self, path: str, exist_okay: bool = False):
         """
         Recursively build the requested directory structure
@@ -339,9 +346,9 @@ class AbstractSlurmBackend(abc.ABC):
         df = pd.read_fwf(
             stdout,
             index_col=0
-        )
+        ).iloc[1:]
         df.index = df.index.map(str)
-        return df.loc[[idx for idx in df.index if not idx.startswith('---')]]
+        return df
 
     def sinfo(self, *slurmopts: str, **slurmparams: typing.Any) -> pd.DataFrame:
         """

@@ -1,4 +1,5 @@
 import typing
+import glob
 import os
 import io
 import sys
@@ -50,6 +51,9 @@ class LocalTransport(AbstractTransport):
         Returns stat information
         """
         return os.stat(path, follow_symlinks=follow_symlinks)
+
+    def glob(self, path: str) -> typing.List[str]:
+        return glob.glob(path)
 
     def chmod(self, path: str, mode: int):
         """

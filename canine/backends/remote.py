@@ -111,6 +111,9 @@ class RemoteTransport(AbstractTransport):
             except KeyError as e:
                 raise FileNotFoundError(path) from e
 
+    def glob(self, path: str) -> typing.List[str]:
+        raise NotImplementedError("globbing not yet implemented for remote transport!")
+
     def chmod(self, path: str, mode: int):
         """
         Change file permissions

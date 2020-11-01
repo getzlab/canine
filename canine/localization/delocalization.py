@@ -5,6 +5,7 @@ import os
 import shutil
 import subprocess
 import shlex
+import sys
 
 """
 This is not actually part of the canine package
@@ -31,11 +32,15 @@ def main(output_dir, jobId, patterns, copy):
         os.makedirs(jobdir)
     with open(os.path.join(jobdir, '.canine_job_manifest'), 'w') as manifest:
         for name, pattern in patterns:
+            n_matched = 0
             for target in glob.iglob(pattern):
+                # construct output file path
                 if name in {'stdout', 'stderr'}:
                     dest = os.path.join(jobdir, name)
                 else:
                     dest = os.path.join(jobdir, name, os.path.relpath(target))
+
+                # populate output directory
                 if not os.path.exists(dest):
                     if not os.path.isdir(os.path.dirname(dest)):
                         os.makedirs(os.path.dirname(dest))
@@ -49,10 +54,38 @@ def main(output_dir, jobId, patterns, copy):
                             os.symlink(os.path.abspath(target), dest)
                     else:
                         shutil.copytree(target, dest)
-                manifest.write("{}\t{}\t{}\n".format(
+
+                # compute checksum
+                if name not in {'stdout', 'stderr'}:
+                    try:
+                        subprocess.check_call(
+                          "sha1sum {target} | awk '{{ print $1 }}' > {output}".format(
+                            target = target,
+                            output = os.path.join(jobdir, name, os.path.dirname(os.path.relpath(target)), "." + os.path.basename(target) + ".sha1")
+                          ),
+                          shell = True
+                        )
+                    except subprocess.CalledProcessError:
+                        print("Error computing checksum for {}!".format(target), file = sys.stderr)
+
+                # write job manifest
+                manifest.write("{}\t{}\t{}\t{}\n".format(
                     jobId,
                     name,
+                    pattern,
                     os.path.relpath(dest.strip(), output_dir)
+                ))
+
+                n_matched += 1
+
+            # warn if no files matched; make log in manifest
+            if n_matched == 0:
+                print('WARNING: output name "{0}" (pattern "{1}") not found.'.format(name,  pattern), file = sys.stderr)
+                manifest.write("{}\t{}\t{}\t{}\n".format(
+                    jobId,
+                    name,
+                    pattern,
+                    "//not_found"
                 ))
 
 if __name__ == '__main__':

@@ -87,6 +87,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # placeholder for Docker container object
         self.container = None
 
+        # flag to indicate whether the Docker was already running
+        self.preexisting_container = False
+
         # placeholder for node list (loaded from lookup table)
         self.nodes = pd.DataFrame()
 
@@ -148,6 +151,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # otherwise, try and start it if it's stopped
         else:
+            self.preexisting_container = True
             self.container = self._get_container(self.config["cluster_name"])
             if self.container().status == "exited":
                 self.container().start()
@@ -246,7 +250,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # this needs to happen after super().stop() is invoked, since that
         # calls scancel, which in turn requires a running Slurm controller Docker
-        if self.container is not None:
+
+        # if the Docker was not spun up by this context manager, do not shut it
+        # down -- it was started from the external wolF server.
+        if self.container is not None and not self.preexisting_container:
             self.container().stop()
 
         #
