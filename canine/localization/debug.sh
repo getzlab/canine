@@ -22,8 +22,8 @@ echo "./localization.sh" >> $CMD_TMP
 # run script to get into Docker
 if grep -q "^#WOLF_DOCKERIZED_TASK" ../../script.sh; then
 	sed -n '/^#WOLF_DOCKERIZED_TASK/,/#DEBUG_END/p' ../../script.sh | \
-	sed -e '/#DEBUG_OMIT/d' -e '$s/ - <<.*$//' -e 's/sudo podman/docker/' \
-	  -e 's/inspect -t image/inspect/' -e 's/docker run/docker run -ti/' >> $CMD_TMP
+	sed -e '/#DEBUG_OMIT/d' -e '$s/ - <<.*$//' -E -e 's/sudo (-E )?podman/docker/' \
+	  -e 's/inspect -t image/inspect/' -e 's/docker run/docker run --rm -ti/' >> $CMD_TMP
 else
 	# TODO: enter Slurm docker if no Docker is specified, and we used the Docker
 	# backend
