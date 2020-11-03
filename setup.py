@@ -29,7 +29,8 @@ setup(
             'backends/slurm-gcp/scripts/*',
             'backends/slurm-docker/src/*',
             'backends/dummy/*',
-            'backends/dummy/conf/*'
+            'backends/dummy/conf/*',
+            'localization/debug.sh'
         ],
     },
     entry_points={
