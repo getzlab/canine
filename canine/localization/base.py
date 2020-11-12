@@ -589,6 +589,7 @@ class AbstractLocalizer(abc.ABC):
             'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2> /dev/null)',
             'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone 2> /dev/null))'
         ]
+        canine_rodisks = []
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
@@ -687,10 +688,15 @@ class AbstractLocalizer(abc.ABC):
                 disk = dgrp[1]
                 file = dgrp[2]
 
+                disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
+
+                if disk not in canine_rodisks:
+                    canine_rodisks.append(disk)
+                    exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
+                    exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
+
                 dest = self.reserve_path('jobs', jobId, 'inputs', file)
 
-                # TODO: handle multiple rodisk inputs, i.e. multiple "CANINE_LOCAL_DISK_DIR". E.g. using ":" to seperate multiple paths?
-                exports += ["export CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk)]
                 localization_tasks += [
                   "CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk),
                   "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
@@ -732,10 +738,9 @@ class AbstractLocalizer(abc.ABC):
 
                   # symlink into the canine directory
                   # note it might already exist if we are retrying this task
-                  "if [[ ! -L {path} ]]; then ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}; fi".format(file = file, path = dest.remotepath),
+                  "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
                 ]
-                # Removed, this is actually '-v :'
-                #docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+
                 exports.append('export {}="{}"'.format(
                     key,
                     dest.remotepath
@@ -751,6 +756,45 @@ class AbstractLocalizer(abc.ABC):
                 canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
                     file=sys.stderr, type="warning"
                 )
+
+        ## Mount RO disks if any
+        exports += ["export CANINE_N_RODISKS={}".format(len(canine_rodisks))]
+        if len(canine_rodisks):
+            localization_tasks += [
+              "for i in `seq ${CANINE_N_RODISKS}`; do",
+              "CANINE_RODISK=CANINE_RODISK_${i}",
+              "CANINE_RODISK=${!CANINE_RODISK}",
+              "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
+              "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
+
+              "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then sudo mkdir -p ${CANINE_RODISK_DIR}; fi",
+
+              # attach the disk if it's not already
+              "if [[ ! -e /dev/disk/by-id/google-${CANINE_RODISK} ]]; then",
+              # we can run into a race condition here if other tasks are
+              # attempting to mount the same disk simultaneously, so we
+              # force a 0 exit
+              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro || true",
+              "fi",
+
+              # mount the disk if it's not already
+              # as before, we can run into a race condition here, so we again
+              # force a zero exit
+              "if ! mountpoint -q ${CANINE_RODISK_DIR}; then",
+              # within container
+              "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} || true",
+              # on host (so that other dockers can access it)
+              "if [[ -f /.dockerenv ]]; then",
+              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} || true",
+              "fi",
+              "fi",
+
+              # because we forced zero exits for the previous commands,
+              # we need to verify that the mount actually exists
+              "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!'; exit 1; }",
+
+              "done",
+            ]
 
         # generate setup script
         setup_script = '\n'.join(
