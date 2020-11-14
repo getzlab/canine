@@ -473,6 +473,8 @@ class AbstractLocalizer(abc.ABC):
                     # common override already handled
                     # No localization needed, already copied
                     self.inputs[jobId][arg] = Localization(None, common_dests[value])
+
+                # override type was explicitly specified; try to handle it
                 elif mode is not False:
                     try:
                         if mode == 'stream':
@@ -519,6 +521,11 @@ class AbstractLocalizer(abc.ABC):
 
                         else:
                             raise ValueError("Invalid override option [{}]".format(mode))
+
+                    # the user specified an invalid override (e.g. "stream" 
+                    # for something that's not a bucket path); fall back to
+                    # handling this input as a string literal
+                    # TODO: should raise a warning here
                     except OverrideValueError as e:
                         canine_logging.error(e.args[0])
                         self.inputs[jobId][arg] = Localization(
@@ -531,6 +538,7 @@ class AbstractLocalizer(abc.ABC):
                             transport=transport
                         )
 
+                # if override was not explicitly specified, autodetect the input type
                 else:
                     # if no overrides were given, see if we can immediately
                     # localize this file
