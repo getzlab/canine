@@ -672,12 +672,15 @@ class AbstractLocalizer(abc.ABC):
                 localization_tasks += [
                   "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
 
+                  # create tempfile to hold diagnostic information
+                  "DIAG_FILE=$(mktemp)",
+
                   # attach the disk if it's not already
                   "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
                   # we can run into a race condition here if other tasks are
                   # attempting to mount the same disk simultaneously, so we
                   # force a 0 exit
-                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro || true".format(disk_name = disk),
+                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro &>> $DIAG_FILE || true".format(disk_name = disk),
                   "fi",
 
                   # mount the disk if it's not already
@@ -685,16 +688,17 @@ class AbstractLocalizer(abc.ABC):
                   # force a zero exit
                   "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
                   # within container
-                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR || true".format(disk_name = disk),
+                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
                   # on host (so that other dockers can access it)
                   "if [[ -f /.dockerenv ]]; then",
-                  "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR || true".format(disk_name = disk),
+                  "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
                   "fi",
                   "fi",
 
                   # because we forced zero exits for the previous commands,
                   # we need to verify that the mount actually exists
-                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; exit 1; }",
+                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; cat $DIAG_FILE; exit 1; }",
+                  # TODO: write error to stderr; this isn't working for some reason
 
                   # symlink into the canine directory
                   # note it might already exist if we are retrying this task
