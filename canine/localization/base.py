@@ -472,98 +472,108 @@ class AbstractLocalizer(abc.ABC):
             self.inputs[jobId] = {}
             for arg, value in job_inputs.items():
                 mode = overrides[arg] if arg in overrides else False
+
+                # common file has already been localized; we simply need to update
+                # self.inputs and continue
                 if value in common_dests or mode == 'common':
-                    # common override already handled
-                    # No localization needed, already copied
                     self.inputs[jobId][arg] = Localization(None, common_dests[value])
+                    continue
 
-                # override type was explicitly specified; try to handle it
-                elif mode is not False:
-                    try:
-                        if mode == 'stream':
-                            if not value.startswith('gs://'):
-                                raise OverrideValueError(mode, arg, value)
+                # user did not explicitly specify an override for this input; try to infer it
+                elif mode is False:
+                    # is it a local path or gs:// path?
+                    if os.path.exists(value) or value.startswith('gs://'):
+                        mode = "localize"
 
-                            self.inputs[jobId][arg] = Localization(
-                                'stream',
-                                value
-                            )
+                    # is it a RODISK?
+                    elif value.startswith('rodisk://'):
+                        mode = "ro_disk"
 
-                        elif mode in ['localize', 'symlink']:
-                            self.inputs[jobId][arg] = Localization(
-                                None,
-                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                            )
+                    # otherwise, treat it like a string literal
+                    else:
+                        mode = None
+
+                # override mode is guaranteed to be known now (whether
+                # auto-inferred or manually specified); try to handle it
+                try:
+                    if mode == 'stream':
+                        if not value.startswith('gs://'):
+                            raise OverrideValueError(mode, arg, value)
+
+                        self.inputs[jobId][arg] = Localization(
+                            'stream',
+                            value
+                        )
+
+                    elif mode in ['localize', 'symlink']:
+                        self.inputs[jobId][arg] = Localization(
+                            None,
+                            self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                        )
+                        try:
                             self.localize_file(
                                 value,
                                 self.inputs[jobId][arg].path,
                                 transport=transport
                             )
+                        # we cannot handle inputs with duplicate filenames
+                        # TODO: handle gs:// URLs as well
+                        # TODO: are all localizers guaranteed to raise this error?
+                        except FileExistsError:
+                            bn = os.path.basename(self.inputs[jobId][arg].path.localpath)
+                            for k, v in self.inputs[jobId].items():
+                                if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
+                                    raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
 
-                        elif mode == 'delayed':
-                            if not value.startswith('gs://'):
-                                raise OverrideValueError(mode, arg, value)
+                    elif mode == 'delayed':
+                        if not value.startswith('gs://'):
+                            raise OverrideValueError(mode, arg, value)
 
-                            self.inputs[jobId][arg] = Localization(
-                                'download',
-                                value
-                            )
-
-                        elif mode == "ro_disk":
-                            if not value.startswith('rodisk://'):
-                                raise OverrideValueError(mode, arg, value)
-                            self.inputs[jobId][arg] = Localization(
-                                'ro_disk',
-                                value
-                            )
-
-                        elif mode is None or mode == 'null':
-                            # Do not reserve path here
-                            # null override treats input as string
-                            self.inputs[jobId][arg] = Localization(None, value)
-
-                        else:
-                            raise ValueError("Invalid override option [{}]".format(mode))
-
-                    # the user specified an invalid override (e.g. "stream" 
-                    # for something that's not a bucket path); fall back to
-                    # handling this input as a string literal
-                    # TODO: should raise a warning here
-                    except OverrideValueError as e:
-                        canine_logging.error(e.args[0])
                         self.inputs[jobId][arg] = Localization(
-                            None,
-                            self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                            'download',
+                            value
                         )
+
+                    elif mode == "ro_disk":
+                        if not value.startswith('rodisk://'):
+                            raise OverrideValueError(mode, arg, value)
+                        self.inputs[jobId][arg] = Localization(
+                            'ro_disk',
+                            value
+                        )
+
+                    elif mode is None or mode == 'null':
+                        # Do not reserve path here
+                        # null override treats input as string
+                        self.inputs[jobId][arg] = Localization(None, value)
+
+                    else:
+                        raise ValueError("Invalid override option [{}]".format(mode))
+
+                # the user specified an invalid override (e.g. "stream" 
+                # for something that's not a bucket path); fall back to
+                # handling this input as a local file
+                # XXX: why not a string literal?
+                except OverrideValueError as e:
+                    canine_logging.error(e.args[0])
+                    self.inputs[jobId][arg] = Localization(
+                        None,
+                        self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                    )
+                    try:
                         self.localize_file(
                             value,
                             self.inputs[jobId][arg].path,
                             transport=transport
                         )
-
-                # if override was not explicitly specified, autodetect the input type
-                else:
-                    # if no overrides were given, see if we can immediately
-                    # localize this file
-                    if os.path.exists(value) or value.startswith('gs://'):
-                        remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                        self.localize_file(value, remote_path, transport=transport)
-                        value = remote_path
-
-                    # autodetect if this is a path on a read-only disk 
-                    loc_type = "ro_disk" if isinstance(value, str) and value.startswith('rodisk://') else None
-
-                    self.inputs[jobId][arg] = Localization(
-                        # localization type will either be:
-                        # * None, indicating no special processing in localization.sh
-                        # * ro_disk, indicating that this is a path on a read-only disk
-                        loc_type,
-
-                        # value will either be a:
-                        # * PathType, if localized above
-                        # * an unchanged string if not handled
-                        value
-                    )
+                    # we cannot handle inputs with duplicate filenames
+                    # TODO: handle gs:// URLs as well
+                    # TODO: are all localizers guaranteed to raise this error?
+                    except FileExistsError:
+                        bn = os.path.basename(self.inputs[jobId][arg].path.localpath)
+                        for k, v in self.inputs[jobId].items():
+                            if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
+                                raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
         """
