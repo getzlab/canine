@@ -437,7 +437,10 @@ class AbstractLocalizer(abc.ABC):
             for path in self.common_inputs:
                 if path.startswith('gs://') or os.path.exists(path):
                     common_dests[path] = self.reserve_path('common', os.path.basename(os.path.abspath(path)))
-                    self.localize_file(path, common_dests[path], transport=transport)
+                    try:
+                        self.localize_file(path, common_dests[path], transport=transport)
+                    except FileExistsError:
+                        pass
 #                else:
 #                    print("Could not handle common file", path, file=sys.stderr)
             return {key: value for key, value in common_dests.items()}
@@ -469,90 +472,108 @@ class AbstractLocalizer(abc.ABC):
             self.inputs[jobId] = {}
             for arg, value in job_inputs.items():
                 mode = overrides[arg] if arg in overrides else False
+
+                # common file has already been localized; we simply need to update
+                # self.inputs and continue
                 if value in common_dests or mode == 'common':
-                    # common override already handled
-                    # No localization needed, already copied
                     self.inputs[jobId][arg] = Localization(None, common_dests[value])
-                elif mode is not False:
-                    try:
-                        if mode == 'stream':
-                            if not value.startswith('gs://'):
-                                raise OverrideValueError(mode, arg, value)
+                    continue
 
-                            self.inputs[jobId][arg] = Localization(
-                                'stream',
-                                value
-                            )
+                # user did not explicitly specify an override for this input; try to infer it
+                elif mode is False:
+                    # is it a local path or gs:// path?
+                    if os.path.exists(value) or value.startswith('gs://'):
+                        mode = "localize"
 
-                        elif mode in ['localize', 'symlink']:
-                            self.inputs[jobId][arg] = Localization(
-                                None,
-                                self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                            )
+                    # is it a RODISK?
+                    elif value.startswith('rodisk://'):
+                        mode = "ro_disk"
+
+                    # otherwise, treat it like a string literal
+                    else:
+                        mode = None
+
+                # override mode is guaranteed to be known now (whether
+                # auto-inferred or manually specified); try to handle it
+                try:
+                    if mode == 'stream':
+                        if not value.startswith('gs://'):
+                            raise OverrideValueError(mode, arg, value)
+
+                        self.inputs[jobId][arg] = Localization(
+                            'stream',
+                            value
+                        )
+
+                    elif mode in ['localize', 'symlink']:
+                        self.inputs[jobId][arg] = Localization(
+                            None,
+                            self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                        )
+                        try:
                             self.localize_file(
                                 value,
                                 self.inputs[jobId][arg].path,
                                 transport=transport
                             )
+                        # we cannot handle inputs with duplicate filenames
+                        # TODO: handle gs:// URLs as well
+                        # TODO: are all localizers guaranteed to raise this error?
+                        except FileExistsError:
+                            bn = os.path.basename(self.inputs[jobId][arg].path.localpath)
+                            for k, v in self.inputs[jobId].items():
+                                if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
+                                    raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
 
-                        elif mode == 'delayed':
-                            if not value.startswith('gs://'):
-                                raise OverrideValueError(mode, arg, value)
+                    elif mode == 'delayed':
+                        if not value.startswith('gs://'):
+                            raise OverrideValueError(mode, arg, value)
 
-                            self.inputs[jobId][arg] = Localization(
-                                'download',
-                                value
-                            )
-
-                        elif mode == "ro_disk":
-                            if not value.startswith('rodisk://'):
-                                raise OverrideValueError(mode, arg, value)
-                            self.inputs[jobId][arg] = Localization(
-                                'ro_disk',
-                                value
-                            )
-
-                        elif mode is None or mode == 'null':
-                            # Do not reserve path here
-                            # null override treats input as string
-                            self.inputs[jobId][arg] = Localization(None, value)
-
-                        else:
-                            raise ValueError("Invalid override option [{}]".format(mode))
-                    except OverrideValueError as e:
-                        canine_logging.error(e.args[0])
                         self.inputs[jobId][arg] = Localization(
-                            None,
-                            self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                            'download',
+                            value
                         )
+
+                    elif mode == "ro_disk":
+                        if not value.startswith('rodisk://'):
+                            raise OverrideValueError(mode, arg, value)
+                        self.inputs[jobId][arg] = Localization(
+                            'ro_disk',
+                            value
+                        )
+
+                    elif mode is None or mode == 'null':
+                        # Do not reserve path here
+                        # null override treats input as string
+                        self.inputs[jobId][arg] = Localization(None, value)
+
+                    else:
+                        raise ValueError("Invalid override option [{}]".format(mode))
+
+                # the user specified an invalid override (e.g. "stream" 
+                # for something that's not a bucket path); fall back to
+                # handling this input as a local file
+                # XXX: why not a string literal?
+                except OverrideValueError as e:
+                    canine_logging.error(e.args[0])
+                    self.inputs[jobId][arg] = Localization(
+                        None,
+                        self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                    )
+                    try:
                         self.localize_file(
                             value,
                             self.inputs[jobId][arg].path,
                             transport=transport
                         )
-
-                else:
-                    # if no overrides were given, see if we can immediately
-                    # localize this file
-                    if os.path.exists(value) or value.startswith('gs://'):
-                        remote_path = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                        self.localize_file(value, remote_path, transport=transport)
-                        value = remote_path
-
-                    # autodetect if this is a path on a read-only disk 
-                    loc_type = "ro_disk" if isinstance(value, str) and value.startswith('rodisk://') else None
-
-                    self.inputs[jobId][arg] = Localization(
-                        # localization type will either be:
-                        # * None, indicating no special processing in localization.sh
-                        # * ro_disk, indicating that this is a path on a read-only disk
-                        loc_type,
-
-                        # value will either be a:
-                        # * PathType, if localized above
-                        # * an unchanged string if not handled
-                        value
-                    )
+                    # we cannot handle inputs with duplicate filenames
+                    # TODO: handle gs:// URLs as well
+                    # TODO: are all localizers guaranteed to raise this error?
+                    except FileExistsError:
+                        bn = os.path.basename(self.inputs[jobId][arg].path.localpath)
+                        for k, v in self.inputs[jobId].items():
+                            if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
+                                raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
         """
@@ -672,12 +693,15 @@ class AbstractLocalizer(abc.ABC):
                 localization_tasks += [
                   "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
 
+                  # create tempfile to hold diagnostic information
+                  "DIAG_FILE=$(mktemp)",
+
                   # attach the disk if it's not already
                   "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
                   # we can run into a race condition here if other tasks are
                   # attempting to mount the same disk simultaneously, so we
                   # force a 0 exit
-                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro || true".format(disk_name = disk),
+                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro &>> $DIAG_FILE || true".format(disk_name = disk),
                   "fi",
 
                   # mount the disk if it's not already
@@ -685,16 +709,17 @@ class AbstractLocalizer(abc.ABC):
                   # force a zero exit
                   "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
                   # within container
-                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR || true".format(disk_name = disk),
+                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
                   # on host (so that other dockers can access it)
                   "if [[ -f /.dockerenv ]]; then",
-                  "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR || true".format(disk_name = disk),
+                  "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
                   "fi",
                   "fi",
 
                   # because we forced zero exits for the previous commands,
                   # we need to verify that the mount actually exists
-                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; exit 1; }",
+                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; cat $DIAG_FILE; exit 1; }",
+                  # TODO: write error to stderr; this isn't working for some reason
 
                   # symlink into the canine directory
                   # note it might already exist if we are retrying this task
