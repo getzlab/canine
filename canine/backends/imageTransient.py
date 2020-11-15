@@ -327,6 +327,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 if "status" in e.resp and e.resp["status"] != "404":
                     canine_logging.error("Couldn't shutdown instance {}".format(node))
                     canine_logging.error(e)
+                elif "status" not in e.resp:
+                    canine_logging.error("Unknown error shutting down instance {}".format(node))
+                    canine_logging.error(e)
             except Exception as e:
                 canine_logging.error("Couldn't shutdown instance {}".format(node))
                 canine_logging.error(e)
