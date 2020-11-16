@@ -698,45 +698,10 @@ class AbstractLocalizer(abc.ABC):
                 dest = self.reserve_path('jobs', jobId, 'inputs', file)
 
                 localization_tasks += [
-                  "CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk),
-                  "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
-
-                  # create tempfile to hold diagnostic information
-                  "DIAG_FILE=$(mktemp)",
-
-                  # attach the disk if it's not already
-                  "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
-                  # we can run into a race condition here if other tasks are
-                  # attempting to mount the same disk simultaneously, so we
-                  # force a 0 exit
-                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro &>> $DIAG_FILE || true".format(disk_name = disk),
-                  "fi",
-
-                  # mount the disk if it's not already
-                  # as before, we can run into a race condition here, so we again
-                  # force a zero exit
-                  "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
-                  # wait for device to attach
-                  "tries=0",
-                  "while [ ! -b /dev/disk/by-id/google-{disk_name} ]; do".format(disk_name = disk),
-                  '[ $tries -gt 12 ] && { echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:"; cat $DIAG_FILE; exit 1; } || :',
-                  "sleep 10; ((++tries))",
-                  "done",
-
-                  # mount within container
-                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
-                  # mount on host (so that other dockers can access it)
-                  "if [[ -f /.dockerenv ]]; then",
-                  "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
-                  "fi",
-                  "fi",
-
-                  # because we forced zero exits for the previous commands,
-                  # we need to verify that the mount actually exists
-                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; cat $DIAG_FILE; exit 1; }",
-
-                  # symlink into the canine directory
-                  # note it might already exist if we are retrying this task
+                  # symlink the future RODISK path into the Canine inputs directory
+                  # NOTE: it will be broken upon creation, since the RODISK will
+                  #   be mounted subsequently.
+                  # NOTE: it might already exist if we are retrying this task
                   "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
                 ]
 
