@@ -589,6 +589,7 @@ class AbstractLocalizer(abc.ABC):
             'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2> /dev/null)',
             'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone 2> /dev/null))'
         ]
+        canine_rodisks = []
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
@@ -687,53 +688,23 @@ class AbstractLocalizer(abc.ABC):
                 disk = dgrp[1]
                 file = dgrp[2]
 
+                disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
+
+                if disk not in canine_rodisks:
+                    canine_rodisks.append(disk)
+                    exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
+                    exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
+
                 dest = self.reserve_path('jobs', jobId, 'inputs', file)
 
-                exports += ["export CANINE_LOCAL_DISK_DIR=/mnt/nfs/ro_disks/{}".format(disk)]
                 localization_tasks += [
-                  "if [[ ! -d $CANINE_LOCAL_DISK_DIR ]]; then sudo mkdir -p $CANINE_LOCAL_DISK_DIR; fi",
-
-                  # create tempfile to hold diagnostic information
-                  "DIAG_FILE=$(mktemp)",
-
-                  # attach the disk if it's not already
-                  "if [[ ! -e /dev/disk/by-id/google-{} ]]; then".format(disk),
-                  # we can run into a race condition here if other tasks are
-                  # attempting to mount the same disk simultaneously, so we
-                  # force a 0 exit
-                  "gcloud compute instances attach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {disk_name} --device-name {disk_name} --mode ro &>> $DIAG_FILE || true".format(disk_name = disk),
-                  "fi",
-
-                  # mount the disk if it's not already
-                  # as before, we can run into a race condition here, so we again
-                  # force a zero exit
-                  "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
-                  # wait for device to attach
-                  "tries=0",
-                  "while [ ! -b /dev/disk/by-id/google-{disk_name} ]; do".format(disk_name = disk),
-                  '[ $tries -gt 12 ] && { echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:"; cat $DIAG_FILE; exit 1; } || :',
-                  "sleep 10; ((++tries))",
-                  "done",
-
-                  # mount within container
-                  "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
-                  # mount on host (so that other dockers can access it)
-                  "if [[ -f /.dockerenv ]]; then",
-                  "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
-                  "fi",
-                  "fi",
-
-                  # because we forced zero exits for the previous commands,
-                  # we need to verify that the mount actually exists
-                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; cat $DIAG_FILE; exit 1; }",
-                  # TODO: write error to stderr; this isn't working for some reason
-
-                  # symlink into the canine directory
-                  # note it might already exist if we are retrying this task
-                  "if [[ ! -L {path} ]]; then ln -s ${{CANINE_LOCAL_DISK_DIR}}/{file} {path}; fi".format(file = file, path = dest.remotepath),
+                  # symlink the future RODISK path into the Canine inputs directory
+                  # NOTE: it will be broken upon creation, since the RODISK will
+                  #   be mounted subsequently.
+                  # NOTE: it might already exist if we are retrying this task
+                  "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
                 ]
-                # Removed, this is actually '-v :'
-                #docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
+
                 exports.append('export {}="{}"'.format(
                     key,
                     dest.remotepath
@@ -749,6 +720,56 @@ class AbstractLocalizer(abc.ABC):
                 canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
                     file=sys.stderr, type="warning"
                 )
+
+        ## Mount RO disks if any
+        exports += ["export CANINE_N_RODISKS={}".format(len(canine_rodisks))]
+        if len(canine_rodisks):
+            localization_tasks += [
+              "for i in `seq ${CANINE_N_RODISKS}`; do",
+              "CANINE_RODISK=CANINE_RODISK_${i}",
+              "CANINE_RODISK=${!CANINE_RODISK}",
+              "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
+              "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
+
+              "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then sudo mkdir -p ${CANINE_RODISK_DIR}; fi",
+
+              # create tempfile to hold diagnostic information
+              "DIAG_FILE=$(mktemp)",
+
+              # attach the disk if it's not already
+              "if [[ ! -e /dev/disk/by-id/google-${CANINE_RODISK} ]]; then",
+              # we can run into a race condition here if other tasks are
+              # attempting to mount the same disk simultaneously, so we
+              # force a 0 exit
+              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || true",
+              "fi",
+
+              # mount the disk if it's not already
+              # as before, we can run into a race condition here, so we again
+              # force a zero exit
+              "if ! mountpoint -q ${CANINE_RODISK_DIR}; then",
+              # wait for device to attach
+              "tries=0",
+              "while [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ]; do",
+              '[ $tries -gt 12 ] && { echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:"; cat $DIAG_FILE; exit 1; } || :',
+              "sleep 10; ((++tries))",
+              "done",
+
+              # mount within container
+              "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
+              # mount on host (so that other dockers can access it)
+              "if [[ -f /.dockerenv ]]; then",
+              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
+              "fi",
+              "fi",
+
+              # because we forced zero exits for the previous commands,
+              # we need to verify that the mount actually exists
+              "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!'; cat $DIAG_FILE; exit 1; }",
+              # TODO: write error to stderr; this isn't working for some reason
+
+              "done",
+            ]
 
         # generate setup script
         setup_script = '\n'.join(
