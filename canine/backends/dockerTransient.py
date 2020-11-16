@@ -215,71 +215,71 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           pd.DataFrame({ "machine_type" : "nfs" }, index = [self.config["worker_prefix"] + "-nfs"])
         ])
 
-    def stop(self):
-        # delete node configuration file
-        try:
-            subprocess.check_call(
-              "rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle",
-              shell = True,
-              timeout = 10
-            )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
-            canine_logging.error("Couldn't delete node configuration file:")
-            canine_logging.error(e)
-
-        #
-        # shutdown nodes that are still running (except NFS)
-        allnodes = self.nodes
-
-        # if we're aborting before the NFS has even been started, there are no
-        # nodes to shutdown.
-        if not allnodes.empty:
-            # sometimes the Google API will spectacularly fail; in that case, we
-            # just try to shutdown everything in the node list, regardless of whether
-            # it exists.
+    def stop(self): 
+        # if the Docker was not spun up by this context manager, do not tear
+        # anything down -- we don't want to clobber an already running cluster
+        if not self.preexisting_container:
+            # delete node configuration file
             try:
-                extant_nodes = self.list_instances_all_zones()
-                self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
-                               (allnodes["machine_type"] != "nfs")]
-            except:
-                self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
+                subprocess.check_call(
+                  "rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle",
+                  shell = True,
+                  timeout = 10
+                )
+            except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
+                canine_logging.error("Couldn't delete node configuration file:")
+                canine_logging.error(e)
 
-            # superclass method will stop/delete/leave these running, depending on how
-            # self.config["action_on_stop"] is set
-            super().stop()
+            #
+            # shutdown nodes that are still running (except NFS)
+            allnodes = self.nodes
 
-        #
-        # stop the Docker
+            # if we're aborting before the NFS has even been started, there are no
+            # nodes to shutdown.
+            if not allnodes.empty:
+                # sometimes the Google API will spectacularly fail; in that case, we
+                # just try to shutdown everything in the node list, regardless of whether
+                # it exists.
+                try:
+                    extant_nodes = self.list_instances_all_zones()
+                    self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
+                                   (allnodes["machine_type"] != "nfs")]
+                except:
+                    self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
 
-        # this needs to happen after super().stop() is invoked, since that
-        # calls scancel, which in turn requires a running Slurm controller Docker
+                # superclass method will stop/delete/leave these running, depending on how
+                # self.config["action_on_stop"] is set
+                super().stop()
 
-        # if the Docker was not spun up by this context manager, do not shut it
-        # down -- it was started from the external wolF server.
-        if self.container is not None and not self.preexisting_container:
-            self.container().stop()
+            #
+            # stop the Docker
 
-        #
-        # unmount the NFS
+            # this needs to happen after super().stop() is invoked, since that
+            # calls scancel, which in turn requires a running Slurm controller Docker
+            if self.container is not None:
+                self.container().stop()
 
-        # this needs to be the last step, since Docker will hang if NFS is pulled
-        # out from under it
-        if self.config["nfs_action_on_stop"] != "run":
-            try:
-                subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
-            except subprocess.CalledProcessError:
-                canine_logging.error("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
+            #
+            # unmount the NFS
 
-        # superclass method will stop/delete/leave the NFS running, depending on
-        # how self.config["nfs_action_on_stop"] is set.
+            # this needs to be the last step, since Docker will hang if NFS is pulled
+            # out from under it
+            if self.config["nfs_action_on_stop"] != "run":
+                try:
+                    subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
+                except subprocess.CalledProcessError:
+                    canine_logging.error("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
+
+            # superclass method will stop/delete/leave the NFS running, depending on
+            # how self.config["nfs_action_on_stop"] is set.
+
+            if not allnodes.empty:
+                self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
+                super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
 
         # kill thread that auto-restarts NFS
         if self.NFS_monitor_lock is not None:
             self.NFS_monitor_lock.set()
-
-        if not allnodes.empty:
-            self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
-            super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
 
     def _get_container(self, container_name):
         def closure():
