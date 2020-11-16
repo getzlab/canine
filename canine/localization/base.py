@@ -708,9 +708,16 @@ class AbstractLocalizer(abc.ABC):
                   # as before, we can run into a race condition here, so we again
                   # force a zero exit
                   "if ! mountpoint -q $CANINE_LOCAL_DISK_DIR; then",
-                  # within container
+                  # wait for device to attach
+                  "tries=0",
+                  "while [ ! -b /dev/disk/by-id/google-{disk_name} ]; do".format(disk_name = disk),
+                  '[ $tries -gt 12 ] && { echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:"; cat $DIAG_FILE; exit 1; } || :',
+                  "sleep 10; ((++tries))",
+                  "done",
+
+                  # mount within container
                   "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
-                  # on host (so that other dockers can access it)
+                  # mount on host (so that other dockers can access it)
                   "if [[ -f /.dockerenv ]]; then",
                   "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-{disk_name} $CANINE_LOCAL_DISK_DIR &>> $DIAG_FILE || true".format(disk_name = disk),
                   "fi",
