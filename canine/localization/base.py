@@ -718,8 +718,7 @@ class AbstractLocalizer(abc.ABC):
 
                   # because we forced zero exits for the previous commands,
                   # we need to verify that the mount actually exists
-                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; cat $DIAG_FILE; exit 1; }",
-                  # TODO: write error to stderr; this isn't working for some reason
+                  "mountpoint -q $CANINE_LOCAL_DISK_DIR || { echo 'Read-only disk mount failed!'; cat $DIAG_FILE; exit 1; } > /dev/stderr",
 
                   # symlink into the canine directory
                   # note it might already exist if we are retrying this task
