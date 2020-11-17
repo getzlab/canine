@@ -58,7 +58,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     if [ $CANINE_JOB_RC == 0 ]; then
       break
     else
-      [ $SLURM_RESTART_COUNT -gt $CANINE_RETRY_LIMIT ] && { echo "Retry limit exceeded" >&2; break; } || :
+      [[ $SLURM_RESTART_COUNT -gt $CANINE_RETRY_LIMIT ]] && { echo "Retry limit exceeded" >&2; break; } || :
       echo "Retrying job (attempt $SLURM_RESTART_COUNT/$CANINE_RETRY_LIMIT)" >&2
       scontrol requeue $SLURM_ARRAY_JOB_ID
       # FIXME: what about the rest of the script?
