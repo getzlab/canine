@@ -536,30 +536,25 @@ class Orchestrator(object):
         if len(job_spec) == 0:
             return -2
 
+        # remove noop'd jobs from array spec
+        noop_idx = np.r_[-1, np.array([k for k, v in job_spec.items() if v is None], dtype = np.int), len(job_spec)]
+        array_range = np.c_[noop_idx[:-1] + 1, noop_idx[1:] - 1]
+        array_range = array_range[(np.diff(array_range, 1) >= 0).ravel(), :].astype(str).astype(np.object)
+        array_str = ",".join(array_range[:, 0] + "-" + array_range[:, 1])
+
+        # submit to sbatch
         batch_id = self.backend.sbatch(
             entrypoint_path,
-            "H", # submit in "held" state to allow for noop'd jobs to be cancelled
             **{
                 'requeue': True,
                 'job_name': self.name,
-                'array': "0-{}".format(len(job_spec)-1),
+                'array': array_str,
                 'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
                 'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
                 **self.resources,
                 **Orchestrator.stringify(extra_sbatch_args)
             }
         )
-
-        # cancel noop'd jobs
-        for k, v in job_spec.items():
-            if v is None:
-                self.backend.scancel(batch_id + "_" + k)
-
-        # release the batch
-        # TODO: should scontrol be added to the backend class? AFAIK this is the
-        # only place it's used
-        status, stdout, stderr = self.backend.invoke("scontrol release " + batch_id)
-        check_call("scontrol release", status, stdout, stderr)
 
         return batch_id
 
