@@ -14,7 +14,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.10.2'
+version = '0.10.3'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -140,7 +140,7 @@ class Orchestrator(object):
         with localizer.transport_context() as tr:
             for j in job_spec.keys():
                 sacct_path = os.path.join(jobs_dir, j, ".sacct")
-                jid = batch_id + "_" + j
+                jid = str(batch_id) + "_" + j
                 if tr.exists(sacct_path):
                     with tr.open(sacct_path, "r") as f:
                         acct[jid] = pd.read_csv(
@@ -312,7 +312,8 @@ class Orchestrator(object):
                 # submit job
                 canine_logging.info("Submitting batch job")
                 batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'))
-                canine_logging.print("Batch id:", batch_id)
+                if batch_id != -2:
+                    canine_logging.print("Batch id:", batch_id)
 
                 #
                 # wait for jobs to finish
@@ -321,7 +322,8 @@ class Orchestrator(object):
                 uptime = {}
                 prev_acct = None
                 try:
-                    completed_jobs, uptime, acct = self.wait_for_jobs_to_finish(batch_id)
+                    if batch_id != -2: # check if all shards were avoided
+                        completed_jobs, uptime, acct = self.wait_for_jobs_to_finish(batch_id)
                 except:
                     canine_logging.error("Encountered unhandled exception. Cancelling batch job")
                     self.backend.scancel(batch_id)
@@ -456,67 +458,63 @@ class Orchestrator(object):
     def make_output_DF(self, batch_id, job_spec, outputs, acct, localizer = None) -> pd.DataFrame:
         df = pd.DataFrame()
 
-        if batch_id != -2:
-            try:
-                # we cannot assume that all outputs were properly delocalized, i.e.
-                # self.job_spec.keys() == outputs.keys()
-                #
-                # this could happen if a preemptible job runs out of preemption
-                # attempts, so delocalization.py never gets a chance to run
-    
-                # sanity check: outputs cannot contain more keys than inputs
-                if outputs.keys() - job_spec.keys():
-                    raise ValueError("{} job outputs discovered, but only {} job(s) specified!".format(
-                      len(outputs), len(job_spec)
-                    ))
+        try:
+            # we cannot assume that all outputs were properly delocalized, i.e.
+            # self.job_spec.keys() == outputs.keys()
+            #
+            # this could happen if a preemptible job runs out of preemption
+            # attempts, so delocalization.py never gets a chance to run
 
-                # for jobs that failed to delocalize any outputs, pad the outputs
-                # dict with blanks
-                missing_outputs = job_spec.keys() - outputs.keys()
-                if missing_outputs:
-                    canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
-                      len(missing_outputs), len(job_spec)
-                    ))
-                    outputs = { **outputs, **{ k : {} for k in missing_outputs } }
+            # sanity check: outputs cannot contain more keys than inputs
+            if outputs.keys() - job_spec.keys():
+                raise ValueError("{} job outputs discovered, but only {} job(s) specified!".format(
+                  len(outputs), len(job_spec)
+                ))
 
-                # make the output dataframe
-                df = pd.DataFrame.from_dict(
-                    data={
-                        job_id: {
-                            ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
-                            ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
-                            ('job', 'cpu_seconds'): acct['CPUTimeRAW'][batch_id+'_'+str(array_id)],
-                            ('job', 'submit_time'): acct['Submit'][batch_id+'_'+str(array_id)],
-                            ('job', 'n_preempted'): acct['n_preempted'][batch_id+'_'+str(array_id)],
-                            **{ ('inputs', key) : val for key, val in job_spec[job_id].items() },
-                            **{
-                                ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
-                                for key, val in outputs[job_id].items()
-                            }
+            # for jobs that failed to delocalize any outputs, pad the outputs
+            # dict with blanks
+            missing_outputs = job_spec.keys() - outputs.keys()
+            if missing_outputs:
+                canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
+                  len(missing_outputs), len(job_spec)
+                ))
+                outputs = { **outputs, **{ k : {} for k in missing_outputs } }
+
+            batch_id = str(batch_id) # in case it's set to special value -2
+
+            # make the output dataframe
+            df = pd.DataFrame.from_dict(
+                data={
+                    job_id: {
+                        ('job', 'slurm_state'): acct['State'][batch_id+'_'+str(array_id)],
+                        ('job', 'exit_code'): acct['ExitCode'][batch_id+'_'+str(array_id)],
+                        ('job', 'cpu_seconds'): acct['CPUTimeRAW'][batch_id+'_'+str(array_id)],
+                        ('job', 'submit_time'): acct['Submit'][batch_id+'_'+str(array_id)],
+                        ('job', 'n_preempted'): acct['n_preempted'][batch_id+'_'+str(array_id)],
+                        **{ ('inputs', key) : val for key, val in job_spec[job_id].items() },
+                        **{
+                            ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
+                            for key, val in outputs[job_id].items()
                         }
-                        for array_id, job_id in enumerate(job_spec)
-                    },
-                    orient = "index"
-                ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int})
+                    }
+                    for array_id, job_id in enumerate(job_spec)
+                },
+                orient = "index"
+            ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int})
 
-                #
-                # apply functions to output columns (if any)
-                if len(self.output_map) > 0:
-                    # columns that receive no (i.e., identity) transformation
-                    identity_map = { x : lambda y : y for x in set(df.columns.get_loc_level("outputs")[1]) - self.output_map.keys() }
+            #
+            # apply functions to output columns (if any)
+            if len(self.output_map) > 0:
+                # columns that receive no (i.e., identity) transformation
+                identity_map = { x : lambda y : y for x in set(df.columns.get_loc_level("outputs")[1]) - self.output_map.keys() }
 
-                    # we get back all columns from the dataframe by aggregating columns
-                    # that don't receive any transformation with transformed columns
-                    df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
-            except:
-                df = pd.DataFrame()
-                canine_logging.error("Error generating output dataframe; see stack trace for details.")
-                traceback.print_exc()
-
-
-        # concatenate with any previously existing job avoided results
-        if self.df_avoided is not None:
-            df = pd.concat([df, self.df_avoided]).sort_index()
+                # we get back all columns from the dataframe by aggregating columns
+                # that don't receive any transformation with transformed columns
+                df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
+        except:
+            df = pd.DataFrame()
+            canine_logging.error("Error generating output dataframe; see stack trace for details.")
+            traceback.print_exc()
 
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
@@ -532,34 +530,29 @@ class Orchestrator(object):
         if job_spec is None:
             job_spec = self.job_spec
 
-        # this job was avoided
-        if len(job_spec) == 0:
+        # all shards in this job were avoided
+        if all([x is None for x in job_spec.values()]):
             return -2
 
+        # remove noop'd jobs from array spec
+        noop_idx = np.r_[-1, np.array([k for k, v in job_spec.items() if v is None], dtype = np.int), len(job_spec)]
+        array_range = np.c_[noop_idx[:-1] + 1, noop_idx[1:] - 1]
+        array_range = array_range[(np.diff(array_range, 1) >= 0).ravel(), :].astype(str).astype(np.object)
+        array_str = ",".join(array_range[:, 0] + "-" + array_range[:, 1])
+
+        # submit to sbatch
         batch_id = self.backend.sbatch(
             entrypoint_path,
-            "H", # submit in "held" state to allow for noop'd jobs to be cancelled
             **{
                 'requeue': True,
                 'job_name': self.name,
-                'array': "0-{}".format(len(job_spec)-1),
+                'array': array_str,
                 'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
                 'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
                 **self.resources,
                 **Orchestrator.stringify(extra_sbatch_args)
             }
         )
-
-        # cancel noop'd jobs
-        for k, v in job_spec.items():
-            if v is None:
-                self.backend.scancel(batch_id + "_" + k)
-
-        # release the batch
-        # TODO: should scontrol be added to the backend class? AFAIK this is the
-        # only place it's used
-        status, stdout, stderr = self.backend.invoke("scontrol release " + batch_id)
-        check_call("scontrol release", status, stdout, stderr)
 
         return batch_id
 
