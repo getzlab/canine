@@ -532,8 +532,8 @@ class Orchestrator(object):
         if job_spec is None:
             job_spec = self.job_spec
 
-        # this job was avoided
-        if len(job_spec) == 0:
+        # all shards in this job were avoided
+        if all([x is None for x in job_spec.values()]):
             return -2
 
         # remove noop'd jobs from array spec
