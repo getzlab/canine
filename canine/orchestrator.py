@@ -51,8 +51,18 @@ source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh
 LOCALIZER_JOB_RC=$?
 if [ $LOCALIZER_JOB_RC -eq 0 ]; then
-  {{pipeline_script}}
-  CANINE_JOB_RC=$?
+  while true; do
+    {{pipeline_script}}
+    CANINE_JOB_RC=$?
+    if [ $CANINE_JOB_RC == 0 ]; then
+      break
+    else
+      [ $SLURM_RESTART_COUNT -gt $CANINE_RETRY_LIMIT ] && { echo "Retry limit exceeded" >&2; break; } || :
+      echo "Retrying job (attempt $SLURM_RESTART_COUNT/$CANINE_RETRY_LIMIT)" >&2
+      scontrol requeue $SLURM_JOBID
+      # FIXME: what about the rest of the script?
+    fi
+  done
   echo -n $CANINE_JOB_RC > ../.job_exit_code
   echo -n 0 > ../.localizer_exit_code
 else
