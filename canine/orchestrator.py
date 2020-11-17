@@ -51,6 +51,7 @@ source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh
 LOCALIZER_JOB_RC=$?
 if [ $LOCALIZER_JOB_RC -eq 0 ]; then
+  echo -n 0 > ../.localizer_exit_code
   while true; do
     {{pipeline_script}}
     CANINE_JOB_RC=$?
@@ -64,7 +65,6 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     fi
   done
   echo -n $CANINE_JOB_RC > ../.job_exit_code
-  echo -n 0 > ../.localizer_exit_code
 else
   echo "Localization failure!" > /dev/stderr
   echo -n "DNR" > ../.job_exit_code
