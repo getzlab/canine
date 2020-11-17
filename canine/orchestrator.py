@@ -433,7 +433,7 @@ class Orchestrator(object):
               job = batch_id,
               format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
             ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
-            acct = acct.loc[~acct.index.str.endswith("batch")]
+            acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))]
             acct.loc[acct["ResvCPURAW"].isna(), "ResvCPURAW"] = 0
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
             acct = acct.drop(columns = ["ResvCPURAW"])
@@ -444,7 +444,7 @@ class Orchestrator(object):
                     job = jid.split('_')[1]
 
                     # job has completed
-                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'} or self.job_spec[job] is None:
+                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL', 'REQUEUED'} or self.job_spec[job] is None:
 #                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
