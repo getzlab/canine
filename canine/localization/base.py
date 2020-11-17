@@ -613,7 +613,7 @@ class AbstractLocalizer(abc.ABC):
             ]
             localization_tasks += [
                 'sudo mkdir -p $CANINE_LOCAL_DISK_DIR',
-                'if [[ -z "$CANINE_NODE_NAME" ]]; then echo "Unable to provision disk (not running on GCE instance). Attempting download to directory on boot disk" > /dev/stderr; else',
+                'if [[ -z "$CANINE_NODE_NAME" ]]; then echo "Unable to provision disk (not running on GCE instance). Attempting download to directory on boot disk" >&2; else',
                 'echo Provisioning and mounting temporary disk {}'.format(disk_name),
                 'gcloud compute disks create {} --size {} --type pd-{} --zone $CANINE_NODE_ZONE'.format(
                     disk_name,
@@ -751,7 +751,7 @@ class AbstractLocalizer(abc.ABC):
               # wait for device to attach
               "tries=0",
               "while [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ]; do",
-              '[ $tries -gt 12 ] && { echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:"; cat $DIAG_FILE; exit 1; } || :',
+              '[ $tries -gt 12 ] && { echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:" >&2; cat $DIAG_FILE >&2; exit 1; } || :',
               "sleep 10; ((++tries))",
               "done",
 
@@ -765,8 +765,7 @@ class AbstractLocalizer(abc.ABC):
 
               # because we forced zero exits for the previous commands,
               # we need to verify that the mount actually exists
-              "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!'; cat $DIAG_FILE; exit 1; }",
-              # TODO: write error to stderr; this isn't working for some reason
+              "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; cat $DIAG_FILE >&2; exit 1; }",
 
               "done",
             ]
