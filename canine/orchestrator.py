@@ -14,7 +14,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.10.3'
+version = '0.10.4'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -43,6 +43,7 @@ ENTRYPOINT = """#!/bin/bash
 export CANINE="{version}"
 export CANINE_BACKEND="{{backend}}"
 export CANINE_ADAPTER="{{adapter}}"
+export CANINE_RETRY_LIMIT={{retry_limit}}
 export CANINE_ROOT="{{CANINE_ROOT}}"
 export CANINE_COMMON="{{CANINE_COMMON}}"
 export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
@@ -51,10 +52,19 @@ source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh
 LOCALIZER_JOB_RC=$?
 if [ $LOCALIZER_JOB_RC -eq 0 ]; then
-  {{pipeline_script}}
-  CANINE_JOB_RC=$?
-  echo -n $CANINE_JOB_RC > ../.job_exit_code
   echo -n 0 > ../.localizer_exit_code
+  while true; do
+    {{pipeline_script}}
+    CANINE_JOB_RC=$?
+    if [ $CANINE_JOB_RC == 0 ]; then
+      break
+    else
+      [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
+      echo "Retrying job (attempt ${{{{SLURM_RESTART_COUNT:-0}}}}/$CANINE_RETRY_LIMIT)" >&2
+      scontrol requeue $SLURM_JOB_ID
+    fi
+  done
+  echo -n $CANINE_JOB_RC > ../.job_exit_code
 else
   echo "Localization failure!" > /dev/stderr
   echo -n "DNR" > ../.job_exit_code
@@ -190,6 +200,13 @@ class Orchestrator(object):
         config["inputs"] = { k : config["inputs"][k] for k in config["inputs"].keys() - inputs_to_void }
         self.raw_inputs = Orchestrator.stringify(config['inputs']) if 'inputs' in config else {}
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
+
+        # retries
+        if type(config["retry"]) != int:
+            raise TypeError("Retry count must be an int")
+        if config["retry"] < 0:
+            raise ValueError("Retry count must be >= 0")
+        self.retry_limit = Orchestrator.stringify(config['retry']) if 'resources' in config else 0
 
         #
         # adapter
@@ -385,6 +402,7 @@ class Orchestrator(object):
                     backend=self._backend_type,
                     adapter=self._adapter_type,
                     pipeline_script=pipeline_path,
+                    retry_limit=self.retry_limit,
                     **env
                 ))
             transport.chmod(entrypoint_path, 0o775)
@@ -424,7 +442,7 @@ class Orchestrator(object):
               job = batch_id,
               format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
             ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
-            acct = acct.loc[~acct.index.str.endswith("batch")]
+            acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))]
             acct.loc[acct["ResvCPURAW"].isna(), "ResvCPURAW"] = 0
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
             acct = acct.drop(columns = ["ResvCPURAW"])
@@ -435,7 +453,7 @@ class Orchestrator(object):
                     job = jid.split('_')[1]
 
                     # job has completed
-                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL'} or self.job_spec[job] is None:
+                    if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL', 'REQUEUED'} or self.job_spec[job] is None:
 #                        print("Job",job, "completed with status", acct['State'][jid], acct['ExitCode'][jid].split(':')[0])
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
