@@ -202,11 +202,12 @@ class Orchestrator(object):
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
 
         # retries
-        if type(config["retry"]) != int:
-            raise TypeError("Retry count must be an int")
-        if config["retry"] < 0:
-            raise ValueError("Retry count must be >= 0")
-        self.retry_limit = Orchestrator.stringify(config['retry']) if 'resources' in config else 0
+        if "retry" in config:
+            if type(config["retry"]) != int:
+                raise TypeError("Retry count must be an int")
+            if config["retry"] < 0:
+                raise ValueError("Retry count must be >= 0")
+        self.retry_limit = Orchestrator.stringify(config['retry']) if 'retry' in config else 0
 
         #
         # adapter
