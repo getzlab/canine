@@ -146,6 +146,7 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
+        placeholder_fields = { "State" : np.nan, "CPUTimeRAW" : -1, "n_preempted" : -1 }
 
         with localizer.transport_context() as tr:
             for j in job_spec.keys():
@@ -164,8 +165,10 @@ class Orchestrator(object):
                           'CPUTimeRAW': int,
                           "Submit" : np.datetime64
                         })
+                    if acct[jid].empty:
+                        acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
                 else:
-                    acct[jid] = pd.DataFrame({ "State" : np.nan }, index = [0])
+                    acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
 
         return pd.concat(acct).droplevel(1).rename_axis("JobID")
 
@@ -519,7 +522,7 @@ class Orchestrator(object):
                     for array_id, job_id in enumerate(job_spec)
                 },
                 orient = "index"
-            ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int})
+            ).rename_axis(index = "_job_id").astype({('job', 'cpu_seconds'): int, ('job', 'n_preempted'): int})
 
             #
             # apply functions to output columns (if any)
