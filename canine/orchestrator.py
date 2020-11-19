@@ -199,7 +199,7 @@ class Orchestrator(object):
         # inputs/resources
         inputs_to_void = { k for k, v in config["inputs"].items() if v is None }
         for k in inputs_to_void:
-            print('WARNING: input "{}" was specified as None, ignoring.'.format(k)) 
+            canine_logging.warning('Input "{}" was specified as None, ignoring.'.format(k)) 
         config["inputs"] = { k : config["inputs"][k] for k in config["inputs"].keys() - inputs_to_void }
         self.raw_inputs = Orchestrator.stringify(config['inputs']) if 'inputs' in config else {}
         self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
@@ -220,6 +220,11 @@ class Orchestrator(object):
         self._adapter_type=adapter['type']
         self.adapter = ADAPTERS[adapter['type']](**{arg:val for arg,val in adapter.items() if arg != 'type'})
         self.job_spec = self.adapter.parse_inputs(self.raw_inputs)
+
+        # if no inputs were provided, assume this is a standalone task
+        if not self.job_spec:
+            canine_logging.warning("No inputs provided; assuming this is a standalone task")
+            self.job_spec = { "0" : { "null" : "null" } }
 
         #
         # backend
