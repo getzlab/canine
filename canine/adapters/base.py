@@ -44,6 +44,15 @@ class AbstractAdapter(abc.ABC):
         """
         pass
 
+def maxdepth(li):
+    """
+    Gets maximum nested depth of an array.
+    """
+    if isinstance(li, list):
+        return max([maxdepth(j) for j in li]) + 1
+    else:
+        return 0
+
 class ManualAdapter(AbstractAdapter):
     """
     Handles manual argument formatting
@@ -77,6 +86,11 @@ class ManualAdapter(AbstractAdapter):
             key: len(val) if isinstance(val, list) else 1
             for key, val in inputs.items()
         }
+
+        # make sure input arrays are not >2D
+        for key, val in inputs.items():
+            if maxdepth(val) > 2:
+                raise ValueError("Input {} is an array with nesting >2".format(key))
 
         #
         # HACK: deal with lists of length 1
