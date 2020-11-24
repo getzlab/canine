@@ -601,6 +601,7 @@ class AbstractLocalizer(abc.ABC):
             'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2> /dev/null)',
             'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone 2> /dev/null))'
         ]
+        array_exports = {}
         canine_rodisks = []
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
@@ -647,9 +648,18 @@ class AbstractLocalizer(abc.ABC):
             ]
             docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
 
+        def export_writer(key, value, is_array):
+            if not is_array:
+                exports.append("export {}={}".format(key, value))
+            else:
+                if key not in array_exports:
+                    array_exports[key] = []
+                array_exports[key].append(value)
+
         compute_env = self.environment('remote')
         stream_dir_ready = False
         for key, val_array in self.inputs[jobId].items():
+            is_array = True if len(val_array) > 1 else False
             for val in val_array:
                 if val.type == 'stream':
                     job_vars.append(shlex.quote(key))
@@ -668,10 +678,7 @@ class AbstractLocalizer(abc.ABC):
                             dest
                         )
                     ]
-                    exports.append('export {}="{}"'.format(
-                        key,
-                        dest
-                    ))
+                    export_writer(key, dest, is_array)
 
                 elif val.type in {'download', 'local'}:
                     job_vars.append(shlex.quote(key))
@@ -687,10 +694,7 @@ class AbstractLocalizer(abc.ABC):
                             dest.remotepath
                         )
                     ]
-                    exports.append('export {}="{}"'.format(
-                        key,
-                        dest.remotepath
-                    ))
+                    export_writer(key, dest.remotepath, is_array)
 
                 elif val.type == 'ro_disk':
                     assert val.path.startswith("rodisk://")
@@ -718,23 +722,28 @@ class AbstractLocalizer(abc.ABC):
                       "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
                     ]
 
-                    exports.append('export {}="{}"'.format(
-                        key,
-                        dest.remotepath
-                    ))
+                    export_writer(key, dest.remotepath, is_array)
 
                 elif val.type is None:
                     job_vars.append(shlex.quote(key))
-                    exports.append('export {}={}'.format(
-                        key,
-                        shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path)
-                    ))
+                    export_writer(
+                      key,
+                      shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path),
+                      is_array
+                    )
+
                 else:
                     canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
                         file=sys.stderr, type="warning"
                     )
 
-        ## Mount RO disks if any
+        #
+        # add paths to array job files to exports
+        for k in array_exports.keys():
+            exports += ['export {0}="$CANINE_JOB_INPUTS/inputs/{0}_array.txt"'.format(k)]
+
+        #
+        # Mount RO disks if any
         exports += ["export CANINE_N_RODISKS={}".format(len(canine_rodisks))]
         if len(canine_rodisks):
             localization_tasks += [
@@ -837,7 +846,7 @@ class AbstractLocalizer(abc.ABC):
                 ] if disk_name is not None else []
             )
         )
-        return setup_script, localization_script, teardown_script
+        return setup_script, localization_script, teardown_script, array_exports
 
     @abc.abstractmethod
     def __enter__(self):
