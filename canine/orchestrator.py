@@ -539,9 +539,8 @@ class Orchestrator(object):
                 # that don't receive any transformation with transformed columns
                 df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
         except:
-            df = pd.DataFrame()
-            canine_logging.error("Error generating output dataframe; see stack trace for details.")
-            traceback.print_exc()
+            canine_logging.error("There were some errors generating output dataframe; see stack trace for details.")
+            canine_logging.error(traceback.format_exc())
 
         # save DF to disk
         if isinstance(localizer, AbstractLocalizer):
