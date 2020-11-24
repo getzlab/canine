@@ -596,7 +596,7 @@ class AbstractLocalizer(abc.ABC):
         # generate job variable, exports, and localization_tasks arrays
         # - job variables and exports are set when setup.sh is _sourced_
         # - localization tasks are run when localization.sh is _run_
-        job_vars = []
+        job_vars = set()
         exports = [
             'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2> /dev/null)',
             'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone 2> /dev/null))'
@@ -662,7 +662,7 @@ class AbstractLocalizer(abc.ABC):
             is_array = True if len(val_array) > 1 else False
             for val in val_array:
                 if val.type == 'stream':
-                    job_vars.append(shlex.quote(key))
+                    job_vars.add(shlex.quote(key))
                     if not stream_dir_ready:
                         exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
                         docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
@@ -681,7 +681,7 @@ class AbstractLocalizer(abc.ABC):
                     export_writer(key, dest, is_array)
 
                 elif val.type in {'download', 'local'}:
-                    job_vars.append(shlex.quote(key))
+                    job_vars.add(shlex.quote(key))
                     if val.type == 'download':
                         dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                     else:
@@ -699,7 +699,7 @@ class AbstractLocalizer(abc.ABC):
                 elif val.type == 'ro_disk':
                     assert val.path.startswith("rodisk://")
 
-                    job_vars.append(shlex.quote(key))
+                    job_vars.add(shlex.quote(key))
 
                     dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
                     disk = dgrp[1]
@@ -725,7 +725,7 @@ class AbstractLocalizer(abc.ABC):
                     export_writer(key, dest.remotepath, is_array)
 
                 elif val.type is None:
-                    job_vars.append(shlex.quote(key))
+                    job_vars.add(shlex.quote(key))
                     export_writer(
                       key,
                       shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path),
