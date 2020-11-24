@@ -422,17 +422,23 @@ class AbstractLocalizer(abc.ABC):
         with self.transport_context(transport) as transport:
             self.common_inputs = set()
             seen = set()
+
+            # 1. scan for any duplicate values across inputs
             for jobId, values in inputs.items():
                 # noop; this shard was avoided
                 if values is None:
                     continue
 
-                for arg, path in values.items():
-                    if path in seen and (arg not in overrides or overrides[arg] == 'common'):
-                        self.common_inputs.add(path)
-                    if arg in overrides and overrides[arg] == 'common':
-                        self.common_inputs.add(path)
-                    seen.add(path)
+                for arg, paths in values.items():
+                    paths = [paths] if not isinstance(paths, list) else paths
+                    if arg not in overrides:
+                        for p in paths:
+                            if p in seen:
+                                self.common_inputs.add(p)
+                    for p in paths:
+                        seen.add(p)
+
+            # 2. see if any of these duplicate values correspond to files; if so, localize them now.
             common_dests = {}
             for path in self.common_inputs:
                 if path.startswith('gs://') or os.path.exists(path):

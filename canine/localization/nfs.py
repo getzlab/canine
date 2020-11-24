@@ -121,7 +121,7 @@ class NFSLocalizer(BatchedLocalizer):
                 continue
 
             for k, v in input_dict.items():
-                if k not in overrides:
+                if k not in overrides and len(v) == 1:
                     if re.match(r"^/", v) is not None and self.same_volume(v) and \
                       re.match(r".*/outputs/\d+/.*", v) is None:
                         overrides[k] = None
