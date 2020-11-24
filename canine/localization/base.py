@@ -472,17 +472,12 @@ class AbstractLocalizer(abc.ABC):
         Prepares job-specific inputs.
         Fills self.inputs[jobId] with Localization objects for each input
         """
-        if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
-            overrides['CANINE_JOB_ALIAS'] = None
-        self.inputs[jobId] = {}
-        for arg, value in job_inputs.items():
-            mode = overrides[arg] if arg in overrides else False
 
-            # common file has already been localized; we simply need to update
-            # self.inputs and continue
-            if value in common_dests or mode == 'common':
-                self.inputs[jobId][arg] = Localization(None, common_dests[value])
-                continue
+        def handle_input(value, mode):
+            # common file has already been localized; we can thus treat this as a
+            # string literal
+            if value in common_dests:
+                return Localization(None, common_dests[value])
 
             # user did not explicitly specify an override for this input; try to infer it
             elif mode is False:
@@ -504,17 +499,12 @@ class AbstractLocalizer(abc.ABC):
                 if mode == 'stream':
                     if not value.startswith('gs://'):
                         raise OverrideValueError(mode, arg, value)
-
-                    self.inputs[jobId][arg] = Localization(
+                    return Localization(
                         'stream',
                         value
                     )
 
                 elif mode in ['localize', 'symlink']:
-                    self.inputs[jobId][arg] = Localization(
-                        None,
-                        self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                    )
                     try:
                         with self.transport_context(transport) as transport:
                             self.localize_file(
@@ -530,12 +520,15 @@ class AbstractLocalizer(abc.ABC):
                         for k, v in self.inputs[jobId].items():
                             if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
                                 raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
+                    return Localization(
+                        None,
+                        self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                    )
 
                 elif mode == 'delayed':
                     if not value.startswith('gs://'):
                         raise OverrideValueError(mode, arg, value)
-
-                    self.inputs[jobId][arg] = Localization(
+                    return Localization(
                         'download',
                         value
                     )
@@ -543,7 +536,7 @@ class AbstractLocalizer(abc.ABC):
                 elif mode == "ro_disk":
                     if not value.startswith('rodisk://'):
                         raise OverrideValueError(mode, arg, value)
-                    self.inputs[jobId][arg] = Localization(
+                    return Localization(
                         'ro_disk',
                         value
                     )
@@ -551,7 +544,7 @@ class AbstractLocalizer(abc.ABC):
                 elif mode is None or mode == 'null':
                     # Do not reserve path here
                     # null override treats input as string
-                    self.inputs[jobId][arg] = Localization(None, value)
+                    return Localization(None, value)
 
                 else:
                     raise ValueError("Invalid override option [{}]".format(mode))
@@ -562,10 +555,6 @@ class AbstractLocalizer(abc.ABC):
             # XXX: why not a string literal?
             except OverrideValueError as e:
                 canine_logging.error(e.args[0])
-                self.inputs[jobId][arg] = Localization(
-                    None,
-                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                )
                 try:
                     with self.transport_context(transport) as transport:
                         self.localize_file(
@@ -581,6 +570,22 @@ class AbstractLocalizer(abc.ABC):
                     for k, v in self.inputs[jobId].items():
                         if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
                             raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
+                return Localization(
+                    None,
+                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                )
+
+        if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
+            overrides['CANINE_JOB_ALIAS'] = None
+        self.inputs[jobId] = {}
+        for arg, value in job_inputs.items():
+            mode = overrides[arg] if arg in overrides else False
+            value = [value] if not isinstance(value, list) else value
+
+            self.inputs[jobId][arg] = [None]*len(value)
+
+            for i, v in enumerate(value):
+                self.inputs[jobId][arg][i] = handle_input(v, mode)
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
         """
