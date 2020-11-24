@@ -649,89 +649,90 @@ class AbstractLocalizer(abc.ABC):
 
         compute_env = self.environment('remote')
         stream_dir_ready = False
-        for key, val in self.inputs[jobId].items():
-            if val.type == 'stream':
-                job_vars.append(shlex.quote(key))
-                if not stream_dir_ready:
-                    exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
-                    docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
-                    stream_dir_ready = True
-                dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(val.path)))
-                localization_tasks += [
-                    'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
-                    'mkfifo {}'.format(dest),
-                    "gsutil {} cat {} > {} &".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
+        for key, val_array in self.inputs[jobId].items():
+            for val in val_array:
+                if val.type == 'stream':
+                    job_vars.append(shlex.quote(key))
+                    if not stream_dir_ready:
+                        exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
+                        docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
+                        stream_dir_ready = True
+                    dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(val.path)))
+                    localization_tasks += [
+                        'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
+                        'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
+                        'mkfifo {}'.format(dest),
+                        "gsutil {} cat {} > {} &".format(
+                            '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
+                            shlex.quote(val.path),
+                            dest
+                        )
+                    ]
+                    exports.append('export {}="{}"'.format(
+                        key,
                         dest
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest
-                ))
+                    ))
 
-            elif val.type in {'download', 'local'}:
-                job_vars.append(shlex.quote(key))
-                if val.type == 'download':
-                    dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                else:
-                    # Local and controller paths not needed on this object
-                    dest = PathType(None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
-                localization_tasks += [
-                    "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
+                elif val.type in {'download', 'local'}:
+                    job_vars.append(shlex.quote(key))
+                    if val.type == 'download':
+                        dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
+                    else:
+                        # Local and controller paths not needed on this object
+                        dest = PathType(None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
+                    localization_tasks += [
+                        "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
+                            '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
+                            shlex.quote(val.path),
+                            dest.remotepath
+                        )
+                    ]
+                    exports.append('export {}="{}"'.format(
+                        key,
                         dest.remotepath
+                    ))
+
+                elif val.type == 'ro_disk':
+                    assert val.path.startswith("rodisk://")
+
+                    job_vars.append(shlex.quote(key))
+
+                    dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
+                    disk = dgrp[1]
+                    file = dgrp[2]
+
+                    disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
+
+                    if disk not in canine_rodisks:
+                        canine_rodisks.append(disk)
+                        exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
+                        exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
+
+                    dest = self.reserve_path('jobs', jobId, 'inputs', file)
+
+                    localization_tasks += [
+                      # symlink the future RODISK path into the Canine inputs directory
+                      # NOTE: it will be broken upon creation, since the RODISK will
+                      #   be mounted subsequently.
+                      # NOTE: it might already exist if we are retrying this task
+                      "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
+                    ]
+
+                    exports.append('export {}="{}"'.format(
+                        key,
+                        dest.remotepath
+                    ))
+
+                elif val.type is None:
+                    job_vars.append(shlex.quote(key))
+                    exports.append('export {}={}'.format(
+                        key,
+                        shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path)
+                    ))
+                else:
+                    canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
+                        file=sys.stderr, type="warning"
                     )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.remotepath
-                ))
-
-            elif val.type == 'ro_disk':
-                assert val.path.startswith("rodisk://")
-
-                job_vars.append(shlex.quote(key))
-
-                dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
-                disk = dgrp[1]
-                file = dgrp[2]
-
-                disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
-
-                if disk not in canine_rodisks:
-                    canine_rodisks.append(disk)
-                    exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
-                    exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
-
-                dest = self.reserve_path('jobs', jobId, 'inputs', file)
-
-                localization_tasks += [
-                  # symlink the future RODISK path into the Canine inputs directory
-                  # NOTE: it will be broken upon creation, since the RODISK will
-                  #   be mounted subsequently.
-                  # NOTE: it might already exist if we are retrying this task
-                  "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
-                ]
-
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.remotepath
-                ))
-
-            elif val.type is None:
-                job_vars.append(shlex.quote(key))
-                exports.append('export {}={}'.format(
-                    key,
-                    shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path)
-                ))
-            else:
-                canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
-                    file=sys.stderr, type="warning"
-                )
 
         ## Mount RO disks if any
         exports += ["export CANINE_N_RODISKS={}".format(len(canine_rodisks))]
