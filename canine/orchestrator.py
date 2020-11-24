@@ -76,36 +76,35 @@ echo -n $? > ../.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=version)
 
+def stringify(obj: typing.Any) -> typing.Any:
+    """
+    Recurses through the dictionary, converting objects to strings
+    """
+    if isinstance(obj, list):
+        return [
+            stringify(elem)
+            for elem in obj
+        ]
+    elif isinstance(obj, dict):
+        return {
+            key:stringify(val)
+            for key, val in obj.items()
+        }
+    elif isinstance(obj, pd.core.series.Series):
+        return [
+            stringify(elem)
+            for elem in obj.tolist()
+        ]
+    elif isinstance(obj, pd.core.frame.DataFrame):
+        return stringify(obj.to_dict(orient = "list"))
+
+    return str(obj)
+
 class Orchestrator(object):
     """
     Main class
     Parses a configuration object, initializes, runs, and cleans up a Canine Pipeline
     """
-
-    @staticmethod
-    def stringify(obj: typing.Any) -> typing.Any:
-        """
-        Recurses through the dictionary, converting objects to strings
-        """
-        if isinstance(obj, list):
-            return [
-                Orchestrator.stringify(elem)
-                for elem in obj
-            ]
-        elif isinstance(obj, dict):
-            return {
-                key:Orchestrator.stringify(val)
-                for key, val in obj.items()
-            }
-        elif isinstance(obj, pd.core.series.Series):
-            return [
-                Orchestrator.stringify(elem)
-                for elem in obj.tolist()
-            ]
-        elif isinstance(obj, pd.core.frame.DataFrame):
-            return Orchestrator.stringify(obj.to_dict(orient = "list"))
-
-        return str(obj)
 
     @staticmethod
     def fill_config(cfg: typing.Union[str, typing.Dict[str, typing.Any]]) -> typing.Dict[str, typing.Any]:
@@ -201,8 +200,8 @@ class Orchestrator(object):
         for k in inputs_to_void:
             canine_logging.warning('Input "{}" was specified as None, ignoring.'.format(k)) 
         config["inputs"] = { k : config["inputs"][k] for k in config["inputs"].keys() - inputs_to_void }
-        self.raw_inputs = Orchestrator.stringify(config['inputs']) if 'inputs' in config else {}
-        self.resources = Orchestrator.stringify(config['resources']) if 'resources' in config else {}
+        self.raw_inputs = stringify(config['inputs']) if 'inputs' in config else {}
+        self.resources = stringify(config['resources']) if 'resources' in config else {}
 
         # retries
         if "retry" in config:
@@ -210,7 +209,7 @@ class Orchestrator(object):
                 raise TypeError("Retry count must be an int")
             if config["retry"] < 0:
                 raise ValueError("Retry count must be >= 0")
-        self.retry_limit = Orchestrator.stringify(config['retry']) if 'retry' in config else 0
+        self.retry_limit = stringify(config['retry']) if 'retry' in config else 0
 
         #
         # adapter
@@ -255,7 +254,7 @@ class Orchestrator(object):
                     self.output_map[k] = v[1]
                     config["outputs"][k] = v[0]
 
-            self.raw_outputs = Orchestrator.stringify(config['outputs'])
+            self.raw_outputs = stringify(config['outputs'])
         else:
             self.raw_outputs = {}
 
@@ -467,6 +466,7 @@ class Orchestrator(object):
                         completed_jobs.append((job, jid))
                         waiting_jobs.remove(jid)
 
+                    # TODO: run this on each worker node
                     # save sacct info for each shard if it's not a noop (None)
                     if save_acct and self.job_spec[job] is not None:
                         with localizer.transport_context() as transport:
@@ -576,7 +576,7 @@ class Orchestrator(object):
                 'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
                 'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
                 **self.resources,
-                **Orchestrator.stringify(extra_sbatch_args)
+                **stringify(extra_sbatch_args)
             }
         )
 
