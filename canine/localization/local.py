@@ -106,8 +106,9 @@ class BatchedLocalizer(AbstractLocalizer):
                 ))
                 self.prepare_job_inputs(jobId, data, common_dests, overrides, transport=transport)
 
-                # Now localize job setup, localization, and teardown scripts
-                setup_script, localization_script, teardown_script = self.job_setup_teardown(jobId, patterns)
+                # Now localize job setup, localization, and teardown scripts, and
+                # any array job files
+                setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns)
 
                 # Setup: 
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
@@ -126,6 +127,12 @@ class BatchedLocalizer(AbstractLocalizer):
                 with open(script_path.localpath, 'w') as w:
                     w.write(teardown_script)
                 os.chmod(script_path.localpath, 0o775)
+
+                # Array exports
+                for k, v in array_exports.items():
+                    export_path = self.reserve_path('jobs', jobId, k + "_array.txt")
+                    with open(export_path.localpath, 'w') as w:
+                        w.write("\n".join(v))
 
             # symlink delocalization script
             os.symlink(
