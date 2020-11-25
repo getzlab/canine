@@ -474,6 +474,8 @@ class AbstractLocalizer(abc.ABC):
         """
 
         def handle_input(value, mode):
+            nonlocal transport
+
             # common file has already been localized; we can thus treat this as a
             # string literal
             if value in common_dests:
@@ -505,25 +507,27 @@ class AbstractLocalizer(abc.ABC):
                     )
 
                 elif mode in ['localize', 'symlink']:
+                    ret = Localization(
+                        None,
+                        self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                    )
                     try:
                         with self.transport_context(transport) as transport:
                             self.localize_file(
                                 value,
-                                self.inputs[jobId][arg].path,
+                                ret.path,
                                 transport=transport
                             )
                     # we cannot handle inputs with duplicate filenames
                     # TODO: handle gs:// URLs as well
                     # TODO: are all localizers guaranteed to raise this error?
                     except FileExistsError:
-                        bn = os.path.basename(self.inputs[jobId][arg].path.localpath)
+                        bn = os.path.basename(ret.path.localpath)
                         for k, v in self.inputs[jobId].items():
-                            if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
-                                raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
-                    return Localization(
-                        None,
-                        self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                    )
+                            for p in v:
+                                if isinstance(p.path, PathType) and bn == os.path.basename(p.path.localpath):
+                                    raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
+                    return ret
 
                 elif mode == 'delayed':
                     if not value.startswith('gs://'):
@@ -555,25 +559,28 @@ class AbstractLocalizer(abc.ABC):
             # XXX: why not a string literal?
             except OverrideValueError as e:
                 canine_logging.error(e.args[0])
+                ret = Localization(
+                    None,
+                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
+                )
+
                 try:
                     with self.transport_context(transport) as transport:
                         self.localize_file(
                             value,
-                            self.inputs[jobId][arg].path,
+                            ret.path,
                             transport=transport
                         )
                 # we cannot handle inputs with duplicate filenames
                 # TODO: handle gs:// URLs as well
                 # TODO: are all localizers guaranteed to raise this error?
                 except FileExistsError:
-                    bn = os.path.basename(self.inputs[jobId][arg].path.localpath)
+                    bn = os.path.basename(ret.path.localpath)
                     for k, v in self.inputs[jobId].items():
-                        if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
-                            raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
-                return Localization(
-                    None,
-                    self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                )
+                        for p in v:
+                            if isinstance(p.path, PathType) and bn == os.path.basename(p.path.localpath):
+                                raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
+                return ret
 
         if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
             overrides['CANINE_JOB_ALIAS'] = None
