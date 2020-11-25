@@ -442,13 +442,22 @@ class AbstractLocalizer(abc.ABC):
             common_dests = {}
             for path in self.common_inputs:
                 if path.startswith('gs://') or os.path.exists(path):
-                    common_dests[path] = self.reserve_path('common', os.path.basename(os.path.abspath(path)))
+                    basename = os.path.basename(os.path.abspath(path))
+                    common_dests[path] = self.reserve_path('common', basename)
+                    n = 2
+                    while transport.exists(common_dests[path].remotepath):
+                        if n == 2:
+                            basename += "_2"
+                        else:
+                            basename = re.sub(r"_\d+$", "_" + str(n), basename)
+                        n += 1
+                        common_dests[path] = self.reserve_path('common', basename)
+
                     try:
                         self.localize_file(path, common_dests[path], transport=transport)
-                    except FileExistsError:
-                        pass
-#                else:
-#                    print("Could not handle common file", path, file=sys.stderr)
+                    except:
+                        canine_logging.error("Unknown error localizing common file {}".format(path))
+                        raise
             return {key: value for key, value in common_dests.items()}
 
     def finalize_staging_dir(self, jobs: typing.Iterable[str], transport: typing.Optional[AbstractTransport] = None) -> str:
