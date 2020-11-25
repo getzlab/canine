@@ -740,7 +740,8 @@ class AbstractLocalizer(abc.ABC):
         #
         # add paths to array job files to exports
         for k in array_exports.keys():
-            exports += ['export {0}="$CANINE_JOB_INPUTS/inputs/{0}_array.txt"'.format(k)]
+            dest = self.reserve_path('jobs', jobId)
+            exports += ['export {0}="{1}/{0}_array.txt"'.format(k, dest.remotepath)]
 
         #
         # Mount RO disks if any
