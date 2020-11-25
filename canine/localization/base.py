@@ -772,7 +772,7 @@ class AbstractLocalizer(abc.ABC):
         
         ## Symlink common inputs to job inputs
         localization_tasks += [
-            '(ls -d "$CANINE_COMMON"/* 2>/dev/null || true) | xargs -L1 -I{} ln -s {} "$CANINE_JOB_INPUTS"/'
+            'find "$CANINE_COMMON"/ -mindepth 1 -maxdepth 1 -exec ln -sf {} "$CANINE_JOB_INPUTS"/ \;'
         ]
 
         # generate setup script
