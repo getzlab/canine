@@ -1,17 +1,18 @@
 
 <!DOCTYPE html>
 
-<html xmlns="http://www.w3.org/1999/xhtml">
+<html>
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>canine.localization &#8212; Canine  documentation</title>
-    <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
     <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
-    <script type="text/javascript" id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
-    <script type="text/javascript" src="../_static/jquery.js"></script>
-    <script type="text/javascript" src="../_static/underscore.js"></script>
-    <script type="text/javascript" src="../_static/doctools.js"></script>
-    <script type="text/javascript" src="../_static/language_data.js"></script>
+    <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
+    <script id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
+    <script src="../_static/jquery.js"></script>
+    <script src="../_static/underscore.js"></script>
+    <script src="../_static/doctools.js"></script>
+    <script src="../_static/language_data.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="canine.utils" href="utils.html" />
@@ -35,9 +36,9 @@
   <div class="section" id="canine-localization">
 <h1>canine.localization<a class="headerlink" href="#canine-localization" title="Permalink to this headline">¶</a></h1>
 <p>Contains code to stage job inputs on the slurm cluster and transfer job outputs back</p>
-<span class="target" id="module-canine.localization"></span><dl class="class">
+<span class="target" id="module-canine.localization"></span><dl class="py class">
 <dt id="canine.localization.BatchedLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">BatchedLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">BatchedLocalizer</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">backend</span><span class="p">:</span> <span class="n">canine.backends.base.AbstractSlurmBackend</span></em>, <em class="sig-param"><span class="n">transfer_bucket</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">common</span><span class="p">:</span> <span class="n">bool</span> <span class="o">=</span> <span class="default_value">True</span></em>, <em class="sig-param"><span class="n">staging_dir</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">project</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="o">**</span><span class="n">kwargs</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Default localization strategy:
 Constructs the canine staging directory locally.
 Local inputs are symlinked into the staging directory.
@@ -45,51 +46,51 @@ gs:// inputs are queued for later
 After staging, the directory is copied to the slurm controller
 (If a transfer bucket is provided, a more efficient copy is used)
 After all jobs have finished, the output directory is copied back here</p>
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.build_manifest">
-<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.BatchedLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.BatchedLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns the job output manifest from this pipeline.
 Builds the manifest if it does not exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.delocalize">
-<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.BatchedLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">output_dir</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">'canine_output'</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
 <dd><p>Delocalizes output from all jobs</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.environment">
-<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.environment" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">location</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.environment" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns environment variables relative to the given location.
 Location must be one of {“local”, “remote”}</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.finalize_staging_dir">
-<code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param">jobs: Iterable[str], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.BatchedLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobs</span><span class="p">:</span> <span class="n">Iterable<span class="p">[</span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.BatchedLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.get_object_size">
-<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.BatchedLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">path</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.BatchedLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns the total number of bytes of the given gsutil object.
 If a directory is given, this will return the total space used by all objects in the directory</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.get_requester_pays">
-<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.BatchedLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">path</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.BatchedLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns True if the requested gs:// object or bucket resides in a
 requester pays bucket</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.gs_copy">
-<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">context</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
 <dd><p>Copy a google storage (gs://) object
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run
@@ -97,9 +98,9 @@ When uploading to gs://, the destination gs:// directory does not have to exist
 When downloading from gs:// the destination parent directory must exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.gs_dircp">
-<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">context</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
 <dd><p>gs_copy for directories
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run
@@ -108,16 +109,16 @@ When downloading from gs:// the destination directory does not have to exist,
 but its parent does</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.job_setup_teardown">
-<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobId</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em><span class="sig-paren">)</span> &#x2192; Tuple<span class="p">[</span>str<span class="p">, </span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
 Must call after pre-scanning inputs</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.localize">
-<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.BatchedLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span><span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.BatchedLocalizer.localize" title="Permalink to this definition">¶</a></dt>
 <dd><p>3 phase task:
 1) Pre-scan inputs to determine proper localization strategy for all inputs
 2) Begin localizing job inputs. For each job, check the predetermined strategy
@@ -127,53 +128,53 @@ staging directory or copying a batch of gsutil files
 Returns the remote staging directory, which is now ready for final startup</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.localize_file">
-<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: canine.localization.base.PathType</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">canine.localization.base.PathType</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
 <dd><p>Localizes the given file.
 gs:// files are queued for later transfer
 local files are symlinked to the staging directory</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.pick_common_inputs">
-<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.BatchedLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
 Returns the dictionary of common inputs {input path: common path}</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.prepare_job_inputs">
-<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, str], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobId</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">job_inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">common_dests</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Prepares job-specific inputs.
 Fills self.inputs[jobId] with Localization objects for each input</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.receivetree">
-<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">exist_okay</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
 <dd><p>Transfers the given remote folder to the given local destination.
 Source must be a remote folder, and dest must not exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.reserve_path">
-<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.BatchedLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param"><span class="o">*</span><span class="n">args</span><span class="p">:</span> <span class="n">Any</span></em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.BatchedLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
 <dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
 Returns a PathType object which can be used to view the path relative to
 local, compute, or controller contexts</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.sendtree">
-<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">exist_okay</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
 <dd><p>Transfers the given local folder to the given remote destination.
 Source must be a local folder, and destination must not exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.BatchedLocalizer.transport_context">
-<code class="sig-name descname">transport_context</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; AbstractContextManager[canine.backends.base.AbstractTransport]<a class="headerlink" href="#canine.localization.BatchedLocalizer.transport_context" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">transport_context</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; AbstractContextManager<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span><a class="headerlink" href="#canine.localization.BatchedLocalizer.transport_context" title="Permalink to this definition">¶</a></dt>
 <dd><p>Opens a file transport in the context.
 If an existing transport is provided, it is passed through
 If None (default) is provided, a new transport is opened, and closed after the context</p>
@@ -181,9 +182,9 @@ If None (default) is provided, a new transport is opened, and closed after the c
 
 </dd></dl>
 
-<dl class="class">
+<dl class="py class">
 <dt id="canine.localization.LocalLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">LocalLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">LocalLocalizer</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">backend</span><span class="p">:</span> <span class="n">canine.backends.base.AbstractSlurmBackend</span></em>, <em class="sig-param"><span class="n">transfer_bucket</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">common</span><span class="p">:</span> <span class="n">bool</span> <span class="o">=</span> <span class="default_value">True</span></em>, <em class="sig-param"><span class="n">staging_dir</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">project</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="o">**</span><span class="n">kwargs</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer" title="Permalink to this definition">¶</a></dt>
 <dd><p>Similar to BatchedLocalizer:
 Constructs the canine staging directory locally.
 Local inputs are symlinked into the staging directory.
@@ -194,51 +195,51 @@ After all jobs have finished, the output directory is copied back here</p>
 Unlike BatchedLocalizer, gs:// files are copied into the local staging directory
 prior to it being copied to the slurm node. This is less efficient (as it
 increases the size of the staging transfer) but utilizes local gsutil credentials</p>
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.build_manifest">
-<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.LocalLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.LocalLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns the job output manifest from this pipeline.
 Builds the manifest if it does not exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.delocalize">
-<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.LocalLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">output_dir</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">'canine_output'</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span><a class="headerlink" href="#canine.localization.LocalLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
 <dd><p>Delocalizes output from all jobs</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.environment">
-<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.environment" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">location</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.LocalLocalizer.environment" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns environment variables relative to the given location.
 Location must be one of {“local”, “remote”}</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.finalize_staging_dir">
-<code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param">jobs: Iterable[str], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.LocalLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobs</span><span class="p">:</span> <span class="n">Iterable<span class="p">[</span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.LocalLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.get_object_size">
-<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.LocalLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">path</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.LocalLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns the total number of bytes of the given gsutil object.
 If a directory is given, this will return the total space used by all objects in the directory</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.get_requester_pays">
-<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.LocalLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">path</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.LocalLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns True if the requested gs:// object or bucket resides in a
 requester pays bucket</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.gs_copy">
-<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">context</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
 <dd><p>Copy a google storage (gs://) object
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run
@@ -246,9 +247,9 @@ When uploading to gs://, the destination gs:// directory does not have to exist
 When downloading from gs:// the destination parent directory must exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.gs_dircp">
-<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">context</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
 <dd><p>gs_copy for directories
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run
@@ -257,16 +258,16 @@ When downloading from gs:// the destination directory does not have to exist,
 but its parent does</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.job_setup_teardown">
-<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobId</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em><span class="sig-paren">)</span> &#x2192; Tuple<span class="p">[</span>str<span class="p">, </span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.LocalLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
 Must call after pre-scanning inputs</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.localize">
-<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.LocalLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span><span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.LocalLocalizer.localize" title="Permalink to this definition">¶</a></dt>
 <dd><p>3 phase task:
 1) Pre-scan inputs to determine proper localization strategy for all inputs
 2) Begin localizing job inputs. For each job, check the predetermined strategy
@@ -276,53 +277,53 @@ staging directory or copying a batch of gsutil files
 Returns the remote staging directory, which is now ready for final startup</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.localize_file">
-<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: canine.localization.base.PathType</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">canine.localization.base.PathType</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
 <dd><p>Localizes the given file.
 gs:// files are queued for later transfer
 local files are symlinked to the staging directory</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.pick_common_inputs">
-<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.LocalLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.LocalLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
 Returns the dictionary of common inputs {input path: common path}</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.prepare_job_inputs">
-<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, str], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobId</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">job_inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">common_dests</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Prepares job-specific inputs.
 Fills self.inputs[jobId] with Localization objects for each input</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.receivetree">
-<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">exist_okay</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
 <dd><p>Transfers the given remote folder to the given local destination.
 Source must be a remote folder, and dest must not exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.reserve_path">
-<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.LocalLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param"><span class="o">*</span><span class="n">args</span><span class="p">:</span> <span class="n">Any</span></em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.LocalLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
 <dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
 Returns a PathType object which can be used to view the path relative to
 local, compute, or controller contexts</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.sendtree">
-<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">exist_okay</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.LocalLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
 <dd><p>Transfers the given local folder to the given remote destination.
 Source must be a local folder, and destination must not exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.LocalLocalizer.transport_context">
-<code class="sig-name descname">transport_context</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; AbstractContextManager[canine.backends.base.AbstractTransport]<a class="headerlink" href="#canine.localization.LocalLocalizer.transport_context" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">transport_context</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; AbstractContextManager<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span><a class="headerlink" href="#canine.localization.LocalLocalizer.transport_context" title="Permalink to this definition">¶</a></dt>
 <dd><p>Opens a file transport in the context.
 If an existing transport is provided, it is passed through
 If None (default) is provided, a new transport is opened, and closed after the context</p>
@@ -330,56 +331,62 @@ If None (default) is provided, a new transport is opened, and closed after the c
 
 </dd></dl>
 
-<dl class="class">
-<dt id="canine.localization.RemoteLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">RemoteLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">temporary_disk_type: str = 'standard'</em>, <em class="sig-param">local_download_dir: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer" title="Permalink to this definition">¶</a></dt>
-<dd><p>Remote Only strategy:
-Staging dir is created remotely and files are copied in</p>
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.build_manifest">
-<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.RemoteLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
+<dl class="py class">
+<dt id="canine.localization.NFSLocalizer">
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">NFSLocalizer</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">backend</span><span class="p">:</span> <span class="n">canine.backends.base.AbstractSlurmBackend</span></em>, <em class="sig-param"><span class="n">transfer_bucket</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">common</span><span class="p">:</span> <span class="n">bool</span> <span class="o">=</span> <span class="default_value">True</span></em>, <em class="sig-param"><span class="n">staging_dir</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">project</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">temporary_disk_type</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">'standard'</span></em>, <em class="sig-param"><span class="n">local_download_dir</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="o">**</span><span class="n">kwargs</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer" title="Permalink to this definition">¶</a></dt>
+<dd><p>Similar to LocalLocalizer:
+Constructs the canine staging directory locally.
+Local inputs are symlinked into the staging directory.</p>
+<p>EXCEPT:
+Unlike LocalLocalizer, there is no final transfer step.
+Files are staged locally and this strategy expects that the given local staging dir
+is NFS mounted to the slurm cluster</p>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.build_manifest">
+<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.NFSLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns the job output manifest from this pipeline.
 Builds the manifest if it does not exist</p>
 </dd></dl>
 
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.delocalize">
-<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: str = 'canine_output'</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.RemoteLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
-<dd><p>Delocalizes output from all jobs</p>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.delocalize">
+<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">output_dir</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span><a class="headerlink" href="#canine.localization.NFSLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
+<dd><p>Delocalizes output from all jobs.
+NFSLocalizer does not delocalize files. Data is copied from output dir</p>
 </dd></dl>
 
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.environment">
-<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.environment" title="Permalink to this definition">¶</a></dt>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.environment">
+<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">location</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.NFSLocalizer.environment" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns environment variables relative to the given location.
 Location must be one of {“local”, “remote”}</p>
 </dd></dl>
 
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.finalize_staging_dir">
-<code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param">jobs: Iterable[str], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.RemoteLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.finalize_staging_dir">
+<code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobs</span><span class="p">:</span> <span class="n">Iterable<span class="p">[</span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.NFSLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
 <dd><p>Finalizes the staging directory by building any missing directory trees
 (such as those dropped during transfer for being empty).
 Returns the absolute path of the remote staging directory on the controller node.</p>
 </dd></dl>
 
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.get_object_size">
-<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.RemoteLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.get_object_size">
+<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">path</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.NFSLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns the total number of bytes of the given gsutil object.
 If a directory is given, this will return the total space used by all objects in the directory</p>
 </dd></dl>
 
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.get_requester_pays">
-<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.RemoteLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.get_requester_pays">
+<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">path</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.NFSLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns True if the requested gs:// object or bucket resides in a
 requester pays bucket</p>
 </dd></dl>
 
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.gs_copy">
-<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.gs_copy">
+<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">context</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
 <dd><p>Copy a google storage (gs://) object
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run
@@ -387,9 +394,9 @@ When uploading to gs://, the destination gs:// directory does not have to exist
 When downloading from gs:// the destination parent directory must exist</p>
 </dd></dl>
 
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.gs_dircp">
-<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.gs_dircp">
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">context</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
 <dd><p>gs_copy for directories
 context must be one of {‘local’, ‘remote’}, which specifies
 where the command should be run
@@ -398,16 +405,164 @@ When downloading from gs:// the destination directory does not have to exist,
 but its parent does</p>
 </dd></dl>
 
-<dl class="method">
-<dt id="canine.localization.RemoteLocalizer.job_setup_teardown">
-<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.job_setup_teardown">
+<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobId</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em><span class="sig-paren">)</span> &#x2192; Tuple<span class="p">[</span>str<span class="p">, </span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.NFSLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
 Must call after pre-scanning inputs</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.localize">
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span><span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.NFSLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<dd><p>3 phase task:
+1) Pre-scan inputs to determine proper localization strategy for all inputs
+2) Begin localizing job inputs. For each job, check the predetermined strategy
+and set up the job’s setup, localization, and teardown scripts
+3) Finally, finalize the localization. This may include broadcasting the
+staging directory or copying a batch of gsutil files
+Returns the remote staging directory, which is now ready for final startup</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.localize_file">
+<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">canine.localization.base.PathType</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
+<dd><p>Localizes the given file.
+* gs:// files are copied to the specified destination
+* local files are symlinked to the specified destination
+* results dataframes are copied to the specified directory</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.pick_common_inputs">
+<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.NFSLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
+<dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
+Returns the dictionary of common inputs {input path: common path}</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.prepare_job_inputs">
+<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobId</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">job_inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">common_dests</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
+<dd><p>Prepares job-specific inputs.
+Fills self.inputs[jobId] with Localization objects for each input</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.receivetree">
+<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">exist_okay</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Transfers the given remote folder to the given local destination.
+Source must be a remote folder, and dest must not exist</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.reserve_path">
+<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param"><span class="o">*</span><span class="n">args</span><span class="p">:</span> <span class="n">Any</span></em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.NFSLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
+<dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
+Returns a PathType object which can be used to view the path relative to
+local, compute, or controller contexts</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.same_volume">
+<code class="sig-name descname">same_volume</code><span class="sig-paren">(</span><em class="sig-param"><span class="o">*</span><span class="n">args</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.same_volume" title="Permalink to this definition">¶</a></dt>
+<dd><p>Check if args are stored on the same NFS mount as the output directory.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.sendtree">
+<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">exist_okay</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
+<dd><p>Transfers the given local folder to the given remote destination.
+Source must be a local folder, and destination must not exist</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.NFSLocalizer.transport_context">
+<code class="sig-name descname">transport_context</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; AbstractContextManager<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span><a class="headerlink" href="#canine.localization.NFSLocalizer.transport_context" title="Permalink to this definition">¶</a></dt>
+<dd><p>Opens a file transport in the context.
+If an existing transport is provided, it is passed through
+If None (default) is provided, a new transport is opened, and closed after the context</p>
+</dd></dl>
+
+</dd></dl>
+
+<dl class="py class">
+<dt id="canine.localization.RemoteLocalizer">
+<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">RemoteLocalizer</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">backend</span><span class="p">:</span> <span class="n">canine.backends.base.AbstractSlurmBackend</span></em>, <em class="sig-param"><span class="n">transfer_bucket</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">common</span><span class="p">:</span> <span class="n">bool</span> <span class="o">=</span> <span class="default_value">True</span></em>, <em class="sig-param"><span class="n">staging_dir</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">project</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">temporary_disk_type</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">'standard'</span></em>, <em class="sig-param"><span class="n">local_download_dir</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="o">**</span><span class="n">kwargs</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer" title="Permalink to this definition">¶</a></dt>
+<dd><p>Remote Only strategy:
+Staging dir is created remotely and files are copied in</p>
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.build_manifest">
+<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.RemoteLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the job output manifest from this pipeline.
+Builds the manifest if it does not exist</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.delocalize">
+<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">output_dir</span><span class="p">:</span> <span class="n">str</span> <span class="o">=</span> <span class="default_value">'canine_output'</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
+<dd><p>Delocalizes output from all jobs</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.environment">
+<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">location</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.environment" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns environment variables relative to the given location.
+Location must be one of {“local”, “remote”}</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.finalize_staging_dir">
+<code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobs</span><span class="p">:</span> <span class="n">Iterable<span class="p">[</span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.RemoteLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
+<dd><p>Finalizes the staging directory by building any missing directory trees
+(such as those dropped during transfer for being empty).
+Returns the absolute path of the remote staging directory on the controller node.</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.get_object_size">
+<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">path</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.RemoteLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns the total number of bytes of the given gsutil object.
+If a directory is given, this will return the total space used by all objects in the directory</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.get_requester_pays">
+<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">path</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.RemoteLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns True if the requested gs:// object or bucket resides in a
+requester pays bucket</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.gs_copy">
+<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">context</span><span class="p">:</span> <span class="n">str</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
+<dd><p>Copy a google storage (gs://) object
+context must be one of {‘local’, ‘remote’}, which specifies
+where the command should be run
+When uploading to gs://, the destination gs:// directory does not have to exist
+When downloading from gs:// the destination parent directory must exist</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.gs_dircp">
+<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">context</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
+<dd><p>gs_copy for directories
+context must be one of {‘local’, ‘remote’}, which specifies
+where the command should be run
+When uploading to gs://, the destination gs:// director does not have to exist
+When downloading from gs:// the destination directory does not have to exist,
+but its parent does</p>
+</dd></dl>
+
+<dl class="py method">
+<dt id="canine.localization.RemoteLocalizer.job_setup_teardown">
+<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobId</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em><span class="sig-paren">)</span> &#x2192; Tuple<span class="p">[</span>str<span class="p">, </span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
+<dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
+Must call after pre-scanning inputs</p>
+</dd></dl>
+
+<dl class="py method">
 <dt id="canine.localization.RemoteLocalizer.localize">
-<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.RemoteLocalizer.localize" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">patterns</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span><span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.RemoteLocalizer.localize" title="Permalink to this definition">¶</a></dt>
 <dd><p>3 phase task:
 1) Pre-scan inputs to determine proper localization strategy for all inputs
 2) Begin localizing job inputs. For each job, check the predetermined strategy
@@ -417,206 +572,52 @@ staging directory or copying a batch of gsutil files
 Returns the remote staging directory, which is now ready for final startup</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.RemoteLocalizer.localize_file">
-<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: canine.localization.base.PathType</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">canine.localization.base.PathType</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
 <dd><p>Localizes the given file.
 All files are immediately transferred</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.RemoteLocalizer.pick_common_inputs">
-<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.RemoteLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
 Returns the dictionary of common inputs {input path: common path}</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.RemoteLocalizer.prepare_job_inputs">
-<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, str], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">jobId</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">job_inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">common_dests</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>str<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">overrides</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Optional<span class="p">[</span>str<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
 <dd><p>Prepares job-specific inputs.
 Fills self.inputs[jobId] with Localization objects for each input</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.RemoteLocalizer.receivetree">
-<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">exist_okay</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
 <dd><p>Transfers the given remote folder to the given local destination.
 Source must be a remote folder, and dest must not exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.RemoteLocalizer.reserve_path">
-<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.RemoteLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param"><span class="o">*</span><span class="n">args</span><span class="p">:</span> <span class="n">Any</span></em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.RemoteLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
 <dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
 Returns a PathType object which can be used to view the path relative to
 local, compute, or controller contexts</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.RemoteLocalizer.sendtree">
-<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">src</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">dest</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">exist_okay</span><span class="o">=</span><span class="default_value">False</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
 <dd><p>Transfers the given local folder to the given remote destination.
 Source must be a local folder, and destination must not exist</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.localization.RemoteLocalizer.transport_context">
-<code class="sig-name descname">transport_context</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; AbstractContextManager[canine.backends.base.AbstractTransport]<a class="headerlink" href="#canine.localization.RemoteLocalizer.transport_context" title="Permalink to this definition">¶</a></dt>
-<dd><p>Opens a file transport in the context.
-If an existing transport is provided, it is passed through
-If None (default) is provided, a new transport is opened, and closed after the context</p>
-</dd></dl>
-
-</dd></dl>
-
-<dl class="class">
-<dt id="canine.localization.NFSLocalizer">
-<em class="property">class </em><code class="sig-prename descclassname">canine.localization.</code><code class="sig-name descname">NFSLocalizer</code><span class="sig-paren">(</span><em class="sig-param">backend: canine.backends.base.AbstractSlurmBackend</em>, <em class="sig-param">transfer_bucket: Optional[str] = None</em>, <em class="sig-param">common: bool = True</em>, <em class="sig-param">staging_dir: str = None</em>, <em class="sig-param">project: Optional[str] = None</em>, <em class="sig-param">temporary_disk_type: str = 'standard'</em>, <em class="sig-param">local_download_dir: Optional[str] = None</em>, <em class="sig-param">**kwargs</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer" title="Permalink to this definition">¶</a></dt>
-<dd><p>Similar to LocalLocalizer:
-Constructs the canine staging directory locally.
-Local inputs are symlinked into the staging directory.</p>
-<p>EXCEPT:
-Unlike LocalLocalizer, there is no final transfer step.
-Files are staged locally and this strategy expects that the given local staging dir
-is NFS mounted to the slurm cluster</p>
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.build_manifest">
-<code class="sig-name descname">build_manifest</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.localization.NFSLocalizer.build_manifest" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns the job output manifest from this pipeline.
-Builds the manifest if it does not exist</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.delocalize">
-<code class="sig-name descname">delocalize</code><span class="sig-paren">(</span><em class="sig-param">patterns: Dict[str, str], output_dir: Optional[str] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, Dict[str, str]]<a class="headerlink" href="#canine.localization.NFSLocalizer.delocalize" title="Permalink to this definition">¶</a></dt>
-<dd><p>Delocalizes output from all jobs.
-NFSLocalizer does not delocalize files. Data is copied from output dir</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.environment">
-<code class="sig-name descname">environment</code><span class="sig-paren">(</span><em class="sig-param">location: str</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.NFSLocalizer.environment" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns environment variables relative to the given location.
-Location must be one of {“local”, “remote”}</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.finalize_staging_dir">
-<code class="sig-name descname">finalize_staging_dir</code><span class="sig-paren">(</span><em class="sig-param">jobs: Iterable[str], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.NFSLocalizer.finalize_staging_dir" title="Permalink to this definition">¶</a></dt>
-<dd><p>Finalizes the staging directory by building any missing directory trees
-(such as those dropped during transfer for being empty).
-Returns the absolute path of the remote staging directory on the controller node.</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.get_object_size">
-<code class="sig-name descname">get_object_size</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.localization.NFSLocalizer.get_object_size" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns the total number of bytes of the given gsutil object.
-If a directory is given, this will return the total space used by all objects in the directory</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.get_requester_pays">
-<code class="sig-name descname">get_requester_pays</code><span class="sig-paren">(</span><em class="sig-param">path: str</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.localization.NFSLocalizer.get_requester_pays" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns True if the requested gs:// object or bucket resides in a
-requester pays bucket</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.gs_copy">
-<code class="sig-name descname">gs_copy</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.gs_copy" title="Permalink to this definition">¶</a></dt>
-<dd><p>Copy a google storage (gs://) object
-context must be one of {‘local’, ‘remote’}, which specifies
-where the command should be run
-When uploading to gs://, the destination gs:// directory does not have to exist
-When downloading from gs:// the destination parent directory must exist</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.gs_dircp">
-<code class="sig-name descname">gs_dircp</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">context: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.gs_dircp" title="Permalink to this definition">¶</a></dt>
-<dd><p>gs_copy for directories
-context must be one of {‘local’, ‘remote’}, which specifies
-where the command should be run
-When uploading to gs://, the destination gs:// director does not have to exist
-When downloading from gs:// the destination directory does not have to exist,
-but its parent does</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.job_setup_teardown">
-<code class="sig-name descname">job_setup_teardown</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, patterns: Dict[str, str]</em><span class="sig-paren">)</span> &#x2192; Tuple[str, str, str]<a class="headerlink" href="#canine.localization.NFSLocalizer.job_setup_teardown" title="Permalink to this definition">¶</a></dt>
-<dd><p>Returns a tuple of (setup script, localization script, teardown script) for the given job id.
-Must call after pre-scanning inputs</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.localize">
-<code class="sig-name descname">localize</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], patterns: Dict[str, str], overrides: Optional[Dict[str, Optional[str]]] = None</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.localization.NFSLocalizer.localize" title="Permalink to this definition">¶</a></dt>
-<dd><p>3 phase task:
-1) Pre-scan inputs to determine proper localization strategy for all inputs
-2) Begin localizing job inputs. For each job, check the predetermined strategy
-and set up the job’s setup, localization, and teardown scripts
-3) Finally, finalize the localization. This may include broadcasting the
-staging directory or copying a batch of gsutil files
-Returns the remote staging directory, which is now ready for final startup</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.localize_file">
-<code class="sig-name descname">localize_file</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: canine.localization.base.PathType</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.localize_file" title="Permalink to this definition">¶</a></dt>
-<dd><p>Localizes the given file.
-* gs:// files are copied to the specified destination
-* local files are symlinked to the specified destination
-* results dataframes are copied to the specified directory</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.pick_common_inputs">
-<code class="sig-name descname">pick_common_inputs</code><span class="sig-paren">(</span><em class="sig-param">inputs: Dict[str, Dict[str, str]], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; Dict[str, str]<a class="headerlink" href="#canine.localization.NFSLocalizer.pick_common_inputs" title="Permalink to this definition">¶</a></dt>
-<dd><p>Scans input configuration and overrides to choose inputs which should be treated as common.
-Returns the dictionary of common inputs {input path: common path}</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.prepare_job_inputs">
-<code class="sig-name descname">prepare_job_inputs</code><span class="sig-paren">(</span><em class="sig-param">jobId: str, job_inputs: Dict[str, str], common_dests: Dict[str, str], overrides: Dict[str, Optional[str]], transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.prepare_job_inputs" title="Permalink to this definition">¶</a></dt>
-<dd><p>Prepares job-specific inputs.
-Fills self.inputs[jobId] with Localization objects for each input</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.receivetree">
-<code class="sig-name descname">receivetree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.receivetree" title="Permalink to this definition">¶</a></dt>
-<dd><p>Transfers the given remote folder to the given local destination.
-Source must be a remote folder, and dest must not exist</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.reserve_path">
-<code class="sig-name descname">reserve_path</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span> &#x2192; canine.localization.base.PathType<a class="headerlink" href="#canine.localization.NFSLocalizer.reserve_path" title="Permalink to this definition">¶</a></dt>
-<dd><p>Takes any number of path components, relative to the CANINE_ROOT directory
-Returns a PathType object which can be used to view the path relative to
-local, compute, or controller contexts</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.same_volume">
-<code class="sig-name descname">same_volume</code><span class="sig-paren">(</span><em class="sig-param">*args</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.same_volume" title="Permalink to this definition">¶</a></dt>
-<dd><p>Check if args are stored on the same NFS mount as the output directory.</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.sendtree">
-<code class="sig-name descname">sendtree</code><span class="sig-paren">(</span><em class="sig-param">src: str</em>, <em class="sig-param">dest: str</em>, <em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em>, <em class="sig-param">exist_okay=False</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.localization.NFSLocalizer.sendtree" title="Permalink to this definition">¶</a></dt>
-<dd><p>Transfers the given local folder to the given remote destination.
-Source must be a local folder, and destination must not exist</p>
-</dd></dl>
-
-<dl class="method">
-<dt id="canine.localization.NFSLocalizer.transport_context">
-<code class="sig-name descname">transport_context</code><span class="sig-paren">(</span><em class="sig-param">transport: Optional[canine.backends.base.AbstractTransport] = None</em><span class="sig-paren">)</span> &#x2192; AbstractContextManager[canine.backends.base.AbstractTransport]<a class="headerlink" href="#canine.localization.NFSLocalizer.transport_context" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">transport_context</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">transport</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span> &#x2192; AbstractContextManager<span class="p">[</span>canine.backends.base.AbstractTransport<span class="p">]</span><a class="headerlink" href="#canine.localization.RemoteLocalizer.transport_context" title="Permalink to this definition">¶</a></dt>
 <dd><p>Opens a file transport in the context.
 If an existing transport is provided, it is passed through
 If None (default) is provided, a new transport is opened, and closed after the context</p>
@@ -671,7 +672,7 @@ If None (default) is provided, a new transport is opened, and closed after the c
     </form>
     </div>
 </div>
-<script type="text/javascript">$('#searchbox').show(0);</script>
+<script>$('#searchbox').show(0);</script>
 
 
 
@@ -688,7 +689,7 @@ If None (default) is provided, a new transport is opened, and closed after the c
       &copy;2019, Aaron graubert.
       
       |
-      Powered by <a href="http://sphinx-doc.org/">Sphinx 2.1.2</a>
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 3.3.1</a>
       &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
       
       |

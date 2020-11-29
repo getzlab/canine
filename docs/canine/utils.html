@@ -1,17 +1,18 @@
 
 <!DOCTYPE html>
 
-<html xmlns="http://www.w3.org/1999/xhtml">
+<html>
   <head>
     <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>canine.utils &#8212; Canine  documentation</title>
-    <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
     <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
-    <script type="text/javascript" id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
-    <script type="text/javascript" src="../_static/jquery.js"></script>
-    <script type="text/javascript" src="../_static/underscore.js"></script>
-    <script type="text/javascript" src="../_static/doctools.js"></script>
-    <script type="text/javascript" src="../_static/language_data.js"></script>
+    <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
+    <script id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
+    <script src="../_static/jquery.js"></script>
+    <script src="../_static/underscore.js"></script>
+    <script src="../_static/doctools.js"></script>
+    <script src="../_static/language_data.js"></script>
     <link rel="index" title="Index" href="../genindex.html" />
     <link rel="search" title="Search" href="../search.html" />
     <link rel="next" title="canine.xargs" href="xargs.html" />
@@ -35,76 +36,78 @@
   <div class="section" id="canine-utils">
 <h1>canine.utils<a class="headerlink" href="#canine-utils" title="Permalink to this headline">¶</a></h1>
 <p>Utility code for canine</p>
-<span class="target" id="module-canine.utils"></span><dl class="class">
+<span class="target" id="module-canine.utils"></span><dl class="py class">
 <dt id="canine.utils.ArgumentHelper">
-<em class="property">class </em><code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">ArgumentHelper</code><span class="sig-paren">(</span><em class="sig-param">*flags</em>, <em class="sig-param">**params</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper" title="Permalink to this definition">¶</a></dt>
+<em class="property">class </em><code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">ArgumentHelper</code><span class="sig-paren">(</span><em class="sig-param"><span class="o">*</span><span class="n">flags</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="o">**</span><span class="n">params</span><span class="p">:</span> <span class="n">Any</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper" title="Permalink to this definition">¶</a></dt>
 <dd><p>Helper class for setting arguments to slurm commands
 Used only to handle keyword arguments to console commands
 Should not be responsible for positionals</p>
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.clear">
 <code class="sig-name descname">clear</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; None.  Remove all items from D.<a class="headerlink" href="#canine.utils.ArgumentHelper.clear" title="Permalink to this definition">¶</a></dt>
 <dd></dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.commandline">
 <em class="property">property </em><code class="sig-name descname">commandline</code><a class="headerlink" href="#canine.utils.ArgumentHelper.commandline" title="Permalink to this definition">¶</a></dt>
 <dd><p>Expands the arguments to command line form</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.copy">
 <code class="sig-name descname">copy</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; a shallow copy of D<a class="headerlink" href="#canine.utils.ArgumentHelper.copy" title="Permalink to this definition">¶</a></dt>
 <dd></dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.fromkeys">
-<code class="sig-name descname">fromkeys</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.fromkeys" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">fromkeys</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">value</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="o">/</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.fromkeys" title="Permalink to this definition">¶</a></dt>
 <dd><p>Create a new dictionary with keys from iterable and values set to value.</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.get">
-<code class="sig-name descname">get</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.get" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">get</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">key</span></em>, <em class="sig-param"><span class="n">default</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="o">/</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.get" title="Permalink to this definition">¶</a></dt>
 <dd><p>Return the value for key if key is in the dictionary, else default.</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.items">
-<code class="sig-name descname">items</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; a set-like object providing a view on D's items<a class="headerlink" href="#canine.utils.ArgumentHelper.items" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">items</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; a set-like object providing a view on D’s items<a class="headerlink" href="#canine.utils.ArgumentHelper.items" title="Permalink to this definition">¶</a></dt>
 <dd></dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.keys">
-<code class="sig-name descname">keys</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; a set-like object providing a view on D's keys<a class="headerlink" href="#canine.utils.ArgumentHelper.keys" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">keys</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; a set-like object providing a view on D’s keys<a class="headerlink" href="#canine.utils.ArgumentHelper.keys" title="Permalink to this definition">¶</a></dt>
 <dd></dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.pop">
 <code class="sig-name descname">pop</code><span class="sig-paren">(</span><em class="sig-param">k</em><span class="optional">[</span>, <em class="sig-param">d</em><span class="optional">]</span><span class="sig-paren">)</span> &#x2192; v, remove specified key and return the corresponding value.<a class="headerlink" href="#canine.utils.ArgumentHelper.pop" title="Permalink to this definition">¶</a></dt>
 <dd><p>If key is not found, d is returned if given, otherwise KeyError is raised</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.popitem">
-<code class="sig-name descname">popitem</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; (k, v), remove and return some (key, value) pair as a<a class="headerlink" href="#canine.utils.ArgumentHelper.popitem" title="Permalink to this definition">¶</a></dt>
-<dd><p>2-tuple; but raise KeyError if D is empty.</p>
+<code class="sig-name descname">popitem</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.popitem" title="Permalink to this definition">¶</a></dt>
+<dd><p>Remove and return a (key, value) pair as a 2-tuple.</p>
+<p>Pairs are returned in LIFO (last-in, first-out) order.
+Raises KeyError if the dict is empty.</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.setdefault">
-<code class="sig-name descname">setdefault</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.setdefault" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">setdefault</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">key</span></em>, <em class="sig-param"><span class="n">default</span><span class="o">=</span><span class="default_value">None</span></em>, <em class="sig-param"><span class="o">/</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.ArgumentHelper.setdefault" title="Permalink to this definition">¶</a></dt>
 <dd><p>Insert key with a value of default if key is not in the dictionary.</p>
 <p>Return the value for key if key is in the dictionary, else default.</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.translate">
-<em class="property">static </em><code class="sig-name descname">translate</code><span class="sig-paren">(</span><em class="sig-param">flag</em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.utils.ArgumentHelper.translate" title="Permalink to this definition">¶</a></dt>
+<em class="property">static </em><code class="sig-name descname">translate</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">flag</span></em><span class="sig-paren">)</span> &#x2192; str<a class="headerlink" href="#canine.utils.ArgumentHelper.translate" title="Permalink to this definition">¶</a></dt>
 <dd><p>Converts acceptable python strings to command line args</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.update">
 <code class="sig-name descname">update</code><span class="sig-paren">(</span><span class="optional">[</span><em class="sig-param">E</em>, <span class="optional">]</span><em class="sig-param">**F</em><span class="sig-paren">)</span> &#x2192; None.  Update D from dict/iterable E and F.<a class="headerlink" href="#canine.utils.ArgumentHelper.update" title="Permalink to this definition">¶</a></dt>
 <dd><p>If E is present and has a .keys() method, then does:  for k in E: D[k] = E[k]
@@ -112,97 +115,103 @@ If E is present and lacks a .keys() method, then does:  for k, v in E: D[k] = v
 In either case, this is followed by: for k in F:  D[k] = F[k]</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.ArgumentHelper.values">
-<code class="sig-name descname">values</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; an object providing a view on D's values<a class="headerlink" href="#canine.utils.ArgumentHelper.values" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">values</code><span class="sig-paren">(</span><span class="sig-paren">)</span> &#x2192; an object providing a view on D’s values<a class="headerlink" href="#canine.utils.ArgumentHelper.values" title="Permalink to this definition">¶</a></dt>
 <dd></dd></dl>
 
 </dd></dl>
 
-<dl class="class">
+<dl class="py class">
 <dt id="canine.utils.CustomPricing">
-<em class="property">class </em><code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">CustomPricing</code><span class="sig-paren">(</span><em class="sig-param">cpu_cost</em>, <em class="sig-param">mem_cost</em>, <em class="sig-param">ext_cost</em>, <em class="sig-param">preempt_cpu_cost</em>, <em class="sig-param">preempt_mem_cost</em>, <em class="sig-param">preempt_ext_cost</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing" title="Permalink to this definition">¶</a></dt>
-<dd><dl class="method">
+<em class="property">class </em><code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">CustomPricing</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">cpu_cost</span></em>, <em class="sig-param"><span class="n">mem_cost</span></em>, <em class="sig-param"><span class="n">ext_cost</span></em>, <em class="sig-param"><span class="n">preempt_cpu_cost</span></em>, <em class="sig-param"><span class="n">preempt_mem_cost</span></em>, <em class="sig-param"><span class="n">preempt_ext_cost</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing" title="Permalink to this definition">¶</a></dt>
+<dd><dl class="py method">
 <dt id="canine.utils.CustomPricing.count">
-<code class="sig-name descname">count</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing.count" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">count</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">value</span></em>, <em class="sig-param"><span class="o">/</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing.count" title="Permalink to this definition">¶</a></dt>
 <dd><p>Return number of occurrences of value.</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py attribute">
 <dt id="canine.utils.CustomPricing.cpu_cost">
-<em class="property">property </em><code class="sig-name descname">cpu_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.cpu_cost" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">cpu_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.cpu_cost" title="Permalink to this definition">¶</a></dt>
 <dd><p>Alias for field number 0</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py attribute">
 <dt id="canine.utils.CustomPricing.ext_cost">
-<em class="property">property </em><code class="sig-name descname">ext_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.ext_cost" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">ext_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.ext_cost" title="Permalink to this definition">¶</a></dt>
 <dd><p>Alias for field number 2</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py method">
 <dt id="canine.utils.CustomPricing.index">
-<code class="sig-name descname">index</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing.index" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">index</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">value</span></em>, <em class="sig-param"><span class="n">start</span><span class="o">=</span><span class="default_value">0</span></em>, <em class="sig-param"><span class="n">stop</span><span class="o">=</span><span class="default_value">9223372036854775807</span></em>, <em class="sig-param"><span class="o">/</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.CustomPricing.index" title="Permalink to this definition">¶</a></dt>
 <dd><p>Return first index of value.</p>
 <p>Raises ValueError if the value is not present.</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py attribute">
 <dt id="canine.utils.CustomPricing.mem_cost">
-<em class="property">property </em><code class="sig-name descname">mem_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.mem_cost" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">mem_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.mem_cost" title="Permalink to this definition">¶</a></dt>
 <dd><p>Alias for field number 1</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py attribute">
 <dt id="canine.utils.CustomPricing.preempt_cpu_cost">
-<em class="property">property </em><code class="sig-name descname">preempt_cpu_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_cpu_cost" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">preempt_cpu_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_cpu_cost" title="Permalink to this definition">¶</a></dt>
 <dd><p>Alias for field number 3</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py attribute">
 <dt id="canine.utils.CustomPricing.preempt_ext_cost">
-<em class="property">property </em><code class="sig-name descname">preempt_ext_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_ext_cost" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">preempt_ext_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_ext_cost" title="Permalink to this definition">¶</a></dt>
 <dd><p>Alias for field number 5</p>
 </dd></dl>
 
-<dl class="method">
+<dl class="py attribute">
 <dt id="canine.utils.CustomPricing.preempt_mem_cost">
-<em class="property">property </em><code class="sig-name descname">preempt_mem_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_mem_cost" title="Permalink to this definition">¶</a></dt>
+<code class="sig-name descname">preempt_mem_cost</code><a class="headerlink" href="#canine.utils.CustomPricing.preempt_mem_cost" title="Permalink to this definition">¶</a></dt>
 <dd><p>Alias for field number 4</p>
 </dd></dl>
 
 </dd></dl>
 
-<dl class="function">
+<dl class="py function">
+<dt id="canine.utils.base32">
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">base32</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">buf</span><span class="p">:</span> <span class="n">bytes</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.base32" title="Permalink to this definition">¶</a></dt>
+<dd><p>Convert a byte array into a base32 encoded string</p>
+</dd></dl>
+
+<dl class="py function">
 <dt id="canine.utils.check_call">
-<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">check_call</code><span class="sig-paren">(</span><em class="sig-param">cmd: str</em>, <em class="sig-param">rc: int</em>, <em class="sig-param">stdout: Optional[BinaryIO] = None</em>, <em class="sig-param">stderr: Optional[BinaryIO] = None</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.check_call" title="Permalink to this definition">¶</a></dt>
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">check_call</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">cmd</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">rc</span><span class="p">:</span> <span class="n">int</span></em>, <em class="sig-param"><span class="n">stdout</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>BinaryIO<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">stderr</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>BinaryIO<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.check_call" title="Permalink to this definition">¶</a></dt>
 <dd><p>Checks that the rc is 0
 If not, flush stdout and stderr streams and raise a CalledProcessError</p>
 </dd></dl>
 
-<dl class="function">
+<dl class="py function">
 <dt id="canine.utils.gcp_hourly_cost">
-<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">gcp_hourly_cost</code><span class="sig-paren">(</span><em class="sig-param">mtype: str</em>, <em class="sig-param">preemptible: bool = False</em>, <em class="sig-param">ssd_size: int = 0</em>, <em class="sig-param">hdd_size: int = 0</em>, <em class="sig-param">gpu_type: Optional[str] = None</em>, <em class="sig-param">gpu_count: int = 0</em><span class="sig-paren">)</span> &#x2192; float<a class="headerlink" href="#canine.utils.gcp_hourly_cost" title="Permalink to this definition">¶</a></dt>
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">gcp_hourly_cost</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">mtype</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">preemptible</span><span class="p">:</span> <span class="n">bool</span> <span class="o">=</span> <span class="default_value">False</span></em>, <em class="sig-param"><span class="n">ssd_size</span><span class="p">:</span> <span class="n">int</span> <span class="o">=</span> <span class="default_value">0</span></em>, <em class="sig-param"><span class="n">hdd_size</span><span class="p">:</span> <span class="n">int</span> <span class="o">=</span> <span class="default_value">0</span></em>, <em class="sig-param"><span class="n">gpu_type</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">gpu_count</span><span class="p">:</span> <span class="n">int</span> <span class="o">=</span> <span class="default_value">0</span></em><span class="sig-paren">)</span> &#x2192; float<a class="headerlink" href="#canine.utils.gcp_hourly_cost" title="Permalink to this definition">¶</a></dt>
 <dd><p>Gets the hourly cost of a GCP VM based on its machine type and disk size.
 Does not include any sustained usage discounts. Actual pricing may vary based
 on compute region</p>
 </dd></dl>
 
-<dl class="function">
+<dl class="py function">
 <dt id="canine.utils.get_default_gcp_project">
 <code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">get_default_gcp_project</code><span class="sig-paren">(</span><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.get_default_gcp_project" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns the currently configured default project</p>
 </dd></dl>
 
-<dl class="function">
+<dl class="py function">
 <dt id="canine.utils.isatty">
-<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">isatty</code><span class="sig-paren">(</span><em class="sig-param">*streams</em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.utils.isatty" title="Permalink to this definition">¶</a></dt>
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">isatty</code><span class="sig-paren">(</span><em class="sig-param"><span class="o">*</span><span class="n">streams</span><span class="p">:</span> <span class="n">IO</span></em><span class="sig-paren">)</span> &#x2192; bool<a class="headerlink" href="#canine.utils.isatty" title="Permalink to this definition">¶</a></dt>
 <dd><p>Returns true if all of the provided streams are ttys</p>
 </dd></dl>
 
-<dl class="function">
+<dl class="py function">
 <dt id="canine.utils.make_interactive">
-<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">make_interactive</code><span class="sig-paren">(</span><em class="sig-param">channel: paramiko.channel.Channel</em><span class="sig-paren">)</span> &#x2192; Tuple[int, BinaryIO, BinaryIO]<a class="headerlink" href="#canine.utils.make_interactive" title="Permalink to this definition">¶</a></dt>
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">make_interactive</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">channel</span><span class="p">:</span> <span class="n">paramiko.channel.Channel</span></em><span class="sig-paren">)</span> &#x2192; Tuple<span class="p">[</span>int<span class="p">, </span>BinaryIO<span class="p">, </span>BinaryIO<span class="p">]</span><a class="headerlink" href="#canine.utils.make_interactive" title="Permalink to this definition">¶</a></dt>
 <dd><p>Manages an interactive command
 Takes in a paramiko.Channel shared by stdin, stdout, stderr of a currently running command
 The current interpreter stdin is duplicated and written to the command’s stdin
@@ -211,16 +220,23 @@ and also buffered in a ByteStream for later reading
 Returns (exit status, Stdout buffer, Stderr bufer)</p>
 </dd></dl>
 
-<dl class="function">
+<dl class="py function">
 <dt id="canine.utils.pandas_read_hdf5_buffered">
-<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">pandas_read_hdf5_buffered</code><span class="sig-paren">(</span><em class="sig-param">key: str</em>, <em class="sig-param">buf: _io.BufferedReader</em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.utils.pandas_read_hdf5_buffered" title="Permalink to this definition">¶</a></dt>
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">pandas_read_hdf5_buffered</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">key</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">buf</span><span class="p">:</span> <span class="n">_io.BufferedReader</span></em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.utils.pandas_read_hdf5_buffered" title="Permalink to this definition">¶</a></dt>
 <dd><p>Read a Pandas dataframe in HDF5 format from a buffer.</p>
 </dd></dl>
 
-<dl class="function">
+<dl class="py function">
 <dt id="canine.utils.pandas_write_hdf5_buffered">
-<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">pandas_write_hdf5_buffered</code><span class="sig-paren">(</span><em class="sig-param">df: pandas.core.frame.DataFrame</em>, <em class="sig-param">key: str</em>, <em class="sig-param">buf: _io.BufferedWriter</em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.pandas_write_hdf5_buffered" title="Permalink to this definition">¶</a></dt>
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">pandas_write_hdf5_buffered</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">df</span><span class="p">:</span> <span class="n">pandas.core.frame.DataFrame</span></em>, <em class="sig-param"><span class="n">key</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">buf</span><span class="p">:</span> <span class="n">_io.BufferedWriter</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.pandas_write_hdf5_buffered" title="Permalink to this definition">¶</a></dt>
 <dd><p>Write a Pandas dataframe in HDF5 format to a buffer.</p>
+</dd></dl>
+
+<dl class="py function">
+<dt id="canine.utils.sha1_base32">
+<code class="sig-prename descclassname">canine.utils.</code><code class="sig-name descname">sha1_base32</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">buf</span><span class="p">:</span> <span class="n">bytes</span></em>, <em class="sig-param"><span class="n">n</span><span class="p">:</span> <span class="n">int</span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.utils.sha1_base32" title="Permalink to this definition">¶</a></dt>
+<dd><p>Return a base32 representation of the first n bytes of SHA1(buf).
+If n = None, the entire buffer will be encoded.</p>
 </dd></dl>
 
 </div>
@@ -270,7 +286,7 @@ Returns (exit status, Stdout buffer, Stderr bufer)</p>
     </form>
     </div>
 </div>
-<script type="text/javascript">$('#searchbox').show(0);</script>
+<script>$('#searchbox').show(0);</script>
 
 
 
@@ -287,7 +303,7 @@ Returns (exit status, Stdout buffer, Stderr bufer)</p>
       &copy;2019, Aaron graubert.
       
       |
-      Powered by <a href="http://sphinx-doc.org/">Sphinx 2.1.2</a>
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 3.3.1</a>
       &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
       
       |
