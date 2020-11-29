@@ -46,6 +46,10 @@ class Xargs(Orchestrator):
         self.command = command
 
     def run_pipeline(self, dry_run: bool = False) -> pd.DataFrame:
+        warnings.warn(
+            "The Xargs orchestrator is officially deprecated due to lack of use or support. It will be removed soon",
+            DeprecationWarning
+        )
         print("Preparing a pipeline of", self.n_jobs, "jobs")
         print("Connecting to backend...")
         start_time = time.monotonic()

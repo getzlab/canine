@@ -89,6 +89,7 @@ class TestUnit(unittest.TestCase):
                         'export CANINE="{version}"\n'
                         'export CANINE_BACKEND="Dummy"\n'
                         'export CANINE_ADAPTER="Manual"\n'
+                        'export CANINE_RETRY_LIMIT=0\n'
                         'export CANINE_ROOT="/mnt/nfs/canine"\n'
                         'export CANINE_COMMON="/mnt/nfs/canine/common"\n'
                         'export CANINE_OUTPUT="/mnt/nfs/canine/outputs"\n'
@@ -96,10 +97,28 @@ class TestUnit(unittest.TestCase):
                         'source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh\n'
                         '$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh\n'
                         'LOCALIZER_JOB_RC=$?\n'
-                        '/mnt/nfs/canine/script.sh\n'
-                        'CANINE_JOB_RC=$?\n'
-                        '[[ $LOCALIZER_JOB_RC != 0 ]] && CANINE_JOB_RC=$LOCALIZER_JOB_RC || CANINE_JOB_RC=$CANINE_JOB_RC\n'
-                        'source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh\n'
+                        'if [ $LOCALIZER_JOB_RC -eq 0 ]; then\n'
+                        '  echo -n 0 > ../.localizer_exit_code\n'
+                        '  while true; do\n'
+                        '    /mnt/nfs/canine/script.sh\n'
+                        '    CANINE_JOB_RC=$?\n'
+                        '    if [ $CANINE_JOB_RC == 0 ]; then\n'
+                        '      break\n'
+                        '    else\n'
+                        '      [[ ${{SLURM_RESTART_COUNT:-0}} -ge $CANINE_RETRY_LIMIT ]] && {{ echo "Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }} || :\n'
+                        '      echo "Retrying job (attempt ${{SLURM_RESTART_COUNT:-0}}/$CANINE_RETRY_LIMIT)" >&2\n'
+                        '      scontrol requeue $SLURM_JOB_ID\n'
+                        '    fi\n'
+                        '  done\n'
+                        '  echo -n $CANINE_JOB_RC > ../.job_exit_code\n'
+                        'else\n'
+                        '  echo "Localization failure!" > /dev/stderr\n'
+                        '  echo -n "DNR" > ../.job_exit_code\n'
+                        '  echo -n $LOCALIZER_JOB_RC > ../.localizer_exit_code\n'
+                        '  CANINE_JOB_RC=$LOCALIZER_JOB_RC\n'
+                        'fi\n'
+                        '$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh\n'
+                        'echo -n $? > ../.teardown_exit_code\n'
                         'exit $CANINE_JOB_RC\n'.format(version=version)
                     )
                 )
@@ -131,7 +150,7 @@ class TestUnit(unittest.TestCase):
             os.path.join('/root', path),
             array='0-{}'.format(len(self.orchestrator.job_spec) - 1)
         )
-        jobs, cpu_time, uptime, acct = self.orchestrator.wait_for_jobs_to_finish(batch_id)
+        jobs, uptime, acct = self.orchestrator.wait_for_jobs_to_finish(batch_id)
         self.assertListEqual(
             sorted(jobs),
             sorted([(str(i), '{}_{}'.format(batch_id, i)) for i in range(len(self.orchestrator.job_spec))])
@@ -156,19 +175,21 @@ class TestUnit(unittest.TestCase):
 
         df = self.orchestrator.make_output_DF(
             batch_id,
+            self.orchestrator.job_spec,
             {
                 str(jid):{
                     'output-glob': ['f1.txt', 'f2.txt', 'f3.txt']
                 }
                 for jid in range(len(self.orchestrator.job_spec))
             },
-            {},
             pd.DataFrame.from_dict(
                 data={
                     '{}_{}'.format(batch_id, str(jid)): {
                         'State': 'COMPLETED',
                         'ExitCode': '0:0',
-                        'CPUTimeRAW': 5
+                        'CPUTimeRAW': 5,
+                        'Submit': '1970-01-01 00:00:00',
+                        'n_preempted': 0
                     }
                     for jid in range(len(self.orchestrator.job_spec))
                 },
@@ -222,7 +243,7 @@ class TestUnit(unittest.TestCase):
             )
         self.backend.scancel(batch_id)
 
-    @unittest.skip("Skipping Job Avoidance Test. Waiting for julianhess/develop to merge")
+    @unittest.skip("Skipping Job Avoidance Test. @julianhess Can you add this?")
     def test_job_avoidance(self):
         pass
 
@@ -258,7 +279,7 @@ class TestIntegration(unittest.TestCase):
                     '/opt/canine'
                 )
             rc, stdout, stderr = backend.invoke(
-                "bash -c 'pip3 install -e /opt/canine && pip3 install pyopenssl; echo foo | canine-xargs -d /mnt/nfs echo @'"
+                "bash -c 'pip3 install -e /opt/canine && pip3 install pyopenssl six==1.13.0; echo foo | USER=canine canine-xargs -d /mnt/nfs echo @'"
             )
             self.assertFalse(rc)
             time.sleep(5)
