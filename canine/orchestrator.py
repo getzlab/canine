@@ -59,9 +59,9 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     if [ $CANINE_JOB_RC == 0 ]; then
       break
     else
-      [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
       echo "Job failed with exit code $CANINE_JOB_RC" >&2
-      echo "Retrying job (attempt ${{{{SLURM_RESTART_COUNT:-0}}}}/$CANINE_RETRY_LIMIT)" >&2
+      [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
+      echo "Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
       [ -f ../stdout ] && mv ../stdout ../stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       [ -f ../stderr ] && mv ../stderr ../stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       scontrol requeue $SLURM_JOB_ID
