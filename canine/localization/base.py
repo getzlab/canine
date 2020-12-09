@@ -70,7 +70,8 @@ class AbstractLocalizer(abc.ABC):
             #     raise FileExistsError("{} already exists. Supply force=True to override".format(
             #         self.staging_dir
             #     ))
-        self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
+        self.inputs = {} # {jobId: {inputName: [(handle type, handle value), ...]}}
+        self.input_array_flag = {} # {jobId: {inputName: <bool: is this an array?>}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
         self.local_download_size = {} # {jobId: size}
@@ -585,9 +586,11 @@ class AbstractLocalizer(abc.ABC):
         if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
             overrides['CANINE_JOB_ALIAS'] = None
         self.inputs[jobId] = {}
+        self.input_array_flag[jobId] = {}
         for arg, value in job_inputs.items():
             mode = overrides[arg] if arg in overrides else False
-            value = [value] if not isinstance(value, list) else value
+            self.input_array_flag[jobId][arg] = isinstance(value, list)
+            value = [value] if not self.input_array_flag[jobId][arg] else value
 
             self.inputs[jobId][arg] = [None]*len(value)
 
@@ -666,7 +669,7 @@ class AbstractLocalizer(abc.ABC):
         compute_env = self.environment('remote')
         stream_dir_ready = False
         for key, val_array in self.inputs[jobId].items():
-            is_array = True if len(val_array) > 1 else False
+            is_array = self.input_array_flag[jobId][key]
             for val in val_array:
                 if val.type == 'stream':
                     job_vars.add(shlex.quote(key))

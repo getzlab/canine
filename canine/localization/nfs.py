@@ -54,7 +54,8 @@ class NFSLocalizer(BatchedLocalizer):
         self.local_dir = staging_dir
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
-        self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
+        self.inputs = {} # {jobId: {inputName: [(handle type, handle value), ...]}}
+        self.input_array_flag = {} # {jobId: {inputName: <bool: is this an array?>}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
         self.local_download_size = {} # {jobId: size}
@@ -121,7 +122,7 @@ class NFSLocalizer(BatchedLocalizer):
                 continue
 
             for k, v in input_dict.items():
-                if k not in overrides and len(v) == 1:
+                if k not in overrides and isinstance(v, str):
                     if re.match(r"^/", v) is not None and self.same_volume(v) and \
                       re.match(r".*/outputs/\d+/.*", v) is None:
                         overrides[k] = None
