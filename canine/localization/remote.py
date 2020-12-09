@@ -110,7 +110,7 @@ class RemoteLocalizer(AbstractLocalizer):
                 for k, v in array_exports.items():
                     export_path = self.reserve_path('jobs', jobId, k + "_array.txt")
                     with transport.open(export_path.remotepath, 'w') as w:
-                        w.write("\n".join(v))
+                        w.write("\n".join(v) + "\n")
 
             # send delocalization script
             transport.send(

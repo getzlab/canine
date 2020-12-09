@@ -174,7 +174,7 @@ class NFSLocalizer(BatchedLocalizer):
                 for k, v in array_exports.items():
                     export_path = self.reserve_path('jobs', jobId, k + "_array.txt")
                     with open(export_path.localpath, 'w') as w:
-                        w.write("\n".join(v))
+                        w.write("\n".join(v) + "\n")
 
             # copy delocalization script
             shutil.copyfile(
