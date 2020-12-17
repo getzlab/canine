@@ -26,6 +26,20 @@ def same_volume(a, b):
     )
     return len(set(vols.decode("utf-8").rstrip().split("\n"))) == 1
 
+def get_gsfile_crc32c(path):
+    """
+    From wolf.Task
+    """
+    ## TODO: does not work for directories
+    cmd = 'gsutil hash -c -h {}'.format(shlex.quote(gspath))
+    output = subprocess.check_output(cmd, shell=True).decode()
+    output = output.rstrip().split("\n")
+    output = [o for o in output if re.search(r"^\tHash \(crc32c\):\t\t", o)]
+    assert len(output) == 1
+    output = output[0]
+    output = re.sub(r"^\tHash \(crc32c\):\t\t", "", output)
+    return output
+
 def main(output_dir, jobId, patterns, copy):
     jobdir = os.path.join(output_dir, str(jobId))
     if not os.path.isdir(jobdir):
@@ -58,13 +72,17 @@ def main(output_dir, jobId, patterns, copy):
                 # compute checksum
                 if name not in {'stdout', 'stderr'}:
                     try:
-                        subprocess.check_call(
-                          "sha1sum {target} | awk '{{ print $1 }}' > {output}".format(
-                            target = target,
-                            output = os.path.join(jobdir, name, os.path.dirname(os.path.relpath(target)), "." + os.path.basename(target) + ".sha1")
+                        crc32 = get_gsfile_crc32(target)
+                        with open(
+                          os.path.join(
+                            jobdir,
+                            name,
+                            os.path.dirname(os.path.relpath(target)),
+                            "." + os.path.basename(target) + ".crc32c"
                           ),
-                          shell = True
-                        )
+                          "w"
+                        ) as crc32_file:
+                            crc32_file.write(crc32 + "\n")
                     except subprocess.CalledProcessError:
                         print("Error computing checksum for {}!".format(target), file = sys.stderr)
 
