@@ -31,7 +31,7 @@ def get_gsfile_crc32c(path):
     From wolf.Task
     """
     ## TODO: does not work for directories
-    cmd = 'gsutil hash -c -h {}'.format(shlex.quote(gspath))
+    cmd = 'gsutil hash -c -h {}'.format(shlex.quote(path))
     output = subprocess.check_output(cmd, shell=True).decode()
     output = output.rstrip().split("\n")
     output = [o for o in output if re.search(r"^\tHash \(crc32c\):\t\t", o)]
