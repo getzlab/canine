@@ -72,7 +72,7 @@ def main(output_dir, jobId, patterns, copy):
                 # compute checksum
                 if name not in {'stdout', 'stderr'}:
                     try:
-                        crc32 = get_gsfile_crc32(target)
+                        crc32 = get_gsfile_crc32c(target)
                         with open(
                           os.path.join(
                             jobdir,
