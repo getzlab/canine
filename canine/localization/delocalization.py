@@ -32,7 +32,7 @@ def get_gsfile_crc32c(path):
     From wolf.Task
     """
     ## TODO: does not work for directories
-    cmd = 'gsutil hash -c -h {}'.format(shlex.quote(path))
+    cmd = 'echo "Computing CRC32C checksum for {0} ..." >&2; gsutil hash -c -h {0}'.format(shlex.quote(path))
     output = subprocess.check_output(cmd, shell=True).decode()
     output = output.rstrip().split("\n")
     output = [o for o in output if re.search(r"^\tHash \(crc32c\):\t\t", o)]
@@ -130,4 +130,6 @@ if __name__ == '__main__':
         help="Copy outputs instead of symlinking"
     )
     args = parser.parse_args()
+    print("**** STARTING DELOCALIZATION STEPS ****", file = sys.stderr, flush = True)
     main(args.dest, args.jobId, args.pattern, args.copy)
+    print("**** DELOCALIZATION COMPLETE ****", file = sys.stderr, flush = True)
