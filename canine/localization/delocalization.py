@@ -31,7 +31,6 @@ def get_gsfile_crc32c(path):
     """
     From wolf.Task
     """
-    ## TODO: does not work for directories
     cmd = 'echo "Computing CRC32C checksum for {0} ..." >&2; gsutil hash -c -h {0}'.format(shlex.quote(path))
     output = subprocess.check_output(cmd, shell=True).decode()
     output = output.rstrip().split("\n")
