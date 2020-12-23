@@ -393,7 +393,9 @@ class AbstractLocalizer(abc.ABC):
         """
         Delocalizes output from all jobs
         """
-        self.build_manifest()
+        # this seems to be crashing pipelines; since we don't use it anywhere,
+        # let's disable it for now
+        #self.build_manifest()
         self.receivetree(
             self.environment('remote')['CANINE_OUTPUT'],
             output_dir,
