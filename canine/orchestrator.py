@@ -477,11 +477,17 @@ class Orchestrator(object):
                                 acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
 
             # track node uptime
-            for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
-                if node in uptime:
-                    uptime[node] += 1
-                else:
-                    uptime[node] = 1
+            try:
+                for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
+                    if node in uptime:
+                        uptime[node] += 1
+                    else:
+                        uptime[node] = 1
+            # squeue can fail here if the job completed by the time we call it,
+            # so we catch any errors.
+            # TODO: make something less heavy-handed; this may hide true failures
+            except CalledProcessError:
+                pass
 
         return completed_jobs, uptime, acct
 
