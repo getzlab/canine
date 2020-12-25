@@ -151,7 +151,7 @@ class Orchestrator(object):
         placeholder_fields = { "State" : np.nan, "CPUTimeRAW" : -1, "n_preempted" : -1 }
 
         with localizer.transport_context() as tr:
-            for j in job_spec.keys():
+            for j, v in job_spec.items():
                 sacct_path = os.path.join(jobs_dir, j, ".sacct")
                 jid = str(batch_id) + "_" + j
                 if tr.exists(sacct_path):
@@ -167,8 +167,17 @@ class Orchestrator(object):
                           'CPUTimeRAW': int,
                           "Submit" : np.datetime64
                         })
+
+                    # sacct info is blank (write error?)
                     if acct[jid].empty:
                         acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
+
+                    # if job_spec[j] is None, this indicates a noop (job was avoided)
+                    # override state to completed
+                    if v is None:
+                        acct[jid]["State"] = "COMPLETED"
+
+                # sacct never got written
                 else:
                     acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
 
@@ -360,7 +369,7 @@ class Orchestrator(object):
                 finally:
                     # if some jobs were avoided, read the Slurm accounting info from disk
                     if n_avoided != 0:
-                        acct = Orchestrator.load_acct_from_disk(original_job_spec, localizer, batch_id)
+                        acct = Orchestrator.load_acct_from_disk(self.job_spec, localizer, batch_id)
 
                     # Check if fully job-avoided so we still delocalize
                     if batch_id == -2 or len(completed_jobs):
