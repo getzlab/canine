@@ -172,14 +172,14 @@ class Orchestrator(object):
                     if acct[jid].empty:
                         acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
 
-                    # if job_spec[j] is None, this indicates a noop (job was avoided)
-                    # override state to completed
-                    if v is None:
-                        acct[jid]["State"] = "COMPLETED"
-
                 # sacct never got written
                 else:
                     acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
+
+                # if job_spec[j] is None, this indicates a noop (job was avoided)
+                # override state to completed, regardless of what got loaded from disk
+                if v is None:
+                    acct[jid]["State"] = "COMPLETED"
 
         return pd.concat(acct).droplevel(1).rename_axis("JobID")
 
