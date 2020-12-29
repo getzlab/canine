@@ -44,7 +44,7 @@ def compute_crc32c(direc):
         print(err, file = sys.stderr, flush = True)
         return []
     else:
-        return re.findall(r'Hashes \[hex\] for (.*):\n\tHash \(crc32c\):\t\t([A-F0-9]{8})\n', out)
+        return re.findall(r'Hashes \[hex\] for (.*):\n\tHash \(crc32c\):\t\t([A-Fa-f0-9]{8})\n', out)
 
 def main(output_dir, jobId, patterns, copy):
     jobdir = os.path.join(output_dir, str(jobId))
