@@ -683,6 +683,7 @@ class Orchestrator(object):
                 except (ValueError, OSError) as e:
                     canine_logging.warning("Cannot recover preexisting task outputs: " + str(e))
                     canine_logging.warning("Overwriting output and aborting job avoidance.")
+                    self.job_spec = old_job_spec
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
                     return 0, old_job_spec
