@@ -387,11 +387,35 @@ class canine_logging:
         CANINE_GET_LOGGER_HOOK = func
 
     @staticmethod
+    def log(level, msg, *args, **kwargs):
+        if not CANINE_GET_LOGGER_HOOK:
+            return print(msg)
+        else:
+            return CANINE_GET_LOGGER_HOOK().log(level, msg, *args, **kwargs)
+
+    @staticmethod
     def info(msg):
         if not CANINE_GET_LOGGER_HOOK:
             return print(msg)
         else:
             return CANINE_GET_LOGGER_HOOK().info(msg)
+
+    ## Increased logging level. By default, we want to log our staff with info1.
+    ## This is to distinguish our logs from prefect logs so that we can filter them
+    ## in an interactive session.
+    @staticmethod
+    def info1(msg):
+        if not CANINE_GET_LOGGER_HOOK:
+            return print(msg)
+        else:
+            return CANINE_GET_LOGGER_HOOK().log(logging.INFO + 1, msg)
+
+    @staticmethod
+    def info2(msg):
+        if not CANINE_GET_LOGGER_HOOK:
+            return print(msg)
+        else:
+            return CANINE_GET_LOGGER_HOOK().log(logging.INFO + 2, msg)
 
     @staticmethod
     def warning(msg):
@@ -415,14 +439,14 @@ class canine_logging:
             return CANINE_GET_LOGGER_HOOK().error(msg)
     
     @staticmethod
-    def print(*args, type="info", **kwargs):
+    def print(*args, **kwargs):
         "print-like logging function"
         ## kwargs will be passed to print, but won't be used if logging hook is enabled
         if not CANINE_GET_LOGGER_HOOK:
             return print(*args, **kwargs)
         args = [str(x) for x in args]
         msg = " ".join(args)
-        return getattr(CANINE_GET_LOGGER_HOOK(), type)(msg)
+        return CANINE_GET_LOGGER_HOOK().log(logging.INFO+1, msg) # info1
     
 # Redirect warnings to logging
 logging.captureWarnings(True)
