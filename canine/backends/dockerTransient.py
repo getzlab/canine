@@ -137,7 +137,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         #
         # create the Slurm container if it's not already present
-        canine_logging.info("Starting Slurm controller ...")
+        canine_logging.info1("Starting Slurm controller ...")
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
             # FIXME: gcloud is cloud-provider specific. how can we make this more generic?
             gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
@@ -295,7 +295,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # TODO: use API for this
         nfs_inst = instances.loc[instances["name"] == nfs_nodename].squeeze()
         if nfs_inst.empty:
-            canine_logging.info("Creating NFS server " + nfs_nodename)
+            canine_logging.info1("Creating NFS server " + nfs_nodename)
             subprocess.check_call(
                 """gcloud compute instances create {nfs_nodename} \
                    --image {image} --machine-type n1-standard-4 --zone {compute_zone} \
@@ -307,7 +307,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # otherwise, check that NFS is a valid node, and if so, start if necessary
         else:
-            canine_logging.info("Found preexisting NFS server " + nfs_nodename)
+            canine_logging.info1("Found preexisting NFS server " + nfs_nodename)
 
             # make sure NFS was created by Canine
             if "caninetransientimage" not in nfs_inst["tags"]:
@@ -419,7 +419,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                     # since this may indicate something is wrong
                     else:
                         # TODO: when we implement verbosity, this should be "verbose"
-                        canine_logging.info(
+                        canine_logging.info1(
                           'Command {cmd} returned stderr "{err}"'.format(
                             cmd = command,
                             err = stderr_str
@@ -445,7 +445,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             time.sleep(60)
 
     def wait_for_container_to_be_ready(self, timeout = 3000):
-        canine_logging.info("Waiting up to {} seconds for Slurm controller to start ...".format(timeout))
+        canine_logging.info1("Waiting up to {} seconds for Slurm controller to start ...".format(timeout))
         (rc, _, _) = self.invoke(
           "timeout {} bash -c 'while [ ! -f /.started ]; do sleep 1; done'".format(timeout),
           interactive = True

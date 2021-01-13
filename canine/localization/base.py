@@ -292,13 +292,13 @@ class AbstractLocalizer(abc.ABC):
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
-                canine_logging.info(cmd)
+                canine_logging.info1(cmd)
                 subprocess.check_call(
                     cmd,
                     shell=True
                 )
             else:
-                canine_logging.info("Transferring directly over SFTP")
+                canine_logging.info1("Transferring directly over SFTP")
                 transport.sendtree(src, dest)
 
     def receivetree(self, src: str, dest: str, transport: typing.Optional[AbstractTransport] = None, exist_okay=False):
@@ -348,13 +348,13 @@ class AbstractLocalizer(abc.ABC):
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
-                canine_logging.info(cmd)
+                canine_logging.info1(cmd)
                 subprocess.check_call(
                     cmd,
                     shell=True
                 )
             else:
-                canine_logging.info("Transferring directly over SFTP")
+                canine_logging.info1("Transferring directly over SFTP")
                 transport.receivetree(src, dest)
 
     def reserve_path(self, *args: typing.Any) -> PathType:
