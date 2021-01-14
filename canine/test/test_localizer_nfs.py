@@ -12,7 +12,7 @@ from canine.localization.base import Localization, PathType
 from canine.localization.nfs import NFSLocalizer
 from timeout_decorator import timeout as with_timeout
 
-STAGING_DIR = './travis_tmp' if 'TRAVIS' in os.environ else None
+STAGING_DIR = './ci_tmp' if 'CI' in os.environ else None
 BACKEND = None
 
 @with_timeout(120)

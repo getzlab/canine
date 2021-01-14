@@ -12,7 +12,7 @@ from canine.localization.local import BatchedLocalizer
 from timeout_decorator import timeout as with_timeout
 import agutil
 
-STAGING_DIR = './travis_tmp' if 'TRAVIS' in os.environ else None
+STAGING_DIR = './ci_tmp' if 'CI' in os.environ else None
 WARNING_CONTEXT = None
 BACKEND = None
 
