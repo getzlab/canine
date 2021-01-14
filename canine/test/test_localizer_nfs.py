@@ -105,7 +105,7 @@ class TestIntegration(unittest.TestCase):
     Tests high-level features of the localizer
     """
 
-    @with_timeout(30)
+    # @with_timeout(30)
     def test_localize_delocalize(self):
         """
         This is the full integration test.
@@ -121,10 +121,9 @@ class TestIntegration(unittest.TestCase):
             with patch_localizer(NFSLocalizer(BACKEND, staging_dir=os.path.join(BACKEND.bind_path.name, 'canine'))) as localizer:
                 inputs = {
                     str(jid): {
-                        # no gs:// files; We don't want to actually download anything
                         'gs-stream': 'gs://foo/'+os.urandom(8).hex(),
                         'gs-download': 'gs://foo/'+os.urandom(8).hex(),
-                        'file-common': test_file,
+                        # 'file-common': test_file, # Can't use this since NFS localizer will force override to None, and common isn't a legal override anymore
                         'file-incommon': makefile(os.path.join(tempdir, os.urandom(8).hex())),
                         'string-common': 'hey!',
                         'string-incommon': os.urandom(8).hex(),
@@ -134,13 +133,10 @@ class TestIntegration(unittest.TestCase):
 
                 output_patterns = {'stdout': '../stdout', 'stderr': '../stderr', 'output-glob': '*.txt', 'output-file': 'file.tar.gz'}
 
-                staging_dir = localizer.localize(inputs, output_patterns, {'gs-stream': 'stream', 'gs-download': 'delayed', 'file-common': 'common', 'file-incommon': 'localize'})
+                staging_dir = localizer.localize(inputs, output_patterns, {'gs-stream': 'stream', 'gs-download': 'delayed', 'file-incommon': 'localize'})
                 with localizer.transport_context() as transport:
                     self.assertTrue(transport.isdir(staging_dir))
                     self.assertTrue(transport.isfile(os.path.join(staging_dir, 'delocalization.py')))
-
-                    self.assertTrue(transport.isdir(os.path.join(staging_dir, 'common')))
-                    self.assertTrue(transport.isfile(os.path.join(staging_dir, 'common', 'testfile')))
 
                     self.assertTrue(transport.isdir(os.path.join(staging_dir, 'jobs')))
                     contents = transport.listdir(os.path.join(staging_dir, 'jobs'))

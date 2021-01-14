@@ -152,7 +152,6 @@ class TestIntegration(unittest.TestCase):
                             'file-common': test_file,
                             'file-common-override': test_file2,
                             'file-incommon': makefile(os.path.join(tempdir, os.urandom(8).hex())),
-                            'file-incommon-override': makefile(os.path.join(tempdir, os.urandom(8).hex())),
                             'string-common': 'hey!',
                             'string-incommon': os.urandom(8).hex(),
                         }
@@ -163,7 +162,6 @@ class TestIntegration(unittest.TestCase):
                         inputs,
                         {
                             'file-common-override': None,
-                            'file-incommon-override': 'common'
                         },
                         transport
                     )
@@ -171,12 +169,6 @@ class TestIntegration(unittest.TestCase):
                     self.assertIn(test_file, localizer.common_inputs)
                     self.assertIn('gs://foo/bar', common_dests)
                     self.assertIn(test_file, common_dests)
-                    for jid in inputs:
-                        localizer.localize_file.assert_any_call(
-                            inputs[jid]['file-incommon-override'],
-                            localizer.reserve_path('common', os.path.basename(os.path.abspath(inputs[jid]['file-incommon-override']))),
-                            transport=transport
-                        )
 
     @with_timeout(10)
     def test_prepare_inputs(self):
@@ -211,46 +203,46 @@ class TestIntegration(unittest.TestCase):
                             with self.subTest(jid=jid, input=k):
                                 self.assertIn(k, localizer.inputs[jid])
                                 if k == 'gs-stream':
-                                    self.assertEqual(
+                                    self.assertListEqual(
                                         localizer.inputs[jid][k],
-                                        Localization(
+                                        [Localization(
                                             'stream',
                                             v
-                                        )
+                                        )]
                                     )
                                 elif k == 'gs-download':
-                                    self.assertEqual(
+                                    self.assertListEqual(
                                         localizer.inputs[jid][k],
-                                        Localization(
+                                        [Localization(
                                             'download',
                                             v
-                                        )
+                                        )]
                                     )
                                 elif k.startswith('string-'):
-                                    self.assertEqual(
+                                    self.assertListEqual(
                                         localizer.inputs[jid][k],
-                                        Localization(
+                                        [Localization(
                                             None,
                                             v
-                                        )
+                                        )]
                                     )
                                 elif k.endswith('-common'):
-                                    self.assertEqual(
+                                    self.assertListEqual(
                                         localizer.inputs[jid][k],
-                                        Localization(
+                                        [Localization(
                                             None,
                                             common_dests[v]
-                                        )
+                                        )]
                                     )
                                 else:
-                                    self.assertEqual(
+                                    self.assertListEqual(
                                         localizer.inputs[jid][k],
-                                        Localization(
+                                        [Localization(
                                             None,
                                             localizer.reserve_path('jobs', jid, 'inputs', os.path.basename(os.path.abspath(v)))
-                                        )
+                                        )]
                                     )
-                                    localizer.localize_file.assert_any_call(v, localizer.inputs[jid][k].path, transport=transport)
+                                    localizer.localize_file.assert_any_call(v, localizer.inputs[jid][k][0].path, transport=transport)
                         localizer.localize_file.reset_mock()
 
     @with_timeout(10)
@@ -266,19 +258,24 @@ class TestIntegration(unittest.TestCase):
                 for jid in range(15):
                     with self.subTest(jid=jid):
                         localizer.inputs[str(jid)] = {
-                            'gs-common': Localization(None, common_gs), # already 'localized'
-                            'gs-incommon': Localization(None, localizer.reserve_path('jobs', str(jid), 'inputs', os.urandom(8).hex())), # already 'localized'
-                            'gs-stream': Localization('stream', 'gs://foo/'+os.urandom(8).hex()), # check for extra tasks in setup_teardown
-                            'gs-download': Localization('download', 'gs://foo/'+os.urandom(8).hex()), # check for extra tasks in setup_teardown
-                            'file-common': Localization(None, common_file), # already 'localized'
-                            'file-incommon': Localization(None, localizer.reserve_path('jobs', str(jid), 'inputs', os.urandom(8).hex())), # already 'localized'
-                            'string-common': Localization(None, 'hey!'), # no localization. Setup teardown exports as string
-                            'string-incommon': Localization(None, os.urandom(8).hex()), # no localization. Setup teardown exports as string
+                            'gs-common': [Localization(None, common_gs)], # already 'localized'
+                            'gs-incommon': [Localization(None, localizer.reserve_path('jobs', str(jid), 'inputs', os.urandom(8).hex()))], # already 'localized'
+                            'gs-stream': [Localization('stream', 'gs://foo/'+os.urandom(8).hex())], # check for extra tasks in setup_teardown
+                            'gs-download': [Localization('download', 'gs://foo/'+os.urandom(8).hex())], # check for extra tasks in setup_teardown
+                            'file-common': [Localization(None, common_file)], # already 'localized'
+                            'file-incommon': [Localization(None, localizer.reserve_path('jobs', str(jid), 'inputs', os.urandom(8).hex()))], # already 'localized'
+                            'string-common': [Localization(None, 'hey!')], # no localization. Setup teardown exports as string
+                            'string-incommon': [Localization(None, os.urandom(8).hex())], # no localization. Setup teardown exports as string
                         }
+                        localizer.input_array_flag[str(jid)] = {k: False for k in localizer.inputs[str(jid)]}
 
-                        setup_text, localization_text, teardown_text = localizer.job_setup_teardown(
+                        setup_text, localization_text, teardown_text, array_exports = localizer.job_setup_teardown(
                             jobId=str(jid),
                             patterns=output_patterns
+                        )
+                        self.assertEqual(
+                            len(array_exports),
+                            0
                         )
                         self.assertRegex(
                             setup_text,
@@ -300,41 +297,42 @@ class TestIntegration(unittest.TestCase):
                             'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(localizer.environment('remote')['CANINE_JOBS'], str(jid), 'teardown.sh')),
                             setup_text
                         )
-                        for arg, value in localizer.inputs[str(jid)].items():
-                            with self.subTest(arg=arg, value=value.path):
-                                path = value.path
-                                if value.type == 'stream':
-                                    src = path
-                                    path = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(src)))
-                                    self.assertIn(
-                                        'if [[ -e {dest} ]]; then rm {dest}; fi\n'
-                                        'mkfifo {dest}\n'
-                                        'gsutil  cat {src} > {dest} &'.format(
-                                            src=src,
-                                            dest=path
-                                        ),
-                                        localization_text
+                        for arg, value_list in localizer.inputs[str(jid)].items():
+                            for value in value_list:
+                                with self.subTest(arg=arg, value=value.path):
+                                    path = value.path
+                                    if value.type == 'stream':
+                                        src = path
+                                        path = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(src)))
+                                        self.assertIn(
+                                            'if [[ -e {dest} ]]; then rm {dest}; fi\n'
+                                            'mkfifo {dest}\n'
+                                            'gsutil  cat {src} > {dest} &'.format(
+                                                src=src,
+                                                dest=path
+                                            ),
+                                            localization_text
+                                        )
+                                    elif value.type == 'download':
+                                        src = path
+                                        path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).remotepath
+                                        self.assertIn(
+                                            'if [[ ! -e {dest}.fin ]]; then gsutil  '
+                                            '-o GSUtil:check_hashes=if_fast_else_skip'
+                                            ' cp {src} {dest} && touch {dest}.fin'.format(
+                                                src=src,
+                                                dest=path
+                                            ),
+                                            localization_text
+                                        )
+                                    if isinstance(path, PathType):
+                                        path = path.remotepath
+                                    if '$' in path:
+                                        path = path.replace('$', '\\$')
+                                    self.assertRegex(
+                                        setup_text,
+                                        r'export {}=[\'"]?{}[\'"]?'.format(arg, path)
                                     )
-                                elif value.type == 'download':
-                                    src = path
-                                    path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).remotepath
-                                    self.assertIn(
-                                        'if [[ ! -e {dest}.fin ]]; then gsutil  '
-                                        '-o GSUtil:check_hashes=if_fast_else_skip'
-                                        ' cp {src} {dest} && touch {dest}.fin'.format(
-                                            src=src,
-                                            dest=path
-                                        ),
-                                        localization_text
-                                    )
-                                if isinstance(path, PathType):
-                                    path = path.remotepath
-                                if '$' in path:
-                                    path = path.replace('$', '\\$')
-                                self.assertRegex(
-                                    setup_text,
-                                    r'export {}=[\'"]?{}[\'"]?'.format(arg, path)
-                                )
                         for name, pattern in output_patterns.items():
                             with self.subTest(output=name, pattern=pattern):
                                 self.assertTrue(
@@ -356,7 +354,6 @@ class TestIntegration(unittest.TestCase):
             with BatchedLocalizer(BACKEND) as localizer:
                 inputs = {
                     str(jid): {
-                        # no gs:// files; We don't want to actually download anything
                         'gs-stream': 'gs://foo/'+os.urandom(8).hex(),
                         'gs-download': 'gs://foo/'+os.urandom(8).hex(),
                         'file-common': test_file,

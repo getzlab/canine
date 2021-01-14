@@ -105,8 +105,11 @@ class TestUnit(unittest.TestCase):
                         '    if [ $CANINE_JOB_RC == 0 ]; then\n'
                         '      break\n'
                         '    else\n'
+                        '      echo "Job failed with exit code $CANINE_JOB_RC" >&2\n'
                         '      [[ ${{SLURM_RESTART_COUNT:-0}} -ge $CANINE_RETRY_LIMIT ]] && {{ echo "Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }} || :\n'
-                        '      echo "Retrying job (attempt ${{SLURM_RESTART_COUNT:-0}}/$CANINE_RETRY_LIMIT)" >&2\n'
+                        '      echo "Retrying job (attempt $((${{SLURM_RESTART_COUNT:-0}}+1))/$CANINE_RETRY_LIMIT)" >&2\n'
+                        '      [ -f ../stdout ] && mv ../stdout ../stdout_${{SLURM_RESTART_COUNT:-0}} || :\n'
+                        '      [ -f ../stderr ] && mv ../stderr ../stderr_${{SLURM_RESTART_COUNT:-0}} || :\n'
                         '      scontrol requeue $SLURM_JOB_ID\n'
                         '    fi\n'
                         '  done\n'
@@ -375,7 +378,7 @@ class TestIntegration(unittest.TestCase):
 
             self.assertEqual(len(df), len(o.job_spec))
 
-    @with_timeout(300)
+    @with_timeout(600 if 'CI' in os.environ else 300)
     def test_big_pipeline(self):
         """
         Tests a large-scale pipeline
@@ -385,8 +388,8 @@ class TestIntegration(unittest.TestCase):
             o = Orchestrator({
                 'adapter': {'product': True},
                 'inputs': {
-                    'i': [*range(25)],
-                    'j': [*range(25)],
+                    'i': [*range(15)],
+                    'j': [*range(15)],
                 },
                 'script': ['python3 -c "[print(i,j) for i in range($i) for j in range($j)]"'],
                 'backend': {

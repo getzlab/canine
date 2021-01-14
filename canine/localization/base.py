@@ -571,7 +571,7 @@ class AbstractLocalizer(abc.ABC):
                 else:
                     raise ValueError("Invalid override option [{}]".format(mode))
 
-            # the user specified an invalid override (e.g. "stream" 
+            # the user specified an invalid override (e.g. "stream"
             # for something that's not a bucket path); fall back to
             # handling this input as a local file
             # XXX: why not a string literal?
@@ -597,7 +597,7 @@ class AbstractLocalizer(abc.ABC):
             for i, v in enumerate(value):
                 self.inputs[jobId][arg][i] = handle_input(v, mode)
 
-    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
+    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
         """
         Returns a tuple of (setup script, localization script, teardown script) for the given job id.
         Must call after pre-scanning inputs
@@ -802,7 +802,7 @@ class AbstractLocalizer(abc.ABC):
 
               "done",
             ]
-        
+
         ## Symlink common inputs to job inputs
         localization_tasks += [
             'find "$CANINE_COMMON"/ -mindepth 1 -maxdepth 1 -exec ln -sf {} "$CANINE_JOB_INPUTS"/ \;'

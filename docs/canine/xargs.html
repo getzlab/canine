@@ -4,10 +4,10 @@
 <html>
   <head>
     <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>canine.xargs &#8212; Canine  documentation</title>
-    <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
     <link rel="stylesheet" href="../_static/alabaster.css" type="text/css" />
+    <link rel="stylesheet" href="../_static/pygments.css" type="text/css" />
     <script id="documentation_options" data-url_root="../" src="../_static/documentation_options.js"></script>
     <script src="../_static/jquery.js"></script>
     <script src="../_static/underscore.js"></script>
@@ -35,51 +35,6 @@
   <div class="section" id="canine-xargs">
 <h1>canine.xargs<a class="headerlink" href="#canine-xargs" title="Permalink to this headline">¶</a></h1>
 <p>Contains code to run the xargs orchestrator</p>
-<span class="target" id="module-canine.xargs"></span><dl class="py class">
-<dt id="canine.xargs.Xargs">
-<em class="property">class </em><code class="sig-prename descclassname">canine.xargs.</code><code class="sig-name descname">Xargs</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">command</span><span class="p">:</span> <span class="n">str</span></em>, <em class="sig-param"><span class="n">inputs</span><span class="p">:</span> <span class="n">Dict<span class="p">[</span>str<span class="p">, </span>Any<span class="p">]</span></span></em>, <em class="sig-param"><span class="n">backend</span><span class="p">:</span> <span class="n">Union<span class="p">[</span>canine.backends.base.AbstractSlurmBackend<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>Any<span class="p">]</span><span class="p">]</span></span></em>, <em class="sig-param"><span class="n">name</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">cwd</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>str<span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em>, <em class="sig-param"><span class="n">resources</span><span class="p">:</span> <span class="n">Optional<span class="p">[</span>Dict<span class="p">[</span>str<span class="p">, </span>Any<span class="p">]</span><span class="p">]</span></span> <span class="o">=</span> <span class="default_value">None</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.xargs.Xargs" title="Permalink to this definition">¶</a></dt>
-<dd><p>Simplified Orchestrator
-Built to work on a local slurm cluster.
-No localization is performed. Job-specific commands are dumped to a staging
-directory, and jobs are dispatched. Outputs are not gathered or delocalized,
-and the only cleanup performed removes the temporary staging dir</p>
-<dl class="py method">
-<dt id="canine.xargs.Xargs.fill_config">
-<em class="property">static </em><code class="sig-name descname">fill_config</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">cfg</span><span class="p">:</span> <span class="n">Union<span class="p">[</span>str<span class="p">, </span>Dict<span class="p">[</span>str<span class="p">, </span>Any<span class="p">]</span><span class="p">]</span></span></em><span class="sig-paren">)</span> &#x2192; Dict<span class="p">[</span>str<span class="p">, </span>Any<span class="p">]</span><a class="headerlink" href="#canine.xargs.Xargs.fill_config" title="Permalink to this definition">¶</a></dt>
-<dd><p>Loads the given config object (or reads from the given filepath)
-Applies Canine defaults, then returns the final config dictionary</p>
-</dd></dl>
-
-<dl class="py method">
-<dt id="canine.xargs.Xargs.job_avoid">
-<code class="sig-name descname">job_avoid</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">localizer</span><span class="p">:</span> <span class="n">canine.localization.base.AbstractLocalizer</span></em>, <em class="sig-param"><span class="n">overwrite</span><span class="p">:</span> <span class="n">bool</span> <span class="o">=</span> <span class="default_value">False</span></em><span class="sig-paren">)</span> &#x2192; int<a class="headerlink" href="#canine.xargs.Xargs.job_avoid" title="Permalink to this definition">¶</a></dt>
-<dd><p>Detects jobs which have previously been run in this staging directory.
-Succeeded jobs are skipped. Failed jobs are reset and rerun</p>
-</dd></dl>
-
-<dl class="py method">
-<dt id="canine.xargs.Xargs.load_acct_from_disk">
-<em class="property">static </em><code class="sig-name descname">load_acct_from_disk</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">job_spec</span></em>, <em class="sig-param"><span class="n">localizer</span></em>, <em class="sig-param"><span class="n">batch_id</span></em><span class="sig-paren">)</span><a class="headerlink" href="#canine.xargs.Xargs.load_acct_from_disk" title="Permalink to this definition">¶</a></dt>
-<dd><p>Read in accounting information saved to disk, and convert to format
-equivalent to backend.sacct().
-Used for retrieving accounting information for avoided jobs.</p>
-</dd></dl>
-
-<dl class="py method">
-<dt id="canine.xargs.Xargs.run_pipeline">
-<code class="sig-name descname">run_pipeline</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">dry_run</span><span class="p">:</span> <span class="n">bool</span> <span class="o">=</span> <span class="default_value">False</span></em><span class="sig-paren">)</span> &#x2192; pandas.core.frame.DataFrame<a class="headerlink" href="#canine.xargs.Xargs.run_pipeline" title="Permalink to this definition">¶</a></dt>
-<dd><p>Runs the configured pipeline
-Returns a pandas DataFrame containing job inputs, outputs, and runtime information</p>
-</dd></dl>
-
-<dl class="py method">
-<dt id="canine.xargs.Xargs.stringify">
-<em class="property">static </em><code class="sig-name descname">stringify</code><span class="sig-paren">(</span><em class="sig-param"><span class="n">obj</span><span class="p">:</span> <span class="n">Any</span></em><span class="sig-paren">)</span> &#x2192; Any<a class="headerlink" href="#canine.xargs.Xargs.stringify" title="Permalink to this definition">¶</a></dt>
-<dd><p>Recurses through the dictionary, converting objects to strings</p>
-</dd></dl>
-
-</dd></dl>
-
 </div>
 
 
@@ -143,7 +98,7 @@ Returns a pandas DataFrame containing job inputs, outputs, and runtime informati
       &copy;2019, Aaron graubert.
       
       |
-      Powered by <a href="http://sphinx-doc.org/">Sphinx 3.3.1</a>
+      Powered by <a href="http://sphinx-doc.org/">Sphinx 3.1.2</a>
       &amp; <a href="https://github.com/bitprophet/alabaster">Alabaster 0.7.12</a>
       
       |
