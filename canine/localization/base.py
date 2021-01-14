@@ -70,7 +70,8 @@ class AbstractLocalizer(abc.ABC):
             #     raise FileExistsError("{} already exists. Supply force=True to override".format(
             #         self.staging_dir
             #     ))
-        self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
+        self.inputs = {} # {jobId: {inputName: [(handle type, handle value), ...]}}
+        self.input_array_flag = {} # {jobId: {inputName: <bool: is this an array?>}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
         self.local_download_size = {} # {jobId: size}
@@ -422,27 +423,42 @@ class AbstractLocalizer(abc.ABC):
         with self.transport_context(transport) as transport:
             self.common_inputs = set()
             seen = set()
+
+            # 1. scan for any duplicate values across inputs
             for jobId, values in inputs.items():
                 # noop; this shard was avoided
                 if values is None:
                     continue
 
-                for arg, path in values.items():
-                    if path in seen and (arg not in overrides or overrides[arg] == 'common'):
-                        self.common_inputs.add(path)
-                    if arg in overrides and overrides[arg] == 'common':
-                        self.common_inputs.add(path)
-                    seen.add(path)
+                for arg, paths in values.items():
+                    paths = [paths] if not isinstance(paths, list) else paths
+                    if arg not in overrides:
+                        for p in paths:
+                            if p in seen:
+                                self.common_inputs.add(p)
+                    for p in paths:
+                        seen.add(p)
+
+            # 2. see if any of these duplicate values correspond to files; if so, localize them now.
             common_dests = {}
             for path in self.common_inputs:
                 if path.startswith('gs://') or os.path.exists(path):
-                    common_dests[path] = self.reserve_path('common', os.path.basename(os.path.abspath(path)))
+                    basename = os.path.basename(os.path.abspath(path))
+                    common_dests[path] = self.reserve_path('common', basename)
+                    n = 2
+                    while transport.exists(common_dests[path].remotepath):
+                        if n == 2:
+                            basename += "_2"
+                        else:
+                            basename = re.sub(r"_\d+$", "_" + str(n), basename)
+                        n += 1
+                        common_dests[path] = self.reserve_path('common', basename)
+
                     try:
                         self.localize_file(path, common_dests[path], transport=transport)
-                    except FileExistsError:
-                        pass
-#                else:
-#                    print("Could not handle common file", path, file=sys.stderr)
+                    except:
+                        canine_logging.error("Unknown error localizing common file {}".format(path))
+                        raise
             return {key: value for key, value in common_dests.items()}
 
     def finalize_staging_dir(self, jobs: typing.Iterable[str], transport: typing.Optional[AbstractTransport] = None) -> str:
@@ -466,114 +482,120 @@ class AbstractLocalizer(abc.ABC):
         Prepares job-specific inputs.
         Fills self.inputs[jobId] with Localization objects for each input
         """
+
+        def handle_input(value, mode):
+            nonlocal transport
+
+            def localize_now():
+                nonlocal transport
+
+                # if file already exists, append counter to localized path
+                basename = os.path.basename(os.path.abspath(value))
+                path = self.reserve_path('jobs', jobId, 'inputs', basename)
+                n = 2
+                with self.transport_context(transport) as transport:
+                    while transport.exists(path.remotepath):
+                        if n == 2:
+                            basename += "_2"
+                        else:
+                            basename = re.sub(r"_\d+$", "_" + str(n), basename)
+                        n += 1
+                        path = self.reserve_path('jobs', jobId, 'inputs', basename)
+
+                ret = Localization(
+                    None,
+                    path
+                )
+                with self.transport_context(transport) as transport:
+                    self.localize_file(
+                        value,
+                        ret.path,
+                        transport=transport
+                    )
+                return ret
+
+            # common file has already been localized; we can thus treat this as a
+            # string literal
+            if value in common_dests:
+                return Localization(None, common_dests[value])
+
+            # user did not explicitly specify an override for this input; try to infer it
+            elif mode is False:
+                # is it a local path or gs:// path?
+                if os.path.exists(value) or value.startswith('gs://'):
+                    mode = "localize"
+
+                # is it a RODISK?
+                elif value.startswith('rodisk://'):
+                    mode = "ro_disk"
+
+                # otherwise, treat it like a string literal
+                else:
+                    mode = None
+
+            # override mode is guaranteed to be known now (whether
+            # auto-inferred or manually specified); try to handle it
+            try:
+                if mode == 'stream':
+                    if not value.startswith('gs://'):
+                        raise OverrideValueError(mode, arg, value)
+                    return Localization(
+                        'stream',
+                        value
+                    )
+
+                elif mode in ['localize', 'symlink']:
+                    return localize_now()
+
+                elif mode == 'delayed':
+                    if not value.startswith('gs://'):
+                        raise OverrideValueError(mode, arg, value)
+                    return Localization(
+                        'download',
+                        value
+                    )
+
+                elif mode == "ro_disk":
+                    if not value.startswith('rodisk://'):
+                        raise OverrideValueError(mode, arg, value)
+                    return Localization(
+                        'ro_disk',
+                        value
+                    )
+
+                elif mode is None or mode == 'null':
+                    # Do not reserve path here
+                    # null override treats input as string
+                    return Localization(None, value)
+
+                else:
+                    raise ValueError("Invalid override option [{}]".format(mode))
+
+            # the user specified an invalid override (e.g. "stream" 
+            # for something that's not a bucket path); fall back to
+            # handling this input as a local file
+            # XXX: why not a string literal?
+            except OverrideValueError as e:
+                canine_logging.error(e.args[0])
+                return localize_now()
+
+            except:
+                canine_logging.error("Unknown failure preparing job inputs, see stack trace for details")
+                raise
+
         if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
             overrides['CANINE_JOB_ALIAS'] = None
-        with self.transport_context(transport) as transport:
-            self.inputs[jobId] = {}
-            for arg, value in job_inputs.items():
-                mode = overrides[arg] if arg in overrides else False
+        self.inputs[jobId] = {}
+        self.input_array_flag[jobId] = {}
+        for arg, value in job_inputs.items():
+            mode = overrides[arg] if arg in overrides else False
+            self.input_array_flag[jobId][arg] = isinstance(value, list)
+            value = [value] if not self.input_array_flag[jobId][arg] else value
 
-                # common file has already been localized; we simply need to update
-                # self.inputs and continue
-                if value in common_dests or mode == 'common':
-                    self.inputs[jobId][arg] = Localization(None, common_dests[value])
-                    continue
+            self.inputs[jobId][arg] = [None]*len(value)
 
-                # user did not explicitly specify an override for this input; try to infer it
-                elif mode is False:
-                    # is it a local path or gs:// path?
-                    if os.path.exists(value) or value.startswith('gs://'):
-                        mode = "localize"
-
-                    # is it a RODISK?
-                    elif value.startswith('rodisk://'):
-                        mode = "ro_disk"
-
-                    # otherwise, treat it like a string literal
-                    else:
-                        mode = None
-
-                # override mode is guaranteed to be known now (whether
-                # auto-inferred or manually specified); try to handle it
-                try:
-                    if mode == 'stream':
-                        if not value.startswith('gs://'):
-                            raise OverrideValueError(mode, arg, value)
-
-                        self.inputs[jobId][arg] = Localization(
-                            'stream',
-                            value
-                        )
-
-                    elif mode in ['localize', 'symlink']:
-                        self.inputs[jobId][arg] = Localization(
-                            None,
-                            self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                        )
-                        try:
-                            self.localize_file(
-                                value,
-                                self.inputs[jobId][arg].path,
-                                transport=transport
-                            )
-                        # we cannot handle inputs with duplicate filenames
-                        # TODO: handle gs:// URLs as well
-                        # TODO: are all localizers guaranteed to raise this error?
-                        except FileExistsError:
-                            bn = os.path.basename(self.inputs[jobId][arg].path.localpath)
-                            for k, v in self.inputs[jobId].items():
-                                if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
-                                    raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
-
-                    elif mode == 'delayed':
-                        if not value.startswith('gs://'):
-                            raise OverrideValueError(mode, arg, value)
-
-                        self.inputs[jobId][arg] = Localization(
-                            'download',
-                            value
-                        )
-
-                    elif mode == "ro_disk":
-                        if not value.startswith('rodisk://'):
-                            raise OverrideValueError(mode, arg, value)
-                        self.inputs[jobId][arg] = Localization(
-                            'ro_disk',
-                            value
-                        )
-
-                    elif mode is None or mode == 'null':
-                        # Do not reserve path here
-                        # null override treats input as string
-                        self.inputs[jobId][arg] = Localization(None, value)
-
-                    else:
-                        raise ValueError("Invalid override option [{}]".format(mode))
-
-                # the user specified an invalid override (e.g. "stream" 
-                # for something that's not a bucket path); fall back to
-                # handling this input as a local file
-                # XXX: why not a string literal?
-                except OverrideValueError as e:
-                    canine_logging.error(e.args[0])
-                    self.inputs[jobId][arg] = Localization(
-                        None,
-                        self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(value)))
-                    )
-                    try:
-                        self.localize_file(
-                            value,
-                            self.inputs[jobId][arg].path,
-                            transport=transport
-                        )
-                    # we cannot handle inputs with duplicate filenames
-                    # TODO: handle gs:// URLs as well
-                    # TODO: are all localizers guaranteed to raise this error?
-                    except FileExistsError:
-                        bn = os.path.basename(self.inputs[jobId][arg].path.localpath)
-                        for k, v in self.inputs[jobId].items():
-                            if isinstance(v.path, PathType) and bn == os.path.basename(v.path.localpath):
-                                raise KeyError('Input "{name1}" ("{file1}") has the same filename as input "{name2}"'.format(name1 = arg, file1 = bn, name2 = k))
+            for i, v in enumerate(value):
+                self.inputs[jobId][arg][i] = handle_input(v, mode)
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str]:
         """
@@ -584,11 +606,12 @@ class AbstractLocalizer(abc.ABC):
         # generate job variable, exports, and localization_tasks arrays
         # - job variables and exports are set when setup.sh is _sourced_
         # - localization tasks are run when localization.sh is _run_
-        job_vars = []
+        job_vars = set()
         exports = [
             'export CANINE_NODE_NAME=$(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/name 2> /dev/null)',
             'export CANINE_NODE_ZONE=$(basename $(curl -H "Metadata-Flavor: Google" http://metadata.google.internal/computeMetadata/v1/instance/zone 2> /dev/null))'
         ]
+        array_exports = {}
         canine_rodisks = []
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
@@ -635,93 +658,103 @@ class AbstractLocalizer(abc.ABC):
             ]
             docker_args.append('-v $CANINE_LOCAL_DISK_DIR:$CANINE_LOCAL_DISK_DIR')
 
+        def export_writer(key, value, is_array):
+            if not is_array:
+                exports.append("export {}={}".format(key, value))
+            else:
+                if key not in array_exports:
+                    array_exports[key] = []
+                array_exports[key].append(value)
+
         compute_env = self.environment('remote')
         stream_dir_ready = False
-        for key, val in self.inputs[jobId].items():
-            if val.type == 'stream':
-                job_vars.append(shlex.quote(key))
-                if not stream_dir_ready:
-                    exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
-                    docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
-                    stream_dir_ready = True
-                dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(val.path)))
-                localization_tasks += [
-                    'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
-                    'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
-                    'mkfifo {}'.format(dest),
-                    "gsutil {} cat {} > {} &".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest
-                    )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest
-                ))
+        for key, val_array in self.inputs[jobId].items():
+            is_array = self.input_array_flag[jobId][key]
+            for val in val_array:
+                if val.type == 'stream':
+                    job_vars.add(shlex.quote(key))
+                    if not stream_dir_ready:
+                        exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
+                        docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
+                        stream_dir_ready = True
+                    dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(val.path)))
+                    localization_tasks += [
+                        'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
+                        'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
+                        'mkfifo {}'.format(dest),
+                        "gsutil {} cat {} > {} &".format(
+                            '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
+                            shlex.quote(val.path),
+                            dest
+                        )
+                    ]
+                    export_writer(key, dest, is_array)
 
-            elif val.type in {'download', 'local'}:
-                job_vars.append(shlex.quote(key))
-                if val.type == 'download':
-                    dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
+                elif val.type in {'download', 'local'}:
+                    job_vars.add(shlex.quote(key))
+                    if val.type == 'download':
+                        dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
+                    else:
+                        # Local and controller paths not needed on this object
+                        dest = PathType(None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
+                    localization_tasks += [
+                        "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
+                            '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
+                            shlex.quote(val.path),
+                            dest.remotepath
+                        )
+                    ]
+                    export_writer(key, dest.remotepath, is_array)
+
+                elif val.type == 'ro_disk':
+                    assert val.path.startswith("rodisk://")
+
+                    job_vars.add(shlex.quote(key))
+
+                    dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
+                    disk = dgrp[1]
+                    file = dgrp[2]
+
+                    disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
+
+                    if disk not in canine_rodisks:
+                        canine_rodisks.append(disk)
+                        exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
+                        exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
+
+                    dest = self.reserve_path('jobs', jobId, 'inputs', file)
+
+                    localization_tasks += [
+                      # symlink the future RODISK path into the Canine inputs directory
+                      # NOTE: it will be broken upon creation, since the RODISK will
+                      #   be mounted subsequently.
+                      # NOTE: it might already exist if we are retrying this task
+                      "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
+                    ]
+
+                    export_writer(key, dest.remotepath, is_array)
+
+                elif val.type is None:
+                    job_vars.add(shlex.quote(key))
+                    export_writer(
+                      key,
+                      shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path),
+                      is_array
+                    )
+
                 else:
-                    # Local and controller paths not needed on this object
-                    dest = PathType(None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
-                localization_tasks += [
-                    "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
-                        '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                        shlex.quote(val.path),
-                        dest.remotepath
+                    canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
+                        file=sys.stderr, type="warning"
                     )
-                ]
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.remotepath
-                ))
 
-            elif val.type == 'ro_disk':
-                assert val.path.startswith("rodisk://")
+        #
+        # add paths to array job files to exports
+        for k in array_exports.keys():
+            dest = self.reserve_path('jobs', jobId)
+            exports += ['export {0}="{1}/{0}_array.txt"'.format(k, dest.remotepath)]
 
-                job_vars.append(shlex.quote(key))
-
-                dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
-                disk = dgrp[1]
-                file = dgrp[2]
-
-                disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
-
-                if disk not in canine_rodisks:
-                    canine_rodisks.append(disk)
-                    exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
-                    exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
-
-                dest = self.reserve_path('jobs', jobId, 'inputs', file)
-
-                localization_tasks += [
-                  # symlink the future RODISK path into the Canine inputs directory
-                  # NOTE: it will be broken upon creation, since the RODISK will
-                  #   be mounted subsequently.
-                  # NOTE: it might already exist if we are retrying this task
-                  "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
-                ]
-
-                exports.append('export {}="{}"'.format(
-                    key,
-                    dest.remotepath
-                ))
-
-            elif val.type is None:
-                job_vars.append(shlex.quote(key))
-                exports.append('export {}={}'.format(
-                    key,
-                    shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path)
-                ))
-            else:
-                canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
-                    file=sys.stderr, type="warning"
-                )
-
-        ## Mount RO disks if any
+        #
+        # Mount RO disks if any
         exports += ["export CANINE_N_RODISKS={}".format(len(canine_rodisks))]
         if len(canine_rodisks):
             localization_tasks += [
@@ -824,7 +857,7 @@ class AbstractLocalizer(abc.ABC):
                 ] if disk_name is not None else []
             )
         )
-        return setup_script, localization_script, teardown_script
+        return setup_script, localization_script, teardown_script, array_exports
 
     @abc.abstractmethod
     def __enter__(self):

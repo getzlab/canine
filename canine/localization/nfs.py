@@ -54,7 +54,8 @@ class NFSLocalizer(BatchedLocalizer):
         self.local_dir = staging_dir
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
-        self.inputs = {} # {jobId: {inputName: (handle type, handle value)}}
+        self.inputs = {} # {jobId: {inputName: [(handle type, handle value), ...]}}
+        self.input_array_flag = {} # {jobId: {inputName: <bool: is this an array?>}}
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
         self.local_download_size = {} # {jobId: size}
@@ -121,7 +122,7 @@ class NFSLocalizer(BatchedLocalizer):
                 continue
 
             for k, v in input_dict.items():
-                if k not in overrides:
+                if k not in overrides and isinstance(v, str):
                     if re.match(r"^/", v) is not None and self.same_volume(v) and \
                       re.match(r".*/outputs/\d+/.*", v) is None:
                         overrides[k] = None
@@ -147,8 +148,9 @@ class NFSLocalizer(BatchedLocalizer):
                 ))
                 self.prepare_job_inputs(jobId, data, common_dests, overrides, transport=transport)
 
-                # Now localize job setup, localization, and teardown scripts
-                setup_script, localization_script, teardown_script = self.job_setup_teardown(jobId, patterns)
+                # Now localize job setup, localization, and teardown scripts, and
+                # any array job files
+                setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns)
 
                 # Setup:
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
@@ -167,6 +169,12 @@ class NFSLocalizer(BatchedLocalizer):
                 with open(script_path.localpath, 'w') as w:
                     w.write(teardown_script)
                 os.chmod(script_path.localpath, 0o775)
+
+                # Array exports
+                for k, v in array_exports.items():
+                    export_path = self.reserve_path('jobs', jobId, k + "_array.txt")
+                    with open(export_path.localpath, 'w') as w:
+                        w.write("\n".join(v) + "\n")
 
             # copy delocalization script
             shutil.copyfile(
