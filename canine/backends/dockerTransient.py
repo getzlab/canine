@@ -29,12 +29,9 @@ gce_lock = Lock()
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
-        nfs_startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_storage_container_host.sh",
         startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
         shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
-        nfs_shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
-        nfs_disk_size = 2000, nfs_disk_type = "pd-standard", nfs_action_on_stop = "stop", nfs_image = "",
-        nfs_image_project = "", action_on_stop = "delete", image_family = None, image = None,
+        action_on_stop = "delete", image_family = None, image = None,
         clust_frac = 0.01, user = os.environ["USER"], **kwargs
     ):
         if user is None:
@@ -53,27 +50,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         kwargs["shutdown_script"] = shutdown_script
         super().__init__(**{**kwargs, **{ "slurm_conf_path" : "" }})
 
-        # handle NFS startup/shutdown scripts
-        nfs_compute_script = {
-          "startup-script" : "{script} {nfsds:d} {nfsdt} {nfsimg} {nfsproj}".format(
-            script = nfs_startup_script,
-            nfsds = nfs_disk_size,
-            nfsdt = nfs_disk_type,
-            nfsimg = nfs_image,
-            nfsproj = nfs_image_project
-          ),
-          "shutdown-script" : nfs_shutdown_script
-        }
-
         self.config = {
           "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
-          "nfs_compute_script" :
-            "--metadata " + \
-            ",".join([ "{}=\"{}\"".format(k, v) for k, v in nfs_compute_script.items() if v is not None ]),
           "action_on_stop" : action_on_stop,
-          "nfs_action_on_stop" : nfs_action_on_stop if nfs_action_on_stop is not None
-            else self.config["action_on_stop"],
           "image_family" : image_family if image_family is not None else "slurm-gcp-docker-" + user,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           "user" : user,
@@ -92,11 +72,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # placeholder for node list (loaded from lookup table)
         self.nodes = pd.DataFrame()
-
-        self.NFS_server_ready = False
-        self.NFS_ready = False
-        self.NFS_monitor_thread = None
-        self.NFS_monitor_lock = None
 
     def init_slurm(self):
         self.dkr = docker.from_env()
@@ -122,10 +97,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # start the NFS
         self.start_NFS()
-
-        #
-        # mount the NFS
-        self.mount_NFS()
 
         #
         # ensure that Docker can start (no Slurm processes outside of Docker already running)
@@ -177,10 +148,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             pickle.dump(self.config, f)
 
     def init_nodes(self):
-        if not self.NFS_ready:
-            raise Exception("NFS must be mounted before starting nodes!")
-
-        self.wait_for_cluster_ready(elastic = True)
+        self.wait_for_cluster_ready(elastic = True, timeout=60)
 
         # list all the nodes that Slurm is aware of
 
@@ -259,27 +227,23 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             if self.container is not None:
                 self.container().stop()
 
-            #
-            # unmount the NFS
+            # #
+            # # unmount the NFS
 
-            # this needs to be the last step, since Docker will hang if NFS is pulled
-            # out from under it
-            if self.config["nfs_action_on_stop"] != "run":
-                try:
-                    subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
-                except subprocess.CalledProcessError:
-                    canine_logging.error("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
+            # # this needs to be the last step, since Docker will hang if NFS is pulled
+            # # out from under it
+            # if self.config["nfs_action_on_stop"] != "run":
+            #     try:
+            #         subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
+            #     except subprocess.CalledProcessError:
+            #         canine_logging.error("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
 
             # superclass method will stop/delete/leave the NFS running, depending on
-            # how self.config["nfs_action_on_stop"] is set.
+            # how self.config["action_on_stop"] is set.
 
             if not allnodes.empty:
                 self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
-                super().stop(action_on_stop = self.config["nfs_action_on_stop"], kill_straggling_jobs = False)
-
-        # kill thread that auto-restarts NFS
-        if self.NFS_monitor_lock is not None:
-            self.NFS_monitor_lock.set()
+                super().stop(action_on_stop = self.config["action_on_stop"], kill_straggling_jobs = False) # Question: Shouldn't kill_straggling_jobs be True?
 
     def _get_container(self, container_name):
         def closure():
@@ -288,78 +252,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         return closure
 
     def start_NFS(self):
-        nfs_nodename = self.config["worker_prefix"] + "-nfs"
-        instances = self.list_instances_all_zones()
 
-        # NFS doesn't exist; create it
-        # TODO: use API for this
-        nfs_inst = instances.loc[instances["name"] == nfs_nodename].squeeze()
-        if nfs_inst.empty:
-            canine_logging.info1("Creating NFS server " + nfs_nodename)
-            subprocess.check_call(
-                """gcloud compute instances create {nfs_nodename} \
-                   --image {image} --machine-type n1-standard-4 --zone {compute_zone} \
-                   {nfs_compute_script} \
-                   --tags caninetransientimage
-                """.format(nfs_nodename = nfs_nodename, **self.config),
-                shell = True
-            )
-
-        # otherwise, check that NFS is a valid node, and if so, start if necessary
-        else:
-            canine_logging.info1("Found preexisting NFS server " + nfs_nodename)
-
-            # make sure NFS was created by Canine
-            if "caninetransientimage" not in nfs_inst["tags"]:
-                raise RuntimeError("Preexisting NFS server was not created by Canine.")
-
-            # make sure boot disk image matches image in config.
-            nfs_inst_details = self._pzw(gce.instances().get)(instance = nfs_nodename).execute()
-            nfs_boot_disk = [x for x in nfs_inst_details["disks"] if x["boot"]][0]
-            nfs_disk = self._pzw(gce.disks().get)(
-                         disk = re.sub(r".*/(.*)$", r"\1", nfs_boot_disk["source"])
-                       ).execute()
-            nfs_image = re.sub(r".*/(.*)$", r"\1", nfs_disk["sourceImage"])
-            if nfs_image != self.config["image"]:
-                raise RuntimeError("Preexisting NFS server's image {ni} does not match image {ci} defined in configuration.".format(ni = nfs_image, ci = self.config["image"]))
-
-            # if we passed these checks, start the NFS if necessary
-            # TODO: use the API for this
-            if nfs_inst["status"] == "TERMINATED":
-                canine_logging.print("Starting preexisting NFS server ... ", end = "", flush = True)
-                subprocess.check_call(
-                    """gcloud compute instances start {ni} --zone {z} \
-                    """.format(ni = nfs_nodename, z = nfs_inst["zone"]),
-                    shell = True
-                )
-                canine_logging.print("done", flush = True)
-
-        # start NFS monitoring thread
-        self.NFS_monitor_lock = threading.Event()
-        self.NFS_monitor_thread = threading.Thread(
-          target = self.autorestart_preempted_node,
-          args = (nfs_nodename,)
-        )
-        self.NFS_monitor_thread.start()
-
-        self.NFS_server_ready = True
-
-    def mount_NFS(self):
-        if not self.NFS_server_ready:
-            raise Exception("Need to start NFS server before attempting to mount!")
-
-        # TODO: don't hardcode this script path; make it a parameter instead
-        nfs_prov_script = os.path.join(
-                            os.path.dirname(__file__),
-                            'slurm-docker/src/nfs_provision_worker.sh'
-                          )
-        nfs_nodename = self.config["worker_prefix"] + "-nfs"
-
-        subprocess.check_call("{nps} {nnn}".format(
-          nps = nfs_prov_script, nnn = nfs_nodename
-        ), shell = True)
-
-        self.NFS_ready = True
+        ## Check if /mnt/nfs is created
+        if not os.path.exists("/mnt/nfs"):
+            subprocess.check_call("sudo mkdir /mnt/nfs", shell=True)
+            subprocess.check_call("sudo chmod 777 /mnt/nfs", shell=True)
+        
+        ## Expose NFS (we won't unexport in __exit__)
+        subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/nfs", shell=True)
 
     def get_latest_image(self, image_family = None):
         image_family = self.config["image_family"] if image_family is None else image_family
@@ -434,15 +334,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             return (1, io.BytesIO(), io.BytesIO(b"Container is not running!"))
 
     def autorestart_preempted_node(self, nodename):
-        while not self.NFS_monitor_lock.is_set():
-            try:
-                inst_details = self._pzw(gce.instances().get)(instance = nodename).execute()
-                if inst_details["status"] != "RUNNING":
-                    self._pzw(gce.instances().start)(instance = nodename).execute()
-            except:
-                canine_logging.warning("Error querying NFS server status; retrying in 60s ...")
-
-            time.sleep(60)
+        # This function is no longer used
+        inst_details = self._pzw(gce.instances().get)(instance = nodename).execute()
+        if inst_details["status"] != "RUNNING":
+            self._pzw(gce.instances().start)(instance = nodename).execute()
 
     def wait_for_container_to_be_ready(self, timeout = 3000):
         canine_logging.info1("Waiting up to {} seconds for Slurm controller to start ...".format(timeout))
@@ -483,16 +378,3 @@ def ready_for_docker():
                     break
                 if parent_proc.pid == 1:
                     raise Exception("{desc} is already running on this machine (outside of a Docker container). Please run `[sudo] killall {proc}' and try again.".format(desc = desc, proc = proc))
-
-    #
-    # check if mountpoint exists
-    try:
-        subprocess.check_call(
-          "mountpoint -q /mnt/nfs".format(proc),
-          shell = True,
-          executable = '/bin/bash',
-          timeout = 10
-        )
-    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
-        # TODO: add the repo URL
-        raise Exception("NFS did not successfully mount. Please report this bug as a GitHub issue.")
