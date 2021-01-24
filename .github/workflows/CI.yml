@@ -26,4 +26,22 @@ jobs:
           pip install -r canine/test/requirements.txt &&
           pip install coveralls
       - name: Run Tests
-        run: python -m unittest discover canine/test
+        run: >
+          coverage run --source=canine
+          --omit='canine/backends/dummy/controller.py,*canine/test/*.py,canine/localization/delocalization.py,canine/__main__.py,canine/xargs.py'
+          -m unittest discover canine/test
+      - name: Submit Coverage
+        uses: coverallsapp/github-action@v1.1.2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          flag-name: python-${{ matrix.python-version }}
+          parallel: true
+  finish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Complete Coveralls
+        uses: coverallsapp/github-action@v1.1.2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          parallel-finished: true
