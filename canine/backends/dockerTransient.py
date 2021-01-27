@@ -384,9 +384,52 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                   container = self.config["cluster_name"],
                   command = command
                 )
+                # if command fails for a recoverable reason, retry up to 7 times
+                # with exponential backoff (max ~2 minute wait)
+                timeout = 8
+                tries = 0
+                while tries < 7:
+                    ret, stdout, stderr = local_invoke(cmd, interactive)
+                    stderr_str = stderr.read().decode().rstrip()
+                    stderr.seek(0)
+
+                    # no stderr; assume command ran successfully
+                    if stderr_str == "":
+                        break
+
+                    # stderr corresponds to a known Docker failure mode than can
+                    # be recovered from
+                    if any([stderr_str.startswith(reason) for reason in [
+                      "Error response from daemon: No such exec instance",
+                      "OCI runtime exec failed: exec failed"
+                    ]]):
+                        canine_logging.warning(
+                          'Command {cmd} failed with known recoverable error reason "{err}"; retrying in {timeout} seconds up to {tries} times'.format(
+                            cmd = command,
+                            err = stderr_str,
+                            timeout = timeout,
+                            tries = 5 - tries
+                          )
+                        )
+                        time.sleep(timeout)
+                        timeout *= 2
+                        tries += 1
+
+                    # warn the user that the command had stuff written to stderr,
+                    # since this may indicate something is wrong
+                    else:
+                        # TODO: when we implement verbosity, this should be "verbose"
+                        canine_logging.info(
+                          'Command {cmd} returned stderr "{err}"'.format(
+                            cmd = command,
+                            err = stderr_str
+                          )
+                        )
+                        break
             else:
                 cmd = command
-            return local_invoke(cmd, interactive)
+                ret, stdout, stderr = local_invoke(cmd, interactive)
+            return (ret, stdout, stderr)
         else:
             return (1, io.BytesIO(), io.BytesIO(b"Container is not running!"))
 

@@ -14,7 +14,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.10.5'
+version = '0.10.6'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -151,7 +151,7 @@ class Orchestrator(object):
         placeholder_fields = { "State" : np.nan, "CPUTimeRAW" : -1, "n_preempted" : -1 }
 
         with localizer.transport_context() as tr:
-            for j in job_spec.keys():
+            for j, v in job_spec.items():
                 sacct_path = os.path.join(jobs_dir, j, ".sacct")
                 jid = str(batch_id) + "_" + j
                 if tr.exists(sacct_path):
@@ -167,10 +167,19 @@ class Orchestrator(object):
                           'CPUTimeRAW': int,
                           "Submit" : np.datetime64
                         })
+
+                    # sacct info is blank (write error?)
                     if acct[jid].empty:
                         acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
+
+                # sacct never got written
                 else:
                     acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
+
+                # if job_spec[j] is None, this indicates a noop (job was avoided)
+                # override state to completed, regardless of what got loaded from disk
+                if v is None:
+                    acct[jid]["State"] = "COMPLETED"
 
         return pd.concat(acct).droplevel(1).rename_axis("JobID")
 
@@ -360,7 +369,7 @@ class Orchestrator(object):
                 finally:
                     # if some jobs were avoided, read the Slurm accounting info from disk
                     if n_avoided != 0:
-                        acct = Orchestrator.load_acct_from_disk(original_job_spec, localizer, batch_id)
+                        acct = Orchestrator.load_acct_from_disk(self.job_spec, localizer, batch_id)
 
                     # Check if fully job-avoided so we still delocalize
                     if batch_id == -2 or len(completed_jobs):
@@ -477,11 +486,17 @@ class Orchestrator(object):
                                 acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
 
             # track node uptime
-            for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
-                if node in uptime:
-                    uptime[node] += 1
-                else:
-                    uptime[node] = 1
+            try:
+                for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
+                    if node in uptime:
+                        uptime[node] += 1
+                    else:
+                        uptime[node] = 1
+            # squeue can fail here if the job completed by the time we call it,
+            # so we catch any errors.
+            # TODO: make something less heavy-handed; this may hide true failures
+            except CalledProcessError:
+                pass
 
         return completed_jobs, uptime, acct
 
@@ -668,6 +683,7 @@ class Orchestrator(object):
                 except (ValueError, OSError) as e:
                     canine_logging.warning("Cannot recover preexisting task outputs: " + str(e))
                     canine_logging.warning("Overwriting output and aborting job avoidance.")
+                    self.job_spec = old_job_spec
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
                     return 0, old_job_spec

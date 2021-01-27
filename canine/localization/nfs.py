@@ -203,7 +203,9 @@ class NFSLocalizer(BatchedLocalizer):
         """
         if output_dir is not None:
             warnings.warn("output_dir has no bearing on NFSLocalizer. outputs are available in {}/outputs".format(self.local_dir))
-        self.build_manifest()
+        # this seems to be crashing pipelines; since we don't use it anywhere,
+        # let's disable it for now
+        #self.build_manifest()
         output_dir = os.path.join(self.local_dir, 'outputs')
         output_files = {}
         for jobId in os.listdir(output_dir):
