@@ -171,8 +171,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                           "".join(g.iloc[[0, -1]].index.tolist())
                         )
             (ret, _, _) = self.invoke(
-                                      """sudo -E scontrol update nodename={}
-                                         state=drain reason=unused""".format(node_expr)
+                                      """sudo -E scontrol update nodename={} state=drain reason=unused""".format(node_expr)
                                     )
             if ret != 0:
                 raise RuntimeError("Could not drain nodes!")
