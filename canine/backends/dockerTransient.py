@@ -176,12 +176,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             if ret != 0:
                 raise RuntimeError("Could not drain nodes!")
 
-        # add NFS server to node list
-        self.nodes = pd.concat([
-          self.nodes,
-          pd.DataFrame({ "machine_type" : "nfs" }, index = [self.config["worker_prefix"] + "-nfs"])
-        ])
-
     def stop(self): 
         # if the Docker was not spun up by this context manager, do not tear
         # anything down -- we don't want to clobber an already running cluster
