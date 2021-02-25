@@ -13,6 +13,7 @@ import pickle
 import math
 import threading
 import time
+import shutil
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, gce
 from ..utils import get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
@@ -250,6 +251,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if not os.path.exists("/mnt/nfs"):
             subprocess.check_call("sudo mkdir /mnt/nfs", shell=True)
             subprocess.check_call("sudo chmod 777 /mnt/nfs", shell=True)
+        
+        ## Check disk usage and warn user if it is small
+        free_space_gb = int(shutil.disk_usage("/mnt/nfs").free/(1024**3))
+        if free_space_gb < 300:
+            canine_logging.warning(
+                "Available disk storage at /mnt/nfs is small ({})".format(free_space_gb)
+            )
         
         ## Expose NFS (we won't unexport in __exit__)
         subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/nfs", shell=True)
