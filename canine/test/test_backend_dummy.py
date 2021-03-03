@@ -10,7 +10,7 @@ import port_for
 from timeout_decorator import timeout as with_timeout
 
 WARNING_CONTEXT = None
-STAGING_DIR = './travis_tmp' if 'TRAVIS' in os.environ else None
+STAGING_DIR = './ci_tmp' if 'CI' in os.environ else None
 
 def setUpModule():
     global WARNING_CONTEXT
@@ -185,7 +185,7 @@ class TestIntegration(unittest.TestCase):
         self.assertEqual(job.State, 'COMPLETED')
         self.assertEqual(job.ExitCode, '0:0')
 
-    @with_timeout(60)
+    @with_timeout(90)
     def test_sbatch_squeue_scancel(self):
         path = self.backend.pack_batch_script('echo start', 'sleep 10', 'echo end')
         batch_id = self.backend.sbatch(
@@ -194,12 +194,12 @@ class TestIntegration(unittest.TestCase):
         )
         time.sleep(5)
 
-        squeue = self.backend.squeue()
-        self.assertTrue(len(squeue) >= 10)
+        squeue = self.backend.squeue('array')
+        self.assertTrue(len(squeue) == 10)
         for idx in squeue.index.values:
             self.assertTrue(idx.startswith(batch_id+'_'))
 
-        time.sleep(12)
+        time.sleep(30)
 
         self.assertTrue(len(self.backend.squeue()) == 0)
 
@@ -209,7 +209,7 @@ class TestIntegration(unittest.TestCase):
         )
         time.sleep(5)
 
-        squeue = self.backend.squeue()
+        squeue = self.backend.squeue('array')
         self.assertTrue(len(squeue) >= 10)
         for idx in squeue.index.values:
             self.assertTrue(idx.startswith(batch_id+'_'))

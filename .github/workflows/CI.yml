@@ -1,0 +1,44 @@
+name: CI
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version:
+          - '3.7'
+          - '3.8'
+    steps:
+      - uses: actions/checkout@v2
+      - uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Pip Install
+        run: >
+          pip install -e . &&
+          pip install pyopenssl[security] &&
+          pip install -r canine/test/requirements.txt &&
+          pip install coveralls
+      - name: Run Tests
+        run: >
+          coverage run --source=canine
+          --omit='canine/backends/dummy/controller.py,*canine/test/*.py,canine/localization/delocalization.py,canine/__main__.py,canine/xargs.py'
+          -m unittest discover canine/test
+      - name: Submit Coverage
+        run: >
+          CI_BRANCH=${GITHUB_REF#"ref/heads"} coveralls
+  finish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Complete Coveralls
+        uses: coverallsapp/github-action@v1.1.2
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          parallel-finished: true
