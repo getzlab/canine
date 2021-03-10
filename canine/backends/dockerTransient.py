@@ -96,8 +96,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             ))
 
         #
-        # start the NFS
-        self.start_NFS()
+        # export the NFS mountpoint
+        self.export_NFS()
 
         #
         # ensure that Docker can start (no Slurm processes outside of Docker already running)
@@ -245,19 +245,26 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         return closure
 
-    def start_NFS(self):
-
+    def export_NFS(self):
         ## Check if /mnt/nfs is created
         if not os.path.exists("/mnt/nfs"):
-            subprocess.check_call("sudo mkdir /mnt/nfs", shell=True)
-            subprocess.check_call("sudo chmod 777 /mnt/nfs", shell=True)
+            try:
+                subprocess.check_call("sudo mkdir /mnt/nfs", shell=True)
+                subprocess.check_call("sudo chmod 777 /mnt/nfs", shell=True)
+            except:
+                # TODO: be more specific about exception catching
+                canine_logging.error("Could not create NFS mountpoint; see stack trace for details")
+                raise
         
         ## Check disk usage and warn user if it is small
         free_space_gb = int(shutil.disk_usage("/mnt/nfs").free/(1024**3))
         if free_space_gb < 300:
             canine_logging.warning(
-                "Available disk storage at /mnt/nfs is small ({})".format(free_space_gb)
+                "Available disk storage at /mnt/nfs is small ({} GB remaining)".format(free_space_gb)
             )
+
+        # TODO: add warnings if overall disk is small (bad disk IO) or node core
+        #       count is low (bad network IO)
         
         ## Expose NFS (we won't unexport in __exit__)
         subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/nfs", shell=True)
