@@ -221,24 +221,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             if self.container is not None:
                 self.container().stop()
 
-            # #
-            # # unmount the NFS
-
-            # # this needs to be the last step, since Docker will hang if NFS is pulled
-            # # out from under it
-            # if self.config["nfs_action_on_stop"] != "run":
-            #     try:
-            #         subprocess.check_call("sudo umount -f /mnt/nfs", shell = True)
-            #     except subprocess.CalledProcessError:
-            #         canine_logging.error("Could not unmount NFS (do you have open files on it?)\nPlease run `lsof | grep /mnt/nfs`, close any open files, and run `sudo umount -f /mnt/nfs` before attempting to run another pipeline.")
-
-            # superclass method will stop/delete/leave the NFS running, depending on
-            # how self.config["action_on_stop"] is set.
-
-            if not allnodes.empty:
-                self.nodes = allnodes.loc[allnodes["machine_type"] == "nfs"]
-                super().stop(action_on_stop = self.config["action_on_stop"], kill_straggling_jobs = False) # Question: Shouldn't kill_straggling_jobs be True?
-
     def _get_container(self, container_name):
         def closure():
             return self.dkr.containers.get(container_name)
@@ -340,12 +322,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             return (ret, stdout, stderr)
         else:
             return (1, io.BytesIO(), io.BytesIO(b"Container is not running!"))
-
-    def autorestart_preempted_node(self, nodename):
-        # This function is no longer used
-        inst_details = self._pzw(gce.instances().get)(instance = nodename).execute()
-        if inst_details["status"] != "RUNNING":
-            self._pzw(gce.instances().start)(instance = nodename).execute()
 
     def wait_for_container_to_be_ready(self, timeout = 3000):
         canine_logging.info1("Waiting up to {} seconds for Slurm controller to start ...".format(timeout))
