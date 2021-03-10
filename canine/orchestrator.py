@@ -295,12 +295,12 @@ class Orchestrator(object):
             raise ValueError("Cannot exceed 4000000 jobs in one pipeline")
 
         canine_logging.print("Preparing pipeline of", len(self.job_spec), "jobs")
-        canine_logging.info("Connecting to backend...")
+        canine_logging.info1("Connecting to backend...")
         if isinstance(self.backend, RemoteSlurmBackend):
             self.backend.load_config_args()
         start_time = time.monotonic()
         with self.backend:
-            canine_logging.info("Initializing pipeline workspace")
+            canine_logging.info1("Initializing pipeline workspace")
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
@@ -311,7 +311,7 @@ class Orchestrator(object):
                     localizer.clean_on_exit = False
                     return self.job_spec
 
-                canine_logging.info("Waiting for cluster to finish startup...")
+                canine_logging.info1("Waiting for cluster to finish startup...")
                 self.backend.wait_for_cluster_ready()
 
                 # perform hard reset of cluster; some backends do this own their
@@ -323,7 +323,7 @@ class Orchestrator(object):
                         canine_logging.warning("There are active jobs. Skipping slurmctld restart")
                     else:
                         try:
-                            canine_logging.info("Stopping slurmctld")
+                            canine_logging.info1("Stopping slurmctld")
                             rc, stdout, stderr = self.backend.invoke(
                                 'sudo pkill slurmctld',
                                 True
@@ -335,7 +335,7 @@ class Orchestrator(object):
                                 True
                             )
                             check_call('sudo slurmctld -c -f {}'.format(self._slurmconf_path), rc, stdout, stderr)
-                            canine_logging.info("Restarting slurmctl")
+                            canine_logging.info1("Restarting slurmctl")
                             rc, stdout, stderr = self.backend.invoke(
                                 'sudo slurmctld reconfigure',
                                 True
@@ -347,7 +347,7 @@ class Orchestrator(object):
 
                 #
                 # submit job
-                canine_logging.info("Submitting batch job")
+                canine_logging.info1("Submitting batch job")
                 batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'))
                 if batch_id != -2:
                     canine_logging.print("Batch id:", batch_id)
@@ -373,10 +373,10 @@ class Orchestrator(object):
 
                     # Check if fully job-avoided so we still delocalize
                     if batch_id == -2 or len(completed_jobs):
-                        canine_logging.info("Delocalizing outputs")
+                        canine_logging.info1("Delocalizing outputs")
                         outputs = localizer.delocalize(self.raw_outputs, output_dir)
 
-                canine_logging.info("Parsing output data")
+                canine_logging.info1("Parsing output data")
                 self.adapter.parse_outputs(outputs)
 
                 df = self.make_output_DF(batch_id, original_job_spec, outputs, acct, localizer)
@@ -395,14 +395,14 @@ class Orchestrator(object):
             return df
 
     def localize_inputs_and_script(self, localizer) -> str:
-        canine_logging.info("Localizing inputs...")
+        canine_logging.info1("Localizing inputs...")
         abs_staging_dir = localizer.localize(
             self.job_spec,
             self.raw_outputs,
             self.localizer_overrides
         )
         canine_logging.print("Job staged on SLURM controller in:", abs_staging_dir)
-        canine_logging.info("Preparing pipeline script")
+        canine_logging.info1("Preparing pipeline script")
         env = localizer.environment('remote')
         root_dir = env['CANINE_ROOT']
         entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')
