@@ -523,9 +523,13 @@ class AbstractLocalizer(abc.ABC):
 
             # user did not explicitly specify an override for this input; try to infer it
             elif mode is False:
-                # is it a local path or gs:// path?
-                if os.path.exists(value) or value.startswith('gs://'):
+                # is it a local path?
+                if os.path.exists(value):
                     mode = "localize"
+
+                # is it a gs:// path?
+                if value.startswith('gs://'):
+                    mode = "delayed"
 
                 # is it a RODISK?
                 elif value.startswith('rodisk://'):
