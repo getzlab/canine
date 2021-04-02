@@ -716,6 +716,7 @@ class AbstractLocalizer(abc.ABC):
                     dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
                     disk = dgrp[1]
                     file = dgrp[2]
+                    base_name = os.path.basename(file)
 
                     disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
 
@@ -724,7 +725,7 @@ class AbstractLocalizer(abc.ABC):
                         exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
                         exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
 
-                    dest = self.reserve_path('jobs', jobId, 'inputs', file)
+                    dest = self.reserve_path('jobs', jobId, 'inputs', base_name)
 
                     localization_tasks += [
                       # symlink the future RODISK path into the Canine inputs directory
