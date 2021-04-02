@@ -23,9 +23,9 @@ from urllib3.exceptions import ProtocolError
 
 import pandas as pd
 
-from threading import Lock
+import multiprocessing
 
-gce_lock = Lock()
+gce_lock = multiprocessing.Lock()
 
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
@@ -253,7 +253,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def get_latest_image(self, image_family = None):
         image_family = self.config["image_family"] if image_family is None else image_family
-        with gce_lock: # I had issues without the lock
+        with gce_lock: # multiprocessing.Lock
             ans = gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
         return ans
 
