@@ -584,9 +584,14 @@ class Orchestrator(object):
         array_range = array_range[(np.diff(array_range, 1) >= 0).ravel(), :].astype(str).astype(np.object)
         array_str = ",".join(array_range[:, 0] + "-" + array_range[:, 1])
 
+        # parse out flags vs. params in extra_sbatch_args
+        flags = [k for k, v in extra_sbatch_args.items() if v is None]
+        params = { k : v for k, v in extra_sbatch_args.items() if v is not None }
+
         # submit to sbatch
         batch_id = self.backend.sbatch(
             entrypoint_path,
+            *stringify(flags),
             **{
                 'requeue': True,
                 'job_name': self.name,
@@ -594,7 +599,7 @@ class Orchestrator(object):
                 'output': "{}/%a/stdout".format(compute_env['CANINE_JOBS']),
                 'error': "{}/%a/stderr".format(compute_env['CANINE_JOBS']),
                 **self.resources,
-                **stringify(extra_sbatch_args)
+                **stringify(params)
             }
         )
 
