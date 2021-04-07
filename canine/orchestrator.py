@@ -79,7 +79,7 @@ echo -n $? > ../.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=version)
 
-def stringify(obj: typing.Any) -> typing.Any:
+def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
     """
     Recurses through the dictionary, converting objects to strings
     """
@@ -101,7 +101,14 @@ def stringify(obj: typing.Any) -> typing.Any:
     elif isinstance(obj, pd.core.frame.DataFrame):
         return stringify(obj.to_dict(orient = "list"))
 
+    if safe:
+        if "\n" in str(obj):
+            raise TypeError('Unsupported type "{}"'.format(type(obj)))
+
     return str(obj)
+
+class StringifyTypeError(TypeError):
+    pass
 
 class Orchestrator(object):
     """
@@ -212,7 +219,10 @@ class Orchestrator(object):
         for k in inputs_to_void:
             canine_logging.warning('Input "{}" was specified as None, ignoring.'.format(k)) 
         config["inputs"] = { k : config["inputs"][k] for k in config["inputs"].keys() - inputs_to_void }
-        self.raw_inputs = stringify(config['inputs']) if 'inputs' in config else {}
+        try:
+            self.raw_inputs = stringify(config['inputs']) if 'inputs' in config else {}
+        except TypeError:
+            raise StringifyTypeError("Unsupported input type! Inputs can only consist of lists, dicts, and Pandas series/dataframes")
         self.resources = stringify(config['resources']) if 'resources' in config else {}
 
         # retries
