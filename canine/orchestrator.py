@@ -93,7 +93,7 @@ def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
             key:stringify(val)
             for key, val in obj.items()
         }
-    elif isinstance(obj, pd.core.series.Series):
+    elif isinstance(obj, pd.core.series.Series) or isinstance(obj, pd.core.indexes.base.Index):
         return [
             stringify(elem)
             for elem in obj.tolist()
@@ -222,7 +222,7 @@ class Orchestrator(object):
         try:
             self.raw_inputs = stringify(config['inputs']) if 'inputs' in config else {}
         except TypeError:
-            raise StringifyTypeError("Unsupported input type! Inputs can only consist of lists, dicts, and Pandas series/dataframes")
+            raise StringifyTypeError("Unsupported input type! Inputs can only consist of lists, dicts, and Pandas series/dataframes/indices")
         self.resources = stringify(config['resources']) if 'resources' in config else {}
 
         # retries
