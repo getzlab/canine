@@ -31,7 +31,7 @@ PathType = namedtuple(
 
 class OverrideValueError(ValueError):
     def __init__(self, override, arg, value):
-        super().__init__("'{}' override is invalid for input {} with value {}".format(arg, value))
+        super().__init__("'{}' override is invalid for input {} with value {}".format(override, arg, value))
 
 class AbstractLocalizer(abc.ABC):
     """
