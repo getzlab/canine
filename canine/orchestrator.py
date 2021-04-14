@@ -155,7 +155,7 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
-        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": "-", "n_preempted" : -1 }
+        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "n_preempted" : -1 }
 
         with localizer.transport_context() as tr:
             for j, v in job_spec.items():
