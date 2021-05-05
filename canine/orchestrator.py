@@ -48,20 +48,32 @@ export CANINE_ROOT="{{CANINE_ROOT}}"
 export CANINE_COMMON="{{CANINE_COMMON}}"
 export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
+echo -n '---- STARTING JOB SETUP ... ' >&2
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
-$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh
+echo 'COMPLETE ----' >&2
+echo '~~~~ STARTING JOB LOCALIZATION ~~~~' >&2
+$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh >&2
 LOCALIZER_JOB_RC=$?
 if [ $LOCALIZER_JOB_RC -eq 0 ]; then
+  echo '~~~~ LOCALIZATION COMPLETE ~~~~' >&2
   echo -n 0 > ../.localizer_exit_code
   while true; do
+    echo '======================' >&2
+    echo '==== STARTING JOB ====' >&2
+    echo '======================' >&2
     {{pipeline_script}}
     CANINE_JOB_RC=$?
     if [ $CANINE_JOB_RC == 0 ]; then
+      echo '====================================' >&2
+      echo '==== JOB COMPLETED SUCCESSFULLY ====' >&2
+      echo '====================================' >&2
       break
     else
-      echo "Job failed with exit code $CANINE_JOB_RC" >&2
-      [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
-      echo "Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      echo "!!!! JOB FAILED! (EXIT CODE $CANINE_JOB_RC) !!!!" >&2
+      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
+      echo "INFO: Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
       [ -f ../stdout ] && mv ../stdout ../stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       [ -f ../stderr ] && mv ../stderr ../stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       scontrol requeue $SLURM_JOB_ID
@@ -69,13 +81,16 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   done
   echo -n $CANINE_JOB_RC > ../.job_exit_code
 else
-  echo "Localization failure!" > /dev/stderr
+  echo '!~~~ LOCALIZATION FAILURE! ~~~!' >&2
   echo -n "DNR" > ../.job_exit_code
   echo -n $LOCALIZER_JOB_RC > ../.localizer_exit_code
   CANINE_JOB_RC=$LOCALIZER_JOB_RC
 fi
+echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
-echo -n $? > ../.teardown_exit_code
+DELOC_RC=$?
+[ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
+echo -n $DELOC_RC > ../.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=version)
 

@@ -130,6 +130,4 @@ if __name__ == '__main__':
         help="Copy outputs instead of symlinking"
     )
     args = parser.parse_args()
-    print("**** STARTING DELOCALIZATION STEPS ****", file = sys.stderr, flush = True)
     main(args.dest, args.jobId, args.pattern, args.copy)
-    print("**** DELOCALIZATION COMPLETE ****", file = sys.stderr, flush = True)
