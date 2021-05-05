@@ -87,7 +87,7 @@ else
   CANINE_JOB_RC=$LOCALIZER_JOB_RC
 fi
 echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
-$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh
+$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
 DELOC_RC=$?
 [ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
 echo -n $DELOC_RC > ../.teardown_exit_code
