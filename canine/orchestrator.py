@@ -81,7 +81,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   done
   echo -n $CANINE_JOB_RC > ../.job_exit_code
 else
-  echo '!~~~ LOCALIZATION FAILURE! ~~~!' >&2
+  echo '!~~~ LOCALIZATION FAILURE! JOB CANNOT RUN! ~~~!' >&2
   echo -n "DNR" > ../.job_exit_code
   echo -n $LOCALIZER_JOB_RC > ../.localizer_exit_code
   CANINE_JOB_RC=$LOCALIZER_JOB_RC
