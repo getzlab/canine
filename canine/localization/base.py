@@ -528,7 +528,7 @@ class AbstractLocalizer(abc.ABC):
                     mode = "localize"
 
                 # is it a gs:// path?
-                if value.startswith('gs://'):
+                elif value.startswith('gs://'):
                     mode = "delayed"
 
                 # is it a RODISK?
