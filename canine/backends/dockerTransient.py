@@ -15,7 +15,7 @@ import threading
 import time
 import shutil
 
-from .imageTransient import TransientImageSlurmBackend, list_instances, gce
+from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
 from ..utils import get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
 
 from requests.exceptions import ConnectionError as RConnectionError
@@ -23,9 +23,9 @@ from urllib3.exceptions import ProtocolError
 
 import pandas as pd
 
-import multiprocessing
+import threading
 
-gce_lock = multiprocessing.Lock()
+gce_lock = threading.Lock()
 
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
@@ -253,8 +253,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def get_latest_image(self, image_family = None):
         image_family = self.config["image_family"] if image_family is None else image_family
-        with gce_lock: # multiprocessing.Lock
-            ans = gce.images().getFromFamily(family = image_family, project = self.config["project"]).execute()
+        with gce_lock:
+            ans = get_gce_client().images().getFromFamily(family = image_family, project = self.config["project"]).execute()
         return ans
 
     def invoke(self, command, interactive = False, bypass_docker = False):
