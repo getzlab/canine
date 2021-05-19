@@ -12,9 +12,24 @@ from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_co
 import googleapiclient.discovery as gd
 import googleapiclient.errors
 import pandas as pd
+import threading
+
+GCE_CLIENT = None
+GCE_CLIENT_BUILD_PID = os.getpid()
+GCE_CLIENT_BUILD_LOCK = threading.Lock()
+
+def get_gce_client():
+    global GCE_CLIENT
+    global GCE_CLIENT_BUILD_PID
+    global GCE_CLIENT_BUILD_LOCK
+    with GCE_CLIENT_BUILD_LOCK:
+        if GCE_CLIENT is None or os.getpid() != GCE_CLIENT_BUILD_PID: # For each forked process, we want different clients
+            GCE_CLIENT_BUILD_PID = os.getpid()
+            GCE_CLIENT = gce = gd.build('compute', 'v1')
+    return GCE_CLIENT
 
 try:
-    gce = gd.build('compute', 'v1')
+    gce = get_gce_client()
 except gd._auth.google.auth.exceptions.GoogleAuthError:
     canine_logging.warning(
         "Unable to load gcloud credentials. Transient Backends may not be available"
