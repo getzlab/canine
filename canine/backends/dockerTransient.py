@@ -358,7 +358,7 @@ def ready_for_docker():
         if proc in all_procs:
             # iterate through parents to see if it was launched in a Docker (containerd)
             for parent_proc in psutil.Process(all_procs[proc]).parents():
-                if parent_proc.name() == "containerd":
+                if parent_proc.name().startswith("containerd"):
                     break
                 if parent_proc.pid == 1:
                     raise Exception("{desc} is already running on this machine (outside of a Docker container). Please run `[sudo] killall {proc}' and try again.".format(desc = desc, proc = proc))
