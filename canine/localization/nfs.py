@@ -243,7 +243,7 @@ class NFSLocalizer(BatchedLocalizer):
         Check if args are stored on the same NFS mount as the output directory.
         """
         vols = subprocess.check_output(
-          "df {} | awk 'NR > 1 {{ print $1 }}'".format(
+          "df -P {} | awk 'NR > 1 {{ print $6 }}'".format(
             " ".join([shlex.quote(x) for x in [self.staging_dir, *args]])
           ),
           shell = True
