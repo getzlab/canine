@@ -253,9 +253,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         ## make NFS its own virtual filesystem
         # this is so that Canine's system for detecting whether files to be
-        # localized won't symlink things outside /mnt/nfs but on the same
-        # actual filesystem
-        subprocess.check_call("sudo mount --bind /mnt/nfs /mnt/nfs", shell=True)
+        # localized won't symlink things that reside outside /mnt/nfs but on the same
+        # actual filesystem as /mnt/nfs
+        subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
+          sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 
     def get_latest_image(self, image_family = None):
         image_family = self.config["image_family"] if image_family is None else image_family
