@@ -700,7 +700,7 @@ class AbstractLocalizer(abc.ABC):
                         # Local and controller paths not needed on this object
                         dest = PathType(None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
                     localization_tasks += [
-                        "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
+                        "gsutil {0} -o GSUtil:state_dir=${{CANINE_JOB_INPUTS}}/.gsutil_state_dir cp -L $(mktemp) {1} {2}".format(
                             '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
                             shlex.quote(val.path),
                             dest.remotepath
