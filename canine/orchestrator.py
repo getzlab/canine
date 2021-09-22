@@ -248,6 +248,12 @@ class Orchestrator(object):
                 raise ValueError("Retry count must be >= 0")
         self.retry_limit = stringify(config['retry']) if 'retry' in config else 0
 
+        # avoidance
+        if "avoid" in config:
+            if type(config["avoid"]) != bool:
+                raise TypeError("job avoid flag must be a bool!")
+        self.force_avoid = not config["avoid"] if "avoid" in config else False
+
         #
         # adapter
         adapter = config['adapter']
@@ -261,6 +267,7 @@ class Orchestrator(object):
         if not self.job_spec:
             canine_logging.warning("No inputs provided; assuming this is a standalone task")
             self.job_spec = { "0" : { "null" : "null" } }
+            self.force_avoid = True # standalone tasks cannot job avoid, since they have no inputs
 
         #
         # backend
@@ -329,7 +336,7 @@ class Orchestrator(object):
             with self._localizer_type(self.backend, **self.localizer_args) as localizer:
                 #
                 # localize inputs
-                n_avoided, original_job_spec = self.job_avoid(localizer)
+                n_avoided, original_job_spec = self.job_avoid(localizer = localizer, overwrite = self.force_avoid)
                 entrypoint_path = self.localize_inputs_and_script(localizer)
 
                 if dry_run:
@@ -639,8 +646,9 @@ class Orchestrator(object):
         n_avoided = 0
 
         with localizer.transport_context() as transport:
-            #remove all output if specified
+            # remove all output if specified
             if overwrite:
+                canine_logging.warning("Job avoidance disabled for this task; overwriting output.")
                 if transport.isdir(localizer.staging_dir):
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
