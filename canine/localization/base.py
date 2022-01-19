@@ -42,18 +42,23 @@ class AbstractLocalizer(abc.ABC):
     def __init__(
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
         common: bool = True, staging_dir: str = None,
-        project: typing.Optional[str] = None, temporary_disk_type: str = 'standard',
-        local_download_dir: typing.Optional[str] = None, **kwargs
+        project: typing.Optional[str] = None,
+        localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
+        use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard",
+        **kwargs
     ):
         """
         Initializes the Localizer using the given transport.
         Localizer assumes that the SLURMBackend is connected and functional during
         the localizer's entire life cycle.
         If staging_dir is not provided, a random directory is chosen.
-        local_download_dir: Where `local` overrides should be saved. Default: /mnt/canine-local-downloads/(random id).
-        temporary_disk_type: "standard" or "ssd". Default "standard".
-        NOTE: If temporary_disk_type is explicitly "None", disks will not be created. Files will be downloaded
-        to local_download_dir without mounting a disk there. The directory will not be created in that case
+        localize_to_persistent_disk: if True, will create a new GCP persistent disk and
+          localize all files there
+        persistent_disk_type: "standard" or "ssd". Default "standard".
+        use_scratch_disk: if True, will create a new GCP persistent disk to which
+          all job outputs will be written
+        scratch_disk_type: "standard" or "ssd". Default "standard".
+        scratch_disk_size: size of scratch disk, in gigabytes. Default 10GB
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -72,12 +77,15 @@ class AbstractLocalizer(abc.ABC):
             #     ))
         self.inputs = {} # {jobId: {inputName: [(handle type, handle value), ...]}}
         self.input_array_flag = {} # {jobId: {inputName: <bool: is this an array?>}}
+
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
-        self.local_download_size = {} # {jobId: size}
-        self.disk_key = os.urandom(4).hex()
-        self.local_download_dir = local_download_dir if local_download_dir is not None else '/mnt/canine-local-downloads/{}'.format(self.disk_key)
-        self.temporary_disk_type = temporary_disk_type
+
+        self.localize_to_persistent_disk = localize_to_persistent_disk
+        self.persistent_disk_type = persistent_disk_type
+        self.use_scratch_disk = use_scratch_disk
+        self.scratch_disk_size = scratch_disk_size
+        self.scratch_disk_type = scratch_disk_type
         self.requester_pays = {}
 
     def get_requester_pays(self, path: str) -> bool:
