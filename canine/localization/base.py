@@ -31,7 +31,7 @@ PathType = namedtuple(
 
 class OverrideValueError(ValueError):
     def __init__(self, override, arg, value):
-        super().__init__("'{}' override is invalid for input {} with value {}".format(arg, value))
+        super().__init__("'{}' override is invalid for input {} with value {}".format(override, arg, value))
 
 class AbstractLocalizer(abc.ABC):
     """
@@ -523,9 +523,13 @@ class AbstractLocalizer(abc.ABC):
 
             # user did not explicitly specify an override for this input; try to infer it
             elif mode is False:
-                # is it a local path or gs:// path?
-                if os.path.exists(value) or value.startswith('gs://'):
+                # is it a local path?
+                if os.path.exists(value):
                     mode = "localize"
+
+                # is it a gs:// path?
+                elif value.startswith('gs://'):
+                    mode = "delayed"
 
                 # is it a RODISK?
                 elif value.startswith('rodisk://'):
