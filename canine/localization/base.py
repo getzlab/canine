@@ -63,9 +63,12 @@ class AbstractLocalizer(abc.ABC):
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
             self.transfer_bucket = self.transfer_bucket[5:]
+
         self.backend = backend
+
         self.common = common
         self.common_inputs = set()
+
         self._local_dir = tempfile.TemporaryDirectory()
         self.local_dir = self._local_dir.name
         # FIXME: This doesn't actually make sense. Unless we assume staging_dir == mount_path, then transport.normpath gives an inaccurate mount_path
@@ -684,7 +687,8 @@ class AbstractLocalizer(abc.ABC):
         stream_dir_ready = False
         for key, val_array in self.inputs[jobId].items():
             is_array = self.input_array_flag[jobId][key]
-            for val in val_array:
+            for val in val_array: 
+                # create FIFO to stream directly from bucket
                 if val.type == 'stream':
                     job_vars.add(shlex.quote(key))
                     if not stream_dir_ready:
@@ -704,6 +708,7 @@ class AbstractLocalizer(abc.ABC):
                     ]
                     export_writer(key, dest, is_array)
 
+                # this is a cloud bucket URL; create command to download it
                 elif val.type in {'download', 'local'}:
                     job_vars.add(shlex.quote(key))
                     if val.type == 'download':
@@ -720,6 +725,8 @@ class AbstractLocalizer(abc.ABC):
                     ]
                     export_writer(key, dest.remotepath, is_array)
 
+                # this is a read-only disk URL; export variables for subsequent mounting
+                # and command to symlink file mount path to inputs directory
                 elif val.type == 'ro_disk':
                     assert val.path.startswith("rodisk://")
 
@@ -749,6 +756,10 @@ class AbstractLocalizer(abc.ABC):
 
                     export_writer(key, dest.remotepath, is_array)
 
+                # this is a string literal; if it corresponds to a path, it
+                # has already been localized to the inputs directory. if 
+                # we are using a persistent disk, add commands to copy it to the PD,
+                # and update exports accordingly.
                 elif val.type is None:
                     job_vars.add(shlex.quote(key))
                     export_writer(
