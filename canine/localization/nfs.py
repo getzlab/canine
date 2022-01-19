@@ -148,7 +148,7 @@ class NFSLocalizer(BatchedLocalizer):
                 ))
                 self.prepare_job_inputs(jobId, data, common_dests, overrides, transport=transport)
 
-                # Now localize job setup, localization, and teardown scripts, and
+                # Now generate and localize job setup, localization, and teardown scripts, and
                 # any array job files
                 setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns)
 
