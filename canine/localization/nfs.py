@@ -150,7 +150,7 @@ class NFSLocalizer(BatchedLocalizer):
 
                 # Now generate and localize job setup, localization, and teardown scripts, and
                 # any array job files
-                setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns)
+                setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns, transport)
 
                 # Setup:
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')

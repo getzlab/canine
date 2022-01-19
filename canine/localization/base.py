@@ -603,7 +603,7 @@ class AbstractLocalizer(abc.ABC):
             for i, v in enumerate(value):
                 self.inputs[jobId][arg][i] = handle_input(v, mode)
 
-    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str]) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
+    def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str], transport = None) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
         """
         Returns a tuple of (setup script, localization script, teardown script) for the given job id.
         Must call after pre-scanning inputs
