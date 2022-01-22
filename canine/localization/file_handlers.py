@@ -180,6 +180,13 @@ class HandleRegularFile(FileType):
         return os.path.getsize(self.path)
 
     def _get_hash(self):
+        # if Canine-generated checksum exists, use it
+        k9_crc = os.path.join(os.path.dirname(x), "." + os.path.basename(x) + ".crc32c")
+        if os.path.exists(k9_crc):
+            with open(k9_crc, "r") as f:
+                return f.read().rstrip()
+
+        # otherwise, compute it
         hash_alg = google_crc32c.Checksum()
         buffer_size = 8 * 1024
 
