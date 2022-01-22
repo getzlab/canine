@@ -21,7 +21,6 @@ class FileType(abc.ABC):
 
         self._size = None
         self._hash = None
-        self.localization_command = None
 
     @property
     def size(self):
