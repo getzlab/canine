@@ -252,7 +252,7 @@ def get_file_handler(path, transport, url_map = None, **kwargs):
 
     # next, consult the mapping of path URL -> handler
     for pat, handler in url_map.items():
-        if re.match(k, path):
+        if re.match(pat, path):
             return handler(path, **kwargs)
 
     # otherwise, assume it's a string literal; use the base class
