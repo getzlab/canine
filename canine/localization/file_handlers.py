@@ -104,8 +104,8 @@ class HandleGSURL(FileType):
             canine_logging.error(ret.stderr.decode())
             raise subprocess.CalledProcessError(ret.returncode, "")
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
 
         # check if this bucket is requester pays
         self.rp_string = ""
