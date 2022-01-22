@@ -156,7 +156,7 @@ class HandleGSURL(FileType):
 
     def localization_command(self, dest):
         dest_dir = os.path.dirname(dest)
-        dest_file = os.path.basname(dest)
+        dest_file = os.path.basename(dest)
         return f'gsutil -o "GSUtil:state_dir={dest_dir}/.gsutil_state_dir" cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file} {self.rp_string}'
 
 class HandleGSURLStream(HandleGSURL):
