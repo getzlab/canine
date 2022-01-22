@@ -87,21 +87,22 @@ class HandleGSURL(FileType):
         requester pays bucket
         """
         bucket = self.path.split('/')[0]
-        if bucket not in self.requester_pays:
-            ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
-            if ret.returncode == 0 or b'BucketNotFoundException: 404' not in ret.stderr:
-               return \
-                 b'requester pays bucket but no user project provided' in ret.stderr \
-                 or 'gs://{}: Enabled'.format(bucket).encode() in ret.stdout
-            else:
-                # Try again ls-ing the object itself
-                # sometimes permissions can disallow bucket inspection
-                # but allow object inspection
-                ret = subprocess.run('gsutil ls gs://{}'.format(self.path), shell = True, capture_output = True)
-                return b'requester pays bucket but no user project provided' in ret.stderr
-            if ret.returncode == 1 and b'BucketNotFoundException: 404' in ret.stderr:
-                canine_logging.error(ret.stderr.decode())
-                raise subprocess.CalledProcessError(ret.returncode, "")
+
+        ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
+        if ret.returncode == 0 or b'BucketNotFoundException: 404' not in ret.stderr:
+           return \
+             b'requester pays bucket but no user project provided' in ret.stderr \
+             or 'gs://{}: Enabled'.format(bucket).encode() in ret.stdout
+        else:
+            # Try again ls-ing the object itself
+            # sometimes permissions can disallow bucket inspection
+            # but allow object inspection
+            ret = subprocess.run('gsutil ls gs://{}'.format(self.path), shell = True, capture_output = True)
+            return b'requester pays bucket but no user project provided' in ret.stderr
+
+        if ret.returncode == 1 and b'BucketNotFoundException: 404' in ret.stderr:
+            canine_logging.error(ret.stderr.decode())
+            raise subprocess.CalledProcessError(ret.returncode, "")
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
