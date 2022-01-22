@@ -28,10 +28,7 @@ class NFSLocalizer(BatchedLocalizer):
     """
 
     def __init__(
-        self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
-        common: bool = True, staging_dir: str = None,
-        project: typing.Optional[str] = None, temporary_disk_type: str = 'standard',
-        local_download_dir: typing.Optional[str] = None,**kwargs
+        self, backend: AbstractSlurmBackend, staging_dir = None, **kwargs
     ):
         """
         Initializes the Localizer using the given transport.
@@ -43,26 +40,16 @@ class NFSLocalizer(BatchedLocalizer):
         """
         if staging_dir is None:
             raise TypeError("staging_dir is a required argument for NFSLocalizer")
-        if transfer_bucket is not None:
-            warnings.warn("transfer_bucket has no bearing on NFSLocalizer. It is kept purely for adherence to the API")
-        self.backend = backend
-        self.common = common
-        self.common_inputs = set()
+
+        # superclass constructor can mostly be re-used as is, except ...
+        super().__init__(backend, staging_dir = staging_dir, **kwargs)
+
+        # ... we don't normalize paths for this localizer. Use staging dir as given
         self._local_dir = None
-        # We don't normalize paths for this localizer. Use staging dir as given
         self.staging_dir = staging_dir
         self.local_dir = staging_dir
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
-        self.inputs = {} # {jobId: {inputName: [(handle type, handle value), ...]}}
-        self.input_array_flag = {} # {jobId: {inputName: <bool: is this an array?>}}
-        self.clean_on_exit = True
-        self.project = project if project is not None else get_default_gcp_project()
-        self.local_download_size = {} # {jobId: size}
-        self.disk_key = os.urandom(4).hex()
-        self.local_download_dir = local_download_dir if local_download_dir is not None else '/mnt/canine-local-downloads/{}'.format(self.disk_key)
-        self.temporary_disk_type = temporary_disk_type
-        self.requester_pays = {}
 
     def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
