@@ -19,8 +19,8 @@ class FileType(abc.ABC):
         self.transport = transport # currently not used
         self.extra_args = kwargs
 
-        self.size = None
-        self.hash = None
+        self._size = None
+        self._hash = None
         self.localization_command = None
 
     @property
@@ -28,9 +28,9 @@ class FileType(abc.ABC):
         """
         Returns size of this file in bytes
         """
-        if self.size is None:
-            self.size = self._get_size()
-        return self.size
+        if self._size is None:
+            self._size = self._get_size()
+        return self._size
 
     def _get_size(self):
         pass
@@ -40,9 +40,9 @@ class FileType(abc.ABC):
         """
         Returns a hash for this file
         """
-        if self.hash is None:
-            self.hash = self._get_hash()
-        return self.hash
+        if self._hash is None:
+            self._hash = self._get_hash()
+        return self._hash
 
     def _get_hash(self):
         """
