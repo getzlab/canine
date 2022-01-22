@@ -237,7 +237,7 @@ class HandleRODISKURL(FileType):
 
 # }}}
 
-def get_file_handler(path, transport, url_map = None):
+def get_file_handler(path, transport, url_map = None, **kwargs):
     url_map = {
       r"^gs://" : HandleGSURL, 
       r"^gdc://" : None,
@@ -247,12 +247,12 @@ def get_file_handler(path, transport, url_map = None):
     # firstly, check if the path is a regular file
     with transport as tr:
         if transport.exists(path):
-            return HandleRegularFile
+            return HandleRegularFile(path, **kwargs)
 
     # next, consult the mapping of path URL -> handler
     for pat, handler in url_map.items():
         if re.match(k, path):
-            return handler
+            return handler(path, **kwargs)
 
     # otherwise, assume it's a string literal; use the base class
-    return FileType
+    return FileType(path, **kwargs)
