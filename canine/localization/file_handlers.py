@@ -1,6 +1,6 @@
 import abc
 import google.cloud.storage
-import glob, google_crc32c, json, hashlib, base64, binascii, re, subprocess, threading
+import glob, google_crc32c, json, hashlib, base64, binascii, os, re, shlex, subprocess, threading
 
 from ..utils import sha1_base32
 
