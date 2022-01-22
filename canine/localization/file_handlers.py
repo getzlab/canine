@@ -11,13 +11,12 @@ class FileType(abc.ABC):
     * size
     * hash
     """
-    def __init__(self, path, regex = None, **kwargs):
+    def __init__(self, path, transport = None, **kwargs):
         """
         path: path/URL to file
-        regex: regular expression for recognizing this type of file
         """
         self.path = path
-        self.regex = regex
+        self.transport = transport # currently not used
         self.extra_args = kwargs
 
         self.size = None
