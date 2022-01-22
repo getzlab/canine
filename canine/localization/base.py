@@ -664,7 +664,7 @@ class AbstractLocalizer(abc.ABC):
                 file_paths_arrays_transformed[inputId_sp[0]].append(f.disk_paths)
 
             ## Disk name is determined by files' disk paths and hashes
-            disk_name = "gsdisk-" + \
+            disk_name = "canine-" + \
               hash_set(set(
                 F.loc[F["localize"], "disk_paths"] + "_" + \
                 F.loc[F["localize"], "file_paths"].apply(crc32c) <<< #need to port over hash function, make it work with GDC URL's too
@@ -674,7 +674,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## Check if the disk already exists
 			out = subprocess.check_output(
-				"gcloud compute disks list --filter 'labels.wolf=gsdisk and labels.finished=yes and name=({})'".format(disk_name), shell=True
+				"gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
 			)
 			out = out.decode().rstrip().split("\n")
 			if len(out) > 2:
@@ -692,7 +692,7 @@ class AbstractLocalizer(abc.ABC):
 
         # otherwise, we create a blank disk with a random name
         else:
-            disk_name = <random>
+            disk_name = "canine-scratch-{}".format(os.urandom(4).hex())
 
         canine_logging.info1("Creating new persistent disk {}".format(disk_name))
 
@@ -705,7 +705,7 @@ class AbstractLocalizer(abc.ABC):
 
 			## create disk
 			'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
-			'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=gsdisk',
+			'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
 			'fi',
 
 			## attach as read-write, using same device-name as disk-name
