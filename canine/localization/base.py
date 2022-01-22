@@ -842,6 +842,15 @@ class AbstractLocalizer(abc.ABC):
                 # this is a cloud bucket URL; create command to download it
                 elif val.type in {'download', 'local'}:
                     job_vars.add(shlex.quote(key))
+
+                    # localize this file to a persistent disk, if specified
+                    if self.localize_to_persistent_disk:
+                        # set dest to persistent disk mountpoint
+                        pass
+                    else:
+                        # set dest to local path
+                        pass
+
                     if val.type == 'download':
                         dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
                     else:
@@ -893,6 +902,13 @@ class AbstractLocalizer(abc.ABC):
                 # and update exports accordingly.
                 elif val.type is None:
                     job_vars.add(shlex.quote(key))
+
+                    # if this string literal corresponds to a file, localize
+                    # it to a persistent disk, if specified
+                    if self.localize_to_persistent_disk and is_localizable(val.path, transport):
+                        # add command to copy to persistent disk, update export
+                        pass
+
                     export_writer(
                       key,
                       shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path),
