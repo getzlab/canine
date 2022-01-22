@@ -2,6 +2,8 @@ import abc
 import google.cloud.storage
 import glob, google_crc32c, json, hashlib, base64, binascii, re, threading
 
+from ..utils import sha1_base32
+
 class FileType(abc.ABC):
     """
     Stores properties of and instructions for handling a given file type:
@@ -44,7 +46,10 @@ class FileType(abc.ABC):
         return self.hash
 
     def _get_hash(self):
-        pass
+        """
+        Base class assume self.path is a string literal
+        """
+        return sha1_base32(bytearray(self.path, "utf-8"), 4)
 
     def localization_command(self, dest):
         """
@@ -58,7 +63,7 @@ def hash_set(x):
     return hashlib.md5(json.dumps(x).encode()).hexdigest()
 
 #
-# initialize file type handlers
+# define file type handlers
 
 ## Google Cloud Storage {{{
 
@@ -226,15 +231,6 @@ class HandleRODISKURL(FileType):
 
 # }}}
 
-## String literals {{{
-
-class HandleStringLiteral(FileType):
-    def _get_hash(self):
-        # TODO: use whatever hash scheme wolf.Task uses for string literals
-        pass
-
-# }}}
-
 def get_file_handler(path, transport, url_map = None):
     url_map = {
       r"^gs://" : HandleGSURL, 
@@ -252,5 +248,5 @@ def get_file_handler(path, transport, url_map = None):
         if re.match(k, path):
             return handler
 
-    # otherwise, assume it's a string literal
-    return HandleStringLiteral
+    # otherwise, assume it's a string literal; use the base class
+    return FileType
