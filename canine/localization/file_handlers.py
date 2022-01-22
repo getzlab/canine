@@ -23,7 +23,7 @@ class FileType(abc.ABC):
         self.hash = None
         self.localization_command = None
 
-    @classproperty
+    @property
     def size(self):
         """
         Returns size of this file in bytes
@@ -35,7 +35,7 @@ class FileType(abc.ABC):
     def _get_size(self):
         pass
 
-    @classproperty
+    @property
     def hash(self):
         """
         Returns a hash for this file
@@ -114,8 +114,8 @@ class HandleGSURL(FileType):
             self.rp_string = f' -u {self.extra_args["project"]}'
 
     def _get_size(self):
-		output = subprocess.check_output('gsutil du -s {} {}'.format(shlex.quote(self.path.strip("/")), self.rp_string), shell=True).decode()
-		return int(output.split()[0])
+        output = subprocess.check_output('gsutil du -s {} {}'.format(shlex.quote(self.path.strip("/")), self.rp_string), shell=True).decode()
+        return int(output.split()[0])
 
     def _get_hash(self):
         assert self.path.startswith("gs://")
