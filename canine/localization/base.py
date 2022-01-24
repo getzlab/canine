@@ -569,11 +569,6 @@ class AbstractLocalizer(abc.ABC):
 
                 return value
 
-            # common file has already been localized; we can thus return its
-            # file handler object
-            if value.path in common_dests:
-                return common_dests[value.path]
-
             # if this is a local file, localize it now
             if value.localization_mode == "local":
                 return localize_now()
@@ -593,6 +588,12 @@ class AbstractLocalizer(abc.ABC):
                 # user wants to treat this path as a string literal
                 elif mode is None or mode == 'null' or mode == 'string':
                     return file_handlers.StringLiteral(value.path)
+
+            # common file has already been localized and handling mode has not
+            # been overridden; we can thus return its file handler object
+            # created during pick_common_inputs()
+            if value.path in common_dests:
+                return common_dests[value.path]
 
             # otherwise, return whatever file type was inferred
             return value
