@@ -428,6 +428,21 @@ class AbstractLocalizer(abc.ABC):
                     output_files[jobId][outputname] = [dirpath]
         return output_files
 
+    def get_destination_path(self, filename, transport, *destdir):
+        basename = os.path.basename(os.path.abspath(filename))
+        path = self.reserve_path(*destdir, basename)
+        n = 2
+        with self.transport_context(transport) as transport:
+            while transport.exists(path.remotepath):
+                if n == 2:
+                    basename += "_2"
+                else:
+                    basename = re.sub(r"_\d+$", "_" + str(n), basename)
+                n += 1
+                path = self.reserve_path(*destdir, basename)
+
+        return path
+
     def pick_common_inputs(self, inputs: typing.Dict[str, typing.Dict[str, str]], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None) -> typing.Dict[str, str]:
         """
         Scans input configuration and overrides to choose inputs which should be treated as common.
