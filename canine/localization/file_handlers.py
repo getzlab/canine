@@ -11,7 +11,10 @@ class FileType(abc.ABC):
     * size
     * hash
     """
-    def __init__(self, path, transport = None, localization_mode = None, **kwargs):
+
+    localization_mode = None # to be overridden in child classes
+
+    def __init__(self, path, transport = None, **kwargs):
         """
         path: path/URL to file
         transport: Canine transport object for handling local/remote files (currently not used)
@@ -28,7 +31,6 @@ class FileType(abc.ABC):
         self.path = path
         self.localized_path = self.path # path where file got localized to. needs to be manually updated
         self.transport = transport # currently not used
-        self.localization_mode = localization_mode
         self.extra_args = kwargs
 
         self._size = None
@@ -80,7 +82,6 @@ class StringLiteral(FileType):
     the StringLiteral class for clarification
     """
     localization_mode = "string"
-    pass
 
 def hash_set(x):
     assert isinstance(x, set)
@@ -107,6 +108,8 @@ class GSFileNotExists(Exception):
     pass
 
 class HandleGSURL(FileType):
+    localization_mode = "url"
+
     def get_requester_pays(self) -> bool:
         """
         Returns True if the requested gs:// object or bucket resides in a
@@ -130,8 +133,8 @@ class HandleGSURL(FileType):
             canine_logging.error(ret.stderr.decode())
             raise subprocess.CalledProcessError(ret.returncode, "")
 
-    def __init__(self, path, localization_mode = "url", **kwargs):
-        super().__init__(path, localization_mode = localization_mode, **kwargs)
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
 
         # check if this bucket is requester pays
         self.rp_string = ""
@@ -195,7 +198,7 @@ class HandleGSURLStream(HandleGSURL):
 
 ## GDC HTTPS URLs {{{
 class HandleGDCHTTPURL(FileType):
-    pass
+    localization_mode = "url"
 
 # }}}
 
