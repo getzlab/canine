@@ -583,7 +583,8 @@ class AbstractLocalizer(abc.ABC):
             for i, v in enumerate(value):
                 self.inputs[jobId][arg][i] = handle_input(v, mode)
 
-    def is_localizable(self, path, transport = None):
+    @staticmethod
+    def is_localizable(path):
         """
         Returns True if Canine can handle this type of file/URL
         """
@@ -864,7 +865,7 @@ class AbstractLocalizer(abc.ABC):
 
                     # if this string literal corresponds to a file, localize
                     # it to a persistent disk, if specified
-                    if self.localize_to_persistent_disk and is_localizable(file_handler.path, transport):
+                    if self.localize_to_persistent_disk and self.is_localizable(file_handler.path):
                         # add command to copy to persistent disk, update export
                         pass
 
