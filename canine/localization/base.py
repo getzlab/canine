@@ -587,17 +587,12 @@ class AbstractLocalizer(abc.ABC):
         """
         Returns True if Canine can handle this type of file/URL
         """
-        # is it a local file?
-        with self.transport_context(transport) as transport:
-            if transport.exists(path):
-                return True
+        # use get_file_handler to autodetect the file type
+        file_type = file_handlers.get_file_handler(path)
 
-        # is it a URL we can handle?
-        if re.match(r"gs://|gdc://", path) is not None:
-            return True
-
-        # otherwise, we can't handle it
-        return False
+        # string literals and RODISK URLs cannot/should not be localized
+        return not (isinstance(file_type, file_handlers.StringLiteral) or
+                    isinstance(file_type, file_handlers.HandleRODISKURL)
 
     def create_persistent_disk(self, file_paths_arrays: typing.Dict[str, list] = {}, disk_size: int = None):
         # if we already have files in mind to localize
