@@ -503,11 +503,14 @@ class AbstractLocalizer(abc.ABC):
                       'common'
                     )
 
-                    common_dests[path] = file_handler
-
                     try:
                         self.localize_file(file_handler, dest_path, transport=transport)
-                        common_dests[path].localized_path = dest_path
+
+                        # this is now a regular file
+                        common_dests[path] = file_handlers.HandleRegularFile(dest_path)
+                        # copy over hash if it's been precomputed
+                        if file_handler._hash is not None:
+                            common_dests[path]._hash = file_handler._hash
                     except:
                         canine_logging.error("Unknown error localizing common file {}".format(path))
                         raise
