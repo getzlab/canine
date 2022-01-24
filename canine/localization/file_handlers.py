@@ -188,7 +188,7 @@ class HandleGSURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
-        return f'gsutil -o "GSUtil:state_dir={dest_dir}/.gsutil_state_dir" cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file} {self.rp_string}'
+        return f'[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; gsutil -o "GSUtil:state_dir={dest_dir}/.gsutil_state_dir" cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file} {self.rp_string}'
 
 class HandleGSURLStream(HandleGSURL):
     localization_mode = "stream"
