@@ -11,12 +11,16 @@ class FileType(abc.ABC):
     * size
     * hash
     """
-    def __init__(self, path, transport = None, **kwargs):
+    def __init__(self, path, transport = None, localization_mode = None, **kwargs):
         """
         path: path/URL to file
+        transport: Canine transport object for handling local/remote files (currently not used)
+        localization_mode: how this file will be handled in localization.job_setup_teardown
+          must be one of "localize", "delayed", "ro_disk", "stream", "null", or None
         """
         self.path = path
         self.transport = transport # currently not used
+        self.localization_mode = localization_mode
         self.extra_args = kwargs
 
         self._size = None
@@ -103,8 +107,8 @@ class HandleGSURL(FileType):
             canine_logging.error(ret.stderr.decode())
             raise subprocess.CalledProcessError(ret.returncode, "")
 
-    def __init__(self, path, **kwargs):
-        super().__init__(path, **kwargs)
+    def __init__(self, path, localization_mode = "delayed", **kwargs):
+        super().__init__(path, localization_mode = localization_mode, **kwargs)
 
         # check if this bucket is requester pays
         self.rp_string = ""
@@ -174,7 +178,7 @@ class HandleGDCHTTPURL(FileType):
 ## Regular files {{{
 
 class HandleRegularFile(FileType):
-    # TODO: use transport for these
+    localization_mode = "localize"
 
     def _get_size(self):
         return os.path.getsize(self.path)
