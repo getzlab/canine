@@ -813,21 +813,15 @@ class AbstractLocalizer(abc.ABC):
                         # set dest to persistent disk mountpoint
                         pass
                     else:
-                        # set dest to local path
-                        pass
-
-                    if val.type == 'download':
-                        dest = self.reserve_path('jobs', jobId, 'inputs', os.path.basename(os.path.abspath(val.path)))
-                    else:
-                        # Local and controller paths not needed on this object
-                        dest = PathType(None, os.path.join(self.local_download_dir, disk_name, os.path.basename(val.path)))
-                    localization_tasks += [
-                        "if [[ ! -e {2}.fin ]]; then gsutil {0} -o GSUtil:check_hashes=if_fast_else_skip cp {1} {2} && touch {2}.fin; fi".format(
-                            '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                            shlex.quote(val.path),
-                            dest.remotepath
+                        # set dest to path on NFS
+                        dest = self.get_destination_path(
+                          os.path.basename(os.path.abspath(file_handler.path)),
+                          transport,
+                          'jobs', jobId, 'inputs', 
                         )
-                    ]
+
+                    localization_tasks += [file_handler.localization_command(dest.remotepath)]
+
                     export_writer(key, dest.remotepath, is_array)
 
                 # this is a read-only disk URL; export variables for subsequent mounting
