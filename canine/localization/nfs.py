@@ -9,6 +9,7 @@ import glob
 import subprocess
 from .base import PathType, Localization
 from .local import BatchedLocalizer
+from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project
 from agutil import status_bar
@@ -51,21 +52,21 @@ class NFSLocalizer(BatchedLocalizer):
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
 
-    def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
+    def localize_file(self, src: file_handlers.FileType, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
         Localizes the given file.
-        * gs:// files are copied to the specified destination
+        * remote URLs are copied to the specified destination
         * local files are symlinked to the specified destination
         * results dataframes are copied to the specified directory
         """
-        if src.startswith('gs://'):
-            self.gs_copy(
-                src,
-                dest.localpath,
-                'local'
-            )
-        elif os.path.exists(src):
-            src = os.path.realpath(os.path.abspath(src))
+        # it's a remote URL; get localization command and execute
+        if src.localization_mode in {"localize", "delayed"}:
+            cmd = src.localization_command(dest.localpath)
+            subprocess.check_call(cmd, shell = True)
+
+        # it's a local file
+        elif os.path.exists(src.path):
+            src = os.path.realpath(os.path.abspath(src.path))
 
             if re.search(r"\.k9df\..*$", os.path.basename(src)) is None:
                 if not os.path.isdir(os.path.dirname(dest.localpath)):
@@ -97,8 +98,8 @@ class NFSLocalizer(BatchedLocalizer):
         if overrides is None:
             overrides = {}
 
-        # automatically override inputs that are absolute paths residing on the same
-        # NFS share and are not Canine outputs
+        # for inputs that are absolute paths residing on the same NFS share,
+        # and are not Canine outputs, treat them as string literals
 
         # XXX: this can be potentially slow, since it has to iterate over every
         #      single input. It would make more sense to do this before the adapter

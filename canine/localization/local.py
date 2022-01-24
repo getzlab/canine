@@ -11,6 +11,7 @@ from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 from .base import AbstractLocalizer, PathType, Localization
+from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project, check_call
 
@@ -179,24 +180,24 @@ class LocalLocalizer(BatchedLocalizer):
     prior to it being copied to the slurm node. This is less efficient (as it
     increases the size of the staging transfer) but utilizes local gsutil credentials
     """
-    def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
+    def localize_file(self, src: file_handlers.FileType, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
         Localizes the given file.
-        gs:// files are queued for later transfer
-        local files are symlinked to the staging directory
+        * remote URLs are copied to the specified destination
+        * local files are symlinked to the staging directory
         """
         if not self._has_localized:
             warnings.warn(
                 "BatchedLocalizer.localize_file called after main localization. File may not be localized"
             )
-        if src.startswith('gs://'):
-            self.gs_copy(
-                src,
-                dest.localpath,
-                'local'
-            )
-        elif os.path.exists(src):
-            src = os.path.abspath(src)
+        # it's a remote URL; get localization command and execute
+        if src.localization_mode in {"localize", "delayed"}:
+            cmd = src.localization_command(dest.localpath)
+            subprocess.check_call(cmd, shell = True)
+
+        # it's a local file
+        elif os.path.exists(src.path):
+            src = os.path.abspath(src.path)
             if not os.path.isdir(os.path.dirname(dest.localpath)):
                 os.makedirs(os.path.dirname(dest.localpath))
             if os.path.isfile(src):
