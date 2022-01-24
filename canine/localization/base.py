@@ -480,7 +480,7 @@ class AbstractLocalizer(abc.ABC):
                     dest_path = self.get_destination_path(
                       path,
                       transport,
-                      'common', basename
+                      'common', os.path.basename(os.path.abspath(path))
                     )
 
                     common_dests[path] = file_handler
