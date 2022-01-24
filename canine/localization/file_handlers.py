@@ -213,7 +213,7 @@ class HandleRegularFile(FileType):
 
     def _get_hash(self):
         # if Canine-generated checksum exists, use it
-        k9_crc = os.path.join(os.path.dirname(x), "." + os.path.basename(x) + ".crc32c")
+        k9_crc = os.path.join(os.path.dirname(self.path), "." + os.path.basename(self.path) + ".crc32c")
         if os.path.exists(k9_crc):
             with open(k9_crc, "r") as f:
                 return f.read().rstrip()
