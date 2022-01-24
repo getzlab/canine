@@ -26,6 +26,7 @@ class FileType(abc.ABC):
           - None: path is a string literal (for backwards compatibility)
         """
         self.path = path
+        self.localized_path = self.path # path where file got localized to. needs to be manually updated
         self.transport = transport # currently not used
         self.localization_mode = localization_mode
         self.extra_args = kwargs
@@ -201,12 +202,6 @@ class HandleGDCHTTPURL(FileType):
 
 class HandleRegularFile(FileType):
     localization_mode = "local"
-
-    def __init__(self, path, **kwargs):
-        super().__init__(path, **kwargs)
-
-        # path where file got localized to. needs to be manually updated
-        self.localized_path = self.path
 
     def _get_size(self):
         return os.path.getsize(self.path)
