@@ -471,9 +471,22 @@ class AbstractLocalizer(abc.ABC):
                     if arg not in overrides:
                         for p in paths:
                             fh = file_handlers.get_file_handler(p)
-                            if fh.hash in seen:
-                                common_inputs[fh.hash] = fh
-                            seen.add(fh.hash)
+
+                            # if hash has already been precomputed, use it
+                            # this will be the case if FileType objects are 
+                            # given directly to Canine, and then expanded by
+                            # adapter into dense non-ragged job arrays
+                            if fh._hash is not None:
+                                if fh.hash in seen:
+                                    common_inputs[fh.hash] = fh
+                                seen.add(fh.hash)
+
+                            # otherwise, use filename: dense job arrays would
+                            # require hashing everything
+                            else:
+                                if fh.path in seen:
+                                    common_inputs[fh.path] = fh
+                                seen.add(fh.path)
 
             # 2. if any of these duplicate values can be immediately localized,
             #    do it, and mark them as localized so that subsequent functions
