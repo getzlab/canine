@@ -60,7 +60,7 @@ class NFSLocalizer(BatchedLocalizer):
         * results dataframes are copied to the specified directory
         """
         # it's a remote URL; get localization command and execute
-        if src.localization_mode in {"localize", "delayed"}:
+        if src.localization_mode == "url":
             cmd = src.localization_command(dest.localpath)
             subprocess.check_call(cmd, shell = True)
 

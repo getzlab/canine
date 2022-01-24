@@ -36,7 +36,7 @@ class RemoteLocalizer(AbstractLocalizer):
         All files are immediately transferred
         """
         # it's a remote URL; get localization command and execute
-        if src.localization_mode in {"localize", "delayed"}:
+        if src.localization_mode == "url":
             cmd = src.localization_command(dest.localpath)
             rc, sout, serr = self.backend.invoke(cmd, True)
             check_call(command, rc, sout, serr)
