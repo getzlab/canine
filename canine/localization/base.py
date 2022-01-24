@@ -551,6 +551,10 @@ class AbstractLocalizer(abc.ABC):
             if value.path in common_dests:
                 return common_dests[value.path]
 
+            # if this is a local file, localize it now
+            if value.localization_mode == "local":
+                return localize_now()
+
             # if user overrode the handling mode, make sure it's compatible
             # with the file type
             if mode is not False: 
@@ -567,6 +571,7 @@ class AbstractLocalizer(abc.ABC):
                 elif mode is None or mode == 'null' or mode == 'string':
                     return file_handlers.StringLiteral(value.path)
 
+            # otherwise, return whatever file type was inferred
             return value
 
         if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
