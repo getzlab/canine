@@ -478,8 +478,8 @@ class AbstractLocalizer(abc.ABC):
                 # a local path
                 if file_handler.localization_mode in {"url", "local"}:
                     dest_path = self.get_destination_path(
-                      filename = path,
-                      transport = transport,
+                      path,
+                      transport,
                       'common', basename
                     )
 
@@ -529,8 +529,8 @@ class AbstractLocalizer(abc.ABC):
                 nonlocal transport
 
                 dest_path = self.get_destination_path(
-                  filename = value.path,
-                  transport = transport, 
+                  value.path,
+                  transport, 
                   'jobs', jobId, 'inputs'
                 )
 
