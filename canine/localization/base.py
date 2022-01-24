@@ -780,31 +780,32 @@ class AbstractLocalizer(abc.ABC):
 
         compute_env = self.environment('remote')
         stream_dir_ready = False
-        for key, val_array in self.inputs[jobId].items():
+        for key, file_handler_array in self.inputs[jobId].items():
             is_array = self.input_array_flag[jobId][key]
-            for val in val_array: 
+            for file_handler in file_handler_array: 
                 # create FIFO to stream directly from bucket
-                if val.type == 'stream':
+                # TODO: generate these commands in file_handlers.py
+                if file_handler.localization_mode == 'stream':
                     job_vars.add(shlex.quote(key))
                     if not stream_dir_ready:
                         exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
                         docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
                         stream_dir_ready = True
-                    dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(val.path)))
+                    dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(file_handler.path)))
                     localization_tasks += [
-                        'gsutil ls {} > /dev/null'.format(shlex.quote(val.path)),
+                        'gsutil ls {} > /dev/null'.format(shlex.quote(file_handler.path)),
                         'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
                         'mkfifo {}'.format(dest),
                         "gsutil {} cat {} > {} &".format(
-                            '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(val.path) else '',
-                            shlex.quote(val.path),
+                            '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(file_handler.path) else '',
+                            shlex.quote(file_handler.path),
                             dest
                         )
                     ]
                     export_writer(key, dest, is_array)
 
-                # this is a cloud bucket URL; create command to download it
-                elif val.type in {'download', 'local'}:
+                # this is a URL; create command to download it
+                elif file_handler.localization_mode == 'url':
                     job_vars.add(shlex.quote(key))
 
                     # localize this file to a persistent disk, if specified
@@ -831,12 +832,12 @@ class AbstractLocalizer(abc.ABC):
 
                 # this is a read-only disk URL; export variables for subsequent mounting
                 # and command to symlink file mount path to inputs directory
-                elif val.type == 'ro_disk':
-                    assert val.path.startswith("rodisk://")
+                elif file_handler.localization_mode == 'ro_disk':
+                    assert file_handler.path.startswith("rodisk://")
 
                     job_vars.add(shlex.quote(key))
 
-                    dgrp = re.search(r"rodisk://(.*?)/(.*)", val.path)
+                    dgrp = re.search(r"rodisk://(.*?)/(.*)", file_handler.path)
                     disk = dgrp[1]
                     file = dgrp[2]
                     base_name = os.path.basename(file)
@@ -864,23 +865,23 @@ class AbstractLocalizer(abc.ABC):
                 # has already been localized to the inputs directory. if 
                 # we are using a persistent disk, add commands to copy it to the PD,
                 # and update exports accordingly.
-                elif val.type is None:
+                elif file_handler.localization_mode == "string":
                     job_vars.add(shlex.quote(key))
 
                     # if this string literal corresponds to a file, localize
                     # it to a persistent disk, if specified
-                    if self.localize_to_persistent_disk and is_localizable(val.path, transport):
+                    if self.localize_to_persistent_disk and is_localizable(file_handler.path, transport):
                         # add command to copy to persistent disk, update export
                         pass
 
                     export_writer(
                       key,
-                      shlex.quote(val.path.remotepath if isinstance(val.path, PathType) else val.path),
+                      shlex.quote(file_handler.path.remotepath if isinstance(file_handler.path, PathType) else file_handler.path),
                       is_array
                     )
 
                 else:
-                    canine_logging.print("Unknown localization command:", val.type, "skipping", key, val.path,
+                    canine_logging.print("Unknown localization command:", file_handler.type, "skipping", key, file_handler.path,
                         file=sys.stderr, type="warning"
                     )
 
