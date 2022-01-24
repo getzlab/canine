@@ -472,7 +472,7 @@ class AbstractLocalizer(abc.ABC):
                     except:
                         canine_logging.error("Unknown error localizing common file {}".format(path))
                         raise
-            return {key: value for key, value in common_dests.items()}
+            return common_dests
 
     def finalize_staging_dir(self, jobs: typing.Iterable[str], transport: typing.Optional[AbstractTransport] = None) -> str:
         """
