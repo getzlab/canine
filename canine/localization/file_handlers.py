@@ -202,6 +202,12 @@ class HandleGDCHTTPURL(FileType):
 class HandleRegularFile(FileType):
     localization_mode = "local"
 
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+
+        # path where file got localized to. needs to be manually updated
+        self.localized_path = self.path
+
     def _get_size(self):
         return os.path.getsize(self.path)
 
