@@ -191,8 +191,8 @@ class HandleGSURL(FileType):
         return f'gsutil -o "GSUtil:state_dir={dest_dir}/.gsutil_state_dir" cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file} {self.rp_string}'
 
 class HandleGSURLStream(HandleGSURL):
+    localization_mode = "stream"
     # TODO: generate the command to make a FIFO. everything else is the same
-    pass
 
 # }}}
 
