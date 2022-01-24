@@ -896,7 +896,7 @@ class AbstractLocalizer(abc.ABC):
                     )
 
                 else:
-                    canine_logging.print("Unknown localization command:", file_handler.type, "skipping", key, file_handler.path,
+                    canine_logging.print("Unknown localization command:", file_handler.localization_mode, "skipping", key, file_handler.path,
                         file=sys.stderr, type="warning"
                     )
 
