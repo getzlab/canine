@@ -512,112 +512,62 @@ class AbstractLocalizer(abc.ABC):
     def prepare_job_inputs(self, jobId: str, job_inputs: typing.Dict[str, str], common_dests: typing.Dict[str, str], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None):
         """
         Prepares job-specific inputs.
-        Fills self.inputs[jobId] with Localization objects for each input
+        Fills self.inputs[jobId] with file_handler objects for each input
         """
 
         def handle_input(value, mode):
             nonlocal transport
 
+            ## if input is a string, convert it to the appropriate FileType object
+            if isinstance(value, str):
+                value = file_handlers.get_file_handler(value)
+            else:
+                assert isinstance(value, file_handlers.FileType)
+
+            ## now that value is known, define closure to localize it immediately
             def localize_now():
                 nonlocal transport
 
-                # if file already exists, append counter to localized path
-                basename = os.path.basename(os.path.abspath(value))
-                path = self.reserve_path('jobs', jobId, 'inputs', basename)
-                n = 2
-                with self.transport_context(transport) as transport:
-                    while transport.exists(path.remotepath):
-                        if n == 2:
-                            basename += "_2"
-                        else:
-                            basename = re.sub(r"_\d+$", "_" + str(n), basename)
-                        n += 1
-                        path = self.reserve_path('jobs', jobId, 'inputs', basename)
-
-                ret = Localization(
-                    None,
-                    path
+                dest_path = self.get_destination_path(
+                  filename = value.path,
+                  transport = transport, 
+                  'jobs', jobId, 'inputs'
                 )
+
                 with self.transport_context(transport) as transport:
                     self.localize_file(
                         value,
-                        ret.path,
+                        dest_path,
                         transport=transport
                     )
-                return ret
 
-            # common file has already been localized; we can thus treat this as a
-            # string literal
-            if value in common_dests:
-                return Localization(None, common_dests[value])
+                # update localized_path
+                value.localized_path = dest_path
 
-            # user did not explicitly specify an override for this input; try to infer it
-            elif mode is False:
-                # is it a local path?
-                if os.path.exists(value):
-                    mode = "localize"
+                return value
 
-                # is it a gs:// path?
-                elif value.startswith('gs://'):
-                    mode = "delayed"
+            # common file has already been localized; we can thus return its
+            # file handler object
+            if value.path in common_dests:
+                return common_dests[value.path]
 
-                # is it a RODISK?
-                elif value.startswith('rodisk://'):
-                    mode = "ro_disk"
-
-                # otherwise, treat it like a string literal
-                else:
-                    mode = None
-
-            # override mode is guaranteed to be known now (whether
-            # auto-inferred or manually specified); try to handle it
-            try:
+            # if user overrode the handling mode, make sure it's compatible
+            # with the file type
+            if mode is not False: 
+                # user wants to stream a URL, rather than download it
                 if mode == 'stream':
+                    # XXX: currently, we only support streaming gs:// URLs,
+                    #      so we explicitly check here
                     if not value.startswith('gs://'):
-                        raise OverrideValueError(mode, arg, value)
-                    return Localization(
-                        'stream',
-                        value
-                    )
+                        raise ValueError("Only gs:// files are currently supported for streaming!")
+                    else:
+                        value.localization_mode = "stream"
 
-                elif mode in ['localize', 'symlink']:
-                    return localize_now()
+                # user wants to treat this path as a string literal
+                elif mode is None or mode == 'null' or mode == 'string':
+                    return file_handlers.StringLiteral(value.path)
 
-                elif mode == 'delayed':
-                    if not value.startswith('gs://'):
-                        raise OverrideValueError(mode, arg, value)
-                    return Localization(
-                        'download',
-                        value
-                    )
-
-                elif mode == "ro_disk":
-                    if not value.startswith('rodisk://'):
-                        raise OverrideValueError(mode, arg, value)
-                    return Localization(
-                        'ro_disk',
-                        value
-                    )
-
-                elif mode is None or mode == 'null':
-                    # Do not reserve path here
-                    # null override treats input as string
-                    return Localization(None, value)
-
-                else:
-                    raise ValueError("Invalid override option [{}]".format(mode))
-
-            # the user specified an invalid override (e.g. "stream"
-            # for something that's not a bucket path); fall back to
-            # handling this input as a local file
-            # XXX: why not a string literal?
-            except OverrideValueError as e:
-                canine_logging.error(e.args[0])
-                return localize_now()
-
-            except:
-                canine_logging.error("Unknown failure preparing job inputs, see stack trace for details")
-                raise
+            return value
 
         if 'CANINE_JOB_ALIAS' in job_inputs and 'CANINE_JOB_ALIAS' not in overrides:
             overrides['CANINE_JOB_ALIAS'] = None
