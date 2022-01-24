@@ -812,6 +812,7 @@ class AbstractLocalizer(abc.ABC):
                     # localize this file to a persistent disk, if specified
                     if self.localize_to_persistent_disk:
                         # set dest to persistent disk mountpoint
+                        # exportpath = ...
                         pass
                     else:
                         # set dest to path on NFS
@@ -820,10 +821,11 @@ class AbstractLocalizer(abc.ABC):
                           transport,
                           'jobs', jobId, 'inputs', 
                         )
+                        exportpath = dest.remotepath
 
                     localization_tasks += [file_handler.localization_command(dest.remotepath)]
 
-                    export_writer(key, dest.remotepath, is_array)
+                    export_writer(key, exportpath, is_array)
 
                 # this is a read-only disk URL; export variables for subsequent mounting
                 # and command to symlink file mount path to inputs directory
@@ -856,22 +858,35 @@ class AbstractLocalizer(abc.ABC):
 
                     export_writer(key, dest.remotepath, is_array)
 
-                # this is a string literal; if it corresponds to a path, it
-                # has already been localized to the inputs directory. if 
-                # we are using a persistent disk, add commands to copy it to the PD,
-                # and update exports accordingly.
-                elif file_handler.localization_mode == "string":
+                # this is a local file. it has already been copied or symlinked 
+                # to the inputs directory. if we are using a persistent disk, create
+                # commands to copy it over. otherwise, do nothing.
+                elif file_handler.localization_mode == "local":
                     job_vars.add(shlex.quote(key))
 
-                    # if this string literal corresponds to a file, localize
-                    # it to a persistent disk, if specified
-                    if self.localize_to_persistent_disk and self.is_localizable(file_handler.path):
-                        # add command to copy to persistent disk, update export
+                    if self.localize_to_persistent_disk:
+                        # update file handler path to reflect persistent disk path
+                        # NOTE: localized_path is a path_object; we'll want to refer its to remotepath
+                        # NOTE: we'll have to dereference symlinks
+                        # file_handler.localized_path = ...
+                        # exportpath = 
                         pass
+                    else:
+                        exportpath = file_handler.localized_path.remotepath
 
                     export_writer(
                       key,
-                      shlex.quote(file_handler.path.remotepath if isinstance(file_handler.path, PathType) else file_handler.path),
+                      exportpath,
+                      is_array
+                    )
+
+                # this is a string literal
+                elif file_handler.localization_mode == "string":
+                    job_vars.add(shlex.quote(key))
+
+                    export_writer(
+                      key,
+                      file_handler.path, # not actually a path, per se
                       is_array
                     )
 
