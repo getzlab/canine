@@ -66,6 +66,12 @@ class FileType(abc.ABC):
         """
         pass
 
+    def __str__(self):
+        """
+        Some functions (e.g. orchestrator.make_output_DF) may be passed FileType
+        objects, but expect strings corresponding to the file path.
+        """
+        return self.path
 
 class StringLiteral(FileType):
     """
