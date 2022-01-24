@@ -275,6 +275,10 @@ def get_file_handler(path, url_map = None, **kwargs):
       r"^rodisk://" : None,
     } if url_map is None else url_map
 
+    # zerothly, if path is already a FileType object, return as-is
+    if isinstance(path, FileType):
+        return path
+
     # firstly, check if the path is a regular file
     if os.path.exists(path):
         return HandleRegularFile(path, **kwargs)
