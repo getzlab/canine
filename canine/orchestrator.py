@@ -568,7 +568,7 @@ class Orchestrator(object):
                         ('job', 'cpu_seconds'): acct['CPUTimeRAW'][batch_id+'_'+str(array_id)],
                         ('job', 'submit_time'): acct['Submit'][batch_id+'_'+str(array_id)],
                         ('job', 'n_preempted'): acct['n_preempted'][batch_id+'_'+str(array_id)],
-                        **{ ('inputs', key) : val for key, val in job_spec[job_id].items() },
+                        **{ ('inputs', key) : str(val) for key, val in job_spec[job_id].items() },
                         **{
                             ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
                             for key, val in outputs[job_id].items()
