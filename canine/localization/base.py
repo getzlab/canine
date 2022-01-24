@@ -14,6 +14,7 @@ import re
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
+from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
 from ..utils import get_default_gcp_project, check_call, canine_logging
 from hound.client import _getblob_bucket
@@ -463,27 +464,30 @@ class AbstractLocalizer(abc.ABC):
                     if arg not in overrides:
                         for p in paths:
                             if p in seen:
-                                self.common_inputs.add(p)
+                                self.common_inputs.add(file_handlers.get_file_handler(p))
                     for p in paths:
                         seen.add(p)
 
-            # 2. see if any of these duplicate values correspond to files; if so, localize them now.
-            common_dests = {}
-            for path in self.common_inputs:
-                if path.startswith('gs://') or os.path.exists(path):
-                    basename = os.path.basename(os.path.abspath(path))
-                    common_dests[path] = self.reserve_path('common', basename)
-                    n = 2
-                    while transport.exists(common_dests[path].remotepath):
-                        if n == 2:
-                            basename += "_2"
-                        else:
-                            basename = re.sub(r"_\d+$", "_" + str(n), basename)
-                        n += 1
-                        common_dests[path] = self.reserve_path('common', basename)
+            # 2. if any of these duplicate values can be immediately localized,
+            #    do it, and mark them as localized so that subsequent functions
+            #    won't touch them
+            common_dests = {} # original path -> FileType object
+            for file_handler in self.common_inputs:
+                path = file_handler.path
+                # this path is either a URL that we know how to download, or
+                # a local path
+                if file_handler.localization_mode in {"url", "local"}:
+                    dest_path = self.get_destination_path(
+                      filename = path,
+                      transport = transport,
+                      'common', basename
+                    )
+
+                    common_dests[path] = file_handler
 
                     try:
-                        self.localize_file(path, common_dests[path], transport=transport)
+                        self.localize_file(file_handler, dest_path, transport=transport)
+                        common_dests[path].localized_path = dest_path
                     except:
                         canine_logging.error("Unknown error localizing common file {}".format(path))
                         raise
