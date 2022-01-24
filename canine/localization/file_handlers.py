@@ -16,7 +16,14 @@ class FileType(abc.ABC):
         path: path/URL to file
         transport: Canine transport object for handling local/remote files (currently not used)
         localization_mode: how this file will be handled in localization.job_setup_teardown
-          must be one of "localize", "delayed", "ro_disk", "stream", "null", or None
+          must be one of:
+          * url: path is a remote URL that must be handled with a special
+                 download command
+          * stream: stream remote URL into a FIFO, rather than downloading
+          * ro_disk: path is a URL to mount a persistent disk read-only
+          * local: path is a local file
+          * string: path is a string literal
+          - None: path is a string literal (for backwards compatibility)
         """
         self.path = path
         self.transport = transport # currently not used
@@ -58,6 +65,15 @@ class FileType(abc.ABC):
         Returns a command to localize this file
         """
         pass
+
+
+class StringLiteral(FileType):
+    """
+    Since the base FileType class also works for string literals, alias
+    the StringLiteral class for clarification
+    """
+    localization_mode = "string"
+    pass
 
 def hash_set(x):
     assert isinstance(x, set)
@@ -107,7 +123,7 @@ class HandleGSURL(FileType):
             canine_logging.error(ret.stderr.decode())
             raise subprocess.CalledProcessError(ret.returncode, "")
 
-    def __init__(self, path, localization_mode = "delayed", **kwargs):
+    def __init__(self, path, localization_mode = "url", **kwargs):
         super().__init__(path, localization_mode = localization_mode, **kwargs)
 
         # check if this bucket is requester pays
@@ -178,7 +194,7 @@ class HandleGDCHTTPURL(FileType):
 ## Regular files {{{
 
 class HandleRegularFile(FileType):
-    localization_mode = "localize"
+    localization_mode = "local"
 
     def _get_size(self):
         return os.path.getsize(self.path)
@@ -232,12 +248,12 @@ class HandleRegularFile(FileType):
 ## Read-only disks {{{
 
 class HandleRODISKURL(FileType):
+    localization_mode = "ro_disk"
     # file size is unnknowable
     # hash will be based on disk hash URL (if present) and/or filename
     # * for single file RODISKS, hash will be disk name
     # * for batch RODISKS, hash will be disk name + filename
     # handler will be command to attach/mount the RODISK
-    pass
 
 # }}}
 
