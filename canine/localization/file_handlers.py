@@ -282,4 +282,4 @@ def get_file_handler(path, url_map = None, **kwargs):
             return handler(path, **kwargs)
 
     # otherwise, assume it's a string literal; use the base class
-    return FileType(path, **kwargs)
+    return StringLiteral(path, **kwargs)
