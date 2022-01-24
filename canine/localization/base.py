@@ -68,7 +68,6 @@ class AbstractLocalizer(abc.ABC):
         self.backend = backend
 
         self.common = common
-        self.common_inputs = set()
 
         self._local_dir = tempfile.TemporaryDirectory()
         self.local_dir = self._local_dir.name
@@ -458,7 +457,7 @@ class AbstractLocalizer(abc.ABC):
         Returns the dictionary of common inputs {input path: common path}
         """
         with self.transport_context(transport) as transport:
-            self.common_inputs = set()
+            common_inputs = {}
             seen = set()
 
             # 1. scan for any duplicate values across inputs
@@ -471,16 +470,16 @@ class AbstractLocalizer(abc.ABC):
                     paths = [paths] if not isinstance(paths, list) else paths
                     if arg not in overrides:
                         for p in paths:
-                            if p in seen:
-                                self.common_inputs.add(file_handlers.get_file_handler(p))
-                    for p in paths:
-                        seen.add(p)
+                            fh = file_handlers.get_file_handler(p)
+                            if fh.hash in seen:
+                                common_inputs[fh.hash] = fh
+                            seen.add(fh.hash)
 
             # 2. if any of these duplicate values can be immediately localized,
             #    do it, and mark them as localized so that subsequent functions
             #    won't touch them
             common_dests = {} # original path -> FileType object
-            for file_handler in self.common_inputs:
+            for file_handler in common_inputs.values():
                 path = file_handler.path
                 # this path is either a URL that we know how to download, or
                 # a local path
