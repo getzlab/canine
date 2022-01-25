@@ -279,13 +279,16 @@ def get_file_handler(path, url_map = None, **kwargs):
     if isinstance(path, FileType):
         return path
 
+    # assume path is a string-like object from here on out
+    path = str(path)
+
     # firstly, check if the path is a regular file
     if os.path.exists(path):
         return HandleRegularFile(path, **kwargs)
 
     # next, consult the mapping of path URL -> handler
     for pat, handler in url_map.items():
-        if re.match(pat, path):
+        if re.match(pat, path) is not None:
             return handler(path, **kwargs)
 
     # otherwise, assume it's a string literal; use the base class
