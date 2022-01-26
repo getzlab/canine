@@ -260,11 +260,35 @@ class HandleRegularFile(FileType):
 
 class HandleRODISKURL(FileType):
     localization_mode = "ro_disk"
+
     # file size is unnknowable
-    # hash will be based on disk hash URL (if present) and/or filename
+
+    # hash is be based on disk hash URL (if present) and/or filename
     # * for single file RODISKS, hash will be disk name
     # * for batch RODISKS, hash will be disk name + filename
+    def _get_hash(self):
+        roURL = re.match(r"rodisk://([^/]+)/(.*)", self.path)
+        if roURL is None or roURL[2] == "":
+            raise ValueError("Invalid RODISK URL specified ({})!".format(self.path))
+
+        # we can only compare RODISK URLs based on the URL string, since
+        # actually hashing the contents would entail mounting them.
+        # most RODISK URLs will contain a hash of their contents, but
+        # if they don't, then we warn the user that we may be inadvertently
+        # avoiding
+        if not roURL[1].startswith("gsdisk-"):
+            canine_logging.warning("RODISK input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
+
+        # single file/directory RODISKs will contain the CRC32C of the file(s)
+        if roURL[1].startswith("gsdisk-crc32c-"):
+            return roURL[1][14:]
+
+        # for BatchLocalDisk multifile RODISKs (or non-hashed URLs), the whole URL
+        # serves as a hash for the file 
+        return self.path
+
     # handler will be command to attach/mount the RODISK
+    # (currently implemented in base.py)
 
 # }}}
 
