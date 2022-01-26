@@ -624,120 +624,120 @@ class AbstractLocalizer(abc.ABC):
         return not (isinstance(file_type, file_handlers.StringLiteral) or
                     isinstance(file_type, file_handlers.HandleRODISKURL))
 
-#    def create_persistent_disk(self, file_paths_arrays: typing.Dict[str, list] = {}, disk_size: int = None):
-#        # if we already have files in mind to localize
-#        if len(file_paths_arrays):
-#            # flatten file_paths dict
-#            # for non-array inputs, { inputName : path }
-#            # disambiguate array inputs with numerical suffix, e.g. { inputName + "_0" : path }
-#            file_paths = {}
-#            for k, v in file_paths_arrays.items(): 
-#                n_suff = 0
-#                for x in v:
-#                    str_suff = "_" + str(n_suff) if len(v) > 1 else ""
-#                    file_paths[k + str_suff] = x
-#                    n_suff += 1
-#
-#            # strip any trailing slashes, in case we are localizing directories 
-#            file_paths = { k : v.strip("/") for k, v in file_paths.items() }
-#
-#            ## Create dataframe of files' attributes
-#            F = pd.DataFrame({
-#              "file_paths" : file_paths.values(),
-#              "file_basenames" : [os.path.basename(x) for x in file_paths.values()]
-#            }, index = file_paths.keys())
-#
-#            F["disk_paths"] = F.index + "/" + F["file_basenames"]
-#
-#            ## Create unflattened dictionary to return (inputId -> [disk paths])
-#            file_paths_arrays_transformed = {}
-#            for inputId, f in F.itertuples():
-#                inputId_sp = inputId.split("_")
-#                if inputId_sp[0] not in file_paths_arrays_transformed:
-#                    file_paths_arrays_transformed[inputId_sp[0]] = []
-#                file_paths_arrays_transformed[inputId_sp[0]].append(f.disk_paths)
-#
-#            ## Disk name is determined by files' disk paths and hashes
-#            disk_name = "canine-" + \
-#              hash_set(set(
-#                F.loc[F["localize"], "disk_paths"] + "_" + \
-#                F.loc[F["localize"], "file_paths"].apply(crc32c) <<< #need to port over hash function, make it work with GDC URL's too
-#              ))
-#
-#            canine_logging.info1("Disk name is {}".format(disk_name))
-#
-#            ## Check if the disk already exists
-#			out = subprocess.check_output(
-#				"gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
-#			)
-#			out = out.decode().rstrip().split("\n")
-#			if len(out) > 2:
-#				raise Exception("Unexpected number of existing disks (should not happen?)")
-#			if len(out) == 2: # header + one result
-#                canine_logging.info1("Found existing disk {}".format(disk_name))
-#
-#                # transform filenames to rodisk:// URLs, which will subsequently be mounted
-#                # TODO
-#                # return ...
-#
-#            ## Calculate disk size
-#            disk_size = F.loc[F["localize"], "file_paths"].apply(LocalizeGSFile.get_gsfile_size).sum() <<< #need to port over size function, make it work with GDC URL's too
-#            disk_size = max(10, 1+int(disk_size / 1022611260)) # bytes -> gib with 5% safety margin
-#
-#        # otherwise, we create a blank disk with a random name
-#        else:
-#            disk_name = "canine-scratch-{}".format(os.urandom(4).hex())
-#
-#        canine_logging.info1("Creating new persistent disk {}".format(disk_name))
-#
-#        ## Generate disk creation script
-#		localization_script = [
-#			'set -eux',
-#			'GCP_DISK_NAME={}'.format(disk_name),
-#			'GCP_DISK_SIZE={}'.format(disk_size),
-#			'GCP_TSNT_DISKS_DIR=/mnt/nfs/ro_disks', # to make consistent with where other persistent disks get mounted
-#
-#			## create disk
-#			'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
-#			'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
-#			'fi',
-#
-#			## attach as read-write, using same device-name as disk-name
-#			'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
-#			'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
-#			'fi',
-#
-#			## wait for disk to attach, with exponential backoff up to 2 minutes
-#			'DELAY=1',
-#			'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
-#			'[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk"; exit 1; } || :',
-#			'sleep $DELAY; ((DELAY *= 2))',
-#			'done',
-#
-#			## format disk
-#			'if [[ $(sudo blkid -o value -s TYPE /dev/disk/by-id/google-${GCP_DISK_NAME}) != "ext4" ]]; then',
-#			'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-${GCP_DISK_NAME}',
-#			'fi',
-#
-#			## mount
-#			'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
-#			'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-#			'fi',
-#			'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
-#			'sudo mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-#			'sudo chmod -R a+rwX "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
-#			'fi'
-#        ]
-#
-#        teardown_script = [
-#        ]
-#
-#        # need to return:
-#        # * transformed paths, accounting for arrays: inputID -> [path on disk]
-#        # * disk name (if we want to repurpose this as a RODISK later)
-#        # * disk creation script (to append to localization_tasks)
-#        # * disk unmount or deletion script (to append to teardown_script)
-#        #   -> need to be able to pass option to not delete, if using as a RODISK later
+    def create_persistent_disk(self, file_paths_arrays: typing.Dict[str, list] = {}, disk_size: int = None):
+        # if we already have files in mind to localize
+        if len(file_paths_arrays):
+            # flatten file_paths dict
+            # for non-array inputs, { inputName : path }
+            # disambiguate array inputs with numerical suffix, e.g. { inputName + "_0" : path }
+            file_paths = {}
+            for k, v in file_paths_arrays.items(): 
+                n_suff = 0
+                for x in v:
+                    str_suff = "_" + str(n_suff) if len(v) > 1 else ""
+                    file_paths[k + str_suff] = x
+                    n_suff += 1
+
+            # strip any trailing slashes, in case we are localizing directories 
+            file_paths = { k : v.strip("/") for k, v in file_paths.items() }
+
+            ## Create dataframe of files' attributes
+            F = pd.DataFrame({
+              "file_paths" : file_paths.values(),
+              "file_basenames" : [os.path.basename(x) for x in file_paths.values()]
+            }, index = file_paths.keys())
+
+            F["disk_paths"] = F.index + "/" + F["file_basenames"]
+
+            ## Create unflattened dictionary to return (inputId -> [disk paths])
+            file_paths_arrays_transformed = {}
+            for inputId, f in F.itertuples():
+                inputId_sp = inputId.split("_")
+                if inputId_sp[0] not in file_paths_arrays_transformed:
+                    file_paths_arrays_transformed[inputId_sp[0]] = []
+                file_paths_arrays_transformed[inputId_sp[0]].append(f.disk_paths)
+
+            ## Disk name is determined by files' disk paths and hashes
+            disk_name = "canine-" + \
+              hash_set(set(
+                F.loc[F["localize"], "disk_paths"] + "_" + \
+                F.loc[F["localize"], "file_paths"].apply(crc32c) <<< #need to port over hash function, make it work with GDC URL's too
+              ))
+
+            canine_logging.info1("Disk name is {}".format(disk_name))
+
+            ## Check if the disk already exists
+			out = subprocess.check_output(
+				"gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
+			)
+			out = out.decode().rstrip().split("\n")
+			if len(out) > 2:
+				raise Exception("Unexpected number of existing disks (should not happen?)")
+			if len(out) == 2: # header + one result
+                canine_logging.info1("Found existing disk {}".format(disk_name))
+
+                # transform filenames to rodisk:// URLs, which will subsequently be mounted
+                # TODO
+                # return ...
+
+            ## Calculate disk size
+            disk_size = F.loc[F["localize"], "file_paths"].apply(LocalizeGSFile.get_gsfile_size).sum() <<< #need to port over size function, make it work with GDC URL's too
+            disk_size = max(10, 1+int(disk_size / 1022611260)) # bytes -> gib with 5% safety margin
+
+        # otherwise, we create a blank disk with a random name
+        else:
+            disk_name = "canine-scratch-{}".format(os.urandom(4).hex())
+
+        canine_logging.info1("Creating new persistent disk {}".format(disk_name))
+
+        ## Generate disk creation script
+		localization_script = [
+			'set -eux',
+			'GCP_DISK_NAME={}'.format(disk_name),
+			'GCP_DISK_SIZE={}'.format(disk_size),
+			'GCP_TSNT_DISKS_DIR=/mnt/nfs/ro_disks', # to make consistent with where other persistent disks get mounted
+
+			## create disk
+			'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
+			'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
+			'fi',
+
+			## attach as read-write, using same device-name as disk-name
+			'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
+			'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
+			'fi',
+
+			## wait for disk to attach, with exponential backoff up to 2 minutes
+			'DELAY=1',
+			'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
+			'[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk"; exit 1; } || :',
+			'sleep $DELAY; ((DELAY *= 2))',
+			'done',
+
+			## format disk
+			'if [[ $(sudo blkid -o value -s TYPE /dev/disk/by-id/google-${GCP_DISK_NAME}) != "ext4" ]]; then',
+			'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-${GCP_DISK_NAME}',
+			'fi',
+
+			## mount
+			'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
+			'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+			'fi',
+			'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
+			'sudo mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+			'sudo chmod -R a+rwX "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
+			'fi'
+        ]
+
+        teardown_script = [
+        ]
+
+        # need to return:
+        # * transformed paths, accounting for arrays: inputID -> [path on disk]
+        # * disk name (if we want to repurpose this as a RODISK later)
+        # * disk creation script (to append to localization_tasks)
+        # * disk unmount or deletion script (to append to teardown_script)
+        #   -> need to be able to pass option to not delete, if using as a RODISK later
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str], transport = None) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
         """
@@ -760,25 +760,25 @@ class AbstractLocalizer(abc.ABC):
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
 
-#        #
-#        # create exports/creation script for persistent disk, if specified
-#        if self.localize_to_persistent_disk:
-#            # enumerate files that will be localized
-#            files_to_localize = dict()
-#            for key, val_array in self.inputs[jobId].items():
-#                for val in val_array:
-#                    if val.type in {"download", None} and is_localizable(val.path, transport):
-#                        if key not in files_to_localize:
-#                            files_to_localize[key] = []
-#                        files_to_localize[key].append(val)
-#
-#            # create disk of requisite size, whose name is the hash of all the files
-#            disk_name, disk_size, disk_script = self.create_persistent_disk(files_to_localize)
-#            # 
-#            exports +=
-#
-#        #
-#        # create exports/creation script for scratch disk, if specified
+        #
+        # create exports/creation script for persistent disk, if specified
+        if self.localize_to_persistent_disk:
+            # enumerate files that will be localized
+            files_to_localize = dict()
+            for key, val_array in self.inputs[jobId].items():
+                for val in val_array:
+                    if val.type in {"download", None} and is_localizable(val.path, transport):
+                        if key not in files_to_localize:
+                            files_to_localize[key] = []
+                        files_to_localize[key].append(val)
+
+            # create disk of requisite size, whose name is the hash of all the files
+            disk_name, disk_size, disk_script = self.create_persistent_disk(files_to_localize)
+            # 
+            exports +=
+
+        #
+        # create exports/creation script for scratch disk, if specified
 
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
