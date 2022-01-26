@@ -8,7 +8,7 @@ import traceback
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
-from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
+from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer, file_handlers
 from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered, canine_logging
 import yaml
 import numpy as np
@@ -115,6 +115,9 @@ def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
         ]
     elif isinstance(obj, pd.core.frame.DataFrame):
         return stringify(obj.to_dict(orient = "list"))
+    # pass through FileType objects as-is
+    elif isinstance(obj, file_handlers.FileType):
+        return obj
 
     if safe:
         if "\n" in str(obj):
