@@ -136,6 +136,9 @@ class HandleGSURL(FileType):
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
 
+        # remove any trailing slashes, in case path refers to a directory
+        self.path = path.strip("/")
+
         # check if this bucket is requester pays
         self.rp_string = ""
         if self.get_requester_pays():

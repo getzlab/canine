@@ -638,9 +638,6 @@ class AbstractLocalizer(abc.ABC):
                     file_paths[k + str_suff] = x
                     n_suff += 1
 
-            # strip any trailing slashes, in case we are localizing directories 
-            file_paths = { k : v.strip("/") for k, v in file_paths.items() }
-
             ## Create dataframe of files' attributes
             F = pd.DataFrame({
               "file_paths" : file_paths.values(),
