@@ -506,8 +506,8 @@ class AbstractLocalizer(abc.ABC):
                     try:
                         self.localize_file(file_handler, dest_path, transport=transport)
 
-                        # this is now a regular file
-                        common_dests[path] = file_handlers.HandleRegularFile(dest_path)
+                        # this is now a regular file, residing at dest_path.remotepath
+                        common_dests[path] = file_handlers.HandleRegularFile(dest_path.remotepath)
                         # copy over hash if it's been precomputed
                         if file_handler._hash is not None:
                             common_dests[path]._hash = file_handler._hash
