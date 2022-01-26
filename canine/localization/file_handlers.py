@@ -29,7 +29,7 @@ class FileType(abc.ABC):
           - None: path is a string literal (for backwards compatibility)
         """
         self.path = path
-        self.localized_path = self.path # path where file got localized to. needs to be manually updated
+        self.localized_path = path # path where file got localized to. needs to be manually updated
         self.transport = transport # currently not used
         self.extra_args = kwargs
 
