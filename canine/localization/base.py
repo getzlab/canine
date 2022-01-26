@@ -774,9 +774,12 @@ class AbstractLocalizer(abc.ABC):
             if len(self.inputs) > 1:
                 raise ValueError("Localization to persistent disk for multishard jobs is currently not supported.")
 
-            # create disk of requisite size, whose name is the hash of all the files
             disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId])
+
+            # add commands to create/mount the disk
             localization_tasks += disk_creation_script
+
+            # save rodisk:// URLs for files saved to the disk for later use
             self.rodisk_paths[jobId] = rodisk_paths
 
         #
