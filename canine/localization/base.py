@@ -699,7 +699,7 @@ class AbstractLocalizer(abc.ABC):
         ## Generate disk creation script
         localization_script = [
             'set -eux',
-            'GCP_DISK_NAME={}'.format(disk_name),
+            'GCP_DISK_NAME={}'.format(disk_name), # TODO: save these as exports that get sourced in setup.sh
             'GCP_DISK_SIZE={}'.format(disk_size),
             'GCP_TSNT_DISKS_DIR={}'.format(mount_prefix),
 
@@ -928,7 +928,10 @@ class AbstractLocalizer(abc.ABC):
                     localized_path = file_handler.localized_path.remotepath
                     if self.localize_to_persistent_disk:
                         exportpath = os.path.join(disk_prefix, key, os.path.basename(localized_path))
-                        localization_tasks += [ "cp -r {} {}".format(localized_path, exportpath) ]
+                        localization_tasks += [
+                          "[ ! -d {0} ] && mkdir -p {0} || :".format(os.path.join(disk_prefix, key)),
+                          "cp -r {} {}".format(localized_path, exportpath)
+                        ]
                         file_handler.localized_path = exportpath
                     else:
                         exportpath = localized_path
