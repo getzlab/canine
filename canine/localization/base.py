@@ -764,24 +764,24 @@ class AbstractLocalizer(abc.ABC):
         ]
 
         #
-        # create exports/creation script for persistent disk, if specified
+        # create creation script for persistent disk, if specified
         if self.localize_to_persistent_disk:
-            # enumerate files that will be localized
-            files_to_localize = dict()
-            for key, val_array in self.inputs[jobId].items():
-                for val in val_array:
-                    if val.type in {"download", None} and is_localizable(val.path, transport):
-                        if key not in files_to_localize:
-                            files_to_localize[key] = []
-                        files_to_localize[key].append(val)
+            # FIXME: we don't have an easy way of parsing which inputs are common
+            #        to all shards at this point. if every localizable input is
+            #        common to each shard, then we'll create the same disk
+            #        multiple times, once per shard. thus, for now we heavyhandedly
+            #        prohibit localizing to persistent disks for multishard jobs.
+            if len(self.inputs) > 1:
+                raise ValueError("Localization to persistent disk for multishard jobs is currently not supported.")
 
             # create disk of requisite size, whose name is the hash of all the files
-            disk_name, disk_size, disk_script = self.create_persistent_disk(files_to_localize)
-            # 
-            exports +=
+            disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId])
+            localization_tasks += disk_creation_script
+            self.rodisk_paths[jobId] = rodisk_paths
 
         #
-        # create exports/creation script for scratch disk, if specified
+        # create creation script for scratch disk, if specified
+        # TODO
 
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
