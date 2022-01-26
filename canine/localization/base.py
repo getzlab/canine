@@ -45,7 +45,7 @@ class AbstractLocalizer(abc.ABC):
         common: bool = True, staging_dir: str = None,
         project: typing.Optional[str] = None,
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
-        use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard",
+        use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
         **kwargs
     ):
         """
@@ -60,6 +60,7 @@ class AbstractLocalizer(abc.ABC):
           all job outputs will be written
         scratch_disk_type: "standard" or "ssd". Default "standard".
         scratch_disk_size: size of scratch disk, in gigabytes. Default 10GB
+        scratch_disk_name: name of scratch disk. Default is a random string
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -90,8 +91,14 @@ class AbstractLocalizer(abc.ABC):
         self.localize_to_persistent_disk = localize_to_persistent_disk
         self.persistent_disk_type = persistent_disk_type
         self.use_scratch_disk = use_scratch_disk
-        self.scratch_disk_size = scratch_disk_size
         self.scratch_disk_type = scratch_disk_type
+        self.scratch_disk_size = scratch_disk_size
+        self.scratch_disk_name = scratch_disk_name
+
+        # to extract rodisk URLs if we want to re-use disk(s) downstream for
+        # other tasks
+        # jobId : { input : [RODISK URLs] }
+        self.rodisk_paths = {}
 
         # will be removed
         self.disk_key = os.urandom(4).hex()
@@ -612,78 +619,79 @@ class AbstractLocalizer(abc.ABC):
             for i, v in enumerate(value):
                 self.inputs[jobId][arg][i] = handle_input(v, mode)
 
-    @staticmethod
-    def is_localizable(path):
+    def create_persistent_disk(self,
+      file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
+      disk_name: str = None,
+      disk_size: int = 0
+    ):
         """
-        Returns True if Canine can handle this type of file/URL
+        Generates the commands to (i) create and (ii) destroy a persistent disk.
+        If a dict of inputs -> [FileTypes] is provided, disk will be named
+        according to the FileType hashes, and sized according to the filesizes.
         """
-        # use get_file_handler to autodetect the file type
-        file_type = file_handlers.get_file_handler(path)
-
-        # string literals and RODISK URLs cannot/should not be localized
-        return not (isinstance(file_type, file_handlers.StringLiteral) or
-                    isinstance(file_type, file_handlers.HandleRODISKURL))
-
-    def create_persistent_disk(self, file_paths_arrays: typing.Dict[str, list] = {}, disk_size: int = None):
+        #
         # if we already have files in mind to localize
         if len(file_paths_arrays):
             # flatten file_paths dict
             # for non-array inputs, { inputName : path }
             # disambiguate array inputs with numerical suffix, e.g. { inputName + "_0" : path }
-            file_paths = {}
+            file_paths = []
             for k, v in file_paths_arrays.items(): 
                 n_suff = 0
                 for x in v:
-                    str_suff = "_" + str(n_suff) if len(v) > 1 else ""
-                    file_paths[k + str_suff] = x
+                    file_paths.append([k, n_suff, x.path, x.hash, x.size, not (isinstance(x, file_handlers.StringLiteral) or isinstance(x, file_handlers.HandleRODISKURL or x.localization_mode == "stream"))])
                     n_suff += 1
 
             ## Create dataframe of files' attributes
-            F = pd.DataFrame({
-              "file_paths" : file_paths.values(),
-              "file_basenames" : [os.path.basename(x) for x in file_paths.values()]
-            }, index = file_paths.keys())
+            F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "path", "hash", "size", "localize"])
+            F["file_basename"] = F["path"].apply(os.path.basename)
 
-            F["disk_paths"] = F.index + "/" + F["file_basenames"]
-
-            ## Create unflattened dictionary to return (inputId -> [disk paths])
-            file_paths_arrays_transformed = {}
-            for inputId, f in F.itertuples():
-                inputId_sp = inputId.split("_")
-                if inputId_sp[0] not in file_paths_arrays_transformed:
-                    file_paths_arrays_transformed[inputId_sp[0]] = []
-                file_paths_arrays_transformed[inputId_sp[0]].append(f.disk_paths)
-
-            ## Disk name is determined by files' disk paths and hashes
+            ## Disk name is determined by files' basenames and hashes
             disk_name = "canine-" + \
-              hash_set(set(
-                F.loc[F["localize"], "disk_paths"] + "_" + \
-                F.loc[F["localize"], "file_paths"].apply(crc32c) <<< #need to port over hash function, make it work with GDC URL's too
+              file_handlers.hash_set(set(
+                F.loc[F["localize"], "file_basename"] + "_" + \
+                F.loc[F["localize"], "hash"]
               ))
 
             canine_logging.info1("Disk name is {}".format(disk_name))
 
-            ## Check if the disk already exists
-            out = subprocess.check_output(
-                "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
-            )
-            out = out.decode().rstrip().split("\n")
-            if len(out) > 2:
-                raise Exception("Unexpected number of existing disks (should not happen?)")
-            if len(out) == 2: # header + one result
-                canine_logging.info1("Found existing disk {}".format(disk_name))
-
-                # transform filenames to rodisk:// URLs, which will subsequently be mounted
-                # TODO
-                # return ...
+            ## create RODISK URLs for files being localized to disk
+            # pass through all other values unaltered
+            F["disk_path"] = F["path"]
+            F.loc[F["localize"], "disk_path"] = "rodisk://" + disk_name + "/" + F.loc[F["localize"], ["input", "file_basename"]].apply(lambda x: "/".join(x), axis = 1)
 
             ## Calculate disk size
-            disk_size = F.loc[F["localize"], "file_paths"].apply(LocalizeGSFile.get_gsfile_size).sum() <<< #need to port over size function, make it work with GDC URL's too
-            disk_size = max(10, 1+int(disk_size / 1022611260)) # bytes -> gib with 5% safety margin
+            disk_size = F.loc[F["localize"], "size"].sum()
+            disk_size = max(10, 1 + int(disk_size/1022611260)) # bytes -> gib with 5% safety margin
 
-        # otherwise, we create a blank disk with a random name
+            ## Save RODISK paths for subsequent use by downstream tasks
+            rodisk_paths = F.loc[F["localize"], :].groupby("input")["disk_path"].apply(list).to_dict()
+
+        #
+        # otherwise, we create a blank disk with a given name (if specified),
+        # otherwise random
         else:
-            disk_name = "canine-scratch-{}".format(os.urandom(4).hex())
+            disk_name = "canine-scratch-{}".format(disk_name if disk_name is not None else os.urandom(4).hex())
+            disk_size = max(10, 1 + int(disk_size/1022611260))
+            rodisk_paths = None
+
+        ## mount prefix
+        mount_prefix = "/mnt/nfs/rodisks"
+        disk_mountpoint = mount_prefix + "/" + disk_name
+
+        ## Check if the disk already exists
+        out = subprocess.check_output(
+            "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
+        )
+        out = out.decode().rstrip().split("\n")
+        if len(out) > 2:
+            raise Exception("Unexpected number of existing disks (should not happen?)")
+
+        # disk exists
+        if len(out) == 2: # header + one result
+            canine_logging.info1("Found existing disk {}".format(disk_name))
+
+            return disk_mountpoint, [], [], rodisk_paths
 
         canine_logging.info1("Creating new persistent disk {}".format(disk_name))
 
@@ -692,7 +700,7 @@ class AbstractLocalizer(abc.ABC):
             'set -eux',
             'GCP_DISK_NAME={}'.format(disk_name),
             'GCP_DISK_SIZE={}'.format(disk_size),
-            'GCP_TSNT_DISKS_DIR=/mnt/nfs/ro_disks', # to make consistent with where other persistent disks get mounted
+            'GCP_TSNT_DISKS_DIR={}'.format(mount_prefix),
 
             ## create disk
             'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
@@ -726,15 +734,12 @@ class AbstractLocalizer(abc.ABC):
             'fi'
         ]
 
+        # * disk unmount or deletion script (to append to teardown_script)
+        #   -> need to be able to pass option to not delete, if using as a RODISK later
         teardown_script = [
         ]
 
-        # need to return:
-        # * transformed paths, accounting for arrays: inputID -> [path on disk]
-        # * disk name (if we want to repurpose this as a RODISK later)
-        # * disk creation script (to append to localization_tasks)
-        # * disk unmount or deletion script (to append to teardown_script)
-        #   -> need to be able to pass option to not delete, if using as a RODISK later
+        return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str], transport = None) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
         """
