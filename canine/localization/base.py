@@ -738,6 +738,9 @@ class AbstractLocalizer(abc.ABC):
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
         teardown_script = [
+          'sudo umount {}/{}'.format(mount_prefix, disk_name),
+          'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
+          # TODO: add command to optionally delete disk
         ]
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
@@ -1053,13 +1056,8 @@ class AbstractLocalizer(abc.ABC):
                     )
                 ),
                 'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi'
-            ] + (
-                [
-                    'sudo umount {}/{}'.format(self.local_download_dir, disk_name),
-                    'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
-                    'gcloud compute disks delete {} --zone $CANINE_NODE_ZONE'.format(disk_name)
-                ] if disk_name is not None else []
-            )
+            ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
+            # TODO: add teardown script for scratch disks
         )
         return setup_script, localization_script, teardown_script, array_exports
 
