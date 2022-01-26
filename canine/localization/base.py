@@ -864,8 +864,10 @@ class AbstractLocalizer(abc.ABC):
                     # localize this file to a persistent disk, if specified
                     if self.localize_to_persistent_disk:
                         # set dest to persistent disk mountpoint
-                        # exportpath = ...
-                        pass
+                        # TODO: basenames of URLs have not been mangled to
+                        # handle multiple non-unique basenames for an array
+                        # input, a la get_destination_path.
+                        exportpath = os.path.join(disk_prefix, key, os.path.basename(file_handler.path))
                     else:
                         # set dest to path on NFS
                         dest = self.get_destination_path(
@@ -874,8 +876,9 @@ class AbstractLocalizer(abc.ABC):
                           'jobs', jobId, 'inputs', 
                         )
                         exportpath = dest.remotepath
+                    file_handler.localized_path = exportpath
 
-                    localization_tasks += [file_handler.localization_command(dest.remotepath)]
+                    localization_tasks += [file_handler.localization_command(exportpath)]
 
                     export_writer(key, exportpath, is_array)
 
@@ -912,19 +915,17 @@ class AbstractLocalizer(abc.ABC):
 
                 # this is a local file. it has already been copied or symlinked 
                 # to the inputs directory. if we are using a persistent disk, create
-                # commands to copy it over. otherwise, do nothing.
+                # commands to copy it over. otherwise, do nothing besides export
                 elif file_handler.localization_mode == "local":
                     job_vars.add(shlex.quote(key))
 
+                    localized_path = file_handler.localized_path.remotepath
                     if self.localize_to_persistent_disk:
-                        # update file handler path to reflect persistent disk path
-                        # NOTE: localized_path is a path_object; we'll want to refer its to remotepath
-                        # NOTE: we'll have to dereference symlinks
-                        # file_handler.localized_path = ...
-                        # exportpath = 
-                        pass
+                        exportpath = os.path.join(disk_prefix, key, os.path.basename(localized_path))
+                        localization_tasks += [ "cp -r {} {}".format(localized_path, exportpath) ]
+                        file_handler.localized_path = exportpath
                     else:
-                        exportpath = file_handler.localized_path.remotepath
+                        exportpath = localized_path
 
                     export_writer(
                       key,
