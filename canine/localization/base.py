@@ -740,6 +740,7 @@ class AbstractLocalizer(abc.ABC):
         teardown_script = [
           'sudo umount {}/{}'.format(mount_prefix, disk_name),
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
+          'gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
         ]
 
