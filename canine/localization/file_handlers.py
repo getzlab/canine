@@ -279,11 +279,11 @@ class HandleRODISKURL(FileType):
         # most RODISK URLs will contain a hash of their contents, but
         # if they don't, then we warn the user that we may be inadvertently
         # avoiding
-        if not roURL[1].startswith("gsdisk-"):
+        if not roURL[1].startswith("canine-"):
             canine_logging.warning("RODISK input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
 
         # single file/directory RODISKs will contain the CRC32C of the file(s)
-        if roURL[1].startswith("gsdisk-crc32c-"):
+        if roURL[1].startswith("canine-crc32c-"):
             return roURL[1][14:]
 
         # for BatchLocalDisk multifile RODISKs (or non-hashed URLs), the whole URL
