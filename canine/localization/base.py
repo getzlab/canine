@@ -664,13 +664,13 @@ class AbstractLocalizer(abc.ABC):
             canine_logging.info1("Disk name is {}".format(disk_name))
 
             ## Check if the disk already exists
-			out = subprocess.check_output(
-				"gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
-			)
-			out = out.decode().rstrip().split("\n")
-			if len(out) > 2:
-				raise Exception("Unexpected number of existing disks (should not happen?)")
-			if len(out) == 2: # header + one result
+            out = subprocess.check_output(
+                "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
+            )
+            out = out.decode().rstrip().split("\n")
+            if len(out) > 2:
+                raise Exception("Unexpected number of existing disks (should not happen?)")
+            if len(out) == 2: # header + one result
                 canine_logging.info1("Found existing disk {}".format(disk_name))
 
                 # transform filenames to rodisk:// URLs, which will subsequently be mounted
@@ -688,42 +688,42 @@ class AbstractLocalizer(abc.ABC):
         canine_logging.info1("Creating new persistent disk {}".format(disk_name))
 
         ## Generate disk creation script
-		localization_script = [
-			'set -eux',
-			'GCP_DISK_NAME={}'.format(disk_name),
-			'GCP_DISK_SIZE={}'.format(disk_size),
-			'GCP_TSNT_DISKS_DIR=/mnt/nfs/ro_disks', # to make consistent with where other persistent disks get mounted
+        localization_script = [
+            'set -eux',
+            'GCP_DISK_NAME={}'.format(disk_name),
+            'GCP_DISK_SIZE={}'.format(disk_size),
+            'GCP_TSNT_DISKS_DIR=/mnt/nfs/ro_disks', # to make consistent with where other persistent disks get mounted
 
-			## create disk
-			'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
-			'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
-			'fi',
+            ## create disk
+            'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
+            'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
+            'fi',
 
-			## attach as read-write, using same device-name as disk-name
-			'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
-			'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
-			'fi',
+            ## attach as read-write, using same device-name as disk-name
+            'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
+            'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
+            'fi',
 
-			## wait for disk to attach, with exponential backoff up to 2 minutes
-			'DELAY=1',
-			'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
-			'[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk"; exit 1; } || :',
-			'sleep $DELAY; ((DELAY *= 2))',
-			'done',
+            ## wait for disk to attach, with exponential backoff up to 2 minutes
+            'DELAY=1',
+            'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
+            '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk"; exit 1; } || :',
+            'sleep $DELAY; ((DELAY *= 2))',
+            'done',
 
-			## format disk
-			'if [[ $(sudo blkid -o value -s TYPE /dev/disk/by-id/google-${GCP_DISK_NAME}) != "ext4" ]]; then',
-			'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-${GCP_DISK_NAME}',
-			'fi',
+            ## format disk
+            'if [[ $(sudo blkid -o value -s TYPE /dev/disk/by-id/google-${GCP_DISK_NAME}) != "ext4" ]]; then',
+            'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-${GCP_DISK_NAME}',
+            'fi',
 
-			## mount
-			'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
-			'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-			'fi',
-			'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
-			'sudo mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-			'sudo chmod -R a+rwX "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
-			'fi'
+            ## mount
+            'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
+            'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            'fi',
+            'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
+            'sudo mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            'sudo chmod -R a+rwX "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
+            'fi'
         ]
 
         teardown_script = [
