@@ -44,6 +44,7 @@ class AbstractLocalizer(abc.ABC):
         self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
         common: bool = True, staging_dir: str = None,
         project: typing.Optional[str] = None,
+        token: typing.Optional[str] = None,
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
         use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
         **kwargs
@@ -84,6 +85,7 @@ class AbstractLocalizer(abc.ABC):
 
         self.clean_on_exit = True
         self.project = project if project is not None else get_default_gcp_project()
+        self.token = token
 
         # will be removed
         self.local_download_size = {} # {jobId: size}
@@ -477,7 +479,7 @@ class AbstractLocalizer(abc.ABC):
                     paths = [paths] if not isinstance(paths, list) else paths
                     if arg not in overrides:
                         for p in paths:
-                            fh = file_handlers.get_file_handler(p)
+                            fh = file_handlers.get_file_handler(p, project = self.project, token = self.token)
 
                             # if hash has already been precomputed, use it
                             # this will be the case if FileType objects are 
@@ -551,7 +553,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## if input is a string, convert it to the appropriate FileType object
             if isinstance(value, str):
-                value = file_handlers.get_file_handler(value)
+                value = file_handlers.get_file_handler(value, project = self.project, token = self.token)
             else:
                 assert isinstance(value, file_handlers.FileType)
 
