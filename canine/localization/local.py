@@ -38,7 +38,7 @@ class BatchedLocalizer(AbstractLocalizer):
         the localizer's entire life cycle.
         If staging_dir is not provided, a random directory is chosen
         """
-        super().__init__(backend, transfer_bucket, common, staging_dir, project)
+        super().__init__(backend, transfer_bucket, common, staging_dir, project, **kwargs)
         self.queued_gs = [] # Queued gs:// -> remote staging transfers
         self.queued_batch = [] # Queued local -> remote directory transfers
         self._has_localized = False
