@@ -692,6 +692,9 @@ class AbstractLocalizer(abc.ABC):
         if len(out) == 2: # header + one result
             canine_logging.info1("Found existing disk {}".format(disk_name))
 
+            # no additional localization or teardown commands necessary, since
+            # inputs will be transformed into rodisk *inputs*, whose localization
+            # commands will be handled downstream
             return disk_mountpoint, [], [], rodisk_paths
 
         canine_logging.info1("Creating new persistent disk {}".format(disk_name))
@@ -785,6 +788,19 @@ class AbstractLocalizer(abc.ABC):
 
             # save rodisk:// URLs for files saved to the disk for later use
             self.rodisk_paths[jobId] = rodisk_paths
+
+            # if disk already exists (as indicated by blank disk creation script),
+            # treat each localizable input as a RODISK
+            if len(disk_creation_script) == 0:
+                for k, v_array in self.rodisk_paths[jobId].items():
+                    # if this input had previously been localized in prepare_job_inputs,
+                    # delete it
+                    for v in self.inputs[jobId][k]:
+                        if v.localization_mode == "local": 
+                            localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path.remotepath)]
+
+                    # transform this input into a RODISK FileType
+                    self.inputs[jobId][k] = [file_handlers.HandleRODISKURL(v) for v in v_array]
 
         #
         # create creation script for scratch disk, if specified
