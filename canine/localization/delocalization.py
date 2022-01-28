@@ -46,7 +46,7 @@ def compute_crc32c(direc):
     else:
         return re.findall(r'Hashes \[hex\] for (.*):\n\tHash \(crc32c\):\t\t([A-Fa-f0-9]{8})\n', out)
 
-def main(output_dir, jobId, patterns, copy):
+def main(output_dir, jobId, patterns, copy, scratch):
     jobdir = os.path.join(output_dir, str(jobId))
     if not os.path.isdir(jobdir):
         os.makedirs(jobdir)
@@ -65,9 +65,13 @@ def main(output_dir, jobId, patterns, copy):
                     if not os.path.isdir(os.path.dirname(dest)):
                         os.makedirs(os.path.dirname(dest))
                     if os.path.isfile(target):
+                        # we've output to a scratch disk; create (broken) symlink to RODISK mount
+                        if scratch:
+                            os.symlink(os.path.abspath(target), dest)
                         # Same volume check catches outputs from outside the workspace
-                        if copy or not same_volume(target, jobdir):
+                        elif copy or not same_volume(target, jobdir):
                             shutil.copyfile(os.path.abspath(target), dest)
+                        # TODO: is st_dev check equivalent to same_volume?
                         elif os.stat(target).st_dev == os.stat(os.path.dirname(dest)).st_dev:
                             os.symlink(os.path.relpath(target, os.path.dirname(dest)), dest)
                         else:
@@ -129,5 +133,10 @@ if __name__ == '__main__':
         action='store_true',
         help="Copy outputs instead of symlinking"
     )
+    parser.add_argument(
+        '-s', '--scratch',
+        action='store_true',
+        help="Outputs were written to a scratch disk; will create (broken) symlinks to the scratch diskmountpoint"
+    )
     args = parser.parse_args()
-    main(args.dest, args.jobId, args.pattern, args.copy)
+    main(args.dest, args.jobId, args.pattern, args.copy, args.scratch)
