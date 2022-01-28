@@ -1,6 +1,7 @@
 import abc
 import google.cloud.storage
-import glob, google_crc32c, json, hashlib, base64, binascii, os, re, shlex, subprocess, threading
+import glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading
+import pandas as pd
 
 from ..utils import sha1_base32, canine_logging
 
@@ -203,6 +204,56 @@ class HandleGSURLStream(HandleGSURL):
 class HandleGDCHTTPURL(FileType):
     localization_mode = "url"
 
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+
+        self.token = self.extra_args["token"] if "token" in self.extra_args else None 
+        self.token_flag = f'--header  "X-Auth-Token: {self.token}"' if self.token is not None else ''
+
+        # parse URL
+        self.url = self.path
+        url_parse = re.match(r"^(https://api.(?:awg\.)gdc.cancer.gov)/(?:files|data)/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})", self.url)
+        if url_parse is None:
+            raise ValueError("Invalid GDC ID '{}'".format(self.url))
+
+        self.prefix = url_parse[1]
+        self.uuid = url_parse[2]
+
+        # the actual filename is encoded in the content-disposition header;
+        # save this to self.path
+        # since the filesize and hashes are also encoded in the header, populate
+        # these fields now
+        resp_headers = subprocess.run(
+          'curl -s -D - -o /dev/full {token_flag} {file}'.format(
+            token_flag = self.token_flag,
+            file = self.path
+          ),
+          shell = True,
+          capture_output = True
+        )
+        try:
+            headers = pd.DataFrame(
+              [x.split(": ") for x in resp_headers.stdout.decode().split("\r\n")[1:]],
+              columns=["header", "value"],
+            ).set_index("header")["value"]
+
+            self.path = re.match(".*filename=(.*)$", headers["Content-Disposition"])[1]
+            self._size = headers["Content-Length"]
+            self._hash = headers["Content-MD5"]
+        except:
+            canine_logging.error("Error parsing GDC filename; see stack trace for details")
+            raise 
+        self.localized_path = self.path
+
+    def localization_command(self, dest):
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+        if self.token is not None:
+            return "curl -OJ {token} '{url}'".format(token = self.token_flag, url = self.url)
+        else:
+            return "curl -OJ '{url}'".format(url = self.url)
+
 # }}}
 
 ## Regular files {{{
@@ -298,8 +349,8 @@ class HandleRODISKURL(FileType):
 def get_file_handler(path, url_map = None, **kwargs):
     url_map = {
       r"^gs://" : HandleGSURL, 
-      r"^gdc://" : None,
-      r"^rodisk://" : None,
+      r"^https://api.gdc.cancer.gov" : HandleGDCHTTPURL,
+      r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^rodisk://" : HandleRODISKURL,
     } if url_map is None else url_map
 
