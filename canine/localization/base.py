@@ -732,7 +732,17 @@ class AbstractLocalizer(abc.ABC):
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
         teardown_script = [
-          'sudo umount {}/{}'.format(mount_prefix, disk_name),
+          ## sync any cached data
+          'sync',
+
+          ## unmount disk, with exponential backoff up to 2 minutes
+          'DELAY=1',
+          'while ! sudo umount {}/{}; do'.format(mount_prefix, disk_name),
+          '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk"; exit 1; } || :',
+          '  sleep $DELAY; ((DELAY *= 2))',
+          'done',
+
+          ## detach disk
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
           'gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
@@ -818,8 +828,8 @@ class AbstractLocalizer(abc.ABC):
               disk_size = self.scratch_disk_size
             )
 
-            # need to leave the job root directory to allow the disk to unmount
-            scratch_disk_teardown_script = ["cd $CANINE_JOB_WORKSPACE/.."] + scratch_disk_teardown_script
+            # need to leave the job workspace directory to allow the disk to unmount
+            scratch_disk_teardown_script = ["cd $CANINE_JOB_ROOT"] + scratch_disk_teardown_script
 
             localization_tasks += scratch_disk_creation_script
 
