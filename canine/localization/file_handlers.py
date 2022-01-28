@@ -116,18 +116,16 @@ class HandleGSURL(FileType):
         Returns True if the requested gs:// object or bucket resides in a
         requester pays bucket
         """
-        bucket = self.path.split('/')[0]
+        bucket = re.match(r"gs://(.*?)/.*", self.path)[1]
 
         ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
-        if ret.returncode == 0 or b'BucketNotFoundException: 404' not in ret.stderr:
-           return \
-             b'requester pays bucket but no user project provided' in ret.stderr \
-             or 'gs://{}: Enabled'.format(bucket).encode() in ret.stdout
+        if b'requester pays bucket but no user project provided' in ret.stderr:
+            return True
         else:
             # Try again ls-ing the object itself
             # sometimes permissions can disallow bucket inspection
             # but allow object inspection
-            ret = subprocess.run('gsutil ls gs://{}'.format(self.path), shell = True, capture_output = True)
+            ret = subprocess.run('gsutil ls {}'.format(self.path), shell = True, capture_output = True)
             return b'requester pays bucket but no user project provided' in ret.stderr
 
         if ret.returncode == 1 and b'BucketNotFoundException: 404' in ret.stderr:
