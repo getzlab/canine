@@ -56,7 +56,7 @@ $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh >&2
 LOCALIZER_JOB_RC=$?
 if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   echo '~~~~ LOCALIZATION COMPLETE ~~~~' >&2
-  echo -n 0 > ../.localizer_exit_code
+  echo -n 0 > $CANINE_JOB_ROOT/.localizer_exit_code
   cd $CANINE_JOB_WORKSPACE
   while true; do
     echo '======================' >&2
@@ -75,23 +75,23 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
       echo "INFO: Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
-      [ -f ../stdout ] && mv ../stdout ../stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
-      [ -f ../stderr ] && mv ../stderr ../stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
+      [ -f $CANINE_JOB_ROOT/stdout ] && mv $CANINE_JOB_ROOT/stdout $CANINE_JOB_ROOT/stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
+      [ -f $CANINE_JOB_ROOT/stderr ] && mv $CANINE_JOB_ROOT/stderr $CANINE_JOB_ROOT/stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       scontrol requeue $SLURM_JOB_ID
     fi
   done
-  echo -n $CANINE_JOB_RC > ../.job_exit_code
+  echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
 else
   echo '!~~~ LOCALIZATION FAILURE! JOB CANNOT RUN! ~~~!' >&2
-  echo -n "DNR" > ../.job_exit_code
-  echo -n $LOCALIZER_JOB_RC > ../.localizer_exit_code
+  echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code
+  echo -n $LOCALIZER_JOB_RC > $CANINE_JOB_ROOT/.localizer_exit_code
   CANINE_JOB_RC=$LOCALIZER_JOB_RC
 fi
 echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
 DELOC_RC=$?
 [ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
-echo -n $DELOC_RC > ../.teardown_exit_code
+echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=version)
 
