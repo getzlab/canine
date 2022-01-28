@@ -155,14 +155,15 @@ class HandleGSURL(FileType):
         bucket = res[1]
         blob = res[2]
 
-        # TODO: do we need to pass in user project for requester pays buckets here?
         gcs_cl = gcloud_storage_client()
+
+        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"])
 
         # check whether this path exists, and whether it's a directory
 
         i = 0
         is_dir = False
-        for b in gcs_cl.list_blobs(bucket, prefix = blob):
+        for b in gcs_cl.list_blobs(bucket_obj, prefix = blob):
             # if there's more than 1 item in the list, it's a directory, since list_blobs
             # returns both the blob and other blobs within it
             if i >= 1:
@@ -177,7 +178,7 @@ class HandleGSURL(FileType):
         # if it's a directory, hash the set of CRCs within
         if is_dir:
             files = set()
-            for b in gcs_cl.list_blobs(bucket, prefix = blob):
+            for b in gcs_cl.list_blobs(bucket_obj, prefix = blob):
                 files.add(b.crc32c)
             return hash_set(files)
 
