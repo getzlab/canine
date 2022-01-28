@@ -596,7 +596,7 @@ class AbstractLocalizer(abc.ABC):
                 if mode == 'stream':
                     # XXX: currently, we only support streaming gs:// URLs,
                     #      so we explicitly check here
-                    if not value.startswith('gs://'):
+                    if not value.path.startswith('gs://'):
                         raise ValueError("Only gs:// files are currently supported for streaming!")
                     else:
                         value.localization_mode = "stream"
