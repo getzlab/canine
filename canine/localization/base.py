@@ -814,7 +814,7 @@ class AbstractLocalizer(abc.ABC):
             )
 
             # need to leave the job root directory to allow the disk to unmount
-            scratch_disk_teardown_script = ["cd $CANINE_JOB_ROOT/.."] + scratch_disk_teardown_script
+            scratch_disk_teardown_script = ["cd $CANINE_JOB_WORKSPACE/.."] + scratch_disk_teardown_script
 
             localization_tasks += scratch_disk_creation_script
 
@@ -1054,7 +1054,8 @@ class AbstractLocalizer(abc.ABC):
                 '#!/bin/bash',
                 'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
                 'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
-                'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
+                'export CANINE_JOB_WORKSPACE="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
+                'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId)),
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
                 'export CANINE_JOB_LOCALIZATION="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'localization.sh')),
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
@@ -1062,11 +1063,11 @@ class AbstractLocalizer(abc.ABC):
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'chmod 755 $CANINE_JOB_LOCALIZATION',
             ] + 
-            # if we are using a scratch disk, make CANINE_JOB_ROOT the disk mountpoint
+            # if we are using a scratch disk, make CANINE_JOB_WORKSPACE the disk mountpoint
             [
-              f"ln -s {scratch_disk_prefix} $CANINE_JOB_ROOT" if self.use_scratch_disk else \
-              'mkdir -p $CANINE_JOB_ROOT'
-            ] + ['cd $CANINE_JOB_ROOT'] + exports
+              f"ln -s {scratch_disk_prefix} $CANINE_JOB_WORKSPACE" if self.use_scratch_disk else \
+              'mkdir -p $CANINE_JOB_WORKSPACE'
+            ] + ['cd $CANINE_JOB_WORKSPACE'] + exports
         ) + "\n"
 
         # generate localization script

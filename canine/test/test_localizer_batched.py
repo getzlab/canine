@@ -286,7 +286,7 @@ class TestIntegration(unittest.TestCase):
                             setup_text
                         )
                         self.assertIn(
-                            'export CANINE_JOB_ROOT="{}"'.format(os.path.join(localizer.environment('remote')['CANINE_JOBS'], str(jid), 'workspace')),
+                            'export CANINE_JOB_WORKSPACE="{}"'.format(os.path.join(localizer.environment('remote')['CANINE_JOBS'], str(jid), 'workspace')),
                             setup_text
                         )
                         self.assertIn(
