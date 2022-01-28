@@ -157,20 +157,23 @@ class HandleGSURL(FileType):
 
         gcs_cl = gcloud_storage_client()
 
-        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"])
+        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"] if "project" in self.extra_args else None)
 
         # check whether this path exists, and whether it's a directory
 
-        i = 0
         is_dir = False
+        exists = False
+        blob_obj = None
         for b in gcs_cl.list_blobs(bucket_obj, prefix = blob):
-            # if there's more than 1 item in the list, it's a directory, since list_blobs
-            # returns both the blob and other blobs within it
-            if i >= 1:
+            if b.name == blob:
+                exists = True
+                blob_obj = b
+            # a blob ending in a trailing slash is a directory
+            if b.name.endswith("/") and b.name.strip("/") == blob:
+                exists = True
                 is_dir = True
+                blob_obj = b
                 break
-            i += 1
-        exists = not i == 0
 
         if not exists:
             raise GSFileNotExists("{} does not exist.".format(self.path))
@@ -185,7 +188,7 @@ class HandleGSURL(FileType):
         # for backwards compatibility, if it's a file, return the file directly
         # TODO: for cleaner code, we really should just always return a set and hash it
         else:
-            return binascii.hexlify(base64.b64decode(b.crc32c)).decode().lower()
+            return binascii.hexlify(base64.b64decode(blob_obj.crc32c)).decode().lower()
 
     def localization_command(self, dest):
         dest_dir = shlex.quote(os.path.dirname(dest))
