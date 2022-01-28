@@ -53,7 +53,7 @@ source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 echo 'COMPLETE ----' >&2
 echo '~~~~ STARTING JOB LOCALIZATION ~~~~' >&2
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh >&2
-LOCALIZER_JOB_RC=$?
+export LOCALIZER_JOB_RC=$?
 if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   echo '~~~~ LOCALIZATION COMPLETE ~~~~' >&2
   echo -n 0 > $CANINE_JOB_ROOT/.localizer_exit_code
