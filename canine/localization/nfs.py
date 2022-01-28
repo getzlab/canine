@@ -207,6 +207,12 @@ class NFSLocalizer(BatchedLocalizer):
                     if outputname not in patterns:
                         warnings.warn("Detected output directory {} which was not declared".format(dirpath))
                     output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
+
+                    # if we're using a scratch disk, outputs should be RODISK
+                    # objects for downstream tasks to mount. read symlinks to
+                    # RODISK URLs
+                    if self.use_scratch_disk:
+                        output_files[jobId][outputname] = ["rodisk://" + re.match(r".*(canine-scratch.*)", os.readlink(x))[1] for x in output_files[jobId][outputname]]
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
         return output_files
