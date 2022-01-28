@@ -57,6 +57,7 @@ LOCALIZER_JOB_RC=$?
 if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   echo '~~~~ LOCALIZATION COMPLETE ~~~~' >&2
   echo -n 0 > ../.localizer_exit_code
+  cd $CANINE_JOB_WORKSPACE
   while true; do
     echo '======================' >&2
     echo '==== STARTING JOB ====' >&2

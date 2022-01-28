@@ -1072,7 +1072,7 @@ class AbstractLocalizer(abc.ABC):
             [
               f"ln -s {scratch_disk_prefix} $CANINE_JOB_WORKSPACE" if self.use_scratch_disk else \
               'mkdir -p $CANINE_JOB_WORKSPACE'
-            ] + ['cd $CANINE_JOB_WORKSPACE'] + exports
+            ] + exports
         ) + "\n"
 
         # generate localization script
