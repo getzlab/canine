@@ -146,7 +146,7 @@ class HandleGSURL(FileType):
             self.rp_string = f' -u {self.extra_args["project"]}'
 
     def _get_size(self):
-        output = subprocess.check_output('gsutil du -s {} {}'.format(shlex.quote(self.path.strip("/")), self.rp_string), shell=True).decode()
+        output = subprocess.check_output('gsutil {} du -s {}'.format(self.rp_string, shlex.quote(self.path.strip("/"))), shell=True).decode()
         return int(output.split()[0])
 
     def _get_hash(self):
