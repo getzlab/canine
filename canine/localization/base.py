@@ -806,7 +806,17 @@ class AbstractLocalizer(abc.ABC):
 
         #
         # create creation script for scratch disk, if specified
-        # TODO
+        if self.use_scratch_disk:
+            scratch_disk_prefix, scratch_disk_creation_script, \
+            scratch_disk_teardown_script, _ = self.create_persistent_disk(
+              disk_name = self.scratch_disk_name,
+              disk_size = self.scratch_disk_size
+            )
+
+            # need to leave the job root directory to allow the disk to unmount
+            scratch_disk_teardown_script = ["cd $CANINE_JOB_ROOT/.."] + scratch_disk_teardown_script
+
+            localization_tasks += scratch_disk_creation_script
 
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
@@ -1048,11 +1058,16 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
                 'export CANINE_JOB_LOCALIZATION="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'localization.sh')),
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
+                'export CANINE_DOCKER_ARGS="{docker}"'.format(docker=' '.join(set(docker_args))),
                 'mkdir -p $CANINE_JOB_INPUTS',
-                'mkdir -p $CANINE_JOB_ROOT',
                 'chmod 755 $CANINE_JOB_LOCALIZATION',
-            ] + exports
-        ) + '\nexport CANINE_DOCKER_ARGS="{docker}"\ncd $CANINE_JOB_ROOT\n'.format(docker=' '.join(set(docker_args)))
+            ] + 
+            # if we are using a scratch disk, make CANINE_JOB_ROOT the disk mountpoint
+            [
+              f"ln -s {scratch_disk_prefix} $CANINE_JOB_ROOT" if self.use_scratch_disk else \
+              'mkdir -p $CANINE_JOB_ROOT'
+            ] + ['cd $CANINE_JOB_ROOT'] + exports
+        ) + "\n"
 
         # generate localization script
         localization_script = '\n'.join([
@@ -1079,7 +1094,7 @@ class AbstractLocalizer(abc.ABC):
                 ),
                 'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi'
             ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
-            # TODO: add teardown script for scratch disks
+              + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
         return setup_script, localization_script, teardown_script, array_exports
 
