@@ -599,7 +599,7 @@ class AbstractLocalizer(abc.ABC):
                     if not value.path.startswith('gs://'):
                         raise ValueError("Only gs:// files are currently supported for streaming!")
                     else:
-                        value.localization_mode = "stream"
+                        return file_handlers.HandleGSURLStream(value.path, project = self.project)
 
                 # user wants to treat this path as a string literal
                 elif mode is None or mode == 'null' or mode == 'string':
@@ -893,7 +893,6 @@ class AbstractLocalizer(abc.ABC):
             is_array = self.input_array_flag[jobId][key]
             for file_handler in file_handler_array: 
                 # create FIFO to stream directly from bucket
-                # TODO: generate these commands in file_handlers.py
                 if file_handler.localization_mode == 'stream':
                     job_vars.add(shlex.quote(key))
                     if not stream_dir_ready:
@@ -901,16 +900,7 @@ class AbstractLocalizer(abc.ABC):
                         docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
                         stream_dir_ready = True
                     dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(file_handler.path)))
-                    localization_tasks += [
-                        'gsutil ls {} > /dev/null'.format(shlex.quote(file_handler.path)),
-                        'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
-                        'mkfifo {}'.format(dest),
-                        "gsutil {} cat {} > {} &".format(
-                            '-u {}'.format(shlex.quote(self.project)) if self.get_requester_pays(file_handler.path) else '',
-                            shlex.quote(file_handler.path),
-                            dest
-                        )
-                    ]
+                    localization_tasks += file_handler.localization_command(dest)
                     export_writer(key, dest, is_array)
 
                 # this is a URL; create command to download it

@@ -198,7 +198,16 @@ class HandleGSURL(FileType):
 
 class HandleGSURLStream(HandleGSURL):
     localization_mode = "stream"
-    # TODO: generate the command to make a FIFO. everything else is the same
+
+    def localization_command(self, dest):
+        return ['gsutil {} ls {} > /dev/null'.format(self.rp_string, shlex.quote(self.path)),
+        'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
+        'mkfifo {}'.format(dest),
+        "gsutil {} cat {} > {} &".format(
+            self.rp_string,
+            shlex.quote(self.path),
+            dest
+        )]
 
 # }}}
 
