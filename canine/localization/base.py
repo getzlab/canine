@@ -988,7 +988,7 @@ class AbstractLocalizer(abc.ABC):
 
                     export_writer(
                       key,
-                      file_handler.path, # not actually a path, per se
+                      shlex.quote(file_handler.path), # not actually a path, per se
                       is_array
                     )
 
