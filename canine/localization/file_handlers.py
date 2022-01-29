@@ -249,7 +249,7 @@ class HandleGDCHTTPURL(FileType):
             ).set_index("header")["value"]
 
             self.path = re.match(".*filename=(.*)$", headers["Content-Disposition"])[1]
-            self._size = headers["Content-Length"]
+            self._size = int(headers["Content-Length"])
             self._hash = headers["Content-MD5"]
         except:
             canine_logging.error("Error parsing GDC filename; see stack trace for details")
