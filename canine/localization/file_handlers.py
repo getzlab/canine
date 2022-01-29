@@ -261,9 +261,9 @@ class HandleGDCHTTPURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         if self.token is not None:
-            return "curl -OJ {token} '{url}'".format(token = self.token_flag, url = self.url)
+            return "curl -C - -o {path} {token} '{url}'".format(path = self.localized_path, token = self.token_flag, url = self.url)
         else:
-            return "curl -OJ '{url}'".format(url = self.url)
+            return "curl -C - -o {path} '{url}'".format(path = self.localized_path, url = self.url)
 
 # }}}
 
