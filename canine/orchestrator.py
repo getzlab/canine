@@ -467,7 +467,7 @@ class Orchestrator(object):
 
         return entrypoint_path
 
-    def wait_for_jobs_to_finish(self, batch_id, localizer = None):
+    def wait_for_jobs_to_finish(self, batch_id, localizer = None, track_uptime = False):
         def grouper(g):
             g = g.sort_values("Submit")
             final = g.iloc[-1]
@@ -523,17 +523,19 @@ class Orchestrator(object):
                                 acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
 
             # track node uptime
-            try:
-                for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
-                    if node in uptime:
-                        uptime[node] += 1
-                    else:
-                        uptime[node] = 1
-            # squeue can fail here if the job completed by the time we call it,
-            # so we catch any errors.
-            # TODO: make something less heavy-handed; this may hide true failures
-            except CalledProcessError:
-                pass
+            # this is an expensive operation, so only track if requested
+            if track_uptime:
+                try:
+                    for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
+                        if node in uptime:
+                            uptime[node] += 1
+                        else:
+                            uptime[node] = 1
+                # squeue can fail here if the job completed by the time we call it,
+                # so we catch any errors.
+                # TODO: make something less heavy-handed; this may hide true failures
+                except CalledProcessError:
+                    pass
 
         return completed_jobs, uptime, acct
 
