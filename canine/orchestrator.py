@@ -493,12 +493,22 @@ class Orchestrator(object):
             jobs_dir = localizer.environment("local")["CANINE_JOBS"]
 
         while len(waiting_jobs):
-            time.sleep(30)
-            acct = self.backend.sacct(
-              "D",
-              job = batch_id,
-              format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
-            ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
+            backoff_factor = 1
+            while True:
+                time.sleep(30*backoff_factor)
+                acct = self.backend.sacct(
+                  "D",
+                  job = batch_id,
+                  format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
+                ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
+                # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
+                if len(acct) > 0:
+                    break
+                # corresponds to a five minute backoff
+                elif backoff_factor >= 31:
+                    raise Exception("Timeout exceeded waiting to query job accounting information; cluster is likely under extreme load!")
+                else:
+                    backoff_factor *= 1.1
             acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))]
             acct.loc[acct["ResvCPURAW"].isna(), "ResvCPURAW"] = 0
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
