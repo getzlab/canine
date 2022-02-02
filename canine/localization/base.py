@@ -708,6 +708,13 @@ class AbstractLocalizer(abc.ABC):
             'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
             'fi',
 
+            # TODO: how to handle if disk is already attached to another instance?
+            #       this likely means that the task exited on the other
+            #       instance without running the teardown script
+            #       (e.g. task was cancelled), in which case we'd want to forcibly
+            #       detach the disk from the other instance
+            #       are there any scenarios in which this would be a bad idea?
+
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
             'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
