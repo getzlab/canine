@@ -4,6 +4,7 @@ import typing
 import shlex
 from contextlib import ExitStack
 from .base import AbstractLocalizer, PathType, Localization
+from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project, check_call
 from agutil import status_bar
@@ -29,18 +30,20 @@ class RemoteLocalizer(AbstractLocalizer):
                 transport.makedirs(self.environment('remote')['CANINE_OUTPUT'])
         return self
 
-    def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
+    def localize_file(self, src: file_handlers.FileType, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
         Localizes the given file.
         All files are immediately transferred
         """
-        if src.startswith('gs://'):
-            self.gs_copy(
-                src,
-                dest.remotepath,
-                'remote'
-            )
-        elif os.path.exists(src):
+        # it's a remote URL; get localization command and execute
+        if src.localization_mode == "url":
+            cmd = src.localization_command(dest.localpath)
+            rc, sout, serr = self.backend.invoke(cmd, True)
+            check_call(command, rc, sout, serr)
+
+        # it's a local file
+        elif os.path.exists(src.path):
+            src = src.path
             with self.transport_context(transport) as transport:
                 if not transport.isdir(os.path.dirname(dest.remotepath)):
                     transport.makedirs(os.path.dirname(dest.remotepath))
@@ -86,7 +89,7 @@ class RemoteLocalizer(AbstractLocalizer):
 
                 # Now localize job setup, localization, and teardown scripts, and
                 # any array job files
-                setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns)
+                setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns, transport)
 
                 # Setup:
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')

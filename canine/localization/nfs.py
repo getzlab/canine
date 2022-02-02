@@ -9,6 +9,7 @@ import glob
 import subprocess
 from .base import PathType, Localization
 from .local import BatchedLocalizer
+from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project
 from agutil import status_bar
@@ -28,10 +29,7 @@ class NFSLocalizer(BatchedLocalizer):
     """
 
     def __init__(
-        self, backend: AbstractSlurmBackend, transfer_bucket: typing.Optional[str] = None,
-        common: bool = True, staging_dir: str = None,
-        project: typing.Optional[str] = None, temporary_disk_type: str = 'standard',
-        local_download_dir: typing.Optional[str] = None,**kwargs
+        self, backend: AbstractSlurmBackend, staging_dir = None, **kwargs
     ):
         """
         Initializes the Localizer using the given transport.
@@ -43,42 +41,32 @@ class NFSLocalizer(BatchedLocalizer):
         """
         if staging_dir is None:
             raise TypeError("staging_dir is a required argument for NFSLocalizer")
-        if transfer_bucket is not None:
-            warnings.warn("transfer_bucket has no bearing on NFSLocalizer. It is kept purely for adherence to the API")
-        self.backend = backend
-        self.common = common
-        self.common_inputs = set()
+
+        # superclass constructor can mostly be re-used as is, except ...
+        super().__init__(backend, staging_dir = staging_dir, **kwargs)
+
+        # ... we don't normalize paths for this localizer. Use staging dir as given
         self._local_dir = None
-        # We don't normalize paths for this localizer. Use staging dir as given
         self.staging_dir = staging_dir
         self.local_dir = staging_dir
         if not os.path.isdir(self.local_dir):
             os.makedirs(self.local_dir)
-        self.inputs = {} # {jobId: {inputName: [(handle type, handle value), ...]}}
-        self.input_array_flag = {} # {jobId: {inputName: <bool: is this an array?>}}
-        self.clean_on_exit = True
-        self.project = project if project is not None else get_default_gcp_project()
-        self.local_download_size = {} # {jobId: size}
-        self.disk_key = os.urandom(4).hex()
-        self.local_download_dir = local_download_dir if local_download_dir is not None else '/mnt/canine-local-downloads/{}'.format(self.disk_key)
-        self.temporary_disk_type = temporary_disk_type
-        self.requester_pays = {}
 
-    def localize_file(self, src: str, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
+    def localize_file(self, src: file_handlers.FileType, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """
         Localizes the given file.
-        * gs:// files are copied to the specified destination
+        * remote URLs are copied to the specified destination
         * local files are symlinked to the specified destination
         * results dataframes are copied to the specified directory
         """
-        if src.startswith('gs://'):
-            self.gs_copy(
-                src,
-                dest.localpath,
-                'local'
-            )
-        elif os.path.exists(src):
-            src = os.path.realpath(os.path.abspath(src))
+        # it's a remote URL; get localization command and execute
+        if src.localization_mode == "url":
+            cmd = src.localization_command(dest.localpath)
+            subprocess.check_call(cmd, shell = True)
+
+        # it's a local file
+        elif os.path.exists(src.path):
+            src = os.path.realpath(os.path.abspath(src.path))
 
             if re.search(r"\.k9df\..*$", os.path.basename(src)) is None:
                 if not os.path.isdir(os.path.dirname(dest.localpath)):
@@ -110,8 +98,8 @@ class NFSLocalizer(BatchedLocalizer):
         if overrides is None:
             overrides = {}
 
-        # automatically override inputs that are absolute paths residing on the same
-        # NFS share and are not Canine outputs
+        # for inputs that are absolute paths residing on the same NFS share,
+        # and are not Canine outputs, treat them as string literals
 
         # XXX: this can be potentially slow, since it has to iterate over every
         #      single input. It would make more sense to do this before the adapter
@@ -148,9 +136,9 @@ class NFSLocalizer(BatchedLocalizer):
                 ))
                 self.prepare_job_inputs(jobId, data, common_dests, overrides, transport=transport)
 
-                # Now localize job setup, localization, and teardown scripts, and
+                # Now generate and localize job setup, localization, and teardown scripts, and
                 # any array job files
-                setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns)
+                setup_script, localization_script, teardown_script, array_exports = self.job_setup_teardown(jobId, patterns, transport)
 
                 # Setup:
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
@@ -219,6 +207,12 @@ class NFSLocalizer(BatchedLocalizer):
                     if outputname not in patterns:
                         warnings.warn("Detected output directory {} which was not declared".format(dirpath))
                     output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
+
+                    # if we're using a scratch disk, outputs should be RODISK
+                    # objects for downstream tasks to mount. read symlinks to
+                    # RODISK URLs
+                    if self.use_scratch_disk:
+                        output_files[jobId][outputname] = ["rodisk://" + re.match(r".*(canine-scratch.*)", os.readlink(x))[1] for x in output_files[jobId][outputname]]
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
         return output_files

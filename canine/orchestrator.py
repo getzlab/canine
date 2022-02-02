@@ -8,13 +8,13 @@ import traceback
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
-from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer
+from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer, file_handlers
 from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered, canine_logging
 import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.10.7'
+version = '0.11.1'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -53,10 +53,11 @@ source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 echo 'COMPLETE ----' >&2
 echo '~~~~ STARTING JOB LOCALIZATION ~~~~' >&2
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh >&2
-LOCALIZER_JOB_RC=$?
+export LOCALIZER_JOB_RC=$?
 if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   echo '~~~~ LOCALIZATION COMPLETE ~~~~' >&2
-  echo -n 0 > ../.localizer_exit_code
+  echo -n 0 > $CANINE_JOB_ROOT/.localizer_exit_code
+  cd $CANINE_JOB_WORKSPACE
   while true; do
     echo '======================' >&2
     echo '==== STARTING JOB ====' >&2
@@ -74,23 +75,24 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
       echo "INFO: Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
-      [ -f ../stdout ] && mv ../stdout ../stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
-      [ -f ../stderr ] && mv ../stderr ../stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
+      [ -f $CANINE_JOB_ROOT/stdout ] && mv $CANINE_JOB_ROOT/stdout $CANINE_JOB_ROOT/stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
+      [ -f $CANINE_JOB_ROOT/stderr ] && mv $CANINE_JOB_ROOT/stderr $CANINE_JOB_ROOT/stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       scontrol requeue $SLURM_JOB_ID
     fi
   done
-  echo -n $CANINE_JOB_RC > ../.job_exit_code
+  echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
 else
   echo '!~~~ LOCALIZATION FAILURE! JOB CANNOT RUN! ~~~!' >&2
-  echo -n "DNR" > ../.job_exit_code
-  echo -n $LOCALIZER_JOB_RC > ../.localizer_exit_code
+  echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code
+  echo -n $LOCALIZER_JOB_RC > $CANINE_JOB_ROOT/.localizer_exit_code
   CANINE_JOB_RC=$LOCALIZER_JOB_RC
 fi
 echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
+cd $CANINE_JOB_ROOT
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
 DELOC_RC=$?
 [ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
-echo -n $DELOC_RC > ../.teardown_exit_code
+echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=version)
 
@@ -115,6 +117,9 @@ def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
         ]
     elif isinstance(obj, pd.core.frame.DataFrame):
         return stringify(obj.to_dict(orient = "list"))
+    # pass through FileType objects as-is
+    elif isinstance(obj, file_handlers.FileType):
+        return obj
 
     if safe:
         if "\n" in str(obj):
@@ -462,7 +467,7 @@ class Orchestrator(object):
 
         return entrypoint_path
 
-    def wait_for_jobs_to_finish(self, batch_id, localizer = None):
+    def wait_for_jobs_to_finish(self, batch_id, localizer = None, track_uptime = False):
         def grouper(g):
             g = g.sort_values("Submit")
             final = g.iloc[-1]
@@ -488,12 +493,22 @@ class Orchestrator(object):
             jobs_dir = localizer.environment("local")["CANINE_JOBS"]
 
         while len(waiting_jobs):
-            time.sleep(30)
-            acct = self.backend.sacct(
-              "D",
-              job = batch_id,
-              format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
-            ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
+            backoff_factor = 1
+            while True:
+                time.sleep(30*backoff_factor)
+                acct = self.backend.sacct(
+                  "D",
+                  job = batch_id,
+                  format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
+                ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
+                # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
+                if len(acct) > 0:
+                    break
+                # corresponds to a five minute backoff
+                elif backoff_factor >= 31:
+                    raise Exception("Timeout exceeded waiting to query job accounting information; cluster is likely under extreme load!")
+                else:
+                    backoff_factor *= 1.1
             acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))]
             acct.loc[acct["ResvCPURAW"].isna(), "ResvCPURAW"] = 0
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
@@ -518,17 +533,19 @@ class Orchestrator(object):
                                 acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
 
             # track node uptime
-            try:
-                for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
-                    if node in uptime:
-                        uptime[node] += 1
-                    else:
-                        uptime[node] = 1
-            # squeue can fail here if the job completed by the time we call it,
-            # so we catch any errors.
-            # TODO: make something less heavy-handed; this may hide true failures
-            except CalledProcessError:
-                pass
+            # this is an expensive operation, so only track if requested
+            if track_uptime:
+                try:
+                    for node in {node for node in self.backend.squeue(jobs=batch_id)['NODELIST(REASON)'] if not node.startswith('(')}:
+                        if node in uptime:
+                            uptime[node] += 1
+                        else:
+                            uptime[node] = 1
+                # squeue can fail here if the job completed by the time we call it,
+                # so we catch any errors.
+                # TODO: make something less heavy-handed; this may hide true failures
+                except CalledProcessError:
+                    pass
 
         return completed_jobs, uptime, acct
 
@@ -568,7 +585,7 @@ class Orchestrator(object):
                         ('job', 'cpu_seconds'): acct['CPUTimeRAW'][batch_id+'_'+str(array_id)],
                         ('job', 'submit_time'): acct['Submit'][batch_id+'_'+str(array_id)],
                         ('job', 'n_preempted'): acct['n_preempted'][batch_id+'_'+str(array_id)],
-                        **{ ('inputs', key) : val for key, val in job_spec[job_id].items() },
+                        **{ ('inputs', key) : str(val) for key, val in job_spec[job_id].items() },
                         **{
                             ('outputs', key) : val[0] if isinstance(val, list) and len(val) == 1 else val
                             for key, val in outputs[job_id].items()
