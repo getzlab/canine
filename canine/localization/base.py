@@ -681,7 +681,7 @@ class AbstractLocalizer(abc.ABC):
         # otherwise random
         else:
             disk_name = "canine-scratch-{}".format(disk_name if disk_name is not None else os.urandom(4).hex())
-            disk_size = max(10, 1 + int(disk_size/1022611260))
+            disk_size = max(10, disk_size)
             rodisk_paths = None
 
         ## mount prefix
