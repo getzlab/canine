@@ -1086,7 +1086,8 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
                 'export CANINE_DOCKER_ARGS="{docker}"'.format(docker=' '.join(set(docker_args))),
                 'mkdir -p $CANINE_JOB_INPUTS',
-                'chmod 755 $CANINE_JOB_LOCALIZATION',
+                'mkdir -p $CANINE_JOB_WORKSPACE',
+                'chmod 755 $CANINE_JOB_LOCALIZATION'
             ]
             # all exported job variables
             + exports
