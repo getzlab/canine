@@ -1103,7 +1103,7 @@ class AbstractLocalizer(abc.ABC):
             for line in [
                 '#!/bin/bash',
                 'set -e',
-                'if [[ -d {0} || -L {0} ]]; then cd {0}; fi'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
+                'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
                 'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3} {4}; else python {0} {1} {2} {3} {4}; fi'.format(
                     os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
