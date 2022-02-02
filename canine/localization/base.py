@@ -446,7 +446,7 @@ class AbstractLocalizer(abc.ABC):
                     # objects for downstream tasks to mount. read symlinks to
                     # RODISK URLs
                     if self.use_scratch_disk:
-                        output_files[jobId][outputname] = [re.match(r".*(canine-scratch.*)", os.readlink(x)) for x in output_files[jobId][outputname]]
+                        output_files[jobId][outputname] = ["rodisk://" + re.match(r".*(canine-scratch.*)", os.readlink(x))[1] for x in output_files[jobId][outputname]]
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
         return output_files
