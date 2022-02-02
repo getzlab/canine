@@ -754,7 +754,8 @@ class AbstractLocalizer(abc.ABC):
 
           ## unmount disk, with exponential backoff up to 2 minutes
           'DELAY=1',
-          'while ! sudo umount {}/{}; do'.format(mount_prefix, disk_name),
+          'while mountpoint {}/{} > /dev/null; do'.format(mount_prefix, disk_name),
+          '  sudo umount {}/{} || :'.format(mount_prefix, disk_name),
           '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk"; exit 1; } || :',
           '  sleep $DELAY; ((DELAY *= 2))',
           'done',
