@@ -1076,7 +1076,9 @@ class AbstractLocalizer(abc.ABC):
                 '#!/bin/bash',
                 'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
                 'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
-                'export CANINE_JOB_WORKSPACE="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')),
+                'export CANINE_JOB_WORKSPACE="{}"'.format(
+                  os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace') if not self.use_scratch_disk else scratch_disk_prefix
+                ),
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId)),
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
                 'export CANINE_JOB_LOCALIZATION="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'localization.sh')),
@@ -1084,11 +1086,6 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_DOCKER_ARGS="{docker}"'.format(docker=' '.join(set(docker_args))),
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'chmod 755 $CANINE_JOB_LOCALIZATION',
-            ] + 
-            # if we are using a scratch disk, make CANINE_JOB_WORKSPACE the disk mountpoint
-            [
-              f"ln -s {scratch_disk_prefix} $CANINE_JOB_WORKSPACE" if self.use_scratch_disk else \
-              'mkdir -p $CANINE_JOB_WORKSPACE'
             ]
             # all exported job variables
             + exports
