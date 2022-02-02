@@ -899,20 +899,21 @@ class AbstractLocalizer(abc.ABC):
                 array_exports[key].append(value)
 
         compute_env = self.environment('remote')
-        stream_dir_ready = False
         for key, file_handler_array in self.inputs[jobId].items():
             is_array = self.input_array_flag[jobId][key]
             for file_handler in file_handler_array: 
-                # create FIFO to stream directly from bucket
+                # identical to URL, but we don't have the option of localizing to
+                # a persistent disk, since localization_command will create
+                # some kind of FIFO
                 if file_handler.localization_mode == 'stream':
                     job_vars.add(shlex.quote(key))
-                    if not stream_dir_ready:
-                        exports.append('export CANINE_STREAM_DIR=$(mktemp -d /tmp/canine_streams.$SLURM_ARRAY_JOB_ID.$SLURM_ARRAY_TASK_ID.XXXX)')
-                        docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
-                        stream_dir_ready = True
-                    dest = os.path.join('$CANINE_STREAM_DIR', os.path.basename(os.path.abspath(file_handler.path)))
-                    localization_tasks += file_handler.localization_command(dest)
-                    export_writer(key, dest, is_array)
+                    dest = self.get_destination_path(
+                      os.path.basename(os.path.abspath(file_handler.path)),
+                      transport,
+                      'jobs', jobId, 'inputs', 
+                    )
+                    localization_tasks += [file_handler.localization_command(dest.remotepath)]
+                    export_writer(key, dest.remotepath, is_array)
 
                 # this is a URL; create command to download it
                 elif file_handler.localization_mode == 'url':
