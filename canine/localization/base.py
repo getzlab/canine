@@ -735,6 +735,17 @@ class AbstractLocalizer(abc.ABC):
             'fi'
         ]
 
+        # if we are creating a scratch disk (which will be accessed via
+        # the task container), we need to mount the scratch disk on the host VM,
+        # in addition to inside the Slurm worker VM (same code as mounting RODISK
+        # in job_setup_teardown)
+        if len(file_paths_arrays) == 0:
+            localization_script += [
+              "if [[ -f /.dockerenv ]]; then",
+              'sudo nsenter -t 1 -m mount -o noload,defaults /dev/disk/by-id/google-${GCP_DISK_NAME} "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+              "fi"
+            ]
+
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
         teardown_script = [
@@ -1038,9 +1049,9 @@ class AbstractLocalizer(abc.ABC):
               "sleep 10; ((++tries))",
               "done",
 
-              # mount within container
+              # mount within Slurm worker container
               "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
-              # mount on host (so that other dockers can access it)
+              # mount on host (so that task dockers can access it)
               "if [[ -f /.dockerenv ]]; then",
               "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
               "fi",
