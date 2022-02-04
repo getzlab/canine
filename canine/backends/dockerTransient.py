@@ -19,7 +19,7 @@ from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_
 from ..utils import get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
 
 from requests.exceptions import ConnectionError as RConnectionError
-from urllib3.exceptions import ProtocolError
+import urllib3.exceptions
 
 import pandas as pd
 
@@ -84,7 +84,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         except docker.errors.ImageNotFound:
             raise Exception("You have not yet built or pulled the Slurm Docker image!")
         except RConnectionError as e:
-            if isinstance(e.args[0], ProtocolError):
+            if isinstance(e.args[0], urllib3.exceptions.ProtocolError):
                 if isinstance(e.args[0].args[1], PermissionError):
                     raise PermissionError("You do not have permission to run Docker!")
                 elif isinstance(e.args[0].args[1], ConnectionRefusedError):
@@ -223,7 +223,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def _get_container(self, container_name):
         def closure():
-            return self.dkr.containers.get(container_name)
+            backoff_factor = 1
+            while True:
+                try:
+                    container = self.dkr.containers.get(container_name)
+                    break
+                except (urllib3.exceptions.HTTPError, urllib3.exceptions.ConnectionError, RConnectionError):
+                    canine_logging.warning(f"Request to controller Docker timed out; retrying in {int(10*backoff_factor)} seconds ...")
+                    time.sleep(10*backoff_factor)
+                    backoff_factor *= 1.1
+            return container
 
         return closure
 
