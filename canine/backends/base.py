@@ -429,6 +429,13 @@ class AbstractSlurmBackend(abc.ABC):
         """
         pass
 
+    def reenter(self):
+        """
+        If backend is passed between processes, some actions may be necessary
+        to ensure that race conditions do not arise.
+        """
+        pass
+
     @abc.abstractmethod
     def __exit__(self, *args):
         """

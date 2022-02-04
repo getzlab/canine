@@ -236,6 +236,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         return closure
 
+    def reenter(self):
+        # docker object cannot be reused between processes due to socket connections
+        self.dkr = docker.from_env()
+
     def export_NFS(self):
         ## Check if /mnt/nfs is created
         if not os.path.exists("/mnt/nfs"):
