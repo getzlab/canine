@@ -310,11 +310,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                       "OCI runtime exec failed: exec failed"
                     ]]):
                         canine_logging.warning(
-                          'Command {cmd} failed with known recoverable error reason "{err}"; retrying in {timeout} seconds up to {tries} times'.format(
+                          'Command {cmd} failed with known recoverable error reason "{err}"; retrying in {timeout} seconds up to {tries} more times'.format(
                             cmd = command,
                             err = stderr_str,
                             timeout = timeout,
-                            tries = 5 - tries
+                            tries = 7 - tries
                           )
                         )
                         time.sleep(timeout)
