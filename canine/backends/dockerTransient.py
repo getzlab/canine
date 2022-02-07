@@ -18,7 +18,7 @@ import shutil
 from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
 from ..utils import get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
 
-from requests.exceptions import ConnectionError as RConnectionError
+from requests.exceptions import ConnectionError as RConnectionError, ReadTimeout
 from urllib3.exceptions import ProtocolError
 
 import pandas as pd
@@ -223,7 +223,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
     def _get_container(self, container_name):
         def closure():
-            return self.dkr.containers.get(container_name)
+            backoff_factor = 1
+            while True:
+                try:
+                    container = self.dkr.containers.get(container_name)
+                    break
+                except ReadTimeout:
+                    canine_logging.warning(f"Request to controller Docker timed out; retrying in {int(10*backoff_factor)} seconds ...")
+                    time.sleep(10*backoff_factor)
+                    backoff_factor *= 1.1
+            return container
 
         return closure
 
