@@ -285,7 +285,9 @@ class HandleAWSURL(FileType):
 
                 ls_resp_headers = json.loads(ls_resp.stdout)
                 if len(ls_resp_headers["Contents"]) > 1:
-                    raise ValueError(f"Object {self.path} is a directory; we do not yet support localizing those from s3,")
+                    raise ValueError(f"Object {self.path} is a directory; we do not yet support localizing those from s3.")
+            elif b"(403)" in head_resp.stderr:
+                raise ValueError(f"You do not have permission to access {self.path}!")
         elif head_resp.returncode != 0:
             raise ValueError(f"Unknown AWS S3 error occurred:\n{head_resp.stderr.decode()}")
                 
