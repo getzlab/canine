@@ -163,7 +163,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # the rest will be set to "drain" (i.e., blacklisted) below.
         self.nodes = allnodes.groupby("machine_type").apply(
           lambda x : x.iloc[0:math.ceil(len(x)*self.config["clust_frac"])]
-        ).droplevel(0)
+        )
+        if self.nodes.index.nlevels > 1: 
+            self.nodes = self.nodes.droplevel(0)
 
         # set nodes that will never be used to drain
         for _, g in allnodes.loc[~allnodes.index.isin(self.nodes.index)].groupby("machine_type"):
