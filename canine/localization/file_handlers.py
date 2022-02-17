@@ -211,6 +211,111 @@ class HandleGSURLStream(HandleGSURL):
 
 # }}}
 
+## AWS S3 {{{
+
+class HandleAWSURL(FileType):
+    localization_mode = "url"
+
+    # TODO: use boto3 API; overhead for calling out to aws shell command might be high
+    # TODO: support directories
+
+    def __init__(self, path, **kwargs):
+        """
+        Optional arguments:
+        * aws_access_key_id
+        * aws_secret_access_key
+        * aws_endpoint_url
+        """
+        super().__init__(path, **kwargs)
+
+        # remove any trailing slashes, in case path refers to a directory
+        self.path = path.strip("/")
+
+        # keys get passed via environment variable
+        self.command_env = {}
+        self.command_env["AWS_ACCESS_KEY_ID"] = self.extra_args["aws_access_key_id"] if "aws_access_key_id" in self.extra_args else None 
+        self.command_env["AWS_SECRET_ACCESS_KEY"] = self.extra_args["aws_secret_access_key"] if "aws_secret_access_key" in self.extra_args else None 
+        self.command_env_str = " ".join([f"{k}={v}" for k, v in self.command_env.items() if v is not None])
+
+        # compute extra arguments for s3 commands
+        # TODO: add requester pays check here
+        self.aws_endpoint_url = self.extra_args["aws_endpoint_url"] if "aws_endpoint_url" in self.extra_args else None 
+
+        self.s3_extra_args = []
+        if self.command_env["AWS_ACCESS_KEY_ID"] is None and self.command_env["AWS_SECRET_ACCESS_KEY"] is None:
+            self.s3_extra_args += ["--no-sign-request" ]
+        if self.aws_endpoint_url is not None:
+            self.s3_extra_args += [f"--endpoint-url {self.aws_endpoint_url}"]
+        self.s3_extra_args_str = " ".join(self.s3_extra_args)
+
+        # get header for object
+        try:
+            res = re.search("^s3://([^/]+)/(.*)$", self.path)
+            bucket = res[1]
+            obj = res[2]
+        except:
+            raise ValueError(f"{self.path} is not a valid s3:// URL!")
+
+        head_resp = subprocess.run(
+          "{env} aws s3api {extra_args} head-object --bucket {bucket} --key {obj}".format(
+            env = self.command_env_str,
+            extra_args = self.s3_extra_args_str,
+            bucket = bucket,
+            obj = obj
+          ),
+          shell = True,
+          capture_output = True
+        )
+
+        if head_resp.returncode == 254:
+            if b"(404)" in head_resp.stderr:
+                # check if it's truly a 404 or a directory; we do not yet support these
+                ls_resp = subprocess.run(
+                  "{env} aws s3api {extra_args} list-objects-v2 --bucket {bucket} --prefix {obj} --max-items 2".format(
+                    env = self.command_env_str,
+                    extra_args = self.s3_extra_args_str,
+                    bucket = bucket,
+                    obj = obj
+                  ),
+                  shell = True,
+                  capture_output = True
+                )
+                if len(ls_resp.stdout) == 0:
+                    raise ValueError(f"Object {self.path} does not exist in bucket!")
+
+                ls_resp_headers = json.loads(ls_resp.stdout)
+                if len(ls_resp_headers["Contents"]) > 1:
+                    raise ValueError(f"Object {self.path} is a directory; we do not yet support localizing those from s3.")
+            elif b"(403)" in head_resp.stderr:
+                raise ValueError(f"You do not have permission to access {self.path}!")
+            else:
+                raise ValueError(f"Error accessing S3 file:\n{head_resp.stderr.decode()}")
+        elif head_resp.returncode != 0:
+            raise ValueError(f"Unknown AWS S3 error occurred:\n{head_resp.stderr.decode()}")
+                
+        self.headers = json.loads(head_resp.stdout)
+
+    def _get_hash(self):
+        return self.headers["ETag"].replace('"', '')
+
+    def _get_size(self):
+        return self.headers["ContentLength"]
+
+    def localization_command(self, dest):
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+
+        return "{env} aws s3 {extra_args} cp {url} {path}".format(
+          env = self.command_env_str,
+          extra_args = self.s3_extra_args_str,
+          url = self.path,
+          path = self.localized_path
+        )
+        
+
+# }}}
+
 ## GDC HTTPS URLs {{{
 class HandleGDCHTTPURL(FileType):
     localization_mode = "url"
@@ -360,6 +465,7 @@ class HandleRODISKURL(FileType):
 def get_file_handler(path, url_map = None, **kwargs):
     url_map = {
       r"^gs://" : HandleGSURL, 
+      r"^s3://" : HandleAWSURL, 
       r"^https://api.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^rodisk://" : HandleRODISKURL,
