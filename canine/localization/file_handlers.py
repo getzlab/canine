@@ -288,6 +288,8 @@ class HandleAWSURL(FileType):
                     raise ValueError(f"Object {self.path} is a directory; we do not yet support localizing those from s3.")
             elif b"(403)" in head_resp.stderr:
                 raise ValueError(f"You do not have permission to access {self.path}!")
+            else:
+                raise ValueError(f"Error accessing S3 file:\n{head_resp.stderr.decode()}")
         elif head_resp.returncode != 0:
             raise ValueError(f"Unknown AWS S3 error occurred:\n{head_resp.stderr.decode()}")
                 
