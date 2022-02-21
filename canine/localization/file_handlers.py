@@ -260,10 +260,16 @@ class HandleGDCHTTPURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
+        cmd = []
         if self.token is not None:
-            return "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} {token} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, token = self.token_flag, url = self.url)
+            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} {token} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, token = self.token_flag, url = self.url)]
         else:
-            return "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)
+            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+
+        # ensure that file downloaded properly
+        cmd += [f"[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]"]
+
+        return "\n".join(cmd)
 
 # }}}
 
