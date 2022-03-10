@@ -217,6 +217,7 @@ class HandleAWSURL(FileType):
     localization_mode = "url"
 
     # TODO: use boto3 API; overhead for calling out to aws shell command might be high
+    #       this would also allow us to run on systems that don't have the aws tool installed
     # TODO: support directories
 
     def __init__(self, path, **kwargs):
@@ -306,12 +307,19 @@ class HandleAWSURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
 
-        return "{env} aws s3 {extra_args} cp {url} {path}".format(
-          env = self.command_env_str,
-          extra_args = self.s3_extra_args_str,
-          url = self.path,
-          path = self.localized_path
-        )
+        return "\n".join([
+          f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
+          f"[ -f {self.localized_path} ] && SZ=$(stat --printf '%s' {self.localized_path}) || SZ=0",
+          f"if [ $SZ != {self.size} ]; then",
+          "{env} aws s3api {extra_args} get-object --bucket {bucket} --key {file} --range \"bytes=$SZ-\" >(cat >> {dest}) > /dev/null".format(
+            env = self.command_env_str,
+            extra_args = self.s3_extra_args_str,
+            bucket = self.path.split("/")[2],
+            file = "/".join(self.path.split("/")[3:]),
+            dest = self.localized_path
+          ),
+          "fi"
+        ])
         
 
 # }}}
