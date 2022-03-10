@@ -153,23 +153,28 @@ class HandleGSURL(FileType):
         assert self.path.startswith("gs://")
         res = re.search("^gs://([^/]+)/(.*)$", self.path)
         bucket = res[1]
-        blob = res[2]
+        obj_name = res[2]
 
         gcs_cl = gcloud_storage_client()
 
         bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"] if "project" in self.extra_args else None)
 
         # check whether this path exists, and whether it's a directory
-
         is_dir = False
         exists = False
         blob_obj = None
-        for b in gcs_cl.list_blobs(bucket_obj, prefix = blob):
-            if b.name == blob:
+        # list_blobs is completely ignorant of "/" as a delimiter
+        # prefix = "dir/b" will list
+        # dir/b (may not even exist as a standalone "directory")
+        # dir/b/file1
+        # dir/b/file2
+        # dir/boy
+        for b in gcs_cl.list_blobs(bucket_obj, prefix = obj_name):
+            if b.name == obj_name:
                 exists = True
                 blob_obj = b
-            # a blob ending in a trailing slash is a directory
-            if b.name.endswith("/") and b.name.strip("/") == blob:
+            # a blob starting with <obj_name>/ is a directory
+            if b.name.startswith(obj_name + "/"):
                 exists = True
                 is_dir = True
                 blob_obj = b
@@ -181,7 +186,7 @@ class HandleGSURL(FileType):
         # if it's a directory, hash the set of CRCs within
         if is_dir:
             files = set()
-            for b in gcs_cl.list_blobs(bucket_obj, prefix = blob):
+            for b in gcs_cl.list_blobs(bucket_obj, prefix = obj_name + "/"):
                 files.add(b.crc32c)
             return hash_set(files)
 
