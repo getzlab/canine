@@ -485,6 +485,7 @@ class AbstractLocalizer(abc.ABC):
                     paths = [paths] if not isinstance(paths, list) else paths
                     if arg not in overrides:
                         for p in paths:
+                            # TODO: pass through other file handler arguments here
                             fh = file_handlers.get_file_handler(p, project = self.project, token = self.token)
 
                             # if hash has already been precomputed, use it
@@ -559,6 +560,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## if input is a string, convert it to the appropriate FileType object
             if isinstance(value, str):
+                # TODO: pass through other file handler arguments here
                 value = file_handlers.get_file_handler(value, project = self.project, token = self.token)
             else:
                 assert isinstance(value, file_handlers.FileType)
