@@ -1075,7 +1075,7 @@ class AbstractLocalizer(abc.ABC):
 
         ## Symlink common inputs to job inputs
         localization_tasks += [
-            'find "$CANINE_COMMON"/ -mindepth 1 -maxdepth 1 -exec ln -sf {} "$CANINE_JOB_INPUTS"/ \;'
+            'find "$CANINE_COMMON"/ -mindepth 1 -maxdepth 1 -exec sh -c "ln -s {} "$CANINE_JOB_INPUTS"/ || echo \'Could not symlink common input {}\' >&2" \;'
         ]
 
         # generate setup script
