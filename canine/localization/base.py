@@ -976,7 +976,8 @@ class AbstractLocalizer(abc.ABC):
                       # NOTE: it will be broken upon creation, since the RODISK will
                       #   be mounted subsequently.
                       # NOTE: it might already exist if we are retrying this task
-                      "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
+                      # NOTE: the task also might have overwritten the symlink with its own file
+                      "if [[ -e {path} && ! -L {path} ]]; then echo 'Warning: task overwrote symlink to {file} on RODISK' >&2; elif [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
                     ]
 
                     export_writer(key, dest.remotepath, is_array)

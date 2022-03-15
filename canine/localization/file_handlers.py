@@ -340,6 +340,7 @@ class HandleGDCHTTPURL(FileType):
 
         self.token = self.extra_args["token"] if "token" in self.extra_args else None 
         self.token_flag = f'--header  "X-Auth-Token: {self.token}"' if self.token is not None else ''
+        self.check_md5 = self.extra_args["check_md5"] if "check_md5" in self.extra_args else False
 
         # parse URL
         self.url = self.path
@@ -380,10 +381,17 @@ class HandleGDCHTTPURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
+        cmd = []
         if self.token is not None:
-            return "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} {token} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, token = self.token_flag, url = self.url)
+            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} {token} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, token = self.token_flag, url = self.url)]
         else:
-            return "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)
+            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+
+        # ensure that file downloaded properly
+        if self.check_md5:
+            cmd += [f"[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]"]
+
+        return "\n".join(cmd)
 
 # }}}
 
