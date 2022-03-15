@@ -333,6 +333,7 @@ class HandleGDCHTTPURL(FileType):
 
         self.token = self.extra_args["token"] if "token" in self.extra_args else None 
         self.token_flag = f'--header  "X-Auth-Token: {self.token}"' if self.token is not None else ''
+        self.check_md5 = self.extra_args["check_md5"] if "check_md5" in self.extra_args else False
 
         # parse URL
         self.url = self.path
@@ -380,7 +381,8 @@ class HandleGDCHTTPURL(FileType):
             cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
 
         # ensure that file downloaded properly
-        cmd += [f"[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]"]
+        if self.check_md5:
+            cmd += [f"[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]"]
 
         return "\n".join(cmd)
 
