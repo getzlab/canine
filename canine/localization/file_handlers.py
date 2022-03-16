@@ -187,6 +187,7 @@ class HandleGSURL(FileType):
 
         # if it's a directory, hash the set of CRCs within
         if self.is_dir:
+            canine_logging.info1(f"Hashing directory {self.path}. This may take some time.")
             files = set()
             for b in gcs_cl.list_blobs(bucket_obj, prefix = obj_name + "/"):
                 files.add(b.crc32c)
