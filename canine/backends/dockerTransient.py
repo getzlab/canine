@@ -353,6 +353,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         )
         if rc == 124:
             raise TimeoutError("Slurm controller did not start within {} seconds!".format(timeout))
+        canine_logging.info1("Started Slurm controller.")
 
 # }}}
 
