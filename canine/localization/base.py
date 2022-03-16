@@ -47,6 +47,7 @@ class AbstractLocalizer(abc.ABC):
         token: typing.Optional[str] = None,
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
         use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
+        persistent_disk_dry_run = False,
         **kwargs
     ):
         """
@@ -62,6 +63,8 @@ class AbstractLocalizer(abc.ABC):
         scratch_disk_type: "standard" or "ssd". Default "standard".
         scratch_disk_size: size of scratch disk, in gigabytes. Default 10GB
         scratch_disk_name: name of scratch disk. Default is a random string
+        persistent_disk_dry_run: don't actually create a persistent disk; just
+          return the paths to the files on the disk
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -96,6 +99,8 @@ class AbstractLocalizer(abc.ABC):
         self.scratch_disk_type = scratch_disk_type
         self.scratch_disk_size = scratch_disk_size
         self.scratch_disk_name = scratch_disk_name
+
+        self.persistent_disk_dry_run = persistent_disk_dry_run
 
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
@@ -633,7 +638,8 @@ class AbstractLocalizer(abc.ABC):
     def create_persistent_disk(self,
       file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
       disk_name: str = None,
-      disk_size: int = 0
+      disk_size: int = 0,
+      dry_run = False
     ):
         """
         Generates the commands to (i) create and (ii) destroy a persistent disk.
@@ -685,6 +691,10 @@ class AbstractLocalizer(abc.ABC):
             disk_name = "canine-scratch-{}".format(disk_name if disk_name is not None else os.urandom(4).hex())
             disk_size = max(10, disk_size)
             rodisk_paths = None
+
+        ## this is a dry run (i.e., don't actually make disk, just return paths)
+        if dry_run:
+            return None, [], [], rodisk_paths
 
         ## mount prefix
         mount_prefix = "/mnt/nfs/rodisks"
@@ -825,7 +835,7 @@ class AbstractLocalizer(abc.ABC):
             if len(self.inputs) > 1:
                 raise ValueError("Localization to persistent disk for multishard jobs is currently not supported.")
 
-            disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId])
+            disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId], dry_run = self.persistent_disk_dry_run)
 
             # add commands to create/mount the disk
             localization_tasks += disk_creation_script
@@ -844,7 +854,11 @@ class AbstractLocalizer(abc.ABC):
                             localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path.remotepath)]
 
                     # transform this input into a RODISK FileType
-                    self.inputs[jobId][k] = [file_handlers.HandleRODISKURL(v) for v in v_array]
+                    if not self.persistent_disk_dry_run:
+                        self.inputs[jobId][k] = [file_handlers.HandleRODISKURL(v) for v in v_array]
+                    # if this is a dry run, we are only interested in the RODISK URL strings
+                    else:
+                        self.inputs[jobId][k] = [file_handlers.StringLiteral(v) for v in v_array]
 
         #
         # create creation script for scratch disk, if specified
@@ -976,7 +990,8 @@ class AbstractLocalizer(abc.ABC):
                       # NOTE: it will be broken upon creation, since the RODISK will
                       #   be mounted subsequently.
                       # NOTE: it might already exist if we are retrying this task
-                      "if [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
+                      # NOTE: the task also might have overwritten the symlink with its own file
+                      "if [[ -e {path} && ! -L {path} ]]; then echo 'Warning: task overwrote symlink to {file} on RODISK' >&2; elif [[ ! -L {path} ]]; then ln -s {disk_dir}/{file} {path}; fi".format(disk_dir=disk_dir, file=file, path=dest.remotepath),
                     ]
 
                     export_writer(key, dest.remotepath, is_array)
