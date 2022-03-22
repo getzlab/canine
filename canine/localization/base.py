@@ -48,6 +48,7 @@ class AbstractLocalizer(abc.ABC):
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
         use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
         persistent_disk_dry_run = False,
+        cleanup_job_workdir = False,
         **kwargs
     ):
         """
@@ -65,6 +66,8 @@ class AbstractLocalizer(abc.ABC):
         scratch_disk_name: name of scratch disk. Default is a random string
         persistent_disk_dry_run: don't actually create a persistent disk; just
           return the paths to the files on the disk
+        cleanup_job_workdir: remove files in the job working directory that aren't
+          denoted as outputs
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -101,6 +104,8 @@ class AbstractLocalizer(abc.ABC):
         self.scratch_disk_name = scratch_disk_name
 
         self.persistent_disk_dry_run = persistent_disk_dry_run
+
+        self.cleanup_job_workdir = cleanup_job_workdir
 
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
@@ -1142,7 +1147,8 @@ class AbstractLocalizer(abc.ABC):
                     ),
                     "--scratch" if self.use_scratch_disk else ""
                 ),
-                'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi'
+                'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi',
+                f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir else ''
             ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
               + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
