@@ -264,7 +264,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #       count is low (bad network IO)
         
         ## Expose NFS (we won't unexport in __exit__)
-        subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/nfs", shell=True)
+        subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
 
         ## make NFS its own virtual filesystem
         # this is so that Canine's system for detecting whether files to be
