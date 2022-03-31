@@ -394,6 +394,33 @@ class HandleGDCHTTPURL(FileType):
 
         return "\n".join(cmd)
 
+class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
+    localization_mode="stream"
+
+    def localization_command(self, dest):
+        
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+        cmd = []
+        
+        #clean exisiting file if it exists
+        cmd += ['if [[ -e {0} ]]; then rm {0}; fi'.format(dest)]
+        
+        #create dir if it doesnt exist
+        cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :;".format(dest_dir = dest_dir)]
+        
+        #create fifo object
+        cmd += ['mkfifo {}'.format(dest)]
+        
+        #stream into fifo object
+        if self.token is not None:
+            cmd += ["curl -C - -o {path} {token} '{url}' &".format(path = self.localized_path, token = self.token_flag, url = self.url)]
+        else:
+            cmd += ["curl -C - -o {path} '{url}' &".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+
+        return "\n".join(cmd)
+
 # }}}
 
 ## Regular files {{{

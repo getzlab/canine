@@ -562,7 +562,7 @@ class AbstractLocalizer(abc.ABC):
 
         def handle_input(value, mode):
             nonlocal transport
-
+            
             ## if input is a string, convert it to the appropriate FileType object
             if isinstance(value, str):
                 # TODO: pass through other file handler arguments here
@@ -601,12 +601,14 @@ class AbstractLocalizer(abc.ABC):
             if mode is not False: 
                 # user wants to stream a URL, rather than download it
                 if mode == 'stream':
-                    # XXX: currently, we only support streaming gs:// URLs,
+                    # XXX: currently, we only support streaming gs:// URLs and GDC bams,
                     #      so we explicitly check here
-                    if not value.path.startswith('gs://'):
-                        raise ValueError("Only gs:// files are currently supported for streaming!")
-                    else:
+                    if value.path.startswith('gs://'):
                         return file_handlers.HandleGSURLStream(value.path, project = self.project)
+                    elif re.match(r"^https://api.gdc.cancer.gov", value.url) or re.match(r"^https://api.awg.gdc.cancer.gov",value.url) is not None:
+                        return file_handlers.HandleGDCHTTPURLStream(value.url, token=self.token)
+                    else:
+                        raise ValueError("Only gs:// or gdc files are currently supported for streaming!")
 
                 # user wants to treat this path as a string literal
                 elif mode is None or mode == 'null' or mode == 'string':
