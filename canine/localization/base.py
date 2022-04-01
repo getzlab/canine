@@ -601,14 +601,20 @@ class AbstractLocalizer(abc.ABC):
             if mode is not False: 
                 # user wants to stream a URL, rather than download it
                 if mode == 'stream':
-                    # XXX: currently, we only support streaming gs:// URLs and GDC bams,
-                    #      so we explicitly check here
-                    if value.path.startswith('gs://'):
-                        return file_handlers.HandleGSURLStream(value.path, project = self.project)
-                    elif re.match(r"^https://api.gdc.cancer.gov", value.url) or re.match(r"^https://api.awg.gdc.cancer.gov",value.url) is not None:
-                        return file_handlers.HandleGDCHTTPURLStream(value.url, token=self.token)
-                    else:
-                        raise ValueError("Only gs:// or gdc files are currently supported for streaming!")
+                    # check if we can stream this, by seeing if any subclasses
+                    # implement localization_mode == "stream"
+                    stream_subclass = None
+                    for subcls in value.__class__.__subclasses__():
+                        if subcls.localization_mode == "stream":
+                            stream_subclass = subcls
+                            break # we assume that only one subclass implements streaming
+                    if stream_subclass is None:
+                        raise ValueError(f"Input type {value.__class__.__name__} cannot be streamed!")
+
+                    # monkey patch the stream subclass to replace its parent
+                    value.__class__ = stream_subclass
+
+                    return value
 
                 # user wants to treat this path as a string literal
                 elif mode is None or mode == 'null' or mode == 'string':
