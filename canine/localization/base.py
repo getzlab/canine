@@ -567,7 +567,7 @@ class AbstractLocalizer(abc.ABC):
 
         def handle_input(value, mode):
             nonlocal transport
-
+            
             ## if input is a string, convert it to the appropriate FileType object
             if isinstance(value, str):
                 # TODO: pass through other file handler arguments here
@@ -606,12 +606,20 @@ class AbstractLocalizer(abc.ABC):
             if mode is not False: 
                 # user wants to stream a URL, rather than download it
                 if mode == 'stream':
-                    # XXX: currently, we only support streaming gs:// URLs,
-                    #      so we explicitly check here
-                    if not value.path.startswith('gs://'):
-                        raise ValueError("Only gs:// files are currently supported for streaming!")
-                    else:
-                        return file_handlers.HandleGSURLStream(value.path, project = self.project)
+                    # check if we can stream this, by seeing if any subclasses
+                    # implement localization_mode == "stream"
+                    stream_subclass = None
+                    for subcls in value.__class__.__subclasses__():
+                        if subcls.localization_mode == "stream":
+                            stream_subclass = subcls
+                            break # we assume that only one subclass implements streaming
+                    if stream_subclass is None:
+                        raise ValueError(f"Input type {value.__class__.__name__} cannot be streamed!")
+
+                    # monkey patch the stream subclass to replace its parent
+                    value.__class__ = stream_subclass
+
+                    return value
 
                 # user wants to treat this path as a string literal
                 elif mode is None or mode == 'null' or mode == 'string':
