@@ -329,6 +329,25 @@ class HandleAWSURL(FileType):
           "fi"
         ])
         
+class HandleAWSURLStream(HandleAWSURL):
+    localization_mode = "stream"
+
+    def localization_command(self, dest):
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+
+        return "\n".join([
+          f"if [[ -e {0} ]]; then rm {0}; fi".format(dest),
+          f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
+          'mkfifo {}'.format(dest),
+          "{env} aws s3 {extra_args} cp {url} {path} &".format(
+            env = self.command_env_str,
+            extra_args = self.s3_extra_args_str,
+            url = self.path,
+            path = dest
+          )
+        ])
 
 # }}}
 
