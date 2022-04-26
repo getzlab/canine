@@ -11,12 +11,13 @@ import shutil
 import warnings
 import crayons
 import re
+import json
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
-from ..utils import get_default_gcp_project, check_call, canine_logging
+from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging
 from hound.client import _getblob_bucket
 from agutil import status_bar
 import pandas as pd
@@ -710,26 +711,48 @@ class AbstractLocalizer(abc.ABC):
         disk_mountpoint = mount_prefix + "/" + disk_name
 
         ## Check if the disk already exists
-        out = subprocess.check_output(
-            "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
+        zone = get_default_gcp_zone()
+        out = subprocess.Popen(
+            f"gcloud compute disks describe {disk_name} --zone {zone} --format 'json'",
+            shell = True, stdout = subprocess.PIPE, stderr = subprocess.PIPE
         )
-        out = out.decode().rstrip().split("\n")
-        if len(out) > 2:
-            raise Exception("Unexpected number of existing disks (should not happen?)")
 
-        # disk exists and has been finalized
-        if len(out) == 2: # header + one result
-            canine_logging.info1("Found existing disk {}".format(disk_name))
+#            "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
+#        )
 
-            # if this is not a scratch disk, no additional localization or
-            # teardown commands necessary, since inputs will be transformed into
-            # rodisk *inputs*, whose localization commands will be handled downstream
-            if len(file_paths_arrays):
-                return disk_mountpoint, [], [], rodisk_paths
+        # disk exists
+        if "HTTPError 404" not in out.stderr.read().decode():
+            disk_attrs = json.load(out.stdout)
 
-            # otherwise, we still need to mount the disk/unmount+detach later
-            # the default localization/teardown script will work for this, since
-            # it can handle existing disks
+            # disk has been finalized
+            if "labels" in disk_attrs and "finished" in disk_attrs["labels"]:
+                canine_logging.info1("Found existing disk {}".format(disk_name))
+
+                # if this is not a scratch disk, no additional localization or
+                # teardown commands necessary, since inputs will be transformed into
+                # rodisk *inputs*, whose localization commands will be handled downstream
+                if len(file_paths_arrays):
+                    return disk_mountpoint, [], [], rodisk_paths
+
+                # otherwise, we still need to mount the disk/unmount+detach later
+                # the default localization/teardown script will work for this, since
+                # it can handle existing disks
+            
+            # check if disk is currently being built by another instance; block if so
+            elif "users" in disk_attrs:
+                blocking_localization_script = [
+                    'while ! gcloud compute disks describe {disk_name} --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
+                    'echo "Waiting for disk to become available ..." >&2',
+                    'sleep 300',
+                    'done'
+                ]
+                return disk_mountpoint, blocking_localization_script, [], rodisk_paths
+
+            # disk has not been finalized; finish it
+            else:
+                canine_logging.info1("Resuming creation of persistent disk {}".format(disk_name))
+
+        # disk does not exist; create it
         else: 
             canine_logging.info1("Creating new persistent disk {}".format(disk_name))
 
