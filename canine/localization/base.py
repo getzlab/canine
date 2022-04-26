@@ -676,9 +676,10 @@ class AbstractLocalizer(abc.ABC):
             F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "path", "hash", "size", "localize"])
             F["file_basename"] = F["path"].apply(os.path.basename)
 
-            ## Disk name is determined by files' basenames and hashes
+            ## Disk name is determined by input names, files' basenames, and hashes
             disk_name = "canine-" + \
               file_handlers.hash_set(set(
+                F.loc[F["localize"], "input"] + "_" + \
                 F.loc[F["localize"], "file_basename"] + "_" + \
                 F.loc[F["localize"], "hash"]
               ))
