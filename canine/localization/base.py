@@ -717,6 +717,22 @@ class AbstractLocalizer(abc.ABC):
         if len(out) > 2:
             raise Exception("Unexpected number of existing disks (should not happen?)")
 
+        # disk exists and has been finalized
+        if len(out) == 2: # header + one result
+            canine_logging.info1("Found existing disk {}".format(disk_name))
+
+            # if this is not a scratch disk, no additional localization or
+            # teardown commands necessary, since inputs will be transformed into
+            # rodisk *inputs*, whose localization commands will be handled downstream
+            if len(file_paths_arrays):
+                return disk_mountpoint, [], [], rodisk_paths
+
+            # otherwise, we still need to mount the disk/unmount+detach later
+            # the default localization/teardown script will work for this, since
+            # it can handle existing disks
+        else: 
+            canine_logging.info1("Creating new persistent disk {}".format(disk_name))
+
         ## Generate disk creation script
         localization_script = [
             'set -eux',
@@ -793,22 +809,6 @@ class AbstractLocalizer(abc.ABC):
           'if [ $LOCALIZER_JOB_RC -eq 0 ]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
         ]
-
-        # disk exists
-        if len(out) == 2: # header + one result
-            canine_logging.info1("Found existing disk {}".format(disk_name))
-
-            # if this is not a scratch disk, no additional localization or
-            # teardown commands necessary, since inputs will be transformed into
-            # rodisk *inputs*, whose localization commands will be handled downstream
-            if len(file_paths_arrays):
-                return disk_mountpoint, [], [], rodisk_paths
-
-            # otherwise, we still need to mount the disk/unmount+detach later
-            # the default localization/teardown script will work for this, since
-            # it can handle existing disks
-        else: 
-            canine_logging.info1("Creating new persistent disk {}".format(disk_name))
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
