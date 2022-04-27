@@ -742,7 +742,7 @@ class AbstractLocalizer(abc.ABC):
             elif "users" in disk_attrs:
                 canine_logging.info1("Persistent disk {} is already being constructed by another instance; waiting to finalize ...".format(disk_name))
                 blocking_localization_script = [
-                    'while ! gcloud compute disks describe {disk_name} --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do'.format(disk_name),
+                    'while ! gcloud compute disks describe {} --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do'.format(disk_name),
                     'echo "Waiting for disk to become available ..." >&2',
                     'sleep {}'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer
                     'done'
