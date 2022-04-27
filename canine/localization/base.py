@@ -744,7 +744,7 @@ class AbstractLocalizer(abc.ABC):
                 blocking_localization_script = [
                     'while ! gcloud compute disks describe {disk_name} --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do'.format(disk_name),
                     'echo "Waiting for disk to become available ..." >&2',
-                    'sleep 300',
+                    'sleep {}'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer
                     'done'
                 ]
                 return disk_mountpoint, blocking_localization_script, [], rodisk_paths
