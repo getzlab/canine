@@ -776,6 +776,15 @@ class AbstractLocalizer(abc.ABC):
             #       detach the disk from the other instance
             #       are there any scenarios in which this would be a bad idea?
 
+            ## check once again if disk is being created by another instance
+            'if ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; then',
+            'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
+            'echo "Waiting for disk to become available ..." >&2',
+            'sleep {}'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer
+            'done',
+            'exit 15', # special exit code to cause rest of entrypoint.sh to be skipped
+            'fi',
+
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
             'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
