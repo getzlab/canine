@@ -86,7 +86,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     fi
   done
   echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
-elif [ $LOCALIZER_JOB_RC -eq 15 ]; then
+elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # this is a special exit code that localization.sh can explicitly return
   echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2
   echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code
   echo -n $LOCALIZER_JOB_RC > $CANINE_JOB_ROOT/.localizer_exit_code
