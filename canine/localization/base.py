@@ -793,7 +793,7 @@ class AbstractLocalizer(abc.ABC):
             ## wait for disk to attach, with exponential backoff up to 2 minutes
             'DELAY=1',
             'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
-            '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk"; exit 1; } || :',
+            '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
             'sleep $DELAY; ((DELAY *= 2))',
             'done',
 
@@ -833,7 +833,7 @@ class AbstractLocalizer(abc.ABC):
           'DELAY=1',
           'while mountpoint {}/{} > /dev/null; do'.format(mount_prefix, disk_name),
           '  sudo umount {}/{} || :'.format(mount_prefix, disk_name),
-          '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk"; exit 1; } || :',
+          '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk" >&2; exit 1; } || :',
           '  sleep $DELAY; ((DELAY *= 2))',
           'done',
 
