@@ -774,22 +774,6 @@ class AbstractLocalizer(abc.ABC):
             'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
             'fi',
 
-            # TODO: how to handle if disk is already attached to another instance?
-            #       this likely means that the task exited on the other
-            #       instance without running the teardown script
-            #       (e.g. task was cancelled), in which case we'd want to forcibly
-            #       detach the disk from the other instance
-            #       are there any scenarios in which this would be a bad idea?
-
-            ## check once again if disk is being created by another instance
-            'if ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; then',
-            'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
-            'echo "Waiting for disk to become available ..." >&2',
-            'sleep {}'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer
-            'done',
-            'exit 15', # special exit code to cause rest of entrypoint.sh to be skipped
-            'fi',
-
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
             'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
@@ -798,7 +782,26 @@ class AbstractLocalizer(abc.ABC):
             ## wait for disk to attach, with exponential backoff up to 2 minutes
             'DELAY=1',
             'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
-            '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk"; exit 1; } || :',
+              ## check once again if disk is being created by another instance
+              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\'; then',
+                'TRIES=0',
+                # wait until disk is marked "finished"
+                'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
+                  'echo "Waiting for disk to become available ..." >&2',
+                  '[ $TRIES == 0 ] && sleep {} || sleep 300'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer for first timeout; 5 minutes thereafter up to 10 times
+                  '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
+                  '((++TRIES))',
+                'done',
+                'exit 15', # special exit code to cause rest of entrypoint.sh to be skipped
+              'fi',
+              # TODO: what if the task exited on the other
+              #       instance without running the teardown script
+              #       (e.g. task was cancelled), in which case we'd want to forcibly
+              #       detach the disk from the other instance
+              #       are there any scenarios in which this would be a bad idea?
+
+            # otherwise, it may just be taking a bit to attach
+            '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
             'sleep $DELAY; ((DELAY *= 2))',
             'done',
 
@@ -838,7 +841,7 @@ class AbstractLocalizer(abc.ABC):
           'DELAY=1',
           'while mountpoint {}/{} > /dev/null; do'.format(mount_prefix, disk_name),
           '  sudo umount {}/{} || :'.format(mount_prefix, disk_name),
-          '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk"; exit 1; } || :',
+          '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk" >&2; exit 1; } || :',
           '  sleep $DELAY; ((DELAY *= 2))',
           'done',
 
