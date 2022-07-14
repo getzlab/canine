@@ -1,9 +1,10 @@
 import abc
 import google.cloud.storage
-import glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading
+import glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading, io
 import pandas as pd
 
 from ..utils import sha1_base32, canine_logging
+
 
 class FileType(abc.ABC):
     """
@@ -13,9 +14,9 @@ class FileType(abc.ABC):
     * hash
     """
 
-    localization_mode = None # to be overridden in child classes
+    localization_mode = None  # to be overridden in child classes
 
-    def __init__(self, path, transport = None, **kwargs):
+    def __init__(self, path, transport=None, **kwargs):
         """
         path: path/URL to file
         transport: Canine transport object for handling local/remote files (currently not used)
@@ -30,8 +31,8 @@ class FileType(abc.ABC):
           - None: path is a string literal (for backwards compatibility)
         """
         self.path = path
-        self.localized_path = path # path where file got localized to. needs to be manually updated
-        self.transport = transport # currently not used
+        self.localized_path = path  # path where file got localized to. needs to be manually updated
+        self.transport = transport  # currently not used
         self.extra_args = kwargs
 
         self._size = None
@@ -77,6 +78,7 @@ class FileType(abc.ABC):
         """
         return self.path
 
+
 class StringLiteral(FileType):
     """
     Since the base FileType class also works for string literals, alias
@@ -84,10 +86,12 @@ class StringLiteral(FileType):
     """
     localization_mode = "string"
 
+
 def hash_set(x):
     assert isinstance(x, set)
     x = list(sorted(x))
     return hashlib.md5(json.dumps(x).encode()).hexdigest()
+
 
 #
 # define file type handlers
@@ -97,6 +101,7 @@ def hash_set(x):
 STORAGE_CLIENT = None
 storage_client_creation_lock = threading.Lock()
 
+
 def gcloud_storage_client():
     global STORAGE_CLIENT
     with storage_client_creation_lock:
@@ -105,8 +110,10 @@ def gcloud_storage_client():
             STORAGE_CLIENT = google.cloud.storage.Client()
     return STORAGE_CLIENT
 
+
 class GSFileNotExists(Exception):
     pass
+
 
 class HandleGSURL(FileType):
     localization_mode = "url"
@@ -118,14 +125,14 @@ class HandleGSURL(FileType):
         """
         bucket = re.match(r"gs://(.*?)/.*", self.path)[1]
 
-        ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
+        ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell=True, capture_output=True)
         if b'requester pays bucket but no user project provided' in ret.stderr:
             return True
         else:
             # Try again ls-ing the object itself
             # sometimes permissions can disallow bucket inspection
             # but allow object inspection
-            ret = subprocess.run('gsutil ls {}'.format(self.path), shell = True, capture_output = True)
+            ret = subprocess.run('gsutil ls {}'.format(self.path), shell=True, capture_output=True)
             return b'requester pays bucket but no user project provided' in ret.stderr
 
         if ret.returncode == 1 and b'BucketNotFoundException: 404' in ret.stderr:
@@ -149,7 +156,8 @@ class HandleGSURL(FileType):
         self.is_dir = False
 
     def _get_size(self):
-        output = subprocess.check_output('gsutil {} du -s {}'.format(self.rp_string, shlex.quote(self.path.strip("/"))), shell=True).decode()
+        output = subprocess.check_output('gsutil {} du -s {}'.format(self.rp_string, shlex.quote(self.path.strip("/"))),
+                                         shell=True).decode()
         return int(output.split()[0])
 
     def _get_hash(self):
@@ -160,7 +168,8 @@ class HandleGSURL(FileType):
 
         gcs_cl = gcloud_storage_client()
 
-        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"] if "project" in self.extra_args else None)
+        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project=self.extra_args[
+            "project"] if "project" in self.extra_args else None)
 
         # check whether this path exists, and whether it's a directory
         exists = False
@@ -171,7 +180,7 @@ class HandleGSURL(FileType):
         # dir/b/file1
         # dir/b/file2
         # dir/boy
-        for b in gcs_cl.list_blobs(bucket_obj, prefix = obj_name):
+        for b in gcs_cl.list_blobs(bucket_obj, prefix=obj_name):
             if b.name == obj_name:
                 exists = True
                 blob_obj = b
@@ -189,7 +198,7 @@ class HandleGSURL(FileType):
         if self.is_dir:
             canine_logging.info1(f"Hashing directory {self.path}. This may take some time.")
             files = set()
-            for b in gcs_cl.list_blobs(bucket_obj, prefix = obj_name + "/"):
+            for b in gcs_cl.list_blobs(bucket_obj, prefix=obj_name + "/"):
                 files.add(b.crc32c)
             return hash_set(files)
 
@@ -202,20 +211,23 @@ class HandleGSURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
-        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'gsutil {self.rp_string} -o "GSUtil:state_dir={dest_dir}/.gsutil_state_dir" cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
+        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
+            dest_dir=self.localized_path if self.is_dir else dest_dir)) + f'gsutil {self.rp_string} -o "GSUtil:state_dir={dest_dir}/.gsutil_state_dir" cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
+
 
 class HandleGSURLStream(HandleGSURL):
     localization_mode = "stream"
 
     def localization_command(self, dest):
         return "\n".join(['gsutil {} ls {} > /dev/null'.format(self.rp_string, shlex.quote(self.path)),
-        'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
-        'mkfifo {}'.format(dest),
-        "gsutil {} cat {} > {} &".format(
-            self.rp_string,
-            shlex.quote(self.path),
-            dest
-        )])
+                          'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
+                          'mkfifo {}'.format(dest),
+                          "gsutil {} cat {} > {} &".format(
+                              self.rp_string,
+                              shlex.quote(self.path),
+                              dest
+                          )])
+
 
 # }}}
 
@@ -242,17 +254,19 @@ class HandleAWSURL(FileType):
 
         # keys get passed via environment variable
         self.command_env = {}
-        self.command_env["AWS_ACCESS_KEY_ID"] = self.extra_args["aws_access_key_id"] if "aws_access_key_id" in self.extra_args else None 
-        self.command_env["AWS_SECRET_ACCESS_KEY"] = self.extra_args["aws_secret_access_key"] if "aws_secret_access_key" in self.extra_args else None 
+        self.command_env["AWS_ACCESS_KEY_ID"] = self.extra_args[
+            "aws_access_key_id"] if "aws_access_key_id" in self.extra_args else None
+        self.command_env["AWS_SECRET_ACCESS_KEY"] = self.extra_args[
+            "aws_secret_access_key"] if "aws_secret_access_key" in self.extra_args else None
         self.command_env_str = " ".join([f"{k}={v}" for k, v in self.command_env.items() if v is not None])
 
         # compute extra arguments for s3 commands
         # TODO: add requester pays check here
-        self.aws_endpoint_url = self.extra_args["aws_endpoint_url"] if "aws_endpoint_url" in self.extra_args else None 
+        self.aws_endpoint_url = self.extra_args["aws_endpoint_url"] if "aws_endpoint_url" in self.extra_args else None
 
         self.s3_extra_args = []
         if self.command_env["AWS_ACCESS_KEY_ID"] is None and self.command_env["AWS_SECRET_ACCESS_KEY"] is None:
-            self.s3_extra_args += ["--no-sign-request" ]
+            self.s3_extra_args += ["--no-sign-request"]
         if self.aws_endpoint_url is not None:
             self.s3_extra_args += [f"--endpoint-url {self.aws_endpoint_url}"]
         self.s3_extra_args_str = " ".join(self.s3_extra_args)
@@ -266,42 +280,43 @@ class HandleAWSURL(FileType):
             raise ValueError(f"{self.path} is not a valid s3:// URL!")
 
         head_resp = subprocess.run(
-          "{env} aws s3api {extra_args} head-object --bucket {bucket} --key {obj}".format(
-            env = self.command_env_str,
-            extra_args = self.s3_extra_args_str,
-            bucket = bucket,
-            obj = obj
-          ),
-          shell = True,
-          capture_output = True
+            "{env} aws s3api {extra_args} head-object --bucket {bucket} --key {obj}".format(
+                env=self.command_env_str,
+                extra_args=self.s3_extra_args_str,
+                bucket=bucket,
+                obj=obj
+            ),
+            shell=True,
+            capture_output=True
         )
 
         if head_resp.returncode == 254:
             if b"(404)" in head_resp.stderr:
                 # check if it's truly a 404 or a directory; we do not yet support these
                 ls_resp = subprocess.run(
-                  "{env} aws s3api {extra_args} list-objects-v2 --bucket {bucket} --prefix {obj} --max-items 2".format(
-                    env = self.command_env_str,
-                    extra_args = self.s3_extra_args_str,
-                    bucket = bucket,
-                    obj = obj
-                  ),
-                  shell = True,
-                  capture_output = True
+                    "{env} aws s3api {extra_args} list-objects-v2 --bucket {bucket} --prefix {obj} --max-items 2".format(
+                        env=self.command_env_str,
+                        extra_args=self.s3_extra_args_str,
+                        bucket=bucket,
+                        obj=obj
+                    ),
+                    shell=True,
+                    capture_output=True
                 )
                 if len(ls_resp.stdout) == 0:
                     raise ValueError(f"Object {self.path} does not exist in bucket!")
 
                 ls_resp_headers = json.loads(ls_resp.stdout)
                 if len(ls_resp_headers["Contents"]) > 1:
-                    raise ValueError(f"Object {self.path} is a directory; we do not yet support localizing those from s3.")
+                    raise ValueError(
+                        f"Object {self.path} is a directory; we do not yet support localizing those from s3.")
             elif b"(403)" in head_resp.stderr:
                 raise ValueError(f"You do not have permission to access {self.path}!")
             else:
                 raise ValueError(f"Error accessing S3 file:\n{head_resp.stderr.decode()}")
         elif head_resp.returncode != 0:
             raise ValueError(f"Unknown AWS S3 error occurred:\n{head_resp.stderr.decode()}")
-                
+
         self.headers = json.loads(head_resp.stdout)
 
     def _get_hash(self):
@@ -316,19 +331,20 @@ class HandleAWSURL(FileType):
         self.localized_path = os.path.join(dest_dir, dest_file)
 
         return "\n".join([
-          f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
-          f"[ -f {self.localized_path} ] && SZ=$(stat --printf '%s' {self.localized_path}) || SZ=0",
-          f"if [ $SZ != {self.size} ]; then",
-          "{env} aws s3api {extra_args} get-object --bucket {bucket} --key {file} --range \"bytes=$SZ-\" >(cat >> {dest}) > /dev/null".format(
-            env = self.command_env_str,
-            extra_args = self.s3_extra_args_str,
-            bucket = self.path.split("/")[2],
-            file = "/".join(self.path.split("/")[3:]),
-            dest = self.localized_path
-          ),
-          "fi"
+            f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
+            f"[ -f {self.localized_path} ] && SZ=$(stat --printf '%s' {self.localized_path}) || SZ=0",
+            f"if [ $SZ != {self.size} ]; then",
+            "{env} aws s3api {extra_args} get-object --bucket {bucket} --key {file} --range \"bytes=$SZ-\" >(cat >> {dest}) > /dev/null".format(
+                env=self.command_env_str,
+                extra_args=self.s3_extra_args_str,
+                bucket=self.path.split("/")[2],
+                file="/".join(self.path.split("/")[3:]),
+                dest=self.localized_path
+            ),
+            "fi"
         ])
-        
+
+
 class HandleAWSURLStream(HandleAWSURL):
     localization_mode = "stream"
 
@@ -338,16 +354,17 @@ class HandleAWSURLStream(HandleAWSURL):
         self.localized_path = os.path.join(dest_dir, dest_file)
 
         return "\n".join([
-          f"if [[ -e {0} ]]; then rm {0}; fi".format(dest),
-          f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
-          'mkfifo {}'.format(dest),
-          "{env} aws s3 {extra_args} cp {url} {path} &".format(
-            env = self.command_env_str,
-            extra_args = self.s3_extra_args_str,
-            url = self.path,
-            path = dest
-          )
+            f"if [[ -e {0} ]]; then rm {0}; fi".format(dest),
+            f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
+            'mkfifo {}'.format(dest),
+            "{env} aws s3 {extra_args} cp {url} {path} &".format(
+                env=self.command_env_str,
+                extra_args=self.s3_extra_args_str,
+                url=self.path,
+                path=dest
+            )
         ])
+
 
 # }}}
 
@@ -358,13 +375,15 @@ class HandleGDCHTTPURL(FileType):
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
 
-        self.token = self.extra_args["token"] if "token" in self.extra_args else None 
+        self.token = self.extra_args["token"] if "token" in self.extra_args else None
         self.token_flag = f'--header  "X-Auth-Token: {self.token}"' if self.token is not None else ''
         self.check_md5 = self.extra_args["check_md5"] if "check_md5" in self.extra_args else False
 
         # parse URL
         self.url = self.path
-        url_parse = re.match(r"^(https://api\.(?:awg\.)?gdc\.cancer\.gov)/(?:files|data)/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})", self.url)
+        url_parse = re.match(
+            r"^(https://api\.(?:awg\.)?gdc\.cancer\.gov)/(?:files|data)/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})",
+            self.url)
         if url_parse is None:
             raise ValueError("Invalid GDC ID '{}'".format(self.url))
 
@@ -376,17 +395,17 @@ class HandleGDCHTTPURL(FileType):
         # since the filesize and hashes are also encoded in the header, populate
         # these fields now
         resp_headers = subprocess.run(
-          'curl -s -D - -o /dev/full {token_flag} {file}'.format(
-            token_flag = self.token_flag,
-            file = self.path
-          ),
-          shell = True,
-          capture_output = True
+            'curl -s -D - -o /dev/full {token_flag} {file}'.format(
+                token_flag=self.token_flag,
+                file=self.path
+            ),
+            shell=True,
+            capture_output=True
         )
         try:
             headers = pd.DataFrame(
-              [x.split(": ") for x in resp_headers.stdout.decode().split("\r\n")[1:]],
-              columns=["header", "value"],
+                [x.split(": ") for x in resp_headers.stdout.decode().split("\r\n")[1:]],
+                columns=["header", "value"],
             ).set_index("header")["value"]
 
             self.path = re.match(".*filename=(.*)$", headers["Content-Disposition"])[1]
@@ -394,7 +413,7 @@ class HandleGDCHTTPURL(FileType):
             self._hash = headers["Content-MD5"]
         except:
             canine_logging.error("Error parsing GDC filename; see stack trace for details")
-            raise 
+            raise
         self.localized_path = self.path
 
     def localization_command(self, dest):
@@ -403,9 +422,13 @@ class HandleGDCHTTPURL(FileType):
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
         if self.token is not None:
-            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} {token} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, token = self.token_flag, url = self.url)]
+            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} {token} '{url}'".format(
+                dest_dir=dest_dir, path=self.localized_path, token=self.token_flag, url=self.url)]
         else:
-            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+            cmd += [
+                "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir=dest_dir,
+                                                                                                      path=self.localized_path,
+                                                                                                      url=self.url)]
 
         # ensure that file downloaded properly
         if self.check_md5:
@@ -413,34 +436,105 @@ class HandleGDCHTTPURL(FileType):
 
         return "\n".join(cmd)
 
+
 class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
-    localization_mode="stream"
+    localization_mode = "stream"
 
     def localization_command(self, dest):
-        
+
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
-        
-        #clean exisiting file if it exists
+
+        # clean exisiting file if it exists
         cmd += ['if [[ -e {0} ]]; then rm {0}; fi'.format(dest)]
-        
-        #create dir if it doesnt exist
-        cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :;".format(dest_dir = dest_dir)]
-        
-        #create fifo object
+
+        # create dir if it doesnt exist
+        cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :;".format(dest_dir=dest_dir)]
+
+        # create fifo object
         cmd += ['mkfifo {}'.format(dest)]
-        
-        #stream into fifo object
+
+        # stream into fifo object
         if self.token is not None:
-            cmd += ["curl -C - -o {path} {token} '{url}' &".format(path = self.localized_path, token = self.token_flag, url = self.url)]
+            cmd += ["curl -C - -o {path} {token} '{url}' &".format(path=self.localized_path, token=self.token_flag,
+                                                                   url=self.url)]
         else:
-            cmd += ["curl -C - -o {path} '{url}' &".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+            cmd += ["curl -C - -o {path} '{url}' &".format(dest_dir=dest_dir, path=self.localized_path, url=self.url)]
 
         return "\n".join(cmd)
 
+
 # }}}
+
+
+## BROAD GET SERVER {{{
+class HandleBroadHTTPURL(FileType):
+    localization_mode = "url"
+
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+
+        # TODO send secure authentication
+        # or for better options see https://stackoverflow.com/questions/2594880/using-curl-with-a-username-and-password
+        self.user = self.extra_args["user"] if "user" in self.extra_args else None
+        self.password = self.extra_args["password"] if "password" in self.extra_args else None
+        self.auth_flag = f'-u  {self.user}:{self.password}' if (
+                    self.user is not None and self.password is not None) else '' # for curl download
+        self.check_md5 = self.extra_args["check_md5"] if "check_md5" in self.extra_args else False
+
+        # parse URL
+        self.url = self.path
+        url_parse = re.match(r"^(https://get\.broadinstitute\.org/pkgs/SN[0-9]{7})/([\w\-. ]+$)", self.url)
+        if url_parse is None:
+            raise ValueError("Invalid broad get package ID '{}'".format(self.url))
+
+        self.prefix = url_parse[1]
+        self.filename = url_parse[2]
+
+        # MD5 hashes come from MANIFEST file of Broad server
+        # the file hash is given in the MANIFEST file at the root
+        self.manifest_url = url_parse[1] + '/' + 'MANIFEST'
+        try:
+            manifest_get = requests.get(self.manifest_url, auth=(self.user, self.password))
+            hashes = pd.read_csv(io.StringIO(manifest_get.text), delim_whitespace=True, names=["file", "md5"], index_col="file")
+            self._hash = hashes.loc[url_parse[2], "md5"]
+        except:
+            canine_logging.error("Couldn't download or read in MANIFEST for url {}".format(self.manifest_url))
+            raise
+
+        # File size comes from header
+        try:
+            self._size = int(requests.head(self.url,
+                                           auth=(self.user, self.password))
+                             .headers["Content-Length"])
+        except:
+            canine_logging.error("HEAD request failed on url {}".format(self.url))
+            raise
+
+        self.localized_path = self.path
+
+    def localization_command(self, dest):
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+        cmd = []
+        if self.auth_flag is not None:
+            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl {auth_flag} -C - -o {path} '{url}'".format(
+                dest_dir=dest_dir, path=self.localized_path, auth_flag=self.auth_flag, url=self.url)]
+        else:
+            cmd += [
+                "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir=dest_dir,
+                                                                                                      path=self.localized_path,
+                                                                                                      url=self.url)]
+
+        # ensure that file downloaded properly
+        if self.check_md5:
+            cmd += [f"[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]"]
+
+        return "\n".join(cmd)
+
 
 ## Regular files {{{
 
@@ -464,16 +558,16 @@ class HandleRegularFile(FileType):
         # check if it's a directory
         isdir = False
         if os.path.isdir(self.path):
-            files = glob.iglob(self.path + "/**", recursive = True)
+            files = glob.iglob(self.path + "/**", recursive=True)
             isdir = True
         else:
             files = [self.path]
 
-        for f in files: 
+        for f in files:
             if os.path.isdir(f):
                 continue
 
-            file_size_MiB = int(os.path.getsize(self.path)/1024**2)
+            file_size_MiB = int(os.path.getsize(self.path) / 1024 ** 2)
 
             # if we are hashing a whole directory, output a message for each file
             if isdir:
@@ -483,8 +577,9 @@ class HandleRegularFile(FileType):
             with open(f, "rb") as fp:
                 while True:
                     # output message every 100 MiB
-                    if ct > 0 and not ct % int(100*1024**2/buffer_size):
-                        canine_logging.info1(f"Hashing file {self.path}; {int(buffer_size*ct/1024**2)}/{file_size_MiB} MiB completed")
+                    if ct > 0 and not ct % int(100 * 1024 ** 2 / buffer_size):
+                        canine_logging.info1(
+                            f"Hashing file {self.path}; {int(buffer_size * ct / 1024 ** 2)}/{file_size_MiB} MiB completed")
 
                     data = fp.read(buffer_size)
                     if not data:
@@ -493,6 +588,7 @@ class HandleRegularFile(FileType):
                     ct += 1
 
         return hash_alg.hexdigest().decode().lower()
+
 
 # }}}
 
@@ -517,7 +613,8 @@ class HandleRODISKURL(FileType):
         # if they don't, then we warn the user that we may be inadvertently
         # avoiding
         if not roURL[1].startswith("canine-"):
-            canine_logging.warning("RODISK input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
+            canine_logging.warning(
+                "RODISK input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
 
         # single file/directory RODISKs will contain the CRC32C of the file(s)
         if roURL[1].startswith("canine-crc32c-"):
@@ -530,15 +627,17 @@ class HandleRODISKURL(FileType):
     # handler will be command to attach/mount the RODISK
     # (currently implemented in base.py)
 
+
 # }}}
 
-def get_file_handler(path, url_map = None, **kwargs):
+def get_file_handler(path, url_map=None, **kwargs):
     url_map = {
-      r"^gs://" : HandleGSURL, 
-      r"^s3://" : HandleAWSURL, 
-      r"^https://api.gdc.cancer.gov" : HandleGDCHTTPURL,
-      r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
-      r"^rodisk://" : HandleRODISKURL,
+        r"^gs://": HandleGSURL,
+        r"^s3://": HandleAWSURL,
+        r"^https://api.gdc.cancer.gov": HandleGDCHTTPURL,
+        r"^https://api.awg.gdc.cancer.gov": HandleGDCHTTPURL,
+        r"^https://get.broadinstitute.org": HandleBroadHTTPURL,
+        r"^rodisk://": HandleRODISKURL
     } if url_map is None else url_map
 
     # zerothly, if path is already a FileType object, return as-is
