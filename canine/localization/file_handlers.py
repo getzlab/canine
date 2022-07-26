@@ -364,7 +364,7 @@ class HandleGDCHTTPURL(FileType):
 
         # parse URL
         self.url = self.path
-        url_parse = re.match(r"^(https://api.(?:awg\.)gdc.cancer.gov)/(?:files|data)/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})", self.url)
+        url_parse = re.match(r"^(https://api\.(?:awg\.)?gdc\.cancer\.gov)/(?:files|data)/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})", self.url)
         if url_parse is None:
             raise ValueError("Invalid GDC ID '{}'".format(self.url))
 
