@@ -447,6 +447,12 @@ class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
 class HandleRegularFile(FileType):
     localization_mode = "local"
 
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+
+        # remove any trailing slashes, in case path refers to a directory
+        self.path = path.rstrip("/")
+
     def _get_size(self):
         return os.path.getsize(self.path)
 
