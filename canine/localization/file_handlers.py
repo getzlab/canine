@@ -448,7 +448,15 @@ class HandleRegularFile(FileType):
     localization_mode = "local"
 
     def _get_size(self):
-        return os.path.getsize(self.path)
+        if os.path.isdir(self.path):
+            total_size = 0
+            for path, dirs, files in os.walk(self.path):
+                for f in files:
+                    file_path = os.path.join(path, f)
+                    total_size += os.path.getsize(file_path)
+            return(total_size)
+        else:
+            return os.path.getsize(self.path)
 
     def _get_hash(self):
         # if Canine-generated checksum exists, use it
