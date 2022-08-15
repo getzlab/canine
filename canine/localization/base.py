@@ -743,16 +743,10 @@ class AbstractLocalizer(abc.ABC):
                 # the default localization/teardown script will work for this, since
                 # it can handle existing disks
             
-            # check if disk is currently being built by another instance; block if so
+            # check if disk is currently being built by another instance; notify user
             elif "users" in disk_attrs:
                 canine_logging.info1("Persistent disk {} is already being constructed by another instance; waiting to finalize ...".format(disk_name))
-                blocking_localization_script = [
-                    'while ! gcloud compute disks describe {} --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do'.format(disk_name),
-                    'echo "Waiting for disk to become available ..." >&2',
-                    'sleep {}'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer
-                    'done'
-                ]
-                return disk_mountpoint, blocking_localization_script, [], rodisk_paths
+                # blocking will happen automatically in localization script
 
             # disk has not been finalized; finish it
             else:
