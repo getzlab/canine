@@ -121,6 +121,8 @@ class ManualAdapter(AbstractAdapter):
             # a = [1, 2, 3], b = 1 -> zip([1, 2, 3], [1, 1, 1])
             # a = [1, 2, 3], b = [4, 5, 6] -> zip([1, 2, 3], [4, 5, 6])
             # a = [1, 2, 3], b = [[4, 5, 6]] -> zip([1, 2, 3], [[4, 5, 6], [4, 5, 6], [4, 5, 6]])
+            # TODO: does this case work?
+            # a = [1, 2], b = [[4, 5, 6], [7, 8, 9]] -> zip([1, 2], [[4, 5, 6], [7, 8, 9]])
             generator = zip(*[
               inputs[key] if isinstance(inputs[key], list) and maxdepth(inputs[key]) == 1 \
                 else repeat(
