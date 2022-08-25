@@ -671,6 +671,14 @@ class AbstractLocalizer(abc.ABC):
             F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "path", "hash", "size", "localize"])
             F["file_basename"] = F["path"].apply(os.path.basename)
 
+            ## if there are no files to localize, throw an error
+            if len(F) > 0 and ~(F["localize"].all()):
+                raise ValueError("You requested to localize files to disk, but no localizable inputs were given:\n{}\nInputs must be valid local paths or supported remote URLs.".format(",".join([f"{input} : \"{path}\"" for _, path, input in F[["path", "input"]].itertuples()])))
+
+            ## if some files cannot be localized, throw a warning
+            if (~F["localize"]).any():
+                canine_logging.warning("You requested to localize files to disk, but some inputs cannot be localized. Inputs must be valid local paths or supported remote URLs. The following inputs will be skipped:\n{}".format(",".join([f"{input} : \"{path}\"" for _, path, input in F.loc[~F["localize"], ["path", "input"]].itertuples()])))
+
             ## Disk name is determined by input names, files' basenames, and hashes
             disk_name = "canine-" + \
               file_handlers.hash_set(set(
@@ -682,7 +690,6 @@ class AbstractLocalizer(abc.ABC):
             canine_logging.info1("Disk name is {}".format(disk_name))
 
             ## create RODISK URLs for files being localized to disk
-            # pass through all other values unaltered
             F["disk_path"] = F["path"]
             F.loc[F["localize"], "disk_path"] = "rodisk://" + disk_name + "/" + F.loc[F["localize"], ["input", "file_basename"]].apply(lambda x: "/".join(x), axis = 1)
 
