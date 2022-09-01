@@ -791,8 +791,8 @@ class AbstractLocalizer(abc.ABC):
             ## wait for disk to attach, with exponential backoff up to 2 minutes
             'DELAY=1',
             'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
-              ## check once again if disk is being created by another instance
-              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\'; then',
+              ## if disk is not a scratch disk, check once again if it's being created by another instance
+              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\' && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
                 'TRIES=0',
                 # wait until disk is marked "finished"
                 'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
@@ -809,9 +809,9 @@ class AbstractLocalizer(abc.ABC):
               #       detach the disk from the other instance
               #       are there any scenarios in which this would be a bad idea?
 
-            # otherwise, it may just be taking a bit to attach
-            '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
-            'sleep $DELAY; ((DELAY *= 2))',
+              # otherwise, it may just be taking a bit to attach
+              '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
+              'sleep $DELAY; ((DELAY *= 2))',
             'done',
 
             ## format disk
@@ -857,6 +857,9 @@ class AbstractLocalizer(abc.ABC):
               'EOF',
               'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh & set -e',
             ]
+
+            # label disk as "scratch" now
+            localization_script += ['gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes']
 
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
@@ -1227,8 +1230,23 @@ class AbstractLocalizer(abc.ABC):
                     ),
                     "--scratch" if self.use_scratch_disk else ""
                 ),
+
+                # remove stream dir
                 'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi',
-                f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir else ''
+
+                # remove all files in workspace directory not captured by outputs
+                f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir else '',
+
+                # unmount all RODISKS, if they're not in use
+                '(cd /',
+                'for i in $(seq ${CANINE_N_RODISKS}); do',
+                '  CANINE_RODISK=CANINE_RODISK_${i}',
+                '  CANINE_RODISK=${!CANINE_RODISK}',
+                '  CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}',
+                '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
+                '  sudo umount ${CANINE_RODISK_DIR} || echo "RODISK ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
+                '  gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK',
+                'done)'
             ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
               + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
