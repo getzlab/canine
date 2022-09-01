@@ -849,7 +849,8 @@ class AbstractLocalizer(abc.ABC):
           ## unmount disk, with exponential backoff up to 2 minutes
           'DELAY=1',
           'while mountpoint {}/{} > /dev/null; do'.format(mount_prefix, disk_name),
-          '  sudo umount {}/{} || :'.format(mount_prefix, disk_name),
+          '  (cd /; sudo umount {}/{}) || :'.format(mount_prefix, disk_name),
+          '  [ $DELAY -gt 4 ] && {{ echo "Warning: attempting lazy unmount!" >&2; (cd /; sudo umount -l {}/{}); }} || :'.format(mount_prefix, disk_name),
           '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk" >&2; exit 1; } || :',
           '  sleep $DELAY; ((DELAY *= 2))',
           'done',
@@ -1191,7 +1192,8 @@ class AbstractLocalizer(abc.ABC):
                 'set -e',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
-                'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3} {4}; else python {0} {1} {2} {3} {4}; fi'.format(
+                # only run delocalization script if script exited OK. rest of teardown script is still run to perform cleanup like unmounting disks
+                'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3} {4}; else python {0} {1} {2} {3} {4}; fi; fi'.format(
                     os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     compute_env['CANINE_OUTPUT'],
                     jobId,

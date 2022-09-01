@@ -64,7 +64,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     echo '==== STARTING JOB ====' >&2
     echo '======================' >&2
     {{pipeline_script}}
-    CANINE_JOB_RC=$?
+    export CANINE_JOB_RC=$?
     if [ $CANINE_JOB_RC == 0 ]; then
       echo '====================================' >&2
       echo '==== JOB COMPLETED SUCCESSFULLY ====' >&2
@@ -74,6 +74,10 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo "!!!! JOB FAILED! (EXIT CODE $CANINE_JOB_RC) !!!!" >&2
       echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      echo '++++ STARTING JOB CLEANUP ++++' >&2
+      $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
+      TEARDOWN_RC=$?
+      [ $TEARDOWN_RC == 0 ] && echo '++++ CLEANUP COMPLETE ++++' >&2 || echo '!+++ CLEANUP FAILURE +++!' >&2
       [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
       if [[ $CANINE_JOB_RC -eq 137 ]]; then
         echo "INFO: job ran out of memory; will not attempt to requeue." >&2
