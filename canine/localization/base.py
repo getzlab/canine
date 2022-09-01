@@ -1172,7 +1172,8 @@ class AbstractLocalizer(abc.ABC):
                 'set -e',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
-                'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3} {4}; else python {0} {1} {2} {3} {4}; fi'.format(
+                # only run delocalization script if script exited OK. rest of teardown script is still run to perform cleanup like unmounting disks
+                'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3} {4}; else python {0} {1} {2} {3} {4}; fi; fi'.format(
                     os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     compute_env['CANINE_OUTPUT'],
                     jobId,
