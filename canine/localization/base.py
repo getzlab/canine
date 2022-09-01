@@ -837,7 +837,7 @@ class AbstractLocalizer(abc.ABC):
 
           ## detach disk
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
-          'if [ $LOCALIZER_JOB_RC -eq 0 ]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
+          'if [ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
         ]
 
