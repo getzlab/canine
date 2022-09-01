@@ -820,6 +820,24 @@ class AbstractLocalizer(abc.ABC):
               "fi"
             ]
 
+            # we also need to be able to dynamically resize the disk if it gets full
+            # if disk has <5% free space remaining, increase its size by 5%
+            localization_script += [
+              'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
+              'while true; do',
+              '  DISK_SIZE_GB=\$(df -k "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int((\$3 + \$4)/1000) }\')',
+              '  FREE_SPACE_GB=\$(df -k "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$4/1000) }\')',
+              '  if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 5 ]]; then',
+              '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB/\${DISK_SIZE_GB}GB); resizing +5%" >&2',
+              '    gcloud compute disks resize $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*105/100))',
+              '    sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+              '  fi',
+              '  sleep 60',
+              'done',
+              'EOF',
+              'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh & set -e',
+            ]
+
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
         teardown_script = [
@@ -839,6 +857,9 @@ class AbstractLocalizer(abc.ABC):
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
           'if [ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
+
+          ## kill disk resizing daemon, if running
+          'pkill -f diskresizedaemon || :'
         ]
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
