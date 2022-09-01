@@ -848,8 +848,8 @@ class AbstractLocalizer(abc.ABC):
               '  DISK_SIZE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
               '  FREE_SPACE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$4) }\')',
               '  if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 5 ]]; then',
-              '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +5%" >&2',
-              '    gcloud compute disks resize $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*105/100))',
+              '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +10%" >&2',
+              '    gcloud compute disks resize $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*110/100))',
               '    sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
               '  fi',
               '  sleep 60',
@@ -875,7 +875,7 @@ class AbstractLocalizer(abc.ABC):
 
           ## detach disk
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
-          'if [ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
+          'if [[ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
 
           ## kill disk resizing daemon, if running
