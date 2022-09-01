@@ -771,8 +771,8 @@ class AbstractLocalizer(abc.ABC):
             ## wait for disk to attach, with exponential backoff up to 2 minutes
             'DELAY=1',
             'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
-              ## check once again if disk is being created by another instance
-              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\'; then',
+              ## if disk is not a scratch disk, check once again if it's being created by another instance
+              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\' && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
                 'TRIES=0',
                 # wait until disk is marked "finished"
                 'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
@@ -789,9 +789,9 @@ class AbstractLocalizer(abc.ABC):
               #       detach the disk from the other instance
               #       are there any scenarios in which this would be a bad idea?
 
-            # otherwise, it may just be taking a bit to attach
-            '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
-            'sleep $DELAY; ((DELAY *= 2))',
+              # otherwise, it may just be taking a bit to attach
+              '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
+              'sleep $DELAY; ((DELAY *= 2))',
             'done',
 
             ## format disk
@@ -837,6 +837,9 @@ class AbstractLocalizer(abc.ABC):
               'EOF',
               'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh & set -e',
             ]
+
+            # label disk as "scratch" now
+            localization_script += ['gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes']
 
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
