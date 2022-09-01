@@ -1210,7 +1210,23 @@ class AbstractLocalizer(abc.ABC):
                     ),
                     "--scratch" if self.use_scratch_disk else ""
                 ),
-                'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi'
+
+                # remove stream dir
+                'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi',
+
+                # remove all files in workspace directory not captured by outputs
+                f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir else '',
+
+                # unmount all RODISKS, if they're not in use
+                '(cd /',
+                'for i in $(seq ${CANINE_N_RODISKS}); do',
+                '  CANINE_RODISK=CANINE_RODISK_${i}',
+                '  CANINE_RODISK=${!CANINE_RODISK}',
+                '  CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}',
+                '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
+                '  sudo umount ${CANINE_RODISK_DIR} || echo "RODISK ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
+                '  gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK',
+                'done)'
             ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
               + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
