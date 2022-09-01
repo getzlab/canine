@@ -828,7 +828,7 @@ class AbstractLocalizer(abc.ABC):
               '  DISK_SIZE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
               '  FREE_SPACE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$4) }\')',
               '  if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 5 ]]; then',
-              '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB/\${DISK_SIZE_GB}GB); resizing +5%" >&2',
+              '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +5%" >&2',
               '    gcloud compute disks resize $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*105/100))',
               '    sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
               '  fi',
