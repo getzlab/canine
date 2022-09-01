@@ -1217,15 +1217,22 @@ class AbstractLocalizer(abc.ABC):
                 # remove all files in workspace directory not captured by outputs
                 f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir else '',
 
-                # unmount all RODISKS, if they're not in use
+                # unmount all RODISKs, if they're not in use
                 '(cd /',
                 'for i in $(seq ${CANINE_N_RODISKS}); do',
                 '  CANINE_RODISK=CANINE_RODISK_${i}',
                 '  CANINE_RODISK=${!CANINE_RODISK}',
                 '  CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}',
                 '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
-                '  sudo umount ${CANINE_RODISK_DIR} || echo "RODISK ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
-                '  gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK',
+                '  if mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
+                # unmount on container host too
+                '    if [[ -f /.dockerenv ]]; then',
+                '      sudo nsenter -t 1 -m umount ${CANINE_RODISK_DIR} || true',
+                '    fi',
+                '    gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK || echo "Error detaching disk ${CANINE_RODISK}" >&2',
+                '  else',
+                '    echo "RODISK ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
+                '  fi',
                 'done)'
             ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
               + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
