@@ -845,8 +845,8 @@ class AbstractLocalizer(abc.ABC):
             localization_script += [
               'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
               'while true; do',
-              '  DISK_SIZE_GB=\$(df -k "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int((\$3 + \$4)/1000) }\')',
-              '  FREE_SPACE_GB=\$(df -k "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$4/1000) }\')',
+              '  DISK_SIZE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
+              '  FREE_SPACE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$4) }\')',
               '  if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 5 ]]; then',
               '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB/\${DISK_SIZE_GB}GB); resizing +5%" >&2',
               '    gcloud compute disks resize $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*105/100))',
