@@ -730,9 +730,16 @@ class AbstractLocalizer(abc.ABC):
 
                 # if this is not a scratch disk, no additional localization or
                 # teardown commands necessary, since inputs will be transformed into
-                # rodisk *inputs*, whose localization commands will be handled downstream
+                # rodisk *inputs*, whose localization commands to mount will be handled downstream
                 if len(file_paths_arrays):
                     return disk_mountpoint, [], [], rodisk_paths
+
+                # if it is a scratch disk, then make the localizer exit early.
+                # a finalized scratch disk means the task must have finished successfully.
+                # return special exit code 15 and skip running everything else.
+                # this is how we do job avoidance for scratch disks.
+                else:
+                    return disk_mountpoint, ["exit 15"], [], rodisk_paths
 
                 # otherwise, we still need to mount the disk/unmount+detach later
                 # the default localization/teardown script will work for this, since
@@ -762,6 +769,9 @@ class AbstractLocalizer(abc.ABC):
             'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
             'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
             'fi',
+
+            ## if this is a scratch disk, label it as such
+            'gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes' if len(file_paths_arrays) == 0 else '',
 
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
@@ -838,9 +848,6 @@ class AbstractLocalizer(abc.ABC):
               'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh & set -e',
             ]
 
-            # label disk as "scratch" now
-            localization_script += ['gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes']
-
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
         teardown_script = [
@@ -858,12 +865,18 @@ class AbstractLocalizer(abc.ABC):
 
           ## detach disk
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
-          'if [[ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
 
           ## kill disk resizing daemon, if running
           'pkill -f diskresizedaemon || :'
         ]
+
+        # scratch disks get labeled "finalized" if the task ran OK.
+        if len(file_paths_arrays) == 0:
+            teardown_script += ['if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
+        # localization disks get labeled "finalized" if the localizer ran OK.
+        else:
+            teardown_script += ['if [[ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 

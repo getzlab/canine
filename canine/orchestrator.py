@@ -100,7 +100,7 @@ else
   echo '!~~~ LOCALIZATION FAILURE! JOB CANNOT RUN! ~~~!' >&2
   echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code
   echo -n $LOCALIZER_JOB_RC > $CANINE_JOB_ROOT/.localizer_exit_code
-  CANINE_JOB_RC=$LOCALIZER_JOB_RC
+  export CANINE_JOB_RC=$LOCALIZER_JOB_RC
 fi
 echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
 cd $CANINE_JOB_ROOT
@@ -700,14 +700,22 @@ class Orchestrator(object):
 
                     # check for failed shards 
                     for i in js_df.index:
-                        for e in [".job_exit_code", ".localizer_exit_code", ".teardown_exit_code"]:
-                            exit_code = os.path.join(jobs_dir, i, e)
-                            if transport.isfile(exit_code):
-                                with transport.open(exit_code, "r") as ec:
-                                    js_df.at[i, "failed"] = (ec.read() != "0") | js_df.at[i, "failed"]
-                            else:
-                                js_df.at[i, "failed"] = True
-                                break
+                        # if workspace directory is missing, consider shard failed
+                        # this is to disable job avoidance for jobs that write to scratch
+                        # directories, which do not generate a workspace directory.
+                        if not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
+                            js_df.at[i, "failed"] = True
+
+                        # otherwise, make sure all three exit code are OK
+                        else:
+                            for e in [".job_exit_code", ".localizer_exit_code", ".teardown_exit_code"]:
+                                exit_code = os.path.join(jobs_dir, i, e)
+                                if transport.isfile(exit_code):
+                                    with transport.open(exit_code, "r") as ec:
+                                        js_df.at[i, "failed"] = (ec.read() != "0") | js_df.at[i, "failed"]
+                                else:
+                                    js_df.at[i, "failed"] = True
+                                    break
 
                     # check for matching outputs
                     # name and pattern must both match
