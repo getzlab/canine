@@ -923,8 +923,12 @@ class AbstractLocalizer(abc.ABC):
             # save rodisk:// URLs for files saved to the disk for later use
             self.rodisk_paths[jobId] = rodisk_paths
 
-            # if disk already exists (as indicated by blank disk creation script),
-            # treat each localizable input as a RODISK
+            # if disk already exists and is finalized (as indicated by blank disk creation script),
+            # treat each localizable input as a RODISK that already exists (to be mounted),
+            # rather than as a RODISK (to be created and localized to)
+            # note that this does not apply to scratch disks that already exist;
+            # these have a special disk creation script that cause the localizer to
+            # exit early.
             if len(disk_creation_script) == 0:
                 for k, v_array in self.rodisk_paths[jobId].items():
                     # if this input had previously been localized in prepare_job_inputs,
@@ -933,10 +937,16 @@ class AbstractLocalizer(abc.ABC):
                         if v.localization_mode == "local": 
                             localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path.remotepath)]
 
-                    # transform this input into a RODISK FileType
+                    # transform this input into a RODISK FileType, to be mounted
                     if not self.persistent_disk_dry_run:
                         self.inputs[jobId][k] = [file_handlers.HandleRODISKURL(v) for v in v_array]
-                    # if this is a dry run, we are only interested in the RODISK URL strings
+
+                    # if this is a dry run, we are only interested in the RODISK URL string literals;
+                    # we will not actually be attempting to mount it. this is mainly
+                    # for wolf.LocalizeToDisk, which returns RODISK path inputs
+                    # as its outputs. this would likely not be useful for most others
+                    # tasks, since they would have no idea what to do with a RODISK string
+                    # literal
                     else:
                         self.inputs[jobId][k] = [file_handlers.StringLiteral(v) for v in v_array]
 
