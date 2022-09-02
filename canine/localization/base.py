@@ -822,6 +822,9 @@ class AbstractLocalizer(abc.ABC):
               # otherwise, it may just be taking a bit to attach
               '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
               'sleep $DELAY; ((DELAY *= 2))',
+
+              # try again if delay has exceeded 8 seconds
+              '[ $DELAY -gt 8 ] && { gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :; } || :',
             'done',
 
             ## format disk
@@ -844,11 +847,13 @@ class AbstractLocalizer(abc.ABC):
         # in addition to inside the Slurm worker VM (same code as mounting RODISK
         # in job_setup_teardown)
         if len(file_paths_arrays) == 0:
-            localization_script += [
-              "if [[ -f /.dockerenv ]]; then",
-              'sudo nsenter -t 1 -m mount -o noload,defaults /dev/disk/by-id/google-${GCP_DISK_NAME} "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-              "fi"
-            ]
+#            localization_script += [
+#              "if [[ -f /.dockerenv ]]; then",
+#              'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
+#              'sudo nsenter -t 1 -m mount -o noload,defaults /dev/disk/by-id/google-${GCP_DISK_NAME} "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+#              'fi',
+#              'fi',
+#            ]
 
             # we also need to be able to dynamically resize the disk if it gets full
             # if disk has <5% free space remaining, increase its size by 5%
@@ -1187,10 +1192,10 @@ class AbstractLocalizer(abc.ABC):
 
               # mount within Slurm worker container
               "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
-              # mount on host (so that task dockers can access it)
-              "if [[ -f /.dockerenv ]]; then",
-              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
-              "fi",
+#              # mount on host (so that task dockers can access it)
+#              "if [[ -f /.dockerenv ]]; then",
+#              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
+#              "fi",
               "fi",
 
               # because we forced zero exits for the previous commands,
@@ -1268,10 +1273,10 @@ class AbstractLocalizer(abc.ABC):
                 '  CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}',
                 '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
                 '  if mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
-                # unmount on container host too
-                '    if [[ -f /.dockerenv ]]; then',
-                '      sudo nsenter -t 1 -m umount ${CANINE_RODISK_DIR} || true',
-                '    fi',
+#                # unmount on container host too
+#                '    if [[ -f /.dockerenv ]]; then',
+#                '      sudo nsenter -t 1 -m umount ${CANINE_RODISK_DIR} || true',
+#                '    fi',
                 '    gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK || echo "Error detaching disk ${CANINE_RODISK}" >&2',
                 '  else',
                 '    echo "RODISK ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
