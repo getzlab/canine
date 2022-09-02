@@ -719,7 +719,7 @@ class AbstractLocalizer(abc.ABC):
         # otherwise random
         else:
             disk_name = "canine-scratch-{}".format(disk_name if disk_name is not None else os.urandom(4).hex())
-            disk_size = max(10, disk_size)
+            disk_size = max(2, disk_size)
             rodisk_paths = None
 
         ## this is a dry run (i.e., don't actually make disk, just return paths)
@@ -750,9 +750,16 @@ class AbstractLocalizer(abc.ABC):
 
                 # if this is not a scratch disk, no additional localization or
                 # teardown commands necessary, since inputs will be transformed into
-                # rodisk *inputs*, whose localization commands will be handled downstream
+                # rodisk *inputs*, whose localization commands to mount will be handled downstream
                 if len(file_paths_arrays):
                     return disk_mountpoint, [], [], rodisk_paths
+
+                # if it is a scratch disk, then make the localizer exit early.
+                # a finalized scratch disk means the task must have finished successfully.
+                # return special exit code 15 and skip running everything else.
+                # this is how we do job avoidance for scratch disks.
+                else:
+                    return disk_mountpoint, ["exit 15"], [], rodisk_paths
 
                 # otherwise, we still need to mount the disk/unmount+detach later
                 # the default localization/teardown script will work for this, since
@@ -782,6 +789,9 @@ class AbstractLocalizer(abc.ABC):
             'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
             'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
             'fi',
+
+            ## if this is a scratch disk, label it as such
+            'gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes' if len(file_paths_arrays) == 0 else '',
 
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
@@ -858,9 +868,6 @@ class AbstractLocalizer(abc.ABC):
               'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh & set -e',
             ]
 
-            # label disk as "scratch" now
-            localization_script += ['gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes']
-
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
         teardown_script = [
@@ -878,12 +885,18 @@ class AbstractLocalizer(abc.ABC):
 
           ## detach disk
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
-          'if [[ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
 
           ## kill disk resizing daemon, if running
           'pkill -f diskresizedaemon || :'
         ]
+
+        # scratch disks get labeled "finalized" if the task ran OK.
+        if len(file_paths_arrays) == 0:
+            teardown_script += ['if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
+        # localization disks get labeled "finalized" if the localizer ran OK.
+        else:
+            teardown_script += ['if [[ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
@@ -930,8 +943,12 @@ class AbstractLocalizer(abc.ABC):
             # save rodisk:// URLs for files saved to the disk for later use
             self.rodisk_paths[jobId] = rodisk_paths
 
-            # if disk already exists (as indicated by blank disk creation script),
-            # treat each localizable input as a RODISK
+            # if disk already exists and is finalized (as indicated by blank disk creation script),
+            # treat each localizable input as a RODISK that already exists (to be mounted),
+            # rather than as a RODISK (to be created and localized to)
+            # note that this does not apply to scratch disks that already exist;
+            # these have a special disk creation script that cause the localizer to
+            # exit early.
             if len(disk_creation_script) == 0:
                 for k, v_array in self.rodisk_paths[jobId].items():
                     # if this input had previously been localized in prepare_job_inputs,
@@ -940,10 +957,16 @@ class AbstractLocalizer(abc.ABC):
                         if v.localization_mode == "local": 
                             localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path.remotepath)]
 
-                    # transform this input into a RODISK FileType
+                    # transform this input into a RODISK FileType, to be mounted
                     if not self.persistent_disk_dry_run:
                         self.inputs[jobId][k] = [file_handlers.HandleRODISKURL(v) for v in v_array]
-                    # if this is a dry run, we are only interested in the RODISK URL strings
+
+                    # if this is a dry run, we are only interested in the RODISK URL string literals;
+                    # we will not actually be attempting to mount it. this is mainly
+                    # for wolf.LocalizeToDisk, which returns RODISK path inputs
+                    # as its outputs. this would likely not be useful for most others
+                    # tasks, since they would have no idea what to do with a RODISK string
+                    # literal
                     else:
                         self.inputs[jobId][k] = [file_handlers.StringLiteral(v) for v in v_array]
 
