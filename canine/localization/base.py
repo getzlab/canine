@@ -802,6 +802,9 @@ class AbstractLocalizer(abc.ABC):
               # otherwise, it may just be taking a bit to attach
               '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
               'sleep $DELAY; ((DELAY *= 2))',
+
+              # try again if delay has exceeded 8 seconds
+              '[ $DELAY -gt 8 ] && { gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :; } || :',
             'done',
 
             ## format disk
