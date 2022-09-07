@@ -720,6 +720,9 @@ class AbstractLocalizer(abc.ABC):
 #            "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
 #        )
 
+        # flag for scratch disks to know to job avoid
+        finished = False
+
         # disk exists
         if "HTTPError 404" not in out.stderr.read().decode():
             disk_attrs = json.load(out.stdout)
@@ -728,18 +731,13 @@ class AbstractLocalizer(abc.ABC):
             if "labels" in disk_attrs and "finished" in disk_attrs["labels"]:
                 canine_logging.info1("Found existing disk {}".format(disk_name))
 
+                finished = True
+
                 # if this is not a scratch disk, no additional localization or
                 # teardown commands necessary, since inputs will be transformed into
                 # rodisk *inputs*, whose localization commands to mount will be handled downstream
                 if len(file_paths_arrays):
                     return disk_mountpoint, [], [], rodisk_paths
-
-                # if it is a scratch disk, then make the localizer exit early.
-                # a finalized scratch disk means the task must have finished successfully.
-                # return special exit code 15 and skip running everything else.
-                # this is how we do job avoidance for scratch disks.
-                else:
-                    return disk_mountpoint, ["exit 15"], [], rodisk_paths
 
                 # otherwise, we still need to mount the disk/unmount+detach later
                 # the default localization/teardown script will work for this, since
@@ -835,23 +833,31 @@ class AbstractLocalizer(abc.ABC):
 #              'fi',
 #            ]
 
+            # if this disk is finished, then we can exit early and skip the job
+            # immediately after mounting. this is how we implement job avoidance
+            # for scratch disk jobs.
+            # use special exit code for this.
+            if finished:
+                localization_script += ["exit 15"]
+
             # we also need to be able to dynamically resize the disk if it gets full
             # if disk has <5% free space remaining, increase its size by 5%
-            localization_script += [
-              'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
-              'while true; do',
-              '  DISK_SIZE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
-              '  FREE_SPACE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$4) }\')',
-              '  if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 5 ]]; then',
-              '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +10%" >&2',
-              '    gcloud compute disks resize $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*110/100))',
-              '    sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
-              '  fi',
-              '  sleep 60',
-              'done',
-              'EOF',
-              'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh & set -e',
-            ]
+            else:
+                localization_script += [
+                  'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
+                  'while true; do',
+                  '  DISK_SIZE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
+                  '  FREE_SPACE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$4) }\')',
+                  '  if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 5 ]]; then',
+                  '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +10%" >&2',
+                  '    gcloud compute disks resize $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*110/100))',
+                  '    sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+                  '  fi',
+                  '  sleep 60',
+                  'done',
+                  'EOF',
+                  'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh & set -e',
+                ]
 
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
