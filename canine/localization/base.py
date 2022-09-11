@@ -1168,6 +1168,7 @@ class AbstractLocalizer(abc.ABC):
         exports += ["export CANINE_N_RODISKS={}".format(len(canine_rodisks))]
         if len(canine_rodisks):
             localization_tasks += [
+              "[ -f .rodisk_lock_pids ] && rm .rodisk_lock_pids || :",
               "for i in `seq ${CANINE_N_RODISKS}`; do",
               "CANINE_RODISK=CANINE_RODISK_${i}",
               "CANINE_RODISK=${!CANINE_RODISK}",
@@ -1209,6 +1210,11 @@ class AbstractLocalizer(abc.ABC):
               # because we forced zero exits for the previous commands,
               # we need to verify that the mount actually exists
               "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; cat $DIAG_FILE >&2; exit 1; }",
+
+              # lock the disk; will be unlocked during teardown script (or if script crashes)
+              # this is to ensure that we don't unmount the disk during teardown
+              # if other processes are still using it
+              "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> .rodisk_lock_pids",
 
               "done",
             ]
@@ -1274,13 +1280,20 @@ class AbstractLocalizer(abc.ABC):
                 f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir else '',
 
                 # unmount all RODISKs, if they're not in use
+                # first, release all locks obtained by this job
+                'if [ -f .rodisk_lock_pids ]; then',
+                '  while read -r pid; do',
+                '    kill $pid',
+                '  done < .rodisk_lock_pids',
+                '  rm -f .rodisk_lock_pids',
+                'fi',
                 '(cd /',
                 'for i in $(seq ${CANINE_N_RODISKS}); do',
                 '  CANINE_RODISK=CANINE_RODISK_${i}',
                 '  CANINE_RODISK=${!CANINE_RODISK}',
                 '  CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}',
                 '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
-                '  if mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
+                '  if flock -n ${CANINE_RODISK_DIR} true && mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
 #                # unmount on container host too
 #                '    if [[ -f /.dockerenv ]]; then',
 #                '      sudo nsenter -t 1 -m umount ${CANINE_RODISK_DIR} || true',
