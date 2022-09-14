@@ -1194,7 +1194,7 @@ class AbstractLocalizer(abc.ABC):
               # lock the disk; will be unlocked during teardown script (or if script crashes)
               # this is to ensure that we don't unmount the disk during teardown
               # if other processes are still using it
-              "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> .rodisk_lock_pids",
+              "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.rodisk_lock_pids",
 
               "done",
             ]
@@ -1261,11 +1261,11 @@ class AbstractLocalizer(abc.ABC):
 
                 # unmount all RODISKs, if they're not in use
                 # first, release all locks obtained by this job
-                'if [ -f .rodisk_lock_pids ]; then',
+                'if [ -f ${CANINE_JOB_INPUTS}/.rodisk_lock_pids ]; then',
                 '  while read -r pid; do',
                 '    kill $pid',
-                '  done < .rodisk_lock_pids',
-                '  rm -f .rodisk_lock_pids',
+                '  done < ${CANINE_JOB_INPUTS}/.rodisk_lock_pids',
+                '  rm -f ${CANINE_JOB_INPUTS}/.rodisk_lock_pids',
                 'fi',
                 '(cd /',
                 'for i in $(seq ${CANINE_N_RODISKS}); do',
