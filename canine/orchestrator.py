@@ -64,7 +64,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     echo '==== STARTING JOB ====' >&2
     echo '======================' >&2
     {{pipeline_script}}
-    CANINE_JOB_RC=$?
+    export CANINE_JOB_RC=$?
     if [ $CANINE_JOB_RC == 0 ]; then
       echo '====================================' >&2
       echo '==== JOB COMPLETED SUCCESSFULLY ====' >&2
@@ -74,6 +74,10 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo "!!!! JOB FAILED! (EXIT CODE $CANINE_JOB_RC) !!!!" >&2
       echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      echo '++++ STARTING JOB CLEANUP ++++' >&2
+      $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
+      TEARDOWN_RC=$?
+      [ $TEARDOWN_RC == 0 ] && echo '++++ CLEANUP COMPLETE ++++' >&2 || echo '!+++ CLEANUP FAILURE +++!' >&2
       [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
       if [[ $CANINE_JOB_RC -eq 137 ]]; then
         echo "INFO: job ran out of memory; will not attempt to requeue." >&2
@@ -86,11 +90,16 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     fi
   done
   echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
+elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # this is a special exit code that localization.sh can explicitly return
+  echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2
+  export CANINE_JOB_RC=0
+  echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code
+  echo -n $LOCALIZER_JOB_RC > $CANINE_JOB_ROOT/.localizer_exit_code
 else
   echo '!~~~ LOCALIZATION FAILURE! JOB CANNOT RUN! ~~~!' >&2
   echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code
   echo -n $LOCALIZER_JOB_RC > $CANINE_JOB_ROOT/.localizer_exit_code
-  CANINE_JOB_RC=$LOCALIZER_JOB_RC
+  export CANINE_JOB_RC=$LOCALIZER_JOB_RC
 fi
 echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
 cd $CANINE_JOB_ROOT
@@ -690,14 +699,22 @@ class Orchestrator(object):
 
                     # check for failed shards 
                     for i in js_df.index:
-                        for e in [".job_exit_code", ".localizer_exit_code", ".teardown_exit_code"]:
-                            exit_code = os.path.join(jobs_dir, i, e)
-                            if transport.isfile(exit_code):
-                                with transport.open(exit_code, "r") as ec:
-                                    js_df.at[i, "failed"] = (ec.read() != "0") | js_df.at[i, "failed"]
-                            else:
-                                js_df.at[i, "failed"] = True
-                                break
+                        # if workspace directory is missing, consider shard failed
+                        # this is to disable job avoidance for jobs that write to scratch
+                        # directories, which do not generate a workspace directory.
+                        if not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
+                            js_df.at[i, "failed"] = True
+
+                        # otherwise, make sure all three exit code are OK
+                        else:
+                            for e in [".job_exit_code", ".localizer_exit_code", ".teardown_exit_code"]:
+                                exit_code = os.path.join(jobs_dir, i, e)
+                                if transport.isfile(exit_code):
+                                    with transport.open(exit_code, "r") as ec:
+                                        js_df.at[i, "failed"] = (ec.read() != "0") | js_df.at[i, "failed"]
+                                else:
+                                    js_df.at[i, "failed"] = True
+                                    break
 
                     # check for matching outputs
                     # name and pattern must both match

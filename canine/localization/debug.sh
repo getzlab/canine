@@ -30,5 +30,8 @@ else
 	echo "bash -i" >> $CMD_TMP
 fi
 
+echo "echo 'Running teardown script, please wait ...'" >> $CMD_TMP
+echo "./teardown.sh" >> $CMD_TMP
+
 bash $CMD_TMP
 rm $CMD_TMP
