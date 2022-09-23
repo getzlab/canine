@@ -113,9 +113,21 @@ class ManualAdapter(AbstractAdapter):
                         raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
                 elif 1 != l != self._job_length:
                     raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
+            # pad out ragged array. we assume there is only one 1D list (over which
+            # we scatter); everything else gets repeated to match it. we need
+            # to be careful when calling repeat() on 2D lists, since it will add
+            # an extra dimension
+            # ex:
+            # a = [1, 2, 3], b = 1 -> zip([1, 2, 3], [1, 1, 1])
+            # a = [1, 2, 3], b = [4, 5, 6] -> zip([1, 2, 3], [4, 5, 6])
+            # a = [1, 2, 3], b = [[4, 5, 6]] -> zip([1, 2, 3], [[4, 5, 6], [4, 5, 6], [4, 5, 6]])
             generator = zip(*[
-                inputs[key] if isinstance(inputs[key], list) else repeat(inputs[key], self._job_length)
-                for key in keys
+              inputs[key] if isinstance(inputs[key], list) and maxdepth(inputs[key]) == 1 \
+                else repeat(
+                  inputs[key][0] if isinstance(inputs[key], list) else inputs[key],
+                  self._job_length
+                )
+              for key in keys
             ])
 
         self.__spec = {
@@ -125,6 +137,7 @@ class ManualAdapter(AbstractAdapter):
             }
             for i, job in enumerate(generator)
         }
+
         assert len(self.__spec) == self._job_length, "Failed to predict input length"
         if self.alias is not None:
             if isinstance(self.alias, list):

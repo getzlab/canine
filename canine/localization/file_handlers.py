@@ -136,7 +136,7 @@ class HandleGSURL(FileType):
         super().__init__(path, **kwargs)
 
         # remove any trailing slashes, in case path refers to a directory
-        self.path = path.strip("/")
+        self.path = path.rstrip("/")
 
         # check if this bucket is requester pays
         self.rp_string = ""
@@ -149,7 +149,7 @@ class HandleGSURL(FileType):
         self.is_dir = False
 
     def _get_size(self):
-        output = subprocess.check_output('gsutil {} du -s {}'.format(self.rp_string, shlex.quote(self.path.strip("/"))), shell=True).decode()
+        output = subprocess.check_output('gsutil {} du -s {}'.format(self.rp_string, shlex.quote(self.path.rstrip("/"))), shell=True).decode()
         return int(output.split()[0])
 
     def _get_hash(self):
@@ -238,7 +238,7 @@ class HandleAWSURL(FileType):
         super().__init__(path, **kwargs)
 
         # remove any trailing slashes, in case path refers to a directory
-        self.path = path.strip("/")
+        self.path = path.rstrip("/")
 
         # keys get passed via environment variable
         self.command_env = {}
@@ -364,7 +364,7 @@ class HandleGDCHTTPURL(FileType):
 
         # parse URL
         self.url = self.path
-        url_parse = re.match(r"^(https://api.(?:awg\.)gdc.cancer.gov)/(?:files|data)/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})", self.url)
+        url_parse = re.match(r"^(https://api\.(?:awg\.)?gdc\.cancer\.gov)/(?:files|data)/([0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12})", self.url)
         if url_parse is None:
             raise ValueError("Invalid GDC ID '{}'".format(self.url))
 
@@ -447,8 +447,22 @@ class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
 class HandleRegularFile(FileType):
     localization_mode = "local"
 
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+
+        # remove any trailing slashes, in case path refers to a directory
+        self.path = path.rstrip("/")
+
     def _get_size(self):
-        return os.path.getsize(self.path)
+        if os.path.isdir(self.path):
+            total_size = 0
+            for path, dirs, files in os.walk(self.path):
+                for f in files:
+                    file_path = os.path.join(path, f)
+                    total_size += os.path.getsize(file_path)
+            return(total_size)
+        else:
+            return os.path.getsize(self.path)
 
     def _get_hash(self):
         # if Canine-generated checksum exists, use it

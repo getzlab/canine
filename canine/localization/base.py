@@ -49,6 +49,7 @@ class AbstractLocalizer(abc.ABC):
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
         use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
         persistent_disk_dry_run = False,
+        cleanup_job_workdir = False,
         **kwargs
     ):
         """
@@ -66,6 +67,8 @@ class AbstractLocalizer(abc.ABC):
         scratch_disk_name: name of scratch disk. Default is a random string
         persistent_disk_dry_run: don't actually create a persistent disk; just
           return the paths to the files on the disk
+        cleanup_job_workdir: remove files in the job working directory that aren't
+          denoted as outputs
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -102,6 +105,8 @@ class AbstractLocalizer(abc.ABC):
         self.scratch_disk_name = scratch_disk_name
 
         self.persistent_disk_dry_run = persistent_disk_dry_run
+
+        self.cleanup_job_workdir = cleanup_job_workdir
 
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
@@ -665,12 +670,24 @@ class AbstractLocalizer(abc.ABC):
             for k, v in file_paths_arrays.items(): 
                 n_suff = 0
                 for x in v:
-                    file_paths.append([k, n_suff, x.path, x.hash, x.size, not (isinstance(x, file_handlers.StringLiteral) or isinstance(x, file_handlers.HandleRODISKURL or x.localization_mode == "stream"))])
+                    file_paths.append([k, n_suff, x.path, x.hash, x.size, not (isinstance(x, file_handlers.StringLiteral) or isinstance(x, file_handlers.HandleRODISKURL or x.localization_mode == "stream")), isinstance(x, file_handlers.HandleRODISKURL)])
                     n_suff += 1
 
             ## Create dataframe of files' attributes
-            F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "path", "hash", "size", "localize"])
+            F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "path", "hash", "size", "localize", "rdpassthru"])
             F["file_basename"] = F["path"].apply(os.path.basename)
+
+            ## if there are no files to localize, throw an error
+            if len(F) > 0 and (~(F["localize"] | F["rdpassthru"])).all():
+                raise ValueError("You requested to localize files to disk, but no localizable inputs were given:\n{}\nInputs must be valid local paths or supported remote URLs.".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F[["path", "input"]].itertuples()])))
+
+            ## if some files cannot be localized, throw a warning
+            if (~(F["localize"] | F["rdpassthru"])).any():
+                canine_logging.warning("You requested to localize files to disk, but some inputs cannot be localized. Inputs must be valid local paths or supported remote URLs. The following inputs will be skipped:\n{}".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F.loc[~(F["localize"] | F["rdpassthru"]), ["path", "input"]].itertuples()])))
+
+            ## handle special case if we are only passing through rodisk URLs; this is like a dry run
+            if F["rdpassthru"].any() and not F["localize"].any():
+                return None, [], [], F.loc[F["rdpassthru"], :].groupby("input")["path"].apply(list).to_dict()
 
             ## Disk name is determined by input names, files' basenames, and hashes
             disk_name = "canine-" + \
@@ -683,7 +700,6 @@ class AbstractLocalizer(abc.ABC):
             canine_logging.info1("Disk name is {}".format(disk_name))
 
             ## create RODISK URLs for files being localized to disk
-            # pass through all other values unaltered
             F["disk_path"] = F["path"]
             F.loc[F["localize"], "disk_path"] = "rodisk://" + disk_name + "/" + F.loc[F["localize"], ["input", "file_basename"]].apply(lambda x: "/".join(x), axis = 1)
 
@@ -693,6 +709,10 @@ class AbstractLocalizer(abc.ABC):
 
             ## Save RODISK paths for subsequent use by downstream tasks
             rodisk_paths = F.loc[F["localize"], :].groupby("input")["disk_path"].apply(list).to_dict()
+
+            # if we are passing through any rodisk paths, add them to the rodisk_paths dict
+            if F["rdpassthru"].any():
+                rodisk_paths = {**rodisk_paths, **F.loc[F["rdpassthru"], :].groupby("input")["path"].apply(list).to_dict()}
 
         #
         # otherwise, we create a blank disk with a given name (if specified),
