@@ -861,22 +861,27 @@ class AbstractLocalizer(abc.ABC):
                 localization_script += ["exit 15"]
 
             # we also need to be able to dynamically resize the disk if it gets full
-            # if disk has <5% free space remaining, increase its size by 5%
+            # if disk has <30% free space remaining, increase its size by 60%
             else:
                 localization_script += [
                   'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
+                  'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
                   'while true; do',
-                  '  DISK_SIZE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
-                  '  FREE_SPACE_GB=\$(df -B1G "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" | awk \'NR == 2 { print int(\$4) }\')',
-                  '  if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 5 ]]; then',
-                  '    echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +10%" >&2',
-                  '    gcloud compute disks resize $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*110/100))',
-                  '    sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+                  '  if ! mountpoint \$DISK_DIR &> /dev/null; then echo "No disk mounted to \$DISK_DIR" >&2; continue; else',
+                  '    DISK_SIZE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
+                  '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
+                  '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
+                  '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
+                  '      gcloud compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
+                  '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+                  '    fi',
                   '  fi',
-                  '  sleep 60',
+                  '  sleep 10',
                   'done',
                   'EOF',
-                  'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh & set -e',
+                  'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
+                  'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
+                  'set -e',
                 ]
 
         # * disk unmount or deletion script (to append to teardown_script)
@@ -899,7 +904,7 @@ class AbstractLocalizer(abc.ABC):
           # TODO: add command to optionally delete disk
 
           ## kill disk resizing daemon, if running
-          'pkill -f diskresizedaemon || :'
+          'kill $(cat .diskresizedaemon_pid) || :'
         ]
 
         # scratch disks get labeled "finalized" if the task ran OK.
