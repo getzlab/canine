@@ -324,9 +324,9 @@ class Orchestrator(object):
         if len(self.raw_outputs) == 0:
             warnings.warn("No outputs declared", stacklevel=2)
         if 'stdout' not in self.raw_outputs:
-            self.raw_outputs['stdout'] = '../stdout'
+            self.raw_outputs['stdout'] = '$CANINE_JOB_ROOT/stdout'
         if 'stderr' not in self.raw_outputs:
-            self.raw_outputs['stderr'] = '../stderr'
+            self.raw_outputs['stderr'] = '$CANINE_JOB_ROOT/stderr'
 
         # placeholder for dataframe containing previous results that were
         # job avoided
