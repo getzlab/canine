@@ -1272,7 +1272,7 @@ class AbstractLocalizer(abc.ABC):
                     compute_env['CANINE_OUTPUT'],
                     jobId,
                     ' '.join(
-                        '-p {} {}'.format(name, shlex.quote(pattern))
+                        '-p {} {}'.format(name, shlex.quote(pattern) if name not in {"stdout", "stderr"} else pattern)
                         for name, pattern in patterns.items()
                     ),
                     "--scratch" if self.use_scratch_disk else ""
