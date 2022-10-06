@@ -2,6 +2,7 @@ from __future__ import print_function
 import argparse
 import glob
 import google_crc32c
+import multiprocessing
 import os
 import re
 import shutil
@@ -123,16 +124,21 @@ def main(output_dir, jobId, patterns, copy, scratch):
 
     # compute checksums for all files
     print('Computing CRC32C checksums ...', file = sys.stderr, flush = True, end = "")
+    pool = multiprocessing.Pool(8)
+    crc_results = []
     for dest, f in matched_files:
-        # don't hash stdout/stderr
-        if f.startswith(".."):
-            continue
-        # compute hash for this file
+        crc_results.append((pool.apply_async(compute_crc32c, (f,)), dest, f))
+
+    for res in crc_results:
+        crc = res[0].get()
+        dest = res[1]
+        f = res[2]
         with open(os.path.join(
             os.path.dirname(dest),
             "." + os.path.basename(dest) + ".crc32c"
           ), "w") as crc32c_file:
-            crc32c_file.write(compute_crc32c(f) + "\n")
+            crc32c_file.write(crc + "\n")
+    pool.terminate()
     print(' done', file = sys.stderr, flush = True)
 
 if __name__ == '__main__':
