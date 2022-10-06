@@ -904,7 +904,7 @@ class AbstractLocalizer(abc.ABC):
           # TODO: add command to optionally delete disk
 
           ## kill disk resizing daemon, if running
-          'kill $(cat .diskresizedaemon_pid) || :'
+          'kill $(cat .diskresizedaemon_pid) || : &> /dev/null'
         ]
 
         # scratch disks get labeled "finalized" if the task ran OK.
