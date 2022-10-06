@@ -809,7 +809,7 @@ class AbstractLocalizer(abc.ABC):
                   '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
                   '((++TRIES))',
                 'done',
-                'exit 15', # special exit code to cause rest of entrypoint.sh to be skipped
+                'exit 15 #DEBUG_OMIT', # special exit code to cause rest of entrypoint.sh to be skipped
               'fi',
               # TODO: what if the task exited on the other
               #       instance without running the teardown script
@@ -858,7 +858,7 @@ class AbstractLocalizer(abc.ABC):
             # for scratch disk jobs.
             # use special exit code for this.
             if finished:
-                localization_script += ["exit 15"]
+                localization_script += ["exit 15 #DEBUG_OMIT"]
 
             # we also need to be able to dynamically resize the disk if it gets full
             # if disk has <30% free space remaining, increase its size by 60%
