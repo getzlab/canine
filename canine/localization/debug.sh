@@ -2,8 +2,10 @@
 
 CMD_TMP=$(mktemp)
 
+echo "export CANINE_DEBUG_MODE=1" > $CMD_TMP
+
 # entrypoint exports (global canine variables)
-sed -n '/^export CANINE/p' ../../entrypoint.sh > $CMD_TMP
+sed -n '/^export CANINE/p' ../../entrypoint.sh >> $CMD_TMP
 
 # setup.sh exports (job-specific variables)
 sed -n '/^export/p' setup.sh >> $CMD_TMP
