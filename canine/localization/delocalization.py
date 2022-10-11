@@ -83,10 +83,11 @@ def main(output_dir, jobId, patterns, copy, scratch):
                     if not os.path.isdir(os.path.dirname(dest)):
                         os.makedirs(os.path.dirname(dest))
                     # we've output to a scratch disk; create (broken) symlink to RODISK mount
-                    if scratch:
+                    if scratch and name not in copy:
                         os.symlink(os.path.abspath(target), dest)
                     # Same volume check catches outputs from outside the workspace
-                    elif copy or not same_volume(target, jobdir):
+                    elif name in copy or not same_volume(target, jobdir):
+                        print(f'INFO: copying (not symlinking) file \'{target}\' (name "{name}", pattern "{pattern}")', file = sys.stderr)
                         if os.path.isfile(target):
                             shutil.copyfile(os.path.abspath(target), dest)
                         else:
@@ -160,8 +161,9 @@ if __name__ == '__main__':
     )
     parser.add_argument(
         '-c', '--copy',
-        action='store_true',
-        help="Copy outputs instead of symlinking"
+        action='append',
+        help="Copy output <name> instead of symlinking",
+        default=[]
     )
     parser.add_argument(
         '-s', '--scratch',
@@ -169,4 +171,4 @@ if __name__ == '__main__':
         help="Outputs were written to a scratch disk; will create (broken) symlinks to the scratch diskmountpoint"
     )
     args = parser.parse_args()
-    main(args.dest, args.jobId, args.pattern, args.copy, args.scratch)
+    main(args.dest, args.jobId, args.pattern, set(args.copy), args.scratch)
