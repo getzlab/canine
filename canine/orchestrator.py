@@ -124,7 +124,9 @@ def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
             key:stringify(val)
             for key, val in obj.items()
         }
-    elif isinstance(obj, pd.core.series.Series) or isinstance(obj, pd.core.indexes.base.Index):
+    elif isinstance(obj, pd.core.series.Series) or \
+         isinstance(obj, pd.core.indexes.base.Index) or \
+         isinstance(obj, np.ndarray):
         return [
             stringify(elem)
             for elem in obj.tolist()
