@@ -18,8 +18,8 @@ cat <<"EOF" >> $CMD_TMP
 chmod 755 $CANINE_JOB_LOCALIZATION
 EOF
 
-# run localization.sh
-echo "./localization.sh" >> $CMD_TMP
+# run localization.sh, omitting lines not suitable for debugging
+echo "bash <(grep -v '#DEBUG_OMIT' localization.sh)" >> $CMD_TMP
 
 # run script to get into Docker
 if grep -q "^#WOLF_DOCKERIZED_TASK" ../../script.sh; then
