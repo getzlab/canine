@@ -1262,7 +1262,7 @@ class AbstractLocalizer(abc.ABC):
                 # do not run delocalization script if:
                 # * we're in debug mode
                 # * localization was skipped
-                'if [[ -z $CANINE_DEBUG_MODE && ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC != 15 ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; fi; fi'.format(
+                'if [[ ( -z $CANINE_DEBUG_MODE && ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC != 15 ) || ( ! -d $CANINE_OUTPUT/$SLURM_ARRAY_TASK_ID ) ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; fi; fi'.format(
                     script_path = os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     output_root = compute_env['CANINE_OUTPUT'],
                     shard = jobId,
