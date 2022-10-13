@@ -576,32 +576,6 @@ class AbstractLocalizer(abc.ABC):
             else:
                 assert isinstance(value, file_handlers.FileType)
 
-            ## now that value is known, define closure to localize it immediately
-            def localize_now():
-                nonlocal transport
-
-                dest_path = self.get_destination_path(
-                  value.path,
-                  transport, 
-                  'jobs', jobId, 'inputs'
-                )
-
-                with self.transport_context(transport) as transport:
-                    self.localize_file(
-                        value,
-                        dest_path,
-                        transport=transport
-                    )
-
-                # update localized_path
-                value.localized_path = dest_path
-
-                return value
-
-            # if this is a local file, localize it now
-            if value.localization_mode == "local":
-                return localize_now()
-
             # if user overrode the handling mode, make sure it's compatible
             # with the file type
             if mode is not False: 
@@ -1050,20 +1024,32 @@ class AbstractLocalizer(abc.ABC):
                     array_exports[key] = []
                 array_exports[key].append(value)
 
+        ## now generate exports/localization commands
+
+        # keep running list of basenames, in order to mangle them if duplicate
+        # basenames exist. this keeps destination paths unique.
+        basenames = {}
+        
         compute_env = self.environment('remote')
         for key, file_handler_array in self.inputs[jobId].items():
             is_array = self.input_array_flag[jobId][key]
             for file_handler in file_handler_array: 
+                # mangle basename if necessary
+                basename = os.path.basename(os.path.abspath(file_handler.path))
+                if basename in basenames:
+                    basenames[basename] += 1
+                    basename = basename + "_" + str(basenames[basename])
+                else:
+                    basenames[basename] = 1
+
+                #dest_path = self.reserve_path('jobs', jobId, 'inputs', basename)
+
                 # identical to URL, but we don't have the option of localizing to
                 # a persistent disk, since localization_command will create
                 # some kind of FIFO
                 if file_handler.localization_mode == 'stream':
                     job_vars.add(shlex.quote(key))
-                    dest = self.get_destination_path(
-                      os.path.basename(os.path.abspath(file_handler.path)),
-                      transport,
-                      'jobs', jobId, 'inputs', 
-                    )
+                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
                     localization_tasks += [file_handler.localization_command(dest.remotepath)]
                     export_writer(key, dest.remotepath, is_array)
 
@@ -1074,17 +1060,10 @@ class AbstractLocalizer(abc.ABC):
                     # localize this file to a persistent disk, if specified
                     if self.localize_to_persistent_disk:
                         # set dest to persistent disk mountpoint
-                        # TODO: basenames of URLs have not been mangled to
-                        # handle multiple non-unique basenames for an array
-                        # input, a la get_destination_path.
-                        exportpath = os.path.join(disk_prefix, key, os.path.basename(file_handler.path))
+                        exportpath = os.path.join(disk_prefix, key, basename)
                     else:
                         # set dest to path on NFS
-                        dest = self.get_destination_path(
-                          os.path.basename(os.path.abspath(file_handler.path)),
-                          transport,
-                          'jobs', jobId, 'inputs', 
-                        )
+                        dest = self.reserve_path('jobs', jobId, 'inputs', basename)
                         exportpath = dest.remotepath
                     file_handler.localized_path = exportpath
 
@@ -1102,7 +1081,6 @@ class AbstractLocalizer(abc.ABC):
                     dgrp = re.search(r"rodisk://(.*?)/(.*)", file_handler.path)
                     disk = dgrp[1]
                     file = dgrp[2]
-                    base_name = os.path.basename(file)
 
                     disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
 
@@ -1111,7 +1089,7 @@ class AbstractLocalizer(abc.ABC):
                         exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
                         exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
 
-                    dest = self.reserve_path('jobs', jobId, 'inputs', base_name)
+                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
 
                     localization_tasks += [
                       # symlink the future RODISK path into the Canine inputs directory
@@ -1124,22 +1102,34 @@ class AbstractLocalizer(abc.ABC):
 
                     export_writer(key, dest.remotepath, is_array)
 
-                # this is a local file. it has already been copied or symlinked 
-                # to the inputs directory. if we are using a persistent disk, create
-                # commands to copy it over. otherwise, do nothing besides export
+                # this is a local file; copy or symlink it to the inputs directory.
+                # if we are localizing to a persistent disk, create commands
+                # to copy it there.
                 elif file_handler.localization_mode == "local":
                     job_vars.add(shlex.quote(key))
 
-                    localized_path = file_handler.localized_path.remotepath
+                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
+
+                    with self.transport_context(transport) as transport:
+                        self.localize_file(
+                            file_handler,
+                            dest,
+                            transport=transport
+                        )
+
+                    # update localized_path
+                    file_handler.localized_path = dest.remotepath
+
+                    # add commands to copy file from NFS to persistent disk, if specified
                     if self.localize_to_persistent_disk:
-                        exportpath = os.path.join(disk_prefix, key, os.path.basename(localized_path))
+                        exportpath = os.path.join(disk_prefix, key, basename)
                         localization_tasks += [
                           "[ ! -d {0} ] && mkdir -p {0} || :".format(os.path.join(disk_prefix, key)),
-                          "cp -r {} {}".format(localized_path, exportpath)
+                          "cp -r {} {}".format(dest.remotepath, exportpath)
                         ]
                         file_handler.localized_path = exportpath
                     else:
-                        exportpath = localized_path
+                        exportpath = dest.remotepath
 
                     export_writer(
                       key,
