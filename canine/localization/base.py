@@ -48,6 +48,7 @@ class AbstractLocalizer(abc.ABC):
         token: typing.Optional[str] = None,
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
         use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
+        files_to_copy_to_outputs = {},
         persistent_disk_dry_run = False,
         cleanup_job_workdir = False,
         **kwargs
@@ -103,6 +104,8 @@ class AbstractLocalizer(abc.ABC):
         self.scratch_disk_type = scratch_disk_type
         self.scratch_disk_size = scratch_disk_size
         self.scratch_disk_name = scratch_disk_name
+
+        self.files_to_copy_to_outputs = files_to_copy_to_outputs
 
         self.persistent_disk_dry_run = persistent_disk_dry_run
 
@@ -456,7 +459,7 @@ class AbstractLocalizer(abc.ABC):
                     # if we're using a scratch disk, outputs should be RODISK
                     # objects for downstream tasks to mount. read symlinks to
                     # RODISK URLs
-                    if self.use_scratch_disk:
+                    if self.use_scratch_disk and outputname not in self.files_to_copy_to_outputs:
                         output_files[jobId][outputname] = ["rodisk://" + re.match(r".*(canine-scratch.*)", os.readlink(x))[1] for x in output_files[jobId][outputname]]
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
@@ -1269,15 +1272,19 @@ class AbstractLocalizer(abc.ABC):
                 # do not run delocalization script if:
                 # * we're in debug mode
                 # * localization was skipped
-                'if [[ -z $CANINE_DEBUG_MODE && ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC != 15 ]]; then if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3} {4}; else python {0} {1} {2} {3} {4}; fi; fi'.format(
-                    os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
-                    compute_env['CANINE_OUTPUT'],
-                    jobId,
-                    ' '.join(
+                'if [[ -z $CANINE_DEBUG_MODE && ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC != 15 ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; fi; fi'.format(
+                    script_path = os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
+                    output_root = compute_env['CANINE_OUTPUT'],
+                    shard = jobId,
+                    patterns = ' '.join(
                         '-p {} {}'.format(name, shlex.quote(pattern) if name not in {"stdout", "stderr"} else pattern)
                         for name, pattern in patterns.items()
                     ),
-                    "--scratch" if self.use_scratch_disk else ""
+                    copyflags = ' '.join(
+                        '-c {}'.format(name)
+                        for name in self.files_to_copy_to_outputs 
+                    ),
+                    scratchflag = "--scratch" if self.use_scratch_disk else "",
                 ),
 
                 # remove stream dir
