@@ -11,12 +11,13 @@ import shutil
 import warnings
 import crayons
 import re
+import json
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
-from ..utils import get_default_gcp_project, check_call, canine_logging
+from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging
 from hound.client import _getblob_bucket
 from agutil import status_bar
 import pandas as pd
@@ -47,7 +48,9 @@ class AbstractLocalizer(abc.ABC):
         token: typing.Optional[str] = None,
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
         use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
+        files_to_copy_to_outputs = {},
         persistent_disk_dry_run = False,
+        cleanup_job_workdir = False,
         **kwargs
     ):
         """
@@ -65,6 +68,8 @@ class AbstractLocalizer(abc.ABC):
         scratch_disk_name: name of scratch disk. Default is a random string
         persistent_disk_dry_run: don't actually create a persistent disk; just
           return the paths to the files on the disk
+        cleanup_job_workdir: remove files in the job working directory that aren't
+          denoted as outputs
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -100,7 +105,11 @@ class AbstractLocalizer(abc.ABC):
         self.scratch_disk_size = scratch_disk_size
         self.scratch_disk_name = scratch_disk_name
 
+        self.files_to_copy_to_outputs = files_to_copy_to_outputs
+
         self.persistent_disk_dry_run = persistent_disk_dry_run
+
+        self.cleanup_job_workdir = cleanup_job_workdir
 
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
@@ -450,7 +459,7 @@ class AbstractLocalizer(abc.ABC):
                     # if we're using a scratch disk, outputs should be RODISK
                     # objects for downstream tasks to mount. read symlinks to
                     # RODISK URLs
-                    if self.use_scratch_disk:
+                    if self.use_scratch_disk and outputname not in self.files_to_copy_to_outputs:
                         output_files[jobId][outputname] = ["rodisk://" + re.match(r".*(canine-scratch.*)", os.readlink(x))[1] for x in output_files[jobId][outputname]]
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
@@ -570,32 +579,6 @@ class AbstractLocalizer(abc.ABC):
             else:
                 assert isinstance(value, file_handlers.FileType)
 
-            ## now that value is known, define closure to localize it immediately
-            def localize_now():
-                nonlocal transport
-
-                dest_path = self.get_destination_path(
-                  value.path,
-                  transport, 
-                  'jobs', jobId, 'inputs'
-                )
-
-                with self.transport_context(transport) as transport:
-                    self.localize_file(
-                        value,
-                        dest_path,
-                        transport=transport
-                    )
-
-                # update localized_path
-                value.localized_path = dest_path
-
-                return value
-
-            # if this is a local file, localize it now
-            if value.localization_mode == "local":
-                return localize_now()
-
             # if user overrode the handling mode, make sure it's compatible
             # with the file type
             if mode is not False: 
@@ -664,12 +647,24 @@ class AbstractLocalizer(abc.ABC):
             for k, v in file_paths_arrays.items(): 
                 n_suff = 0
                 for x in v:
-                    file_paths.append([k, n_suff, x.path, x.hash, x.size, not (isinstance(x, file_handlers.StringLiteral) or isinstance(x, file_handlers.HandleRODISKURL or x.localization_mode == "stream"))])
+                    file_paths.append([k, n_suff, x.path, x.hash, x.size, not (isinstance(x, file_handlers.StringLiteral) or isinstance(x, file_handlers.HandleRODISKURL or x.localization_mode == "stream")), isinstance(x, file_handlers.HandleRODISKURL)])
                     n_suff += 1
 
             ## Create dataframe of files' attributes
-            F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "path", "hash", "size", "localize"])
+            F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "path", "hash", "size", "localize", "rdpassthru"])
             F["file_basename"] = F["path"].apply(os.path.basename)
+
+            ## if there are no files to localize, throw an error
+            if len(F) > 0 and (~(F["localize"] | F["rdpassthru"])).all():
+                raise ValueError("You requested to localize files to disk, but no localizable inputs were given:\n{}\nInputs must be valid local paths or supported remote URLs.".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F[["path", "input"]].itertuples()])))
+
+            ## if some files cannot be localized, throw a warning
+            if (~(F["localize"] | F["rdpassthru"])).any():
+                canine_logging.warning("You requested to localize files to disk, but some inputs cannot be localized. Inputs must be valid local paths or supported remote URLs. The following inputs will be skipped:\n{}".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F.loc[~(F["localize"] | F["rdpassthru"]), ["path", "input"]].itertuples()])))
+
+            ## handle special case if we are only passing through rodisk URLs; this is like a dry run
+            if F["rdpassthru"].any() and not F["localize"].any():
+                return None, [], [], F.loc[F["rdpassthru"], :].groupby("input")["path"].apply(list).to_dict()
 
             ## Disk name is determined by input names, files' basenames, and hashes
             disk_name = "canine-" + \
@@ -682,7 +677,6 @@ class AbstractLocalizer(abc.ABC):
             canine_logging.info1("Disk name is {}".format(disk_name))
 
             ## create RODISK URLs for files being localized to disk
-            # pass through all other values unaltered
             F["disk_path"] = F["path"]
             F.loc[F["localize"], "disk_path"] = "rodisk://" + disk_name + "/" + F.loc[F["localize"], ["input", "file_basename"]].apply(lambda x: "/".join(x), axis = 1)
 
@@ -692,6 +686,10 @@ class AbstractLocalizer(abc.ABC):
 
             ## Save RODISK paths for subsequent use by downstream tasks
             rodisk_paths = F.loc[F["localize"], :].groupby("input")["disk_path"].apply(list).to_dict()
+
+            # if we are passing through any rodisk paths, add them to the rodisk_paths dict
+            if F["rdpassthru"].any():
+                rodisk_paths = {**rodisk_paths, **F.loc[F["rdpassthru"], :].groupby("input")["path"].apply(list).to_dict()}
 
         #
         # otherwise, we create a blank disk with a given name (if specified),
@@ -710,12 +708,50 @@ class AbstractLocalizer(abc.ABC):
         disk_mountpoint = mount_prefix + "/" + disk_name
 
         ## Check if the disk already exists
-        out = subprocess.check_output(
-            "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
+        zone = get_default_gcp_zone()
+        out = subprocess.Popen(
+            f"gcloud compute disks describe {disk_name} --zone {zone} --format 'json'",
+            shell = True, stdout = subprocess.PIPE, stderr = subprocess.PIPE
         )
-        out = out.decode().rstrip().split("\n")
-        if len(out) > 2:
-            raise Exception("Unexpected number of existing disks (should not happen?)")
+
+#            "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
+#        )
+
+        # flag for scratch disks to know to job avoid
+        finished = False
+
+        # disk exists
+        if "HTTPError 404" not in out.stderr.read().decode():
+            disk_attrs = json.load(out.stdout)
+
+            # disk has been finalized
+            if "labels" in disk_attrs and "finished" in disk_attrs["labels"]:
+                canine_logging.info1("Found existing disk {}".format(disk_name))
+
+                finished = True
+
+                # if this is not a scratch disk, no additional localization or
+                # teardown commands necessary, since inputs will be transformed into
+                # rodisk *inputs*, whose localization commands to mount will be handled downstream
+                if len(file_paths_arrays):
+                    return disk_mountpoint, [], [], rodisk_paths
+
+                # otherwise, we still need to mount the disk/unmount+detach later
+                # the default localization/teardown script will work for this, since
+                # it can handle existing disks
+            
+            # check if disk is currently being built by another instance; notify user
+            elif "users" in disk_attrs:
+                canine_logging.info1("Persistent disk {} is already being constructed by another instance; waiting to finalize ...".format(disk_name))
+                # blocking will happen automatically in localization script
+
+            # disk has not been finalized; finish it
+            else:
+                canine_logging.info1("Resuming creation of persistent disk {}".format(disk_name))
+
+        # disk does not exist; create it
+        else: 
+            canine_logging.info1("Creating new persistent disk {}".format(disk_name))
 
         ## Generate disk creation script
         localization_script = [
@@ -729,12 +765,8 @@ class AbstractLocalizer(abc.ABC):
             'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
             'fi',
 
-            # TODO: how to handle if disk is already attached to another instance?
-            #       this likely means that the task exited on the other
-            #       instance without running the teardown script
-            #       (e.g. task was cancelled), in which case we'd want to forcibly
-            #       detach the disk from the other instance
-            #       are there any scenarios in which this would be a bad idea?
+            ## if this is a scratch disk, label it as such
+            'gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes' if len(file_paths_arrays) == 0 else '',
 
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
@@ -744,8 +776,30 @@ class AbstractLocalizer(abc.ABC):
             ## wait for disk to attach, with exponential backoff up to 2 minutes
             'DELAY=1',
             'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
-            '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk"; exit 1; } || :',
-            'sleep $DELAY; ((DELAY *= 2))',
+              ## if disk is not a scratch disk, check once again if it's being created by another instance
+              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\' && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
+                'TRIES=0',
+                # wait until disk is marked "finished"
+                'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
+                  'echo "Waiting for disk to become available ..." >&2',
+                  '[ $TRIES == 0 ] && sleep {} || sleep 300'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer for first timeout; 5 minutes thereafter up to 10 times
+                  '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
+                  '((++TRIES))',
+                'done',
+                'exit 15 #DEBUG_OMIT', # special exit code to cause rest of entrypoint.sh to be skipped
+              'fi',
+              # TODO: what if the task exited on the other
+              #       instance without running the teardown script
+              #       (e.g. task was cancelled), in which case we'd want to forcibly
+              #       detach the disk from the other instance
+              #       are there any scenarios in which this would be a bad idea?
+
+              # otherwise, it may just be taking a bit to attach
+              '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
+              'sleep $DELAY; ((DELAY *= 2))',
+
+              # try again if delay has exceeded 8 seconds
+              '[ $DELAY -gt 8 ] && { gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :; } || :',
             'done',
 
             ## format disk
@@ -768,11 +822,44 @@ class AbstractLocalizer(abc.ABC):
         # in addition to inside the Slurm worker VM (same code as mounting RODISK
         # in job_setup_teardown)
         if len(file_paths_arrays) == 0:
-            localization_script += [
-              "if [[ -f /.dockerenv ]]; then",
-              'sudo nsenter -t 1 -m mount -o noload,defaults /dev/disk/by-id/google-${GCP_DISK_NAME} "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-              "fi"
-            ]
+#            localization_script += [
+#              "if [[ -f /.dockerenv ]]; then",
+#              'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
+#              'sudo nsenter -t 1 -m mount -o noload,defaults /dev/disk/by-id/google-${GCP_DISK_NAME} "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+#              'fi',
+#              'fi',
+#            ]
+
+            # if this disk is finished, then we can exit early and skip the job
+            # immediately after mounting. this is how we implement job avoidance
+            # for scratch disk jobs.
+            # use special exit code for this.
+            if finished:
+                localization_script += ["exit 15 #DEBUG_OMIT"]
+
+            # we also need to be able to dynamically resize the disk if it gets full
+            # if disk has <30% free space remaining, increase its size by 60%
+            else:
+                localization_script += [
+                  'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
+                  'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
+                  'while true; do',
+                  '  sleep 10',
+                  '  if ! mountpoint \$DISK_DIR &> /dev/null; then echo "No disk mounted to \$DISK_DIR" >&2; continue; else',
+                  '    DISK_SIZE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
+                  '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
+                  '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
+                  '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
+                  '      gcloud compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
+                  '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+                  '    fi',
+                  '  fi',
+                  'done',
+                  'EOF',
+                  'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
+                  'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
+                  'set -e',
+                ]
 
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
@@ -783,32 +870,31 @@ class AbstractLocalizer(abc.ABC):
           ## unmount disk, with exponential backoff up to 2 minutes
           'DELAY=1',
           'while mountpoint {}/{} > /dev/null; do'.format(mount_prefix, disk_name),
-          '  sudo umount {}/{} || :'.format(mount_prefix, disk_name),
-          '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk"; exit 1; } || :',
+          '  (cd /; sudo umount {}/{}) || :'.format(mount_prefix, disk_name),
+          '  [ $DELAY -gt 4 ] && {{ echo "Warning: attempting lazy unmount!" >&2; (cd /; sudo umount -l {}/{}); }} || :'.format(mount_prefix, disk_name),
+          '  [ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to unmount disk" >&2; exit 1; } || :',
           '  sleep $DELAY; ((DELAY *= 2))',
           'done',
 
           ## detach disk
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
-          'if [ $LOCALIZER_JOB_RC -eq 0 ]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name), # mark as finished
           # TODO: add command to optionally delete disk
+
+          ## kill disk resizing daemon, if running
+          'kill $(cat .diskresizedaemon_pid) || : &> /dev/null'
         ]
 
-        # disk exists
-        if len(out) == 2: # header + one result
-            canine_logging.info1("Found existing disk {}".format(disk_name))
+        # scratch disks get labeled "finalized" if the task ran OK.
+        if len(file_paths_arrays) == 0:
+            teardown_script += ['if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
 
-            # if this is not a scratch disk, no additional localization or
-            # teardown commands necessary, since inputs will be transformed into
-            # rodisk *inputs*, whose localization commands will be handled downstream
-            if len(file_paths_arrays):
-                return disk_mountpoint, [], [], rodisk_paths
+            # we also need to leave the job workspace directory before anything else
+            # in the scratch disk teardown script to allow the disk to unmount
+            teardown_script = ["cd $CANINE_JOB_ROOT"] + teardown_script
 
-            # otherwise, we still need to mount the disk/unmount+detach later
-            # the default localization/teardown script will work for this, since
-            # it can handle existing disks
-        else: 
-            canine_logging.info1("Creating new persistent disk {}".format(disk_name))
+        # localization disks get labeled "finalized" if the localizer ran OK.
+        else:
+            teardown_script += ['if [[ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
@@ -841,6 +927,9 @@ class AbstractLocalizer(abc.ABC):
             #        common to each shard, then we'll create the same disk
             #        multiple times, once per shard. thus, for now we heavyhandedly
             #        prohibit localizing to persistent disks for multishard jobs.
+            # NOTE:  we are still able to create scratch disks for scatter jobs,
+            #        one per shard. we do this by appending the shard number to the
+            #        scratch disk name
             if len(self.inputs) > 1:
                 raise ValueError("Localization to persistent disk for multishard jobs is currently not supported.")
 
@@ -852,8 +941,12 @@ class AbstractLocalizer(abc.ABC):
             # save rodisk:// URLs for files saved to the disk for later use
             self.rodisk_paths[jobId] = rodisk_paths
 
-            # if disk already exists (as indicated by blank disk creation script),
-            # treat each localizable input as a RODISK
+            # if disk already exists and is finalized (as indicated by blank disk creation script),
+            # treat each localizable input as a RODISK that already exists (to be mounted),
+            # rather than as a RODISK (to be created and localized to)
+            # note that this does not apply to scratch disks that already exist;
+            # these have a special disk creation script that cause the localizer to
+            # exit early.
             if len(disk_creation_script) == 0:
                 for k, v_array in self.rodisk_paths[jobId].items():
                     # if this input had previously been localized in prepare_job_inputs,
@@ -862,24 +955,27 @@ class AbstractLocalizer(abc.ABC):
                         if v.localization_mode == "local": 
                             localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path.remotepath)]
 
-                    # transform this input into a RODISK FileType
+                    # transform this input into a RODISK FileType, to be mounted
                     if not self.persistent_disk_dry_run:
                         self.inputs[jobId][k] = [file_handlers.HandleRODISKURL(v) for v in v_array]
-                    # if this is a dry run, we are only interested in the RODISK URL strings
+
+                    # if this is a dry run, we are only interested in the RODISK URL string literals;
+                    # we will not actually be attempting to mount it. this is mainly
+                    # for wolf.LocalizeToDisk, which returns RODISK path inputs
+                    # as its outputs. this would likely not be useful for most others
+                    # tasks, since they would have no idea what to do with a RODISK string
+                    # literal
                     else:
                         self.inputs[jobId][k] = [file_handlers.StringLiteral(v) for v in v_array]
 
         #
-        # create creation script for scratch disk, if specified
+        # create creation/teardown scripts for scratch disk, if specified
         if self.use_scratch_disk:
             scratch_disk_prefix, scratch_disk_creation_script, \
             scratch_disk_teardown_script, _ = self.create_persistent_disk(
-              disk_name = self.scratch_disk_name,
+              disk_name = self.scratch_disk_name + "-" + jobId, # one scratch disk per shard
               disk_size = self.scratch_disk_size
             )
-
-            # need to leave the job workspace directory to allow the disk to unmount
-            scratch_disk_teardown_script = ["cd $CANINE_JOB_ROOT"] + scratch_disk_teardown_script
 
             localization_tasks += scratch_disk_creation_script
 
@@ -931,20 +1027,32 @@ class AbstractLocalizer(abc.ABC):
                     array_exports[key] = []
                 array_exports[key].append(value)
 
+        ## now generate exports/localization commands
+
+        # keep running list of basenames, in order to mangle them if duplicate
+        # basenames exist. this keeps destination paths unique.
+        basenames = {}
+        
         compute_env = self.environment('remote')
         for key, file_handler_array in self.inputs[jobId].items():
             is_array = self.input_array_flag[jobId][key]
             for file_handler in file_handler_array: 
+                # mangle basename if necessary
+                basename = os.path.basename(os.path.abspath(file_handler.path))
+                if basename in basenames:
+                    basenames[basename] += 1
+                    basename = basename + "_" + str(basenames[basename])
+                else:
+                    basenames[basename] = 1
+
+                #dest_path = self.reserve_path('jobs', jobId, 'inputs', basename)
+
                 # identical to URL, but we don't have the option of localizing to
                 # a persistent disk, since localization_command will create
                 # some kind of FIFO
                 if file_handler.localization_mode == 'stream':
                     job_vars.add(shlex.quote(key))
-                    dest = self.get_destination_path(
-                      os.path.basename(os.path.abspath(file_handler.path)),
-                      transport,
-                      'jobs', jobId, 'inputs', 
-                    )
+                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
                     localization_tasks += [file_handler.localization_command(dest.remotepath)]
                     export_writer(key, dest.remotepath, is_array)
 
@@ -955,17 +1063,10 @@ class AbstractLocalizer(abc.ABC):
                     # localize this file to a persistent disk, if specified
                     if self.localize_to_persistent_disk:
                         # set dest to persistent disk mountpoint
-                        # TODO: basenames of URLs have not been mangled to
-                        # handle multiple non-unique basenames for an array
-                        # input, a la get_destination_path.
-                        exportpath = os.path.join(disk_prefix, key, os.path.basename(file_handler.path))
+                        exportpath = os.path.join(disk_prefix, key, basename)
                     else:
                         # set dest to path on NFS
-                        dest = self.get_destination_path(
-                          os.path.basename(os.path.abspath(file_handler.path)),
-                          transport,
-                          'jobs', jobId, 'inputs', 
-                        )
+                        dest = self.reserve_path('jobs', jobId, 'inputs', basename)
                         exportpath = dest.remotepath
                     file_handler.localized_path = exportpath
 
@@ -983,7 +1084,6 @@ class AbstractLocalizer(abc.ABC):
                     dgrp = re.search(r"rodisk://(.*?)/(.*)", file_handler.path)
                     disk = dgrp[1]
                     file = dgrp[2]
-                    base_name = os.path.basename(file)
 
                     disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
 
@@ -992,7 +1092,7 @@ class AbstractLocalizer(abc.ABC):
                         exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), disk)]
                         exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), disk_dir)]
 
-                    dest = self.reserve_path('jobs', jobId, 'inputs', base_name)
+                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
 
                     localization_tasks += [
                       # symlink the future RODISK path into the Canine inputs directory
@@ -1005,22 +1105,34 @@ class AbstractLocalizer(abc.ABC):
 
                     export_writer(key, dest.remotepath, is_array)
 
-                # this is a local file. it has already been copied or symlinked 
-                # to the inputs directory. if we are using a persistent disk, create
-                # commands to copy it over. otherwise, do nothing besides export
+                # this is a local file; copy or symlink it to the inputs directory.
+                # if we are localizing to a persistent disk, create commands
+                # to copy it there.
                 elif file_handler.localization_mode == "local":
                     job_vars.add(shlex.quote(key))
 
-                    localized_path = file_handler.localized_path.remotepath
+                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
+
+                    with self.transport_context(transport) as transport:
+                        self.localize_file(
+                            file_handler,
+                            dest,
+                            transport=transport
+                        )
+
+                    # update localized_path
+                    file_handler.localized_path = dest.remotepath
+
+                    # add commands to copy file from NFS to persistent disk, if specified
                     if self.localize_to_persistent_disk:
-                        exportpath = os.path.join(disk_prefix, key, os.path.basename(localized_path))
+                        exportpath = os.path.join(disk_prefix, key, basename)
                         localization_tasks += [
                           "[ ! -d {0} ] && mkdir -p {0} || :".format(os.path.join(disk_prefix, key)),
-                          "cp -r {} {}".format(localized_path, exportpath)
+                          "cp -r {} {}".format(dest.remotepath, exportpath)
                         ]
                         file_handler.localized_path = exportpath
                     else:
-                        exportpath = localized_path
+                        exportpath = dest.remotepath
 
                     export_writer(
                       key,
@@ -1054,6 +1166,7 @@ class AbstractLocalizer(abc.ABC):
         exports += ["export CANINE_N_RODISKS={}".format(len(canine_rodisks))]
         if len(canine_rodisks):
             localization_tasks += [
+              "[ -f .rodisk_lock_pids ] && rm .rodisk_lock_pids || :",
               "for i in `seq ${CANINE_N_RODISKS}`; do",
               "CANINE_RODISK=CANINE_RODISK_${i}",
               "CANINE_RODISK=${!CANINE_RODISK}",
@@ -1086,15 +1199,20 @@ class AbstractLocalizer(abc.ABC):
 
               # mount within Slurm worker container
               "sudo mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
-              # mount on host (so that task dockers can access it)
-              "if [[ -f /.dockerenv ]]; then",
-              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
-              "fi",
+#              # mount on host (so that task dockers can access it)
+#              "if [[ -f /.dockerenv ]]; then",
+#              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
+#              "fi",
               "fi",
 
               # because we forced zero exits for the previous commands,
               # we need to verify that the mount actually exists
               "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; cat $DIAG_FILE >&2; exit 1; }",
+
+              # lock the disk; will be unlocked during teardown script (or if script crashes)
+              # this is to ensure that we don't unmount the disk during teardown
+              # if other processes are still using it
+              "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.rodisk_lock_pids",
 
               "done",
             ]
@@ -1141,17 +1259,54 @@ class AbstractLocalizer(abc.ABC):
                 'set -e',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
-                'if which python3 2>/dev/null >/dev/null; then python3 {0} {1} {2} {3} {4}; else python {0} {1} {2} {3} {4}; fi'.format(
-                    os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
-                    compute_env['CANINE_OUTPUT'],
-                    jobId,
-                    ' '.join(
-                        '-p {} {}'.format(name, shlex.quote(pattern))
+                # do not run delocalization script if:
+                # * we're in debug mode
+                # * localization was skipped
+                'if [[ ( -z $CANINE_DEBUG_MODE && ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC != 15 ) || ( ! -d $CANINE_OUTPUT/$SLURM_ARRAY_TASK_ID ) ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; fi; fi'.format(
+                    script_path = os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
+                    output_root = compute_env['CANINE_OUTPUT'],
+                    shard = jobId,
+                    patterns = ' '.join(
+                        '-p {} {}'.format(name, shlex.quote(pattern) if name not in {"stdout", "stderr"} else pattern)
                         for name, pattern in patterns.items()
                     ),
-                    "--scratch" if self.use_scratch_disk else ""
+                    copyflags = ' '.join(
+                        '-c {}'.format(name)
+                        for name in self.files_to_copy_to_outputs 
+                    ),
+                    scratchflag = "--scratch" if self.use_scratch_disk else "",
                 ),
-                'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi'
+
+                # remove stream dir
+                'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi',
+
+                # remove all files in workspace directory not captured by outputs
+                f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir else '',
+
+                # unmount all RODISKs, if they're not in use
+                # first, release all locks obtained by this job
+                'if [ -f ${CANINE_JOB_INPUTS}/.rodisk_lock_pids ]; then',
+                '  while read -r pid; do',
+                '    kill $pid',
+                '  done < ${CANINE_JOB_INPUTS}/.rodisk_lock_pids',
+                '  rm -f ${CANINE_JOB_INPUTS}/.rodisk_lock_pids',
+                'fi',
+                '(cd /',
+                'for i in $(seq ${CANINE_N_RODISKS}); do',
+                '  CANINE_RODISK=CANINE_RODISK_${i}',
+                '  CANINE_RODISK=${!CANINE_RODISK}',
+                '  CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}',
+                '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
+                '  if flock -n ${CANINE_RODISK_DIR} true && mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
+#                # unmount on container host too
+#                '    if [[ -f /.dockerenv ]]; then',
+#                '      sudo nsenter -t 1 -m umount ${CANINE_RODISK_DIR} || true',
+#                '    fi',
+                '    gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK || echo "Error detaching disk ${CANINE_RODISK}" >&2',
+                '  else',
+                '    echo "RODISK ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
+                '  fi',
+                'done)'
             ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
               + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )

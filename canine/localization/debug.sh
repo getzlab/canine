@@ -2,8 +2,10 @@
 
 CMD_TMP=$(mktemp)
 
+echo "export CANINE_DEBUG_MODE=1" > $CMD_TMP
+
 # entrypoint exports (global canine variables)
-sed -n '/^export CANINE/p' ../../entrypoint.sh > $CMD_TMP
+sed -n '/^export CANINE/p' ../../entrypoint.sh >> $CMD_TMP
 
 # setup.sh exports (job-specific variables)
 sed -n '/^export/p' setup.sh >> $CMD_TMP
@@ -16,8 +18,8 @@ cat <<"EOF" >> $CMD_TMP
 chmod 755 $CANINE_JOB_LOCALIZATION
 EOF
 
-# run localization.sh
-echo "./localization.sh" >> $CMD_TMP
+# run localization.sh, omitting lines not suitable for debugging
+echo "bash <(grep -v '#DEBUG_OMIT' localization.sh)" >> $CMD_TMP
 
 # run script to get into Docker
 if grep -q "^#WOLF_DOCKERIZED_TASK" ../../script.sh; then
@@ -29,6 +31,9 @@ else
 	# backend
 	echo "bash -i" >> $CMD_TMP
 fi
+
+echo "echo 'Running teardown script, please wait ...'" >> $CMD_TMP
+echo "./teardown.sh" >> $CMD_TMP
 
 bash $CMD_TMP
 rm $CMD_TMP

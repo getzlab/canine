@@ -81,7 +81,9 @@ class ManualAdapter(AbstractAdapter):
 
         from ..orchestrator import stringify
 
-        keys = sorted(inputs)
+        # sort inputs by job variable
+        inputs = dict(sorted(inputs.items()))
+
         input_lengths = {
             key: len(val) if isinstance(val, list) else 1
             for key, val in inputs.items()
@@ -98,33 +100,63 @@ class ManualAdapter(AbstractAdapter):
             if isinstance(val, list) and len(val) == 1 and not isinstance(val[0], list):
                 inputs[key] = val[0]
 
+        #
+        # convert input dict to job shards, in two possible ways:
+
+        # 1. define jobs shards by Cartesian product of all input arrays
         if self.product:
             self._job_length = reduce(lambda x,y: x*y, input_lengths.values(), 1)
-            generator = product(
-                *[inputs[key] if isinstance(inputs[key], list) else (inputs[key],)
-                for key in keys]
+            self.__spec = { str(i) : dict() for i in range(self._job_length) }
+
+            prod = product(
+                *[input if isinstance(input, list) else (input,)
+                for job_var, input in inputs.items()]
             )
+
+            for shard_idx, input in enumerate(prod):
+                self.__spec[str(shard_idx)] = { k : stringify(v) for k, v in zip(inputs.keys(), input) }
+
+        # 2. define job shards normally, i.e. one shard per array element
         else:
+            # make sure all input arrays have the same length. job length
+            # will be length of each array input
             for key, l in input_lengths.items():
                 if l > self._job_length:
                     if self._job_length <= 1:
                         self._job_length = l
                     else:
-                        raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
+                        raise ValueError("Array inputs to scatter jobs must all have equal length (input \"{}\" is discrepant)".format(key))
                 elif 1 != l != self._job_length:
-                    raise ValueError("Manual Adapter cannot resolve job with uneven input {}".format(key))
-            generator = zip(*[
-                inputs[key] if isinstance(inputs[key], list) else repeat(inputs[key], self._job_length)
-                for key in keys
-            ])
+                    raise ValueError("Array inputs to scatter jobs must all have equal length (input \"{}\" is discrepant)".format(key))
 
-        self.__spec = {
-            str(i): {
-                key: stringify(val)
-                for key, val in zip(keys, job)
-            }
-            for i, job in enumerate(generator)
-        }
+            # tranpose input dict, repeating 1D inputs as necessary
+            # ex:
+            # a = [1, 2, 3], b = 1 ->
+            #     { 0 : { a : 1, b : 1 },
+            #       1 : { a : 2, b : 1 },
+            #       2 : { a : 3, b : 1 } }
+            # a = [1, 2, 3], b = [4, 5, 6] ->
+            #     { 0 : { a : 1, b : 4 },
+            #       1 : { a : 2, b : 5 },
+            #       2 : { a : 3, b : 6 } }
+            # a = [1, 2, 3], b = [[4, 5, 6]] ->
+            #     { 0 : { a : 1, b : [4, 5, 6] },
+            #       1 : { a : 2, b : [4, 5, 6] },
+            #       2 : { a : 3, b : [4, 5, 6] } }
+            # a = [1, 2], b = [[4, 5, 6], [7, 8, 9]] ->
+            #     { 0 : { a : 1, b : [4, 5, 6] },
+            #       1 : { a : 2, b : [7, 8, 9] } }
+            # a = [[1, 2, 3], [4, 5, 6]], b = [[7, 8, 9], [10, 11, 12]] ->
+            #     { 0 : { a : [1, 2, 3], b : [7, 8, 9] },
+            #       1 : { a : [4, 5, 6], b : [10, 11, 12] } }
+            self.__spec = { str(i) : dict() for i in range(self._job_length) }
+            for job_var, input in inputs.items():
+                for shard_idx in range(self._job_length):
+                    if isinstance(input, list):
+                        self.__spec[str(shard_idx)][job_var] = stringify(input[shard_idx])
+                    else:
+                        self.__spec[str(shard_idx)][job_var] = stringify(input)
+
         assert len(self.__spec) == self._job_length, "Failed to predict input length"
         if self.alias is not None:
             if isinstance(self.alias, list):
