@@ -442,6 +442,41 @@ class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
 
 # }}}
 
+class HandleOtherURL(FileType):
+    localization_mode = "url"
+
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+        
+        self.url = self.path
+        url_parse = re.match("(?:http|https|ftp)://.*\/(.*)$", self.url)
+        if url_parse is None:
+            raise ValueError(f"URL {self.url} format not recognized")
+        self.path = url_parse[1]
+        self.localized_path = self.path
+        
+        # get file size from server
+        try:
+            resp_size = subprocess.run("curl -sIL {url} | grep -i Content-Length".format(url=self.url), shell=True, capture_output=True)
+            self._size = int(re.match("[c|C]ontent.[l|L]ength.*?(\d+)", resp_size.stdout.decode())[1])
+        except:
+            raise ValueError("Could not get file header size")
+        
+        # cannot trust server to provide the proper hash so we instead just used the hashed url
+            
+    def _get_hash(self):
+        return sha1_base32(bytearray(self.url, "utf-8"), 4)
+    
+    def localization_command(self, dest):
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+        cmd = []
+        cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+        
+        # md5 checking currently not supported
+        return "\n".join(cmd) 
+
 ## Regular files {{{
 
 class HandleRegularFile(FileType):
@@ -539,6 +574,7 @@ def get_file_handler(path, url_map = None, **kwargs):
       r"^https://api.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^rodisk://" : HandleRODISKURL,
+      r"^(?:ftp|https|http])://" : HandleOtherURL
     } if url_map is None else url_map
 
     # zerothly, if path is already a FileType object, return as-is
