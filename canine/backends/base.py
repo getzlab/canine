@@ -159,6 +159,13 @@ class AbstractTransport(abc.ABC):
         except FileNotFoundError:
             return False
 
+    @abc.abstractmethod
+    def copy(self, src: str, dest: str):
+        """
+        Copies from src to dest. Can handle both files and directories.
+        """
+        pass
+
     def isfile(self, path: str) -> bool:
         """
         Returns True if the requested path is a regular file

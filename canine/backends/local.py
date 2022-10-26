@@ -85,6 +85,15 @@ class LocalTransport(AbstractTransport):
         """
         os.symlink(src, dest)
 
+    def copy(self, src: str, dest: str):
+        """
+        Copies from src to dest. Can handle both files and directories.
+        """
+        if os.path.isdir(src):
+            shutil.copytree(src, dest)
+        else:
+            shutil.copy(src, dest)
+
     def rename(self, src: str, dest: str):
         """
         Move the file or folder 'src' to 'dest'
