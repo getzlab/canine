@@ -90,9 +90,9 @@ class LocalTransport(AbstractTransport):
         Copies from src to dest. Can handle both files and directories.
         """
         if os.path.isdir(src):
-            shutil.copytree(src, dest)
+            shutil.copytree(src, dest, symlinks = True)
         else:
-            shutil.copy(src, dest)
+            shutil.copy(src, dest, follow_symlinks = False)
 
     def rename(self, src: str, dest: str):
         """
