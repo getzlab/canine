@@ -538,7 +538,7 @@ class AbstractLocalizer(abc.ABC):
 
                         # this is now a regular file, residing at dest_path.remotepath
                         common_dests[path] = file_handlers.HandleRegularFile(dest_path.remotepath)
-                        common_dests[path].localized_path = dest_path
+                        common_dests[path].localized_path = dest_path.remotepath
                         # copy over hash if it's been precomputed
                         if file_handler._hash is not None:
                             common_dests[path]._hash = file_handler._hash
@@ -953,7 +953,7 @@ class AbstractLocalizer(abc.ABC):
                     # delete it
                     for v in self.inputs[jobId][k]:
                         if v.localization_mode == "local": 
-                            localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path.remotepath)]
+                            localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path)]
 
                     # transform this input into a RODISK FileType, to be mounted
                     if not self.persistent_disk_dry_run:
