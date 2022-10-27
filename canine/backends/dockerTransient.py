@@ -120,7 +120,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 gcloud_conf_dir : { "bind" : "/etc/gcloud", "mode" : "rw" }
                },
               name = self.config["cluster_name"], command = "/bin/bash",
-              user = self.config["user"], stdin_open = True, remove = True
+              user = self.config["user"], stdin_open = True, remove = True,
+              privileged = True
             )
             self.container = self._get_container(self.config["cluster_name"])
 
