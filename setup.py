@@ -60,7 +60,8 @@ setup(
         'psutil>=5.6.7',
         'port-for>=0.4',
         'tables>=3.6.1',
-        'google-crc32c>=1.5.0'
+        'google-crc32c>=1.5.0',
+        'google-cloud-compute>=1.6.1',
     ],
     classifiers = [
         "Development Status :: 4 - Beta",
