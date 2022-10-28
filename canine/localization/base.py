@@ -6,6 +6,7 @@ import glob
 import shlex
 import tempfile
 import subprocess
+import threading
 import traceback
 import shutil
 import warnings
@@ -21,6 +22,21 @@ from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, c
 from hound.client import _getblob_bucket
 from agutil import status_bar
 import pandas as pd
+import google.cloud.compute_v1, google.api_core.exceptions
+
+DISK_CLIENT = None
+disk_client_creation_lock = threading.Lock()
+
+def gcloud_disk_client():
+    global DISK_CLIENT
+    with disk_client_creation_lock:
+        if DISK_CLIENT is None:
+            # this is the expensive operation
+            DISK_CLIENT = google.cloud.compute_v1.DisksClient()
+    return DISK_CLIENT
+
+ZONE = get_default_gcp_zone()
+PROJECT = get_default_gcp_project()
 
 Localization = namedtuple("Localization", ['type', 'path'])
 # types: stream, download, ro_disk, None
@@ -92,7 +108,7 @@ class AbstractLocalizer(abc.ABC):
         self.input_array_flag = {} # {jobId: {inputName: <bool: is this an array?>}}
 
         self.clean_on_exit = True
-        self.project = project if project is not None else get_default_gcp_project()
+        self.project = project if project is not None else PROJECT
         self.token = token
 
         # will be removed
@@ -708,24 +724,21 @@ class AbstractLocalizer(abc.ABC):
         disk_mountpoint = mount_prefix + "/" + disk_name
 
         ## Check if the disk already exists
-        zone = get_default_gcp_zone()
-        out = subprocess.Popen(
-            f"gcloud compute disks describe {disk_name} --zone {zone} --format 'json'",
-            shell = True, stdout = subprocess.PIPE, stderr = subprocess.PIPE
-        )
-
-#            "gcloud compute disks list --filter 'labels.wolf=canine and labels.finished=yes and name=({})'".format(disk_name), shell=True
-#        )
+        disk_client = gcloud_disk_client()
+        disk_exists = False
+        try:
+            disk_attrs = disk_client.get(disk = disk_name, zone = ZONE, project = PROJECT)
+            disk_exists = True
+        except google.api_core.exceptions.NotFound:
+            pass
 
         # flag for scratch disks to know to job avoid
         finished = False
 
         # disk exists
-        if "HTTPError 404" not in out.stderr.read().decode():
-            disk_attrs = json.load(out.stdout)
-
+        if disk_exists:
             # disk has been finalized
-            if "labels" in disk_attrs and "finished" in disk_attrs["labels"]:
+            if "finished" in disk_attrs.labels:
                 canine_logging.info1("Found existing disk {}".format(disk_name))
 
                 finished = True
@@ -741,7 +754,7 @@ class AbstractLocalizer(abc.ABC):
                 # it can handle existing disks
             
             # check if disk is currently being built by another instance; notify user
-            elif "users" in disk_attrs:
+            elif len(disk_attrs.users):
                 canine_logging.info1("Persistent disk {} is already being constructed by another instance; waiting to finalize ...".format(disk_name))
                 # blocking will happen automatically in localization script
 
