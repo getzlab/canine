@@ -817,7 +817,7 @@ class AbstractLocalizer(abc.ABC):
               'if [ $DELAY -gt 8 ]; then',
                 'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :',
                 'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME; then',
-                  'touch /.fatal_disk_issue_sentinel',
+                  'sudo touch /.fatal_disk_issue_sentinel',
                   'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
                   'exit 1',
                 'fi',
