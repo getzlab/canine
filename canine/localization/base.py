@@ -7,6 +7,7 @@ import shlex
 import tempfile
 import subprocess
 import threading
+import time
 import traceback
 import shutil
 import warnings
@@ -726,11 +727,21 @@ class AbstractLocalizer(abc.ABC):
         ## Check if the disk already exists
         disk_client = gcloud_disk_client()
         disk_exists = False
-        try:
-            disk_attrs = disk_client.get(disk = disk_name, zone = ZONE, project = PROJECT)
-            disk_exists = True
-        except google.api_core.exceptions.NotFound:
-            pass
+        backoff = 1
+        while True:
+            try:
+                disk_attrs = disk_client.get(disk = disk_name, zone = ZONE, project = PROJECT)
+                disk_exists = True
+                break
+            except google.api_core.exceptions.NotFound:
+                break
+            except google.api_core.exceptions.Forbidden as e:
+                # trigger exponential backoff if quota exceeded
+                if "Quota exceeded" in e.message:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    if backoff > 120:
+                        raise RuntimeError("Persistent disk {} cannot be queried due to gcloud quota limit.".format(disk_name))
 
         # flag for scratch disks to know to job avoid
         finished = False
