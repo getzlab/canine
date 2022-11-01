@@ -852,7 +852,7 @@ class AbstractLocalizer(abc.ABC):
             ## lock the disk
             # will be unlocked during teardown script (or if script crashes). this
             # is a way of other processes surveying if this is a hanging disk.
-            'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
+            'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! > ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
         ]
 
         # if we are creating a scratch disk (which will be accessed via
@@ -870,7 +870,8 @@ class AbstractLocalizer(abc.ABC):
 
             # if this disk is finished, then we can exit early and skip the job
             # immediately after mounting. this is how we implement job avoidance
-            # for scratch disk jobs.
+            # for scratch disk jobs. (we still need to mount the disk just in case
+            # delocalization never ran).
             # use special exit code for this.
             if finished:
                 localization_script += ["exit 15 #DEBUG_OMIT"]
