@@ -798,8 +798,17 @@ class AbstractLocalizer(abc.ABC):
               '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
               'sleep $DELAY; ((DELAY *= 2))',
 
-              # try again if delay has exceeded 8 seconds
-              '[ $DELAY -gt 8 ] && { gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :; } || :',
+              # try attaching again if delay has exceeded 8 seconds
+              # if disk has attached successfully, but disk doesn't appear in /dev,
+              # this means that the node is bad
+              'if [ $DELAY -gt 8 ]; then',
+                'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :',
+                'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME; then',
+                  'sudo touch /.fatal_disk_issue_sentinel',
+                  'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
+                  'exit 1',
+                'fi',
+              'fi',
             'done',
 
             ## format disk
@@ -814,7 +823,12 @@ class AbstractLocalizer(abc.ABC):
             'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
             'sudo mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
             'sudo chmod -R a+rwX "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
-            'fi'
+            'fi',
+
+            ## lock the disk
+            # will be unlocked during teardown script (or if script crashes). this
+            # is a way of other processes surveying if this is a hanging disk.
+            'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! > ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
         ]
 
         # if we are creating a scratch disk (which will be accessed via
@@ -832,7 +846,8 @@ class AbstractLocalizer(abc.ABC):
 
             # if this disk is finished, then we can exit early and skip the job
             # immediately after mounting. this is how we implement job avoidance
-            # for scratch disk jobs.
+            # for scratch disk jobs. (we still need to mount the disk just in case
+            # delocalization never ran).
             # use special exit code for this.
             if finished:
                 localization_script += ["exit 15 #DEBUG_OMIT"]
@@ -866,6 +881,14 @@ class AbstractLocalizer(abc.ABC):
         teardown_script = [
           ## sync any cached data
           'sync',
+
+          ## release all locks obtained by this job
+          'if [ -f ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids ]; then',
+          '  while read -r pid; do',
+          '    kill $pid',
+          '  done < ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
+          '  rm -f ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
+          'fi',
 
           ## unmount disk, with exponential backoff up to 2 minutes
           'DELAY=1',
@@ -1193,8 +1216,19 @@ class AbstractLocalizer(abc.ABC):
               # wait for device to attach
               "tries=0",
               "while [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ]; do",
-              '[ $tries -gt 12 ] && { echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:" >&2; cat $DIAG_FILE >&2; exit 1; } || :',
-              "sleep 10; ((++tries))",
+                'if [ $tries -gt 12 ]; then',
+                  # check if the disk has attached successfully, but doesn't appear in /dev
+                  # this means the node is likely bad
+                  'if gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME; then',
+                    'touch /.fatal_disk_issue_sentinel',
+                    'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
+                    'exit 1',
+                  'fi',
+                  # otherwise, it didn't attach for some other reason
+                  'echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:" >&2; cat $DIAG_FILE >&2',
+                  'exit 1',
+                'fi',
+                "sleep 10; ((++tries))",
               "done",
 
               # mount within Slurm worker container
