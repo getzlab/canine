@@ -852,7 +852,7 @@ class AbstractLocalizer(abc.ABC):
             ## lock the disk
             # will be unlocked during teardown script (or if script crashes). this
             # is a way of other processes surveying if this is a hanging disk.
-            'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! > ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
+            'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
         ]
 
         # if we are creating a scratch disk (which will be accessed via
@@ -968,6 +968,9 @@ class AbstractLocalizer(abc.ABC):
 
         #
         # create creation script for persistent disk, if specified
+        if self.localize_to_persistent_disk or self.use_scratch_disk:
+            localization_tasks += ["[ -f .scratchdisk_lock_pids ] && rm .scratchdisk_lock_pids || :"]
+
         if self.localize_to_persistent_disk:
             # FIXME: we don't have an easy way of parsing which inputs are common
             #        to all shards at this point. if every localizable input is
