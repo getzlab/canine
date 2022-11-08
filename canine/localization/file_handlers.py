@@ -588,7 +588,7 @@ def get_file_handler(path, url_map = None, **kwargs):
       r"^https://api.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^rodisk://" : HandleRODISKURL,
-      r"^(?:ftp|https|http])://" : HandleOtherURL
+      r"^(?:ftp|https|http)://" : HandleOtherURL
     } if url_map is None else url_map
 
     # zerothly, if path is already a FileType object, return as-is
