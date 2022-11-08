@@ -458,7 +458,7 @@ class HandleOtherURL(FileType):
         # get file size from server
         try:
             resp_size = subprocess.run("curl -sIL {url} | grep -i Content-Length".format(url=self.url), shell=True, capture_output=True)
-            self._size = int(re.match("[c|C]ontent.[l|L]ength.*?(\d+)", resp_size.stdout.decode())[1])
+            self._size = int(re.match("[cC]ontent.[lL]ength.*?(\d+)", resp_size.stdout.decode())[1])
         except:
             raise ValueError("Could not get file header size")
         
