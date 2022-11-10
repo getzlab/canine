@@ -118,6 +118,11 @@ class HandleGSURL(FileType):
         """
         bucket = re.match(r"gs://(.*?)/.*", self.path)[1]
 
+        gcs_cl = gcloud_storage_client()
+        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"] if "project" in self.extra_args else None)
+
+        return bucket_obj.requester_pays
+
         ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
         if b'requester pays bucket but no user project provided' in ret.stderr:
             return True
