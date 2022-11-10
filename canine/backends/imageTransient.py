@@ -300,7 +300,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 canine_logging.warning("Couldn't shutdown instance {}".format(node))
                 canine_logging.warning(e)
 
-    def stop(self, action_on_stop = None, kill_straggling_jobs = True):
+    def stop(self, action_on_stop = None, kill_straggling_jobs = False):
         """
         Delete or stop (default) compute instances
         """
