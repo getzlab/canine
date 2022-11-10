@@ -799,7 +799,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## wait for disk to attach, with exponential backoff up to 2 minutes
             'DELAY=1',
-            'while [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; do',
+            'while [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; do',
               ## if disk is not a scratch disk, check once again if it's being created by another instance
               'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\' && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
                 'TRIES=0',
@@ -827,7 +827,7 @@ class AbstractLocalizer(abc.ABC):
               # this means that the node is bad
               'if [ $DELAY -gt 8 ]; then',
                 'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :',
-                'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME; then',
+                'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME && [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; then',
                   'sudo touch /.fatal_disk_issue_sentinel',
                   'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
                   'exit 1',
@@ -852,7 +852,7 @@ class AbstractLocalizer(abc.ABC):
             ## lock the disk
             # will be unlocked during teardown script (or if script crashes). this
             # is a way of other processes surveying if this is a hanging disk.
-            'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! > ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
+            'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
         ]
 
         # if we are creating a scratch disk (which will be accessed via
@@ -968,6 +968,9 @@ class AbstractLocalizer(abc.ABC):
 
         #
         # create creation script for persistent disk, if specified
+        if self.localize_to_persistent_disk or self.use_scratch_disk:
+            localization_tasks += ["[ -f .scratchdisk_lock_pids ] && rm .scratchdisk_lock_pids || :"]
+
         if self.localize_to_persistent_disk:
             # FIXME: we don't have an easy way of parsing which inputs are common
             #        to all shards at this point. if every localizable input is
@@ -1243,8 +1246,8 @@ class AbstractLocalizer(abc.ABC):
                 'if [ $tries -gt 12 ]; then',
                   # check if the disk has attached successfully, but doesn't appear in /dev
                   # this means the node is likely bad
-                  'if gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME; then',
-                    'touch /.fatal_disk_issue_sentinel',
+                  'if gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME && [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ]; then',
+                    'sudo touch /.fatal_disk_issue_sentinel',
                     'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
                     'exit 1',
                   'fi',
