@@ -454,8 +454,7 @@ class Orchestrator(object):
             self.raw_outputs,
             self.localizer_overrides
         )
-        canine_logging.print("Job staged on SLURM controller in:", abs_staging_dir)
-        canine_logging.info1("Preparing pipeline script")
+        canine_logging.print("Task staged in", abs_staging_dir)
         env = localizer.environment('remote')
         root_dir = env['CANINE_ROOT']
         entrypoint_path = os.path.join(root_dir, 'entrypoint.sh')
@@ -667,6 +666,10 @@ class Orchestrator(object):
                 **stringify(params)
             }
         )
+
+        # TODO: make more efficient
+        n_jobs = np.array([1 for k, v in job_spec.items() if v is not None]).sum()
+        canine_logging.print("{n_jobs} job{plural} submitted.".format(n_jobs = n_jobs, plural = "s" if n_jobs > 1 else ""))
 
         return batch_id
 
