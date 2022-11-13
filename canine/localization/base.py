@@ -993,7 +993,9 @@ class AbstractLocalizer(abc.ABC):
             # note that this does not apply to scratch disks that already exist;
             # these have a special disk creation script that cause the localizer to
             # exit early.
+            localization_disk_already_exists = False
             if len(disk_creation_script) == 0:
+                localization_disk_already_exists = True
                 for k, v_array in self.rodisk_paths[jobId].items():
                     # if this input had previously been localized in prepare_job_inputs,
                     # delete it
@@ -1307,7 +1309,7 @@ class AbstractLocalizer(abc.ABC):
           "#!/bin/bash",
           "set -e"
         ] + localization_tasks + 
-        (['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes'] if self.localize_to_persistent_disk else [])
+        (['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes'] if self.localize_to_persistent_disk and not localization_disk_already_exists else [])
         ) + "\nset +e\n"
 
         # generate teardown script
