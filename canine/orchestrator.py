@@ -667,9 +667,14 @@ class Orchestrator(object):
             }
         )
 
-        # TODO: make more efficient
-        n_jobs = np.array([1 for k, v in job_spec.items() if v is not None]).sum()
-        canine_logging.print("{n_jobs} job{plural} submitted.".format(n_jobs = n_jobs, plural = "s" if n_jobs > 1 else ""))
+        n_jobs = np.array([v is not None for v in job_spec.values()])
+        n_submitted = n_jobs.sum()
+        n_avoided = (~n_jobs).sum()
+        canine_logging.print("{n_submitted} job{plural} submitted{avoid_string}.".format(
+          n_submitted = n_submitted,
+          plural = "s" if n_submitted > 1 else "",
+          avoid_string = f" ({n_avoided} avoided)" if n_avoided > 0 else ""
+        ))
 
         return batch_id
 
