@@ -801,7 +801,7 @@ class AbstractLocalizer(abc.ABC):
             'DELAY=1',
             'while [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; do',
               ## if disk is not a scratch disk, check once again if it's being created by another instance
-              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\' && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
+              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -qv "$CANINE_NODE_NAME" && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
                 'TRIES=0',
                 # wait until disk is marked "finished"
                 'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
