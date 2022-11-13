@@ -212,7 +212,7 @@ class HandleGSURL(FileType):
         # for backwards compatibility, if it's a file, return the file directly
         # TODO: for cleaner code, we really should just always return a set and hash it
         else:
-            return binascii.hexlify(base64.b64decode(blob.crc32c)).decode().lower()
+            return binascii.hexlify(base64.b64decode(blob[0].crc32c)).decode().lower()
 
     def localization_command(self, dest):
         dest_dir = shlex.quote(os.path.dirname(dest))
