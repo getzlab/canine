@@ -939,10 +939,6 @@ class AbstractLocalizer(abc.ABC):
             # in the scratch disk teardown script to allow the disk to unmount
             teardown_script = ["cd $CANINE_JOB_ROOT"] + teardown_script
 
-        # localization disks get labeled "finalized" if the localizer ran OK.
-        else:
-            teardown_script += ['if [[ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
-
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str], transport = None) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
@@ -1310,7 +1306,9 @@ class AbstractLocalizer(abc.ABC):
         localization_script = '\n'.join([
           "#!/bin/bash",
           "set -e"
-        ] + localization_tasks) + "\nset +e\n"
+        ] + localization_tasks + 
+        (['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes'] if self.localize_to_persistent_disk else [])
+        ) + "\nset +e\n"
 
         # generate teardown script
         teardown_script = '\n'.join(
