@@ -153,7 +153,19 @@ class ManualAdapter(AbstractAdapter):
             for job_var, input in inputs.items():
                 for shard_idx in range(self._job_length):
                     if isinstance(input, list):
-                        self.__spec[str(shard_idx)][job_var] = stringify(input[shard_idx])
+                        # scatter input, e.g. for job_length = 2,
+                        # * [1, 2] (regular scatter)
+                        # * [[1, 2, 3], [4, 5, 6]] (scatter of gathers)
+                        if input_lengths[job_var] == self._job_length:
+                            self.__spec[str(shard_idx)][job_var] = stringify(input[shard_idx])
+
+                        # gather input (e.g. [[1, 2, 3]])
+                        elif input_lengths[job_var] == 1:
+                            self.__spec[str(shard_idx)][job_var] = stringify(input[0])
+
+                        # should not happen!
+                        else:
+                            raise ValueError(f"Malformed job input \"{job_var}\": {input}")
                     else:
                         self.__spec[str(shard_idx)][job_var] = stringify(input)
 
