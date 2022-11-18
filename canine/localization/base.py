@@ -117,6 +117,9 @@ class AbstractLocalizer(abc.ABC):
 
         self.localize_to_persistent_disk = localize_to_persistent_disk
         self.persistent_disk_type = persistent_disk_type
+        # do not use common inputs when localizing to persistent disk
+        if self.localize_to_persistent_disk:
+            self.common = False
         self.use_scratch_disk = use_scratch_disk
         self.scratch_disk_type = scratch_disk_type
         self.scratch_disk_size = scratch_disk_size
@@ -976,8 +979,8 @@ class AbstractLocalizer(abc.ABC):
             # NOTE:  we are still able to create scratch disks for scatter jobs,
             #        one per shard. we do this by appending the shard number to the
             #        scratch disk name
-            if len(self.inputs) > 1:
-                raise ValueError("Localization to persistent disk for multishard jobs is currently not supported.")
+#            if len(self.inputs) > 1:
+#                raise ValueError("Localization to persistent disk for multishard jobs is currently not supported.")
 
             disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId], dry_run = self.persistent_disk_dry_run)
 
