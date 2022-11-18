@@ -566,7 +566,7 @@ class HandleRODISKURL(FileType):
         # if they don't, then we warn the user that we may be inadvertently
         # avoiding
         if not roURL[1].startswith("canine-"):
-            canine_logging.warning("RODISK input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
+            canine_logging.debug("RODISK input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
 
         # single file/directory RODISKs will contain the CRC32C of the file(s)
         if roURL[1].startswith("canine-crc32c-"):
