@@ -118,19 +118,25 @@ class HandleGSURL(FileType):
         """
         bucket = re.match(r"gs://(.*?)/.*", self.path)[1]
 
-        ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
-        if b'requester pays bucket but no user project provided' in ret.stderr:
-            return True
-        else:
-            # Try again ls-ing the object itself
-            # sometimes permissions can disallow bucket inspection
-            # but allow object inspection
-            ret = subprocess.run('gsutil ls {}'.format(self.path), shell = True, capture_output = True)
-            return b'requester pays bucket but no user project provided' in ret.stderr
+        gcs_cl = gcloud_storage_client()
+        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"] if "project" in self.extra_args else None)
 
-        if ret.returncode == 1 and b'BucketNotFoundException: 404' in ret.stderr:
-            canine_logging.error(ret.stderr.decode())
-            raise subprocess.CalledProcessError(ret.returncode, "")
+        return bucket_obj.requester_pays
+
+# TODO: handle case where permissions disallow bucket inspection?
+#        ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
+#        if b'requester pays bucket but no user project provided' in ret.stderr:
+#            return True
+#        else:
+#            # Try again ls-ing the object itself
+#            # sometimes permissions can disallow bucket inspection
+#            # but allow object inspection
+#            ret = subprocess.run('gsutil ls {}'.format(self.path), shell = True, capture_output = True)
+#            return b'requester pays bucket but no user project provided' in ret.stderr
+#
+#        if ret.returncode == 1 and b'BucketNotFoundException: 404' in ret.stderr:
+#            canine_logging.error(ret.stderr.decode())
+#            raise subprocess.CalledProcessError(ret.returncode, "")
 
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
@@ -148,11 +154,7 @@ class HandleGSURL(FileType):
         # is this URL a directory?
         self.is_dir = False
 
-    def _get_size(self):
-        output = subprocess.check_output('gsutil {} du -s {}'.format(self.rp_string, shlex.quote(self.path.rstrip("/"))), shell=True).decode()
-        return int(output.split()[0])
-
-    def _get_hash(self):
+    def blob(self):
         assert self.path.startswith("gs://")
         res = re.search("^gs://([^/]+)/(.*)$", self.path)
         bucket = res[1]
@@ -185,18 +187,32 @@ class HandleGSURL(FileType):
         if not exists:
             raise GSFileNotExists("{} does not exist.".format(self.path))
 
+        if self.is_dir:
+            return gcs_cl.list_blobs(bucket_obj, prefix = obj_name + "/")
+        else:
+            return [blob_obj]
+
+    def _get_size(self):
+        sz = 0
+        for b in self.blob():
+            sz += b.size
+        return sz
+
+    def _get_hash(self):
+        blob = self.blob()
+
         # if it's a directory, hash the set of CRCs within
         if self.is_dir:
             canine_logging.info1(f"Hashing directory {self.path}. This may take some time.")
             files = set()
-            for b in gcs_cl.list_blobs(bucket_obj, prefix = obj_name + "/"):
+            for b in blob:
                 files.add(b.crc32c)
             return hash_set(files)
 
         # for backwards compatibility, if it's a file, return the file directly
         # TODO: for cleaner code, we really should just always return a set and hash it
         else:
-            return binascii.hexlify(base64.b64decode(blob_obj.crc32c)).decode().lower()
+            return binascii.hexlify(base64.b64decode(blob[0].crc32c)).decode().lower()
 
     def localization_command(self, dest):
         dest_dir = shlex.quote(os.path.dirname(dest))
