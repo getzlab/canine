@@ -33,7 +33,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
         shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
         action_on_stop = "delete", image_family = None, image = None,
-        clust_frac = 1.0, user = os.environ["USER"], **kwargs
+        clust_frac = 1.0, user = os.environ["USER"], shutdown_on_exit = False, **kwargs
     ):
         if user is None:
             # IE: USER was not set
@@ -70,6 +70,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # flag to indicate whether the Docker was already running
         self.preexisting_container = False
+
+        # flag to indicate whether we shutdown the container once the backend is exited
+        self.shutdown_on_exit = shutdown_on_exit
 
         # placeholder for node list (loaded from lookup table)
         self.nodes = pd.DataFrame()
@@ -183,7 +186,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def stop(self): 
         # if the Docker was not spun up by this context manager, do not tear
         # anything down -- we don't want to clobber an already running cluster
-        if not self.preexisting_container:
+        if self.shutdown_on_exit and not self.preexisting_container:
             # delete node configuration file
             try:
                 subprocess.check_call(
