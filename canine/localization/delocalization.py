@@ -54,7 +54,7 @@ def compute_crc32c(path, fast = False):
         skip_size = 0
         if file_size_MiB > 1024 and fast:
             skip_size = int(file_size//(1024**3/buffer_size) - buffer_size)
-            print(f"{f} is >1GiB; using fast mode", file = sys.stderr, flush = True)
+            print(f"{f} is >1 GiB; using fast mode", file = sys.stderr, flush = True)
 
         c = 0
         ct = 0
