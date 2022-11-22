@@ -29,12 +29,12 @@ def same_volume(a, b):
     )
     return len(set(vols.decode("utf-8").rstrip().split("\n"))) == 1
 
-def compute_crc32c(path):
+def compute_crc32c(path, fast = False):
     """
     Adapted from localization/file_handlers.py.
     """
     hash_alg = google_crc32c.Checksum()
-    buffer_size = 8 * 1024
+    buffer_size = 1024 * 1024
 
     if os.path.isdir(path):
         files = glob.iglob(path + "/**", recursive = True)
@@ -45,21 +45,36 @@ def compute_crc32c(path):
         if os.path.isdir(f):
             continue
 
-        file_size_MiB = int(os.path.getsize(path)/1024**2)
+        file_size = int(os.path.getsize(path))
+        file_size_MiB = int(file_size/1024**2)
         print(f"Hashing file {f} ({file_size_MiB} MiB)", file = sys.stderr, flush = True)
 
+        # if fast mode is enabled, only compute hash at 1024 locations in each
+        # file (equivalent to number of iterations to hash a 1 GiB file)
+        skip_size = 0
+        if file_size_MiB > 1024 and fast:
+            skip_size = int(file_size//(1024**3/buffer_size) - buffer_size)
+            print(f"{f} is >1GiB; using fast mode", file = sys.stderr, flush = True)
+
+        c = 0
         ct = 0
         with open(f, "rb") as fp:
             while True:
-                # output message every 100 MiB
-                if ct > 0 and not ct % int(100*1024**2/buffer_size):
+                # in slow mode: output message every ~100 MB (1 GiB/(10*buffer size))
+                # in fast mode: output message every 100 hash operations
+                if c > 0 and ((not fast and not c % int(1024/10)) or (fast and not c % 100)):
                     print(f"Hashing file {f}; {int(buffer_size*ct/1024**2)}/{file_size_MiB} MiB completed", file = sys.stderr, flush = True)
 
                 data = fp.read(buffer_size)
                 if not data:
                     break
                 hash_alg.update(data)
-                ct += 1
+                if fast and skip_size > 0:
+                    fp.seek(skip_size, 1)
+                    ct += skip_size//buffer_size
+                else:
+                    ct += 1
+                c += 1
 
     return hash_alg.hexdigest().decode().upper()
 
@@ -129,7 +144,7 @@ def main(output_dir, jobId, patterns, copy, scratch):
         pool = multiprocessing.Pool(8)
         crc_results = []
         for dest, f in matched_files:
-            crc_results.append((pool.apply_async(compute_crc32c, (f,)), dest, f))
+            crc_results.append((pool.apply_async(compute_crc32c, (f, scratch)), dest, f))
 
         for res in crc_results:
             crc = res[0].get()
