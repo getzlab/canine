@@ -77,6 +77,12 @@ class FileType(abc.ABC):
         """
         return self.path
 
+    def __repr__(self):
+        return "<{cl}: {path}>".format(
+          cl = self.__class__.__name__,
+          path = self.path
+        )
+
 class StringLiteral(FileType):
     """
     Since the base FileType class also works for string literals, alias
