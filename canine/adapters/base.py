@@ -92,7 +92,7 @@ class ManualAdapter(AbstractAdapter):
         # make sure input arrays are not >2D
         for key, val in inputs.items():
             if maxdepth(val) > 2:
-                raise ValueError("Input {} is an array with nesting >2".format(key))
+                raise ValueError(f"Input {key} is an array with nesting >2:\n{val}")
 
         #
         # HACK: deal with lists of length 1
