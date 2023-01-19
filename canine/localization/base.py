@@ -810,7 +810,7 @@ class AbstractLocalizer(abc.ABC):
                   '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
                   '((++TRIES))',
                 'done',
-                'exit 0 #DEBUG_OMIT' if not self.use_scratch_disk else "", # other instance has completed the disk; no need to do anything else in the localization script, unless we need to set up a scratch disk for job outputs.
+                'exit 15 #DEBUG_OMIT', # special exit code to cause rest of entrypoint.sh to be skipped
               'fi',
               # TODO: what if the task exited on the other
               #       instance without running the teardown script
