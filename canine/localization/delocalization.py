@@ -45,7 +45,7 @@ def compute_crc32c(path, fast = False):
         if os.path.isdir(f):
             continue
 
-        file_size = int(os.path.getsize(path))
+        file_size = int(os.path.getsize(f))
         file_size_MiB = int(file_size/1024**2)
         print(f"Hashing file {f} ({file_size_MiB} MiB)", file = sys.stderr, flush = True)
 
