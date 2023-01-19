@@ -801,7 +801,7 @@ class AbstractLocalizer(abc.ABC):
             'DELAY=1',
             'while [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; do',
               ## if disk is not a scratch disk, check once again if it's being created by another instance
-              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q \'^http\' && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
+              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -qv "$CANINE_NODE_NAME" && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
                 'TRIES=0',
                 # wait until disk is marked "finished"
                 'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
@@ -939,10 +939,6 @@ class AbstractLocalizer(abc.ABC):
             # in the scratch disk teardown script to allow the disk to unmount
             teardown_script = ["cd $CANINE_JOB_ROOT"] + teardown_script
 
-        # localization disks get labeled "finalized" if the localizer ran OK.
-        else:
-            teardown_script += ['if [[ ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
-
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str], transport = None) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
@@ -997,7 +993,9 @@ class AbstractLocalizer(abc.ABC):
             # note that this does not apply to scratch disks that already exist;
             # these have a special disk creation script that cause the localizer to
             # exit early.
+            localization_disk_already_exists = False
             if len(disk_creation_script) == 0:
+                localization_disk_already_exists = True
                 for k, v_array in self.rodisk_paths[jobId].items():
                     # if this input had previously been localized in prepare_job_inputs,
                     # delete it
@@ -1310,7 +1308,9 @@ class AbstractLocalizer(abc.ABC):
         localization_script = '\n'.join([
           "#!/bin/bash",
           "set -e"
-        ] + localization_tasks) + "\nset +e\n"
+        ] + localization_tasks + 
+        (['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes'] if self.localize_to_persistent_disk and not localization_disk_already_exists else [])
+        ) + "\nset +e\n"
 
         # generate teardown script
         teardown_script = '\n'.join(
