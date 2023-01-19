@@ -65,6 +65,7 @@ class AbstractLocalizer(abc.ABC):
         token: typing.Optional[str] = None,
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
         use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
+        protect_disk = False,
         files_to_copy_to_outputs = {},
         persistent_disk_dry_run = False,
         cleanup_job_workdir = False,
@@ -83,8 +84,12 @@ class AbstractLocalizer(abc.ABC):
         scratch_disk_type: "standard" or "ssd". Default "standard".
         scratch_disk_size: size of scratch disk, in gigabytes. Default 10GB
         scratch_disk_name: name of scratch disk. Default is a random string
+        protect_disk: add label "protect : yes" to disk; this will prevent it
+          from being automatically deleted
+        files_to_copy_to_outputs: if using a scratch disk, copy these output keys
+          to the NFS from the scratch disk
         persistent_disk_dry_run: don't actually create a persistent disk; just
-          return the paths to the files on the disk
+          return the paths to the files on the disk that would be created
         cleanup_job_workdir: remove files in the job working directory that aren't
           denoted as outputs
         """
@@ -124,6 +129,7 @@ class AbstractLocalizer(abc.ABC):
         self.scratch_disk_type = scratch_disk_type
         self.scratch_disk_size = scratch_disk_size
         self.scratch_disk_name = scratch_disk_name
+        self.protect_disk = protect_disk
 
         self.files_to_copy_to_outputs = files_to_copy_to_outputs
 
@@ -936,7 +942,12 @@ class AbstractLocalizer(abc.ABC):
 
         # scratch disks get labeled "finalized" if the task ran OK.
         if len(file_paths_arrays) == 0:
-            teardown_script += ['if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{}" --zone "$CANINE_NODE_ZONE" --labels finished=yes; fi'.format(disk_name)]
+            teardown_script += [
+              'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}; fi'.format(
+                disk_name = disk_name,
+                protect_string = (",protect=yes" if self.protect_disk else "")
+              )
+            ]
 
             # we also need to leave the job workspace directory before anything else
             # in the scratch disk teardown script to allow the disk to unmount
@@ -1308,11 +1319,16 @@ class AbstractLocalizer(abc.ABC):
         ) + "\n"
 
         # generate localization script
-        localization_script = '\n'.join([
-          "#!/bin/bash",
-          "set -e"
-        ] + localization_tasks + 
-        (['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes'] if self.localize_to_persistent_disk and not localization_disk_already_exists else [])
+        localization_script = '\n'.join(
+          [
+            "#!/bin/bash",
+            "set -e"
+          ] + localization_tasks + 
+          (
+            ['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}'.format(
+              protect_string = (",protect=yes" if self.protect_disk else "")
+            )] if self.localize_to_persistent_disk and not localization_disk_already_exists else []
+          )
         ) + "\nset +e\n"
 
         # generate teardown script
