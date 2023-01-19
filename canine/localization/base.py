@@ -1361,7 +1361,7 @@ class AbstractLocalizer(abc.ABC):
                 'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi',
 
                 # remove all files in workspace directory not captured by outputs
-                f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir else '',
+                f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir and not self.use_scratch_disk else '',
 
                 # unmount all RODISKs, if they're not in use
                 # first, release all locks obtained by this job
