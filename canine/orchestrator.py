@@ -643,9 +643,9 @@ class Orchestrator(object):
             return -2
 
         # remove noop'd jobs from array spec
-        noop_idx = np.r_[-1, np.array([k for k, v in job_spec.items() if v is None], dtype = np.int), len(job_spec)]
+        noop_idx = np.r_[-1, np.array([k for k, v in job_spec.items() if v is None], dtype = int), len(job_spec)]
         array_range = np.c_[noop_idx[:-1] + 1, noop_idx[1:] - 1]
-        array_range = array_range[(np.diff(array_range, 1) >= 0).ravel(), :].astype(str).astype(np.object)
+        array_range = array_range[(np.diff(array_range, 1) >= 0).ravel(), :].astype(str).astype(object)
         array_str = ",".join(array_range[:, 0] + "-" + array_range[:, 1])
 
         # parse out flags vs. params in extra_sbatch_args
