@@ -71,7 +71,7 @@ def compute_crc32c(path, fast = False):
                 hash_alg.update(data)
                 if fast and skip_size > 0:
                     fp.seek(skip_size, 1)
-                    ct += skip_size//buffer_size
+                    ct += (skip_size + buffer_size)//buffer_size
                 else:
                     ct += 1
                 c += 1
