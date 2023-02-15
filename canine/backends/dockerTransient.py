@@ -120,7 +120,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
               image = image.tags[0], detach = True, network_mode = "host",
               volumes = {
                 "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" },
-                gcloud_conf_dir : { "bind" : "/etc/gcloud", "mode" : "rw" }
+                gcloud_conf_dir : { "bind" : "/mnt/nfs/clust_conf/gcloud", "mode" : "rw" }
                },
               name = self.config["cluster_name"], command = "/bin/bash",
               user = self.config["user"], stdin_open = True, remove = True,
