@@ -84,8 +84,10 @@ class AbstractLocalizer(abc.ABC):
         scratch_disk_type: "standard" or "ssd". Default "standard".
         scratch_disk_size: size of scratch disk, in gigabytes. Default 10GB
         scratch_disk_name: name of scratch disk. Default is a random string
-        scratch_disk_job_avoid: whether to skip localization for job avoidence
-          if scratch disk already exists.
+        scratch_disk_job_avoid: whether to bypass running job script if scratch disk
+          already exists. Default True; set to False if you want to retroactively
+          modify contents of a scratch disk after it's been created and populated by
+          another task.
         protect_disk: add label "protect : yes" to disk; this will prevent it
           from being automatically deleted
         files_to_copy_to_outputs: if using a scratch disk, copy these output keys
@@ -882,6 +884,8 @@ class AbstractLocalizer(abc.ABC):
             # for scratch disk jobs. (we still need to mount the disk just in case
             # delocalization never ran).
             # use special exit code for this.
+            # note that we will still run the script if scratch_disk_job_avoid is False;
+            # this is useful for modifying the contents of a preexisting scratch disk.
             if finished and self.scratch_disk_job_avoid:
                 localization_script += ["exit 15 #DEBUG_OMIT"]
 
