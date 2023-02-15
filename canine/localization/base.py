@@ -64,7 +64,7 @@ class AbstractLocalizer(abc.ABC):
         project: typing.Optional[str] = None,
         token: typing.Optional[str] = None,
         localize_to_persistent_disk = False, persistent_disk_type: str = "standard",
-        use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_name = None,
+        use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_job_avoid=True, scratch_disk_name = None,
         protect_disk = False,
         files_to_copy_to_outputs = {},
         persistent_disk_dry_run = False,
@@ -84,6 +84,10 @@ class AbstractLocalizer(abc.ABC):
         scratch_disk_type: "standard" or "ssd". Default "standard".
         scratch_disk_size: size of scratch disk, in gigabytes. Default 10GB
         scratch_disk_name: name of scratch disk. Default is a random string
+        scratch_disk_job_avoid: whether to bypass running job script if scratch disk
+          already exists. Default True; set to False if you want to retroactively
+          modify contents of a scratch disk after it's been created and populated by
+          another task.
         protect_disk: add label "protect : yes" to disk; this will prevent it
           from being automatically deleted
         files_to_copy_to_outputs: if using a scratch disk, copy these output keys
@@ -129,6 +133,7 @@ class AbstractLocalizer(abc.ABC):
         self.scratch_disk_type = scratch_disk_type
         self.scratch_disk_size = scratch_disk_size
         self.scratch_disk_name = scratch_disk_name
+        self.scratch_disk_job_avoid = scratch_disk_job_avoid
         self.protect_disk = protect_disk
 
         self.files_to_copy_to_outputs = files_to_copy_to_outputs
@@ -882,7 +887,9 @@ class AbstractLocalizer(abc.ABC):
             # for scratch disk jobs. (we still need to mount the disk just in case
             # delocalization never ran).
             # use special exit code for this.
-            if finished:
+            # note that we will still run the script if scratch_disk_job_avoid is False;
+            # this is useful for modifying the contents of a preexisting scratch disk.
+            if finished and self.scratch_disk_job_avoid:
                 localization_script += ["exit 15 #DEBUG_OMIT"]
 
             # we also need to be able to dynamically resize the disk if it gets full
