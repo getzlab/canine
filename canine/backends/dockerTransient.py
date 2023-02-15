@@ -3,6 +3,7 @@
 import typing
 import subprocess
 import os
+import pwd
 import sys
 import docker
 import re
@@ -116,15 +117,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
             # FIXME: gcloud is cloud-provider specific. how can we make this more generic?
             gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
+            uinfo = pwd.getpwnam(self.config["user"])
             self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
               volumes = {
                 "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" },
-                gcloud_conf_dir : { "bind" : "/mnt/nfs/clust_conf/gcloud", "mode" : "rw" }
+                gcloud_conf_dir : { "bind" : "/mnt/nfs/credentials/gcloud", "mode" : "ro" }
                },
               name = self.config["cluster_name"], command = "/bin/bash",
-              user = self.config["user"], stdin_open = True, remove = True,
-              privileged = True
+              stdin_open = True, remove = True, privileged = True,
+              environment = { "HOST_USER" : self.config["user"], "HOST_UID" : uinfo.pw_uid, "HOST_GID" : uinfo.pw_gid }
             )
             self.container = self._get_container(self.config["cluster_name"])
 
