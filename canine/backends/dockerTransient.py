@@ -31,8 +31,6 @@ gce_lock = threading.Lock()
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
-        startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
-        shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
         action_on_stop = "delete", image_family = None, image = None,
         clust_frac = 1.0, user = os.environ["USER"], shutdown_on_exit = False, **kwargs
     ):
@@ -43,13 +41,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if "image" not in kwargs:
             kwargs["image"] = image
 
-        # superclass constructor does something special with startup|shutdown_script so
-        # we need to pass it in
-        kwargs["startup_script"] = "{script} {worker_prefix}".format(
-          script = startup_script,
-          worker_prefix = socket.gethostname()
-        )
-        kwargs["shutdown_script"] = shutdown_script
         super().__init__(**{**kwargs, **{ "slurm_conf_path" : "" }})
 
         self.config = {
