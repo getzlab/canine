@@ -31,7 +31,10 @@ gce_lock = threading.Lock()
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
-        action_on_stop = "delete", image_family = None, image = None,
+        action_on_stop = "delete",
+        image_family = "slurm-gcp-docker",
+        image_project = "broad-getzlab-workflows",
+        image = None,
         clust_frac = 1.0, user = os.environ["USER"], shutdown_on_exit = False, **kwargs
     ):
         if user is None:
@@ -47,12 +50,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
           "action_on_stop" : action_on_stop,
-          "image_family" : image_family if image_family is not None else "slurm-gcp-docker-" + user,
+          "image_family" : image_family,
+          "image_project" : image_project,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           "user" : user,
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
-        self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
+        self.config["image"] = self.get_latest_image(
+          image_family = self.config["image_family"],
+          project = self.config["image_project"],
+        )["name"] if image is None else image
 
         # placeholder for Docker API
         self.dkr = None
@@ -270,10 +277,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
           sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 
-    def get_latest_image(self, image_family = None):
+    def get_latest_image(self, image_family = None, project = None):
         image_family = self.config["image_family"] if image_family is None else image_family
+        project = self.config["project"] if project is None else project
         with gce_lock:
-            ans = get_gce_client().images().getFromFamily(family = image_family, project = self.config["project"]).execute()
+            ans = get_gce_client().images().getFromFamily(family = image_family, project = project).execute()
         return ans
 
     def invoke(self, command, interactive = False, bypass_docker = False):
