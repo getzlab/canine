@@ -32,7 +32,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
         action_on_stop = "delete",
-        image_family = "slurm-gcp-docker",
+        image_family = "slurm-gcp-docker-v1",
         image_project = "broad-getzlab-workflows",
         image = None,
         clust_frac = 1.0, user = os.environ["USER"], shutdown_on_exit = False, **kwargs
@@ -114,6 +114,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         canine_logging.info1("Starting Slurm controller ...")
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
             # FIXME: gcloud is cloud-provider specific. how can we make this more generic?
+            #        we could use Docker compose within slurm_gcp_docker to automate
+            #        the container startup
             gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
             uinfo = pwd.getpwnam(self.config["user"])
             self.dkr.containers.run(
