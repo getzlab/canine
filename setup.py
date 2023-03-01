@@ -1,11 +1,6 @@
 from setuptools import setup
 import re
 import os
-import sys
-
-ver_info = sys.version_info
-if ver_info < (3,7,0):
-    raise RuntimeError("canine requires at least python 3.7")
 
 with open(os.path.join(os.path.dirname(__file__), 'canine', 'orchestrator.py')) as r:
     version = re.search(r'version = \'(\d+\.\d+\.\d+[-_a-zA-Z0-9]*)\'', r.read()).group(1)
@@ -62,7 +57,9 @@ setup(
         'tables>=3.6.1',
         'google-crc32c>=1.5.0',
         'google-cloud-compute>=1.6.1',
+        'slurm_gcp_docker>=0.12',
     ],
+    python_requires = ">3.7",
     classifiers = [
         "Development Status :: 4 - Beta",
         "Programming Language :: Python :: 3",
