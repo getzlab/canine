@@ -57,7 +57,7 @@ setup(
         'tables>=3.6.1',
         'google-crc32c>=1.5.0',
         'google-cloud-compute>=1.6.1',
-        'slurm_gcp_docker>=0.12',
+        'slurm_gcp_docker>=0.12 @ git+https://github.com/getzlab/slurm_gcp_docker@oneimage',
     ],
     python_requires = ">3.7",
     classifiers = [
