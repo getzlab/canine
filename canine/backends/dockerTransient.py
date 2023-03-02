@@ -101,6 +101,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # export the NFS mountpoint
         self.export_NFS()
 
+        # copy credential files to NFS
+        self.copy_cloud_credentials()
+
         #
         # ensure that Docker can start (no Slurm processes outside of Docker already running)
         try:
@@ -113,16 +116,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # create the Slurm container if it's not already present
         canine_logging.info1("Starting Slurm controller ...")
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
-            # FIXME: gcloud is cloud-provider specific. how can we make this more generic?
-            #        we could use Docker compose within slurm_gcp_docker to automate
-            #        the container startup
-            gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
             uinfo = pwd.getpwnam(self.config["user"])
             self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
               volumes = {
-                "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" },
-                gcloud_conf_dir : { "bind" : "/mnt/nfs/credentials/gcloud", "mode" : "ro" }
+                "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" }
                },
               name = self.config["cluster_name"], command = "/bin/bash",
               stdin_open = True, remove = True, privileged = True,
@@ -278,6 +276,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # actual filesystem as /mnt/nfs
         subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
           sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
+
+    def copy_cloud_credentials(self):
+        ## gcloud
+        # TODO: check that we are properly authenticated
+        # TODO: check $CLOUDSDK_CONFIG environment variable
+        gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
+        if os.path.isdir(gcloud_conf_dir):
+            if not os.path.isdir("/mnt/nfs/credentials/gcloud"):
+                os.makedirs("/mnt/nfs/credentials/gcloud")
+            subprocess.run(f'cp -rf $(find {gcloud_conf_dir} -mindepth 1 -maxdepth 1 ! -name "logs") /mnt/nfs/credentials/gcloud', shell = True)
 
     def get_latest_image(self, image_family = None, project = None):
         image_family = self.config["image_family"] if image_family is None else image_family
