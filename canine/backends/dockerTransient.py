@@ -306,7 +306,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         local_invoke = super(TransientImageSlurmBackend, self).invoke
         if self.container is not None and self.container().status == "running":
             if not bypass_docker:
-                cmd = "docker exec {ti_flag} {container} {command}".format(
+                cmd = "docker exec --user {user} {ti_flag} {container} {command}".format(
+                  user = self.config["user"],
                   ti_flag = "-ti" if interactive else "",
                   container = self.config["cluster_name"],
                   command = command
