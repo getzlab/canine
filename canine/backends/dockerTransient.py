@@ -177,9 +177,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                           r"(.*worker)(\d+)\1(\d+)", r"\1[\2-\3]",
                           "".join(g.iloc[[0, -1]].index.tolist())
                         )
-            (ret, _, _) = self.invoke(
-                                      """sudo -E scontrol update nodename={} state=drain reason=unused""".format(node_expr)
-                                    )
+            (ret, _, _) = self.invoke("scontrol update nodename={} state=drain reason=unused".format(node_expr), user = "root")
             if ret != 0:
                 raise RuntimeError("Could not drain nodes!")
 
@@ -294,7 +292,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             ans = get_gce_client().images().getFromFamily(family = image_family, project = project).execute()
         return ans
 
-    def invoke(self, command, interactive = False, bypass_docker = False):
+    def invoke(self, command, interactive = False, bypass_docker = False, user = None):
         """
         Set bypass_docker to True to execute the command directly on the host,
         rather than in the controller container. Useful for debugging.
@@ -302,12 +300,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if not isatty(sys.stdout, sys.stdin):
             interactive = False
 
+        user = self.config["user"] if user is None else user
+
         # re-purpose LocalSlurmBackend's invoke
         local_invoke = super(TransientImageSlurmBackend, self).invoke
         if self.container is not None and self.container().status == "running":
             if not bypass_docker:
                 cmd = "docker exec --user {user} {ti_flag} {container} {command}".format(
-                  user = self.config["user"],
+                  user = user,
                   ti_flag = "-ti" if interactive else "",
                   container = self.config["cluster_name"],
                   command = command
@@ -365,7 +365,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         canine_logging.info1("Waiting up to {} seconds for Slurm controller to start ...".format(timeout))
         (rc, _, _) = self.invoke(
           "timeout {} bash -c 'while [ ! -f /.started ]; do sleep 1; done'".format(timeout),
-          interactive = True
+          interactive = True,
+          user = "root"
         )
         if rc == 124:
             raise TimeoutError("Slurm controller did not start within {} seconds!".format(timeout))
