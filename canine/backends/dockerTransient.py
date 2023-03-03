@@ -116,7 +116,15 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # create the Slurm container if it's not already present
         canine_logging.info1("Starting Slurm controller ...")
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
-            uinfo = pwd.getpwnam(self.config["user"])
+            # query /etc/passwd for UID/GID information if we are running as a different user
+            # FIXME: how should this work for OS Login/LDAP/etc.?
+            uid = None; gid = None
+            if self.config["user"] != os.getlogin():
+                uinfo = pwd.getpwnam(self.config["user"])
+                uid = uinfo.pw_uid; gid = uinfo.pw_gid
+            else:
+                uid = os.getuid(); gid = os.getgid()
+
             self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
               volumes = {
@@ -124,7 +132,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                },
               name = self.config["cluster_name"], command = "/bin/bash",
               stdin_open = True, remove = True, privileged = True,
-              environment = { "HOST_USER" : self.config["user"], "HOST_UID" : uinfo.pw_uid, "HOST_GID" : uinfo.pw_gid }
+              environment = { "HOST_USER" : self.config["user"], "HOST_UID" : uid, "HOST_GID" : gid }
             )
             self.container = self._get_container(self.config["cluster_name"])
 
