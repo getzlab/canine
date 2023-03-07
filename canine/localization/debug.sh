@@ -21,11 +21,21 @@ EOF
 # run localization.sh, omitting lines not suitable for debugging
 echo "bash <(grep -v '#DEBUG_OMIT' localization.sh)" >> $CMD_TMP
 
+# pass gcloud credential directory through
+if [ -d $HOME/.config/gcloud ]; then
+  echo "export CANINE_DOCKER_ARGS=\"-v $HOME/.config/gcloud:/user_gcloud_config\"" >> $CMD_TMP
+  echo "export CLOUDSDK_CONFIG=/user_gcloud_config" >> $CMD_TMP
+fi
+
+# pass through /etc/passwd to make UID/GID sync
+echo "export CANINE_DOCKER_ARGS=\"-v /etc/passwd:/etc/passwd:ro \$CANINE_DOCKER_ARGS\"" >> $CMD_TMP
+
 # run script to get into Docker
 if grep -q "^#WOLF_DOCKERIZED_TASK" ../../script.sh; then
 	sed -n '/^#WOLF_DOCKERIZED_TASK/,/#DEBUG_END/p' ../../script.sh | \
 	sed -e '/#DEBUG_OMIT/d' -e '$s/ - <<.*$//' -E -e 's/sudo (-E )?podman/docker/' \
-	  -e 's/inspect -t image/inspect/' -e 's/docker run/docker run --rm -ti/' >> $CMD_TMP
+	  -e 's/inspect -t image/inspect/' -e 's/docker run/docker run --rm -ti/' \
+	  -e "s/--user 0:0/--user $UID:$GID/" >> $CMD_TMP
 else
 	# TODO: enter Slurm docker if no Docker is specified, and we used the Docker
 	# backend
@@ -33,6 +43,7 @@ else
 fi
 
 echo "echo 'Running teardown script, please wait ...'" >> $CMD_TMP
+echo "unset CLOUDSDK_CONFIG" >> $CMD_TMP
 echo "./teardown.sh" >> $CMD_TMP
 
 bash $CMD_TMP
