@@ -1129,19 +1129,23 @@ class AbstractLocalizer(abc.ABC):
                 elif file_handler.localization_mode == 'url':
                     job_vars.add(shlex.quote(key))
 
+                    exportpath = self.reserve_path('jobs', jobId, 'inputs', basename)
+
                     # localize this file to a persistent disk, if specified
                     if self.localize_to_persistent_disk:
-                        # set dest to persistent disk mountpoint
-                        exportpath = os.path.join(disk_prefix, key, basename)
+                        # localize to persistent disk mountpoint; symlink into inputs folder
+                        disk_path = os.path.join(disk_prefix, key, basename)
+                        file_handler.localized_path = disk_path
+                        localization_tasks += [
+                          file_handler.localization_command(disk_path),
+                          "if [[ -e {path} && ! -L {path} ]]; then echo 'Warning: task overwrote symlink to {disk_path} on RODISK' >&2; elif [[ ! -L {path} ]]; then ln -s {disk_path} {path}; fi".format(disk_path=disk_path, path=exportpath.remotepath),
+                        ]
                     else:
                         # set dest to path on NFS
-                        dest = self.reserve_path('jobs', jobId, 'inputs', basename)
-                        exportpath = dest.remotepath
-                    file_handler.localized_path = exportpath
+                        localization_tasks += [file_handler.localization_command(exportpath.remotepath)]
+                        file_handler.localized_path = exportpath
 
-                    localization_tasks += [file_handler.localization_command(exportpath)]
-
-                    export_writer(key, exportpath, is_array)
+                    export_writer(key, exportpath.remotepath, is_array)
 
                 # this is a read-only disk URL; export variables for subsequent mounting
                 # and command to symlink file mount path to inputs directory
