@@ -732,7 +732,7 @@ class AbstractLocalizer(abc.ABC):
             return None, [], [], rodisk_paths
 
         ## mount prefix
-        mount_prefix = "/mnt/nfs/rodisks"
+        mount_prefix = "/mnt/nfs/rwdisks"
         disk_mountpoint = mount_prefix + "/" + disk_name
 
         ## Check if the disk already exists
@@ -1151,7 +1151,7 @@ class AbstractLocalizer(abc.ABC):
                     disk = dgrp[1]
                     file = dgrp[2]
 
-                    disk_dir = "/mnt/nfs/ro_disks/{}".format(disk)
+                    disk_dir = "/mnt/nfs/rodisks/{}".format(disk)
 
                     if disk not in canine_rodisks:
                         canine_rodisks.append(disk)
@@ -1239,7 +1239,7 @@ class AbstractLocalizer(abc.ABC):
               "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
               "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
 
-              "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then sudo mkdir -p ${CANINE_RODISK_DIR}; fi",
+              "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then mkdir -p ${CANINE_RODISK_DIR}; fi",
 
               # create tempfile to hold diagnostic information
               "DIAG_FILE=$(mktemp)",
