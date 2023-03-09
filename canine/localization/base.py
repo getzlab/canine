@@ -902,7 +902,7 @@ class AbstractLocalizer(abc.ABC):
                   '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
                   '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
                   '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
-                  '      gcloud compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
+                  '      gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
                   '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
                   '    fi',
                   '  fi',
@@ -1326,7 +1326,8 @@ class AbstractLocalizer(abc.ABC):
         localization_script = '\n'.join(
           [
             "#!/bin/bash",
-            "set -e"
+            "set -e",
+            "alias gcloud=gcloud_exp_backoff"
           ] + localization_tasks + 
           (
             ['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}'.format(
@@ -1341,6 +1342,7 @@ class AbstractLocalizer(abc.ABC):
             for line in [
                 '#!/bin/bash',
                 'set -e',
+                'alias gcloud=gcloud_exp_backoff',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
                 # do not run delocalization script if:
