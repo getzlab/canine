@@ -94,7 +94,7 @@ def main(output_dir, jobId, patterns, copy, scratch):
                     dest = os.path.join(jobdir, name, os.path.relpath(target))
 
                 # populate output directory
-                if not os.path.exists(dest):
+                if not os.path.lexists(dest):
                     if not os.path.isdir(os.path.dirname(dest)):
                         os.makedirs(os.path.dirname(dest))
                     # we've output to a scratch disk; create (broken) symlink to RODISK mount
