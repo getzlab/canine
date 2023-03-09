@@ -3,6 +3,7 @@
 import typing
 import subprocess
 import os
+import pwd
 import sys
 import docker
 import re
@@ -30,9 +31,10 @@ gce_lock = threading.Lock()
 class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
-        startup_script = "/usr/local/share/slurm_gcp_docker/src/provision_worker_container_host.sh",
-        shutdown_script = "/usr/local/share/slurm_gcp_docker/src/shutdown_worker_container_host.sh",
-        action_on_stop = "delete", image_family = None, image = None,
+        action_on_stop = "delete",
+        image_family = "slurm-gcp-docker-v1",
+        image_project = "broad-getzlab-workflows",
+        image = None,
         clust_frac = 1.0, user = os.environ["USER"], shutdown_on_exit = False, **kwargs
     ):
         if user is None:
@@ -42,25 +44,22 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if "image" not in kwargs:
             kwargs["image"] = image
 
-        # superclass constructor does something special with startup|shutdown_script so
-        # we need to pass it in
-        kwargs["startup_script"] = "{script} {worker_prefix}".format(
-          script = startup_script,
-          worker_prefix = socket.gethostname()
-        )
-        kwargs["shutdown_script"] = shutdown_script
         super().__init__(**{**kwargs, **{ "slurm_conf_path" : "" }})
 
         self.config = {
           "cluster_name" : cluster_name,
           "worker_prefix" : socket.gethostname(),
           "action_on_stop" : action_on_stop,
-          "image_family" : image_family if image_family is not None else "slurm-gcp-docker-" + user,
+          "image_family" : image_family,
+          "image_project" : image_project,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           "user" : user,
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
-        self.config["image"] = self.get_latest_image(self.config["image_family"])["name"] if image is None else image
+        self.config["image"] = self.get_latest_image(
+          image_family = self.config["image_family"],
+          project = self.config["image_project"],
+        )["name"] if image is None else image
 
         # placeholder for Docker API
         self.dkr = None
@@ -83,7 +82,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # check if image exists
         try:
-            image = self.dkr.images.get('broadinstitute/slurm_gcp_docker:latest')
+            image = self.dkr.images.get('gcr.io/broad-getzlab-workflows/slurm_gcp_docker:latest')
         except docker.errors.ImageNotFound:
             raise Exception("You have not yet built or pulled the Slurm Docker image!")
         except RConnectionError as e:
@@ -102,6 +101,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # export the NFS mountpoint
         self.export_NFS()
 
+        # copy credential files to NFS
+        self.copy_cloud_credentials()
+
         #
         # ensure that Docker can start (no Slurm processes outside of Docker already running)
         try:
@@ -114,17 +116,23 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # create the Slurm container if it's not already present
         canine_logging.info1("Starting Slurm controller ...")
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
-            # FIXME: gcloud is cloud-provider specific. how can we make this more generic?
-            gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
+            # query /etc/passwd for UID/GID information if we are running as a different user
+            # FIXME: how should this work for OS Login/LDAP/etc.?
+            uid = None; gid = None
+            if self.config["user"] != os.getlogin():
+                uinfo = pwd.getpwnam(self.config["user"])
+                uid = uinfo.pw_uid; gid = uinfo.pw_gid
+            else:
+                uid = os.getuid(); gid = os.getgid()
+
             self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
               volumes = {
-                "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" },
-                gcloud_conf_dir : { "bind" : "/etc/gcloud", "mode" : "rw" }
+                "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" }
                },
               name = self.config["cluster_name"], command = "/bin/bash",
-              user = self.config["user"], stdin_open = True, remove = True,
-              privileged = True
+              stdin_open = True, remove = True, privileged = True,
+              environment = { "HOST_USER" : self.config["user"], "HOST_UID" : uid, "HOST_GID" : gid }
             )
             self.container = self._get_container(self.config["cluster_name"])
 
@@ -177,9 +185,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                           r"(.*worker)(\d+)\1(\d+)", r"\1[\2-\3]",
                           "".join(g.iloc[[0, -1]].index.tolist())
                         )
-            (ret, _, _) = self.invoke(
-                                      """sudo -E scontrol update nodename={} state=drain reason=unused""".format(node_expr)
-                                    )
+            (ret, _, _) = self.invoke("scontrol update nodename={} state=drain reason=unused".format(node_expr), user = "root")
             if ret != 0:
                 raise RuntimeError("Could not drain nodes!")
 
@@ -277,13 +283,24 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
           sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 
-    def get_latest_image(self, image_family = None):
+    def copy_cloud_credentials(self):
+        ## gcloud
+        # TODO: check that we are properly authenticated
+        # TODO: check $CLOUDSDK_CONFIG environment variable
+        gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
+        if os.path.isdir(gcloud_conf_dir):
+            if not os.path.isdir("/mnt/nfs/credentials/gcloud"):
+                os.makedirs("/mnt/nfs/credentials/gcloud")
+            subprocess.run(f'cp -rf $(find {gcloud_conf_dir} -mindepth 1 -maxdepth 1 ! -name "logs") /mnt/nfs/credentials/gcloud', shell = True)
+
+    def get_latest_image(self, image_family = None, project = None):
         image_family = self.config["image_family"] if image_family is None else image_family
+        project = self.config["project"] if project is None else project
         with gce_lock:
-            ans = get_gce_client().images().getFromFamily(family = image_family, project = self.config["project"]).execute()
+            ans = get_gce_client().images().getFromFamily(family = image_family, project = project).execute()
         return ans
 
-    def invoke(self, command, interactive = False, bypass_docker = False):
+    def invoke(self, command, interactive = False, bypass_docker = False, user = None):
         """
         Set bypass_docker to True to execute the command directly on the host,
         rather than in the controller container. Useful for debugging.
@@ -291,11 +308,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         if not isatty(sys.stdout, sys.stdin):
             interactive = False
 
+        user = self.config["user"] if user is None else user
+
         # re-purpose LocalSlurmBackend's invoke
         local_invoke = super(TransientImageSlurmBackend, self).invoke
         if self.container is not None and self.container().status == "running":
             if not bypass_docker:
-                cmd = "docker exec {ti_flag} {container} {command}".format(
+                cmd = "docker exec --user {user} {ti_flag} {container} {command}".format(
+                  user = user,
                   ti_flag = "-ti" if interactive else "",
                   container = self.config["cluster_name"],
                   command = command
@@ -353,7 +373,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         canine_logging.info1("Waiting up to {} seconds for Slurm controller to start ...".format(timeout))
         (rc, _, _) = self.invoke(
           "timeout {} bash -c 'while [ ! -f /.started ]; do sleep 1; done'".format(timeout),
-          interactive = True
+          interactive = True,
+          user = "root"
         )
         if rc == 124:
             raise TimeoutError("Slurm controller did not start within {} seconds!".format(timeout))
