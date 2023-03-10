@@ -992,13 +992,11 @@ class AbstractLocalizer(abc.ABC):
             # FIXME: we don't have an easy way of parsing which inputs are common
             #        to all shards at this point. if every localizable input is
             #        common to each shard, then we'll create the same disk
-            #        multiple times, once per shard. thus, for now we heavyhandedly
-            #        prohibit localizing to persistent disks for multishard jobs.
+            #        multiple times, once per shard. thus, for now we suboptimally
+            #        just localize the same file multiple times.
             # NOTE:  we are still able to create scratch disks for scatter jobs,
             #        one per shard. we do this by appending the shard number to the
             #        scratch disk name
-#            if len(self.inputs) > 1:
-#                raise ValueError("Localization to persistent disk for multishard jobs is currently not supported.")
 
             disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId], dry_run = self.persistent_disk_dry_run)
 
