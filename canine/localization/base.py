@@ -126,6 +126,9 @@ class AbstractLocalizer(abc.ABC):
 
         self.localize_to_persistent_disk = localize_to_persistent_disk
         self.persistent_disk_type = persistent_disk_type
+        # do not use common inputs when localizing to persistent disk
+        if self.localize_to_persistent_disk:
+            self.common = False
         self.use_scratch_disk = use_scratch_disk
         self.scratch_disk_type = scratch_disk_type
         self.scratch_disk_size = scratch_disk_size
@@ -989,13 +992,11 @@ class AbstractLocalizer(abc.ABC):
             # FIXME: we don't have an easy way of parsing which inputs are common
             #        to all shards at this point. if every localizable input is
             #        common to each shard, then we'll create the same disk
-            #        multiple times, once per shard. thus, for now we heavyhandedly
-            #        prohibit localizing to persistent disks for multishard jobs.
+            #        multiple times, once per shard. thus, for now we suboptimally
+            #        just localize the same file multiple times.
             # NOTE:  we are still able to create scratch disks for scatter jobs,
             #        one per shard. we do this by appending the shard number to the
             #        scratch disk name
-            if len(self.inputs) > 1:
-                raise ValueError("Localization to persistent disk for multishard jobs is currently not supported.")
 
             disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId], dry_run = self.persistent_disk_dry_run)
 
@@ -1126,19 +1127,23 @@ class AbstractLocalizer(abc.ABC):
                 elif file_handler.localization_mode == 'url':
                     job_vars.add(shlex.quote(key))
 
+                    exportpath = self.reserve_path('jobs', jobId, 'inputs', basename)
+
                     # localize this file to a persistent disk, if specified
                     if self.localize_to_persistent_disk:
-                        # set dest to persistent disk mountpoint
-                        exportpath = os.path.join(disk_prefix, key, basename)
+                        # localize to persistent disk mountpoint; symlink into inputs folder
+                        disk_path = os.path.join(disk_prefix, key, basename)
+                        file_handler.localized_path = disk_path
+                        localization_tasks += [
+                          file_handler.localization_command(disk_path),
+                          "if [[ -e {path} && ! -L {path} ]]; then echo 'Warning: task overwrote symlink to {disk_path} on RODISK' >&2; elif [[ ! -L {path} ]]; then ln -s {disk_path} {path}; fi".format(disk_path=disk_path, path=exportpath.remotepath),
+                        ]
                     else:
                         # set dest to path on NFS
-                        dest = self.reserve_path('jobs', jobId, 'inputs', basename)
-                        exportpath = dest.remotepath
-                    file_handler.localized_path = exportpath
+                        localization_tasks += [file_handler.localization_command(exportpath.remotepath)]
+                        file_handler.localized_path = exportpath
 
-                    localization_tasks += [file_handler.localization_command(exportpath)]
-
-                    export_writer(key, exportpath, is_array)
+                    export_writer(key, exportpath.remotepath, is_array)
 
                 # this is a read-only disk URL; export variables for subsequent mounting
                 # and command to symlink file mount path to inputs directory
