@@ -1327,7 +1327,7 @@ class AbstractLocalizer(abc.ABC):
           [
             "#!/bin/bash",
             "set -e",
-            "alias gcloud=gcloud_exp_backoff"
+            "alias gcloud=gcloud_exp_backoff #DEBUG_OMIT"
           ] + localization_tasks + 
           (
             ['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}'.format(
@@ -1342,7 +1342,7 @@ class AbstractLocalizer(abc.ABC):
             for line in [
                 '#!/bin/bash',
                 'set -e',
-                'alias gcloud=gcloud_exp_backoff',
+                'alias gcloud=gcloud_exp_backoff #DEBUG_OMIT',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
                 # do not run delocalization script if:
