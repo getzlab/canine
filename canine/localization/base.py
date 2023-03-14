@@ -856,7 +856,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## mount
             'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
-            'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            'mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
             'fi',
             'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
             'sudo mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
