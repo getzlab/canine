@@ -513,7 +513,10 @@ class AbstractLocalizer(abc.ABC):
 
     def pick_common_inputs(self, inputs: typing.Dict[str, typing.Dict[str, str]], overrides: typing.Dict[str, typing.Optional[str]], transport: typing.Optional[AbstractTransport] = None) -> typing.Dict[str, str]:
         """
-        Scans input configuration and overrides to choose inputs which should be treated as common.
+        Scans input configuration and overrides to choose inputs which should be treated as common,
+        namely URLs common to all job shards that should only be localized once
+        on the controller node, rather than multiple times for each shard on
+        worker nodes.
         Returns the dictionary of common inputs {input path: common path}
         """
         with self.transport_context(transport) as transport:
@@ -532,6 +535,12 @@ class AbstractLocalizer(abc.ABC):
                         for p in paths:
                             # TODO: pass through other file handler arguments here
                             fh = file_handlers.get_file_handler(p, project = self.project, token = self.token)
+
+                            # only pick common inputs that are URLs; it does not
+                            # save time for any other input types, and only leads
+                            # to complications down the road.
+                            if fh.localization_mode != "url":
+                                continue
 
                             # if hash has already been precomputed, use it
                             # this will be the case if FileType objects are 
@@ -1099,7 +1108,7 @@ class AbstractLocalizer(abc.ABC):
         # keep running list of basenames, in order to mangle them if duplicate
         # basenames exist. this keeps destination paths unique.
         basenames = {}
-        
+
         compute_env = self.environment('remote')
         for key, file_handler_array in self.inputs[jobId].items():
             is_array = self.input_array_flag[jobId][key]
