@@ -1,5 +1,7 @@
 #!/bin/bash
 
+[ ! -z $1 ] && UIDGID=$1 || UIDGID="$UID:$GID"
+
 CMD_TMP=$(mktemp)
 
 echo "export CANINE_DEBUG_MODE=1" > $CMD_TMP
@@ -35,7 +37,7 @@ if grep -q "^#WOLF_DOCKERIZED_TASK" ../../script.sh; then
 	sed -n '/^#WOLF_DOCKERIZED_TASK/,/#DEBUG_END/p' ../../script.sh | \
 	sed -e '/#DEBUG_OMIT/d' -e '$s/ - <<.*$//' -E -e 's/sudo (-E )?podman/docker/' \
 	  -e 's/inspect -t image/inspect/' -e 's/docker run/docker run --rm -ti/' \
-	  -e "s/--user 0:0/--user $UID:$GID/" >> $CMD_TMP
+	  -e "s/--user 0:0/--user $UIDGID/" >> $CMD_TMP
 else
 	# TODO: enter Slurm docker if no Docker is specified, and we used the Docker
 	# backend
