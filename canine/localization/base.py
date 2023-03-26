@@ -1341,6 +1341,7 @@ class AbstractLocalizer(abc.ABC):
           [
             "#!/bin/bash",
             "set -e",
+            "shopt -s expand_aliases #DEBUG_OMIT",
             "alias gcloud=gcloud_exp_backoff #DEBUG_OMIT"
           ] + localization_tasks + 
           (
@@ -1356,6 +1357,7 @@ class AbstractLocalizer(abc.ABC):
             for line in [
                 '#!/bin/bash',
                 'set -e',
+                'shopt -s expand_aliases #DEBUG_OMIT',
                 'alias gcloud=gcloud_exp_backoff #DEBUG_OMIT',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
