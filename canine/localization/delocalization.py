@@ -78,7 +78,7 @@ def compute_crc32c(path, fast = False):
 
     return hash_alg.hexdigest().decode().upper()
 
-def main(output_dir, jobId, patterns, copy, scratch):
+def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
     jobdir = os.path.join(output_dir, str(jobId))
     if not os.path.isdir(jobdir):
         os.makedirs(jobdir)
@@ -144,16 +144,17 @@ def main(output_dir, jobId, patterns, copy, scratch):
         pool = multiprocessing.Pool(8)
         crc_results = []
         for dest, f in matched_files:
-            crc_results.append((pool.apply_async(compute_crc32c, (f, scratch)), dest, f))
+            crc_path = os.path.join(os.path.dirname(dest), "." + os.path.basename(dest) + ".crc32c")
+            # if we are delocalizing from a finished scratch disk, do not bother
+            # recomputing checksum for this file if it already exists
+            if scratch and finished_scratch and os.path.exists(crc_path):
+                continue
+            crc_results.append((pool.apply_async(compute_crc32c, (f, scratch)), crc_path))
 
         for res in crc_results:
             crc = res[0].get()
-            dest = res[1]
-            f = res[2]
-            with open(os.path.join(
-                os.path.dirname(dest),
-                "." + os.path.basename(dest) + ".crc32c"
-              ), "w") as crc32c_file:
+            crc_path = res[1]
+            with open(crc_path, "w") as crc32c_file:
                 crc32c_file.write(crc + "\n")
         pool.terminate()
         print(' done', file = sys.stderr, flush = True)
@@ -186,5 +187,10 @@ if __name__ == '__main__':
         action='store_true',
         help="Outputs were written to a scratch disk; will create (broken) symlinks to the scratch diskmountpoint"
     )
+    parser.add_argument(
+        '-F', '--finished_scratch',
+        action='store_true',
+        help="Scratch disk was finished; delocalizer is only running to (re)generate output directory. Will skip computing CRC32 hashes if they were precomputed to save time."
+    )
     args = parser.parse_args()
-    main(args.dest, args.jobId, args.pattern, set(args.copy), args.scratch)
+    main(args.dest, args.jobId, args.pattern, set(args.copy), args.scratch, args.finished_scratch)
