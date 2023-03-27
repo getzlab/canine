@@ -817,17 +817,31 @@ class AbstractLocalizer(abc.ABC):
             ## wait for disk to attach, with exponential backoff up to 2 minutes
             'DELAY=1',
             'while [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; do',
-              ## if disk is not a scratch disk, check once again if it's being created by another instance
-              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -qv "$CANINE_NODE_NAME" && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
-                'TRIES=0',
-                # wait until disk is marked "finished"
-                'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
-                  'echo "Waiting for disk to become available ..." >&2',
-                  '[ $TRIES == 0 ] && sleep {} || sleep 300'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer for first timeout; 5 minutes thereafter up to 10 times
-                  '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
-                  '((++TRIES))',
-                'done',
-                'exit 15 #DEBUG_OMIT', # special exit code to cause rest of entrypoint.sh to be skipped
+              ## check if disk is being created by _another_ instance (grep -qv $CANINE_NODE_NAME)
+              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -qv "$CANINE_NODE_NAME"; then',
+                # if disk is a localization disk (i.e. not a scratch disk), wait approximately how long it would take to transfer files to it
+                'if ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
+                  'TRIES=0',
+                  # wait until disk is marked "finished"
+                  'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
+                    'echo "Waiting for localization disk to become available ..." >&2',
+                    '[ $TRIES == 0 ] && sleep {} || sleep 300'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer for first timeout; 5 minutes thereafter up to 10 times
+                    '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
+                    '((++TRIES))',
+                  'done',
+                  'exit 15 #DEBUG_OMIT', # special exit code to cause the script to be skipped in entrypoint.sh
+                # if disk is a scratch disk, wait up to two hours for it to finish. once it's finished, fail the localizer, to cause task to be requeued and avoided.
+                'else',
+                  'TRIES=0',
+                  # wait until disk is marked "finished"
+                  'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
+                    'echo "Waiting for scratch disk to become available ..." >&2',
+                    'sleep 60',
+                    '[ $TRIES -ge 120 ] && { echo "Exceeded timeout waiting for another node to finish making scratch disk" >&2; exit 1; } || :',
+                    '((++TRIES))',
+                  'done',
+                  'exit 1 #DEBUG_OMIT', # fail localizer -> requeue task -> job avoid 
+                'fi',
               'fi',
               # TODO: what if the task exited on the other
               #       instance without running the teardown script
@@ -835,12 +849,12 @@ class AbstractLocalizer(abc.ABC):
               #       detach the disk from the other instance
               #       are there any scenarios in which this would be a bad idea?
 
-              # otherwise, it may just be taking a bit to attach
+              ## if disk is not being created by another instance, it might just be taking a bit to attach. give it a chance to appear in /dev
               '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
               'sleep $DELAY; ((DELAY *= 2))',
 
               # try attaching again if delay has exceeded 8 seconds
-              # if disk has attached successfully, but disk doesn't appear in /dev,
+              # if disk has attached successfully according to GCP, but disk doesn't appear in /dev,
               # this means that the node is bad
               'if [ $DELAY -gt 8 ]; then',
                 'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :',
