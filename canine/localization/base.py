@@ -677,9 +677,10 @@ class AbstractLocalizer(abc.ABC):
         If a dict of inputs -> [FileTypes] is provided, disk will be named
         according to the FileType hashes, and sized according to the filesizes.
         """
+        is_scratch_disk = len(file_paths_arrays) == 0
         #
         # if we already have files in mind to localize
-        if len(file_paths_arrays):
+        if not is_scratch_disk:
             # flatten file_paths dict
             # for non-array inputs, { inputName : path }
             # disambiguate array inputs with numerical suffix, e.g. { inputName + "_0" : path }
@@ -780,7 +781,7 @@ class AbstractLocalizer(abc.ABC):
                 # if this is not a scratch disk, no additional localization or
                 # teardown commands necessary, since inputs will be transformed into
                 # rodisk *inputs*, whose localization commands to mount will be handled downstream
-                if len(file_paths_arrays):
+                if not is_scratch_disk:
                     return disk_mountpoint, [], [], rodisk_paths
 
                 # otherwise, we still need to mount the disk/unmount+detach later
@@ -813,7 +814,7 @@ class AbstractLocalizer(abc.ABC):
             'fi',
 
             ## if this is a scratch disk, label it as such
-            'gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes' if len(file_paths_arrays) == 0 else '',
+            'gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes' if is_scratch_disk else '',
 
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
@@ -882,7 +883,7 @@ class AbstractLocalizer(abc.ABC):
         # the task container), we need to mount the scratch disk on the host VM,
         # in addition to inside the Slurm worker VM (same code as mounting RODISK
         # in job_setup_teardown)
-        if len(file_paths_arrays) == 0:
+        if is_scratch_disk:
 #            localization_script += [
 #              "if [[ -f /.dockerenv ]]; then",
 #              'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
@@ -957,7 +958,7 @@ class AbstractLocalizer(abc.ABC):
         ]
 
         # scratch disks get labeled "finalized" if the task ran OK.
-        if len(file_paths_arrays) == 0:
+        if is_scratch_disk:
             teardown_script += [
               'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}; fi'.format(
                 disk_name = disk_name,
