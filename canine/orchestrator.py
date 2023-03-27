@@ -696,6 +696,10 @@ class Orchestrator(object):
                 return n_avoided, old_job_spec
 
             # check for preexisting jobs' outputs
+            # NOTE: this directory will not exist if the task used a scratch disk,
+            #       which implicitly disables job avoidance for scratch disks.
+            #       Scratch disk tasks will avoid via a different method by having the 
+            #       localizer exit early.
             if transport.exists(localizer.staging_dir):
                 try:
                     js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id") 
