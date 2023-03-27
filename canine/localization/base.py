@@ -872,20 +872,9 @@ class AbstractLocalizer(abc.ABC):
             'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
         ]
 
-        # if we are creating a scratch disk (which will be accessed via
-        # the task container), we need to mount the scratch disk on the host VM,
-        # in addition to inside the Slurm worker VM (same code as mounting RODISK
-        # in job_setup_teardown)
         # scratch disks dynamically resize as they get full.
         # if disk has <30% free space remaining, increase its size by 60%
         if is_scratch_disk:
-#            localization_script += [
-#              "if [[ -f /.dockerenv ]]; then",
-#              'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
-#              'sudo nsenter -t 1 -m mount -o noload,defaults /dev/disk/by-id/google-${GCP_DISK_NAME} "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-#              'fi',
-#              'fi',
-#            ]
             localization_script += [
               'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
               'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
