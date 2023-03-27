@@ -767,26 +767,19 @@ class AbstractLocalizer(abc.ABC):
                     if backoff > 120:
                         raise RuntimeError("Persistent disk {} cannot be queried due to gcloud quota limit.".format(disk_name))
 
-        # flag for scratch disks to know to job avoid
-        finished = False
-
         # disk exists
         if disk_exists:
             # disk has been finalized
             if "finished" in disk_attrs.labels:
                 canine_logging.info1("Found existing disk {}".format(disk_name))
 
-                finished = True
-
-                # if this is not a scratch disk, no additional localization or
-                # teardown commands necessary, since inputs will be transformed into
-                # rodisk *inputs*, whose localization commands to mount will be handled downstream
-                if not is_scratch_disk:
-                    return disk_mountpoint, [], [], rodisk_paths
-
-                # otherwise, we still need to mount the disk/unmount+detach later
-                # the default localization/teardown script will work for this, since
-                # it can handle existing disks
+                # no additional localization or teardown commands necessary
+                # if this is a localization disk, inputs will be transformed into
+                # rodisk *inputs*, whose localization commands to mount will
+                # be handled downstream
+                # if this is a scratch disk, it will be mounted read-only, and
+                # the script will be skipped
+                return disk_mountpoint, [], [], (rodisk_paths if not is_scratch_disk else "rodisk://" + disk_name)
             
             # check if disk is currently being built by another instance; notify user
             elif len(disk_attrs.users):
@@ -883,6 +876,8 @@ class AbstractLocalizer(abc.ABC):
         # the task container), we need to mount the scratch disk on the host VM,
         # in addition to inside the Slurm worker VM (same code as mounting RODISK
         # in job_setup_teardown)
+        # scratch disks dynamically resize as they get full.
+        # if disk has <30% free space remaining, increase its size by 60%
         if is_scratch_disk:
 #            localization_script += [
 #              "if [[ -f /.dockerenv ]]; then",
@@ -891,40 +886,26 @@ class AbstractLocalizer(abc.ABC):
 #              'fi',
 #              'fi',
 #            ]
-
-            # if this disk is finished, then we can exit early and skip the job
-            # immediately after mounting. this is how we implement job avoidance
-            # for scratch disk jobs. (we still need to mount the disk just in case
-            # delocalization never ran).
-            # use special exit code for this.
-            # note that we will still run the script if scratch_disk_job_avoid is False;
-            # this is useful for modifying the contents of a preexisting scratch disk.
-            if finished and self.scratch_disk_job_avoid:
-                localization_script += ["exit 15 #DEBUG_OMIT"]
-
-            # we also need to be able to dynamically resize the disk if it gets full
-            # if disk has <30% free space remaining, increase its size by 60%
-            else:
-                localization_script += [
-                  'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
-                  'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
-                  'while true; do',
-                  '  sleep 10',
-                  '  if ! mountpoint \$DISK_DIR &> /dev/null; then echo "No disk mounted to \$DISK_DIR" >&2; continue; else',
-                  '    DISK_SIZE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
-                  '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
-                  '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
-                  '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
-                  '      gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
-                  '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
-                  '    fi',
-                  '  fi',
-                  'done',
-                  'EOF',
-                  'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
-                  'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
-                  'set -e',
-                ]
+            localization_script += [
+              'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
+              'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
+              'while true; do',
+              '  sleep 10',
+              '  if ! mountpoint \$DISK_DIR &> /dev/null; then echo "No disk mounted to \$DISK_DIR" >&2; continue; else',
+              '    DISK_SIZE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
+              '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
+              '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
+              '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
+              '      gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
+              '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+              '    fi',
+              '  fi',
+              'done',
+              'EOF',
+              'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
+              'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
+              'set -e',
+            ]
 
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
@@ -1047,14 +1028,30 @@ class AbstractLocalizer(abc.ABC):
 
         #
         # create creation/teardown scripts for scratch disk, if specified
+        scratch_disk_already_exists = False
         if self.use_scratch_disk:
-            scratch_disk_prefix, scratch_disk_creation_script, \
-            scratch_disk_teardown_script, _ = self.create_persistent_disk(
+            scratch_disk_prefix, \
+            scratch_disk_creation_script, \
+            scratch_disk_teardown_script, \
+            finished_scratch_disk_url = self.create_persistent_disk(
               disk_name = self.scratch_disk_name + "-" + jobId, # one scratch disk per shard
               disk_size = self.scratch_disk_size
             )
 
             localization_tasks += scratch_disk_creation_script
+
+            # if scratch disk already exists and is finalized (as indicated by
+            # blank disk creation script), mount it read-only using the same
+            # machinery we use to mount any other RODISK.
+            if len(scratch_disk_creation_script) == 0:
+                scratch_disk_already_exists = True
+
+                canine_rodisks.append(finished_scratch_disk_url[9:]) # strip 'rodisk://' prefix
+                exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), finished_scratch_disk_url[9:])] # strip 'rodisk://' prefix
+                exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), scratch_disk_prefix)]
+
+                # we also need to bypass running the script if scratch_disk_job_avoid 
+                # is True. this will happen later
 
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
@@ -1349,6 +1346,9 @@ class AbstractLocalizer(abc.ABC):
             ['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}'.format(
               protect_string = (",protect=yes" if self.protect_disk else "")
             )] if self.localize_to_persistent_disk and not localization_disk_already_exists else []
+          ) +
+          ( # skip running task script if finished scratch disk already exists via special localizer exit code
+            ["exit 15 #DEBUG_OMIT"] if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else []
           )
         ) + "\nset +e\n"
 
