@@ -71,9 +71,9 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo '====================================' >&2
       break
     else
-      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
-      echo "!!!! JOB FAILED! (EXIT CODE $CANINE_JOB_RC) !!!!" >&2
-      echo "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      echo -e "!!!! JOB FAILED! (EXIT CODE                 !!!!\e[29G$CANINE_JOB_RC)" >&2
+      echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo '++++ STARTING JOB CLEANUP ++++' >&2
       $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
       TEARDOWN_RC=$?
