@@ -46,7 +46,7 @@ fi
 
 echo "echo 'Running teardown script, please wait ...'" >> $CMD_TMP
 echo "unset CLOUDSDK_CONFIG" >> $CMD_TMP
-echo "./teardown.sh" >> $CMD_TMP
+echo "bash <(grep -v '#DEBUG_OMIT' teardown.sh)" >> $CMD_TMP
 
 bash $CMD_TMP
 rm $CMD_TMP
