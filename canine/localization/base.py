@@ -868,7 +868,7 @@ class AbstractLocalizer(abc.ABC):
             'mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
             'fi',
             'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
-            'timeout 30 sudo mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            'sudo timeout 30 mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
             'sudo chmod -R a+rwX "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'fi',
 
@@ -1087,7 +1087,7 @@ class AbstractLocalizer(abc.ABC):
                 'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
                 'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
 
-                'timeout 30 sudo mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
+                'sudo timeout 30 mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
                     device_name,
                 ),
                 'sudo chmod -R a+rwX {}'.format(self.local_download_dir),
@@ -1289,7 +1289,7 @@ class AbstractLocalizer(abc.ABC):
               "done",
 
               # mount within Slurm worker container
-              "timeout 30 sudo mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
+              "sudo timeout 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
 #              # mount on host (so that task dockers can access it)
 #              "if [[ -f /.dockerenv ]]; then",
 #              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
