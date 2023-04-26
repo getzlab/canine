@@ -1277,7 +1277,7 @@ class AbstractLocalizer(abc.ABC):
                 'if [ $tries -gt 12 ]; then',
                   # check if the disk has attached successfully, but doesn't appear in /dev
                   # this means the node is likely bad
-                  'if gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\' && [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ]; then',
+                  'if [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ] && gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\'; then',
                     'sudo touch /.fatal_disk_issue_sentinel',
                     'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
                     'exit 1',
