@@ -745,7 +745,7 @@ class AbstractLocalizer(abc.ABC):
             return None, [], [], rodisk_paths
 
         ## mount prefix
-        mount_prefix = "/mnt/nfs/rwdisks"
+        mount_prefix = "/mnt/rwdisks"
         disk_mountpoint = mount_prefix + "/" + disk_name
 
         ## Check if the disk already exists
@@ -873,11 +873,11 @@ class AbstractLocalizer(abc.ABC):
 
             ## mount
             'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
-            'mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            'sudo chown $(id -u):$(id -g) "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'fi',
             'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
             'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-            'sudo chmod -R a+rwX "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'fi',
 
             ## lock the disk
@@ -1166,7 +1166,7 @@ class AbstractLocalizer(abc.ABC):
                     disk = dgrp[1]
                     file = dgrp[2]
 
-                    disk_dir = "/mnt/nfs/rodisks/{}".format(disk)
+                    disk_dir = "/mnt/rodisks/{}".format(disk)
 
                     if disk not in canine_rodisks:
                         canine_rodisks.append(disk)
@@ -1254,7 +1254,10 @@ class AbstractLocalizer(abc.ABC):
               "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
               "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
 
-              "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then mkdir -p ${CANINE_RODISK_DIR}; fi",
+              "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then",
+              "sudo mkdir -p ${CANINE_RODISK_DIR}",
+              "sudo chown $(id -u):$(id -g) ${CANINE_RODISK_DIR}",
+              "fi",
 
               # create tempfile to hold diagnostic information
               "DIAG_FILE=$(mktemp)",
