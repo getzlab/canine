@@ -1105,6 +1105,20 @@ class AbstractLocalizer(abc.ABC):
                     array_exports[key] = []
                 array_exports[key].append(value)
 
+        def sensitive_ext_extract(basename):
+            """
+            Many bioinformatics tools require a index file to exist in the same directory
+            as its data file and have the same basename. Basename mangling must be sensitive
+            to these namespace constraints.
+            """
+            # non exhaustive set of sensitive bioinformatic extensions
+            search = re.search('.*?(\.bam|\.bam\.bai|\.fa|\.fa\.fai|\.fasta|\.fasta\.fai|\.vcf\.gz|\.vcf\.gz\.tbi|\.vcf\.gz\.csi)$', basename)
+            if search is None:
+                return None
+            else:
+                # return sensitive ext
+                return search.groups()[0]
+
         ## now generate exports/localization commands
 
         # keep running list of basenames, in order to mangle them if duplicate
@@ -1119,7 +1133,11 @@ class AbstractLocalizer(abc.ABC):
                 basename = os.path.basename(os.path.abspath(file_handler.path))
                 if basename in basenames:
                     basenames[basename] += 1
-                    basename = basename + "_" + str(basenames[basename])
+                    sensitive_ext = sensitive_ext_extract(basename)
+                    if sensitive_ext is None:
+                        basename = basename + "_" + str(basenames[basename])
+                    else:
+                        basename = basename.rstrip(sensitive_ext) + "_" + str(basenames[basename]) + sensitive_ext
                 else:
                     basenames[basename] = 1
 
