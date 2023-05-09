@@ -1137,7 +1137,7 @@ class AbstractLocalizer(abc.ABC):
                     if sensitive_ext is None:
                         basename = basename + "_" + str(basenames[basename])
                     else:
-                        basename = basename.rstrip(sensitive_ext) + "_" + str(basenames[basename]) + sensitive_ext
+                        basename = basename[:-len(sensitive_ext)] + "_" + str(basenames[basename]) + sensitive_ext
                 else:
                     basenames[basename] = 1
 
