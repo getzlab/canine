@@ -878,6 +878,7 @@ class AbstractLocalizer(abc.ABC):
             'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
             'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
             'sudo chown $(id -u):$(id -g) "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
+            'sudo chmod 774 "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'fi',
 
             ## lock the disk
