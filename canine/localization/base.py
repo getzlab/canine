@@ -677,9 +677,10 @@ class AbstractLocalizer(abc.ABC):
         If a dict of inputs -> [FileTypes] is provided, disk will be named
         according to the FileType hashes, and sized according to the filesizes.
         """
+        is_scratch_disk = len(file_paths_arrays) == 0
         #
         # if we already have files in mind to localize
-        if len(file_paths_arrays):
+        if not is_scratch_disk:
             # flatten file_paths dict
             # for non-array inputs, { inputName : path }
             # disambiguate array inputs with numerical suffix, e.g. { inputName + "_0" : path }
@@ -744,7 +745,7 @@ class AbstractLocalizer(abc.ABC):
             return None, [], [], rodisk_paths
 
         ## mount prefix
-        mount_prefix = "/mnt/nfs/rwdisks"
+        mount_prefix = "/mnt/rwdisks"
         disk_mountpoint = mount_prefix + "/" + disk_name
 
         ## Check if the disk already exists
@@ -766,26 +767,19 @@ class AbstractLocalizer(abc.ABC):
                     if backoff > 120:
                         raise RuntimeError("Persistent disk {} cannot be queried due to gcloud quota limit.".format(disk_name))
 
-        # flag for scratch disks to know to job avoid
-        finished = False
-
         # disk exists
         if disk_exists:
             # disk has been finalized
             if "finished" in disk_attrs.labels:
                 canine_logging.info1("Found existing disk {}".format(disk_name))
 
-                finished = True
-
-                # if this is not a scratch disk, no additional localization or
-                # teardown commands necessary, since inputs will be transformed into
-                # rodisk *inputs*, whose localization commands to mount will be handled downstream
-                if len(file_paths_arrays):
-                    return disk_mountpoint, [], [], rodisk_paths
-
-                # otherwise, we still need to mount the disk/unmount+detach later
-                # the default localization/teardown script will work for this, since
-                # it can handle existing disks
+                # no additional localization or teardown commands necessary
+                # if this is a localization disk, inputs will be transformed into
+                # rodisk *inputs*, whose localization commands to mount will
+                # be handled downstream
+                # if this is a scratch disk, it will be mounted read-only, and
+                # the script will be skipped
+                return disk_mountpoint, [], [], (rodisk_paths if not is_scratch_disk else "rodisk://" + disk_name)
             
             # check if disk is currently being built by another instance; notify user
             elif len(disk_attrs.users):
@@ -813,7 +807,7 @@ class AbstractLocalizer(abc.ABC):
             'fi',
 
             ## if this is a scratch disk, label it as such
-            'gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes' if len(file_paths_arrays) == 0 else '',
+            'gcloud compute disks add-labels "${GCP_DISK_NAME}" --zone "$CANINE_NODE_ZONE" --labels scratch=yes' if is_scratch_disk else '',
 
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
@@ -823,17 +817,31 @@ class AbstractLocalizer(abc.ABC):
             ## wait for disk to attach, with exponential backoff up to 2 minutes
             'DELAY=1',
             'while [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; do',
-              ## if disk is not a scratch disk, check once again if it's being created by another instance
-              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -qv "$CANINE_NODE_NAME" && ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
-                'TRIES=0',
-                # wait until disk is marked "finished"
-                'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
-                  'echo "Waiting for disk to become available ..." >&2',
-                  '[ $TRIES == 0 ] && sleep {} || sleep 300'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer for first timeout; 5 minutes thereafter up to 10 times
-                  '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
-                  '((++TRIES))',
-                'done',
-                'exit 15 #DEBUG_OMIT', # special exit code to cause rest of entrypoint.sh to be skipped
+              ## check if disk is being created by _another_ instance (grep -qv $CANINE_NODE_NAME)
+              'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -qv "$CANINE_NODE_NAME"\'$\'; then',
+                # if disk is a localization disk (i.e. not a scratch disk), wait approximately how long it would take to transfer files to it
+                'if ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
+                  'TRIES=0',
+                  # wait until disk is marked "finished"
+                  'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
+                    'echo "Waiting for localization disk to become available ..." >&2',
+                    '[ $TRIES == 0 ] && sleep {} || sleep 300'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer for first timeout; 5 minutes thereafter up to 10 times
+                    '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
+                    '((++TRIES))',
+                  'done',
+                  'exit 15 #DEBUG_OMIT', # special exit code to cause the script to be skipped in entrypoint.sh
+                # if disk is a scratch disk, wait up to two hours for it to finish. once it's finished, fail the localizer, to cause task to be requeued and avoided.
+                'else',
+                  'TRIES=0',
+                  # wait until disk is marked "finished"
+                  'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
+                    'echo "Waiting for scratch disk to become available ..." >&2',
+                    'sleep 60',
+                    '[ $TRIES -ge 120 ] && { echo "Exceeded timeout waiting for another node to finish making scratch disk" >&2; exit 1; } || :',
+                    '((++TRIES))',
+                  'done',
+                  'exit 1 #DEBUG_OMIT', # fail localizer -> requeue task -> job avoid 
+                'fi',
               'fi',
               # TODO: what if the task exited on the other
               #       instance without running the teardown script
@@ -841,16 +849,16 @@ class AbstractLocalizer(abc.ABC):
               #       detach the disk from the other instance
               #       are there any scenarios in which this would be a bad idea?
 
-              # otherwise, it may just be taking a bit to attach
+              ## if disk is not being created by another instance, it might just be taking a bit to attach. give it a chance to appear in /dev
               '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
               'sleep $DELAY; ((DELAY *= 2))',
 
               # try attaching again if delay has exceeded 8 seconds
-              # if disk has attached successfully, but disk doesn't appear in /dev,
+              # if disk has attached successfully according to GCP, but disk doesn't appear in /dev,
               # this means that the node is bad
               'if [ $DELAY -gt 8 ]; then',
                 'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :',
-                'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME && [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; then',
+                'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\' && [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; then',
                   'sudo touch /.fatal_disk_issue_sentinel',
                   'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
                   'exit 1',
@@ -865,11 +873,12 @@ class AbstractLocalizer(abc.ABC):
 
             ## mount
             'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
-            'mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
             'fi',
             'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
-            'sudo timeout 30 mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-            'sudo chmod -R a+rwX "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
+            'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            'sudo chown $(id -u):$(id -g) "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
+            'sudo chmod 774 "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'fi',
 
             ## lock the disk
@@ -878,52 +887,29 @@ class AbstractLocalizer(abc.ABC):
             'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
         ]
 
-        # if we are creating a scratch disk (which will be accessed via
-        # the task container), we need to mount the scratch disk on the host VM,
-        # in addition to inside the Slurm worker VM (same code as mounting RODISK
-        # in job_setup_teardown)
-        if len(file_paths_arrays) == 0:
-#            localization_script += [
-#              "if [[ -f /.dockerenv ]]; then",
-#              'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
-#              'sudo nsenter -t 1 -m mount -o noload,defaults /dev/disk/by-id/google-${GCP_DISK_NAME} "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
-#              'fi',
-#              'fi',
-#            ]
-
-            # if this disk is finished, then we can exit early and skip the job
-            # immediately after mounting. this is how we implement job avoidance
-            # for scratch disk jobs. (we still need to mount the disk just in case
-            # delocalization never ran).
-            # use special exit code for this.
-            # note that we will still run the script if scratch_disk_job_avoid is False;
-            # this is useful for modifying the contents of a preexisting scratch disk.
-            if finished and self.scratch_disk_job_avoid:
-                localization_script += ["exit 15 #DEBUG_OMIT"]
-
-            # we also need to be able to dynamically resize the disk if it gets full
-            # if disk has <30% free space remaining, increase its size by 60%
-            else:
-                localization_script += [
-                  'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
-                  'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
-                  'while true; do',
-                  '  sleep 10',
-                  '  if ! mountpoint \$DISK_DIR &> /dev/null; then echo "No disk mounted to \$DISK_DIR" >&2; continue; else',
-                  '    DISK_SIZE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
-                  '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
-                  '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
-                  '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
-                  '      gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
-                  '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
-                  '    fi',
-                  '  fi',
-                  'done',
-                  'EOF',
-                  'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
-                  'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
-                  'set -e',
-                ]
+        # scratch disks dynamically resize as they get full.
+        # if disk has <30% free space remaining, increase its size by 60%
+        if is_scratch_disk:
+            localization_script += [
+              'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
+              'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
+              'while true; do',
+              '  sleep 10',
+              '  if ! mountpoint \$DISK_DIR &> /dev/null; then echo "No disk mounted to \$DISK_DIR" >&2; continue; else',
+              '    DISK_SIZE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
+              '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
+              '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
+              '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
+              '      gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
+              '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+              '    fi',
+              '  fi',
+              'done',
+              'EOF',
+              'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
+              'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
+              'set -e',
+            ]
 
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
@@ -957,7 +943,7 @@ class AbstractLocalizer(abc.ABC):
         ]
 
         # scratch disks get labeled "finalized" if the task ran OK.
-        if len(file_paths_arrays) == 0:
+        if is_scratch_disk:
             teardown_script += [
               'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}; fi'.format(
                 disk_name = disk_name,
@@ -1046,14 +1032,30 @@ class AbstractLocalizer(abc.ABC):
 
         #
         # create creation/teardown scripts for scratch disk, if specified
+        scratch_disk_already_exists = False
         if self.use_scratch_disk:
-            scratch_disk_prefix, scratch_disk_creation_script, \
-            scratch_disk_teardown_script, _ = self.create_persistent_disk(
+            scratch_disk_prefix, \
+            scratch_disk_creation_script, \
+            scratch_disk_teardown_script, \
+            finished_scratch_disk_url = self.create_persistent_disk(
               disk_name = self.scratch_disk_name + "-" + jobId, # one scratch disk per shard
               disk_size = self.scratch_disk_size
             )
 
             localization_tasks += scratch_disk_creation_script
+
+            # if scratch disk already exists and is finalized (as indicated by
+            # blank disk creation script), mount it read-only using the same
+            # machinery we use to mount any other RODISK.
+            if len(scratch_disk_creation_script) == 0:
+                scratch_disk_already_exists = True
+
+                canine_rodisks.append(finished_scratch_disk_url[9:]) # strip 'rodisk://' prefix
+                exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), finished_scratch_disk_url[9:])] # strip 'rodisk://' prefix
+                exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), scratch_disk_prefix)]
+
+                # we also need to bypass running the script if scratch_disk_job_avoid 
+                # is True. this will happen later
 
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
@@ -1087,7 +1089,7 @@ class AbstractLocalizer(abc.ABC):
                 'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
                 'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
 
-                'sudo timeout 30 mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
+                'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
                     device_name,
                 ),
                 'sudo chmod -R a+rwX {}'.format(self.local_download_dir),
@@ -1103,6 +1105,20 @@ class AbstractLocalizer(abc.ABC):
                     array_exports[key] = []
                 array_exports[key].append(value)
 
+        def sensitive_ext_extract(basename):
+            """
+            Many bioinformatics tools require a index file to exist in the same directory
+            as its data file and have the same basename. Basename mangling must be sensitive
+            to these namespace constraints.
+            """
+            # non exhaustive set of sensitive bioinformatic extensions
+            search = re.search('.*?(\.bam|\.bam\.bai|\.fa|\.fa\.fai|\.fasta|\.fasta\.fai|\.vcf\.gz|\.vcf\.gz\.tbi|\.vcf\.gz\.csi)$', basename)
+            if search is None:
+                return None
+            else:
+                # return sensitive ext
+                return search.groups()[0]
+
         ## now generate exports/localization commands
 
         # keep running list of basenames, in order to mangle them if duplicate
@@ -1117,7 +1133,11 @@ class AbstractLocalizer(abc.ABC):
                 basename = os.path.basename(os.path.abspath(file_handler.path))
                 if basename in basenames:
                     basenames[basename] += 1
-                    basename = basename + "_" + str(basenames[basename])
+                    sensitive_ext = sensitive_ext_extract(basename)
+                    if sensitive_ext is None:
+                        basename = basename + "_" + str(basenames[basename])
+                    else:
+                        basename = basename[:-len(sensitive_ext)] + "_" + str(basenames[basename]) + sensitive_ext
                 else:
                     basenames[basename] = 1
 
@@ -1165,7 +1185,7 @@ class AbstractLocalizer(abc.ABC):
                     disk = dgrp[1]
                     file = dgrp[2]
 
-                    disk_dir = "/mnt/nfs/rodisks/{}".format(disk)
+                    disk_dir = "/mnt/rodisks/{}".format(disk)
 
                     if disk not in canine_rodisks:
                         canine_rodisks.append(disk)
@@ -1253,7 +1273,9 @@ class AbstractLocalizer(abc.ABC):
               "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
               "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
 
-              "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then mkdir -p ${CANINE_RODISK_DIR}; fi",
+              "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then",
+              "sudo mkdir -p ${CANINE_RODISK_DIR}",
+              "fi",
 
               # create tempfile to hold diagnostic information
               "DIAG_FILE=$(mktemp)",
@@ -1276,7 +1298,7 @@ class AbstractLocalizer(abc.ABC):
                 'if [ $tries -gt 12 ]; then',
                   # check if the disk has attached successfully, but doesn't appear in /dev
                   # this means the node is likely bad
-                  'if gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep -q $CANINE_NODE_NAME && [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ]; then',
+                  'if [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ] && gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\'; then',
                     'sudo touch /.fatal_disk_issue_sentinel',
                     'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
                     'exit 1',
@@ -1289,7 +1311,7 @@ class AbstractLocalizer(abc.ABC):
               "done",
 
               # mount within Slurm worker container
-              "sudo timeout 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
+              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
 #              # mount on host (so that task dockers can access it)
 #              "if [[ -f /.dockerenv ]]; then",
 #              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
@@ -1348,6 +1370,9 @@ class AbstractLocalizer(abc.ABC):
             ['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}'.format(
               protect_string = (",protect=yes" if self.protect_disk else "")
             )] if self.localize_to_persistent_disk and not localization_disk_already_exists else []
+          ) +
+          ( # skip running task script if finished scratch disk already exists via special localizer exit code
+            ["exit 15 #DEBUG_OMIT"] if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else []
           )
         ) + "\nset +e\n"
 
@@ -1361,10 +1386,8 @@ class AbstractLocalizer(abc.ABC):
                 'alias gcloud=gcloud_exp_backoff #DEBUG_OMIT',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
-                # do not run delocalization script if:
-                # * we're in debug mode
-                # * localization was skipped
-                'if [[ ( -z $CANINE_DEBUG_MODE && ! -z $LOCALIZER_JOB_RC && $LOCALIZER_JOB_RC != 15 ) || ( ! -d $CANINE_OUTPUT/$SLURM_ARRAY_TASK_ID ) ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag}; fi; fi'.format(
+                # do not run delocalization script if we're in debug mode
+                'if [[ -z $CANINE_DEBUG_MODE ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag}; fi; fi'.format(
                     script_path = os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     output_root = compute_env['CANINE_OUTPUT'],
                     shard = jobId,
@@ -1377,6 +1400,7 @@ class AbstractLocalizer(abc.ABC):
                         for name in self.files_to_copy_to_outputs 
                     ),
                     scratchflag = "--scratch" if self.use_scratch_disk else "",
+                    finishedflag = "--finished_scratch" if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else "",
                 ),
 
                 # remove stream dir
