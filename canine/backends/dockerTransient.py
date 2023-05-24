@@ -56,7 +56,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "action_on_stop" : action_on_stop,
           "image_family" : image_family,
           "image_project" : image_project,
-          "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
+          "clust_frac" : 1.0,
           "user" : user,
           "storage_namespace" : storage_namespace,
           "storage_bucket" : storage_bucket,
