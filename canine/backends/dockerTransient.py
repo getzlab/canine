@@ -303,28 +303,57 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def init_storage(self):
         ## Create shared volume, if specified
 
-        # all scripts should be embedded in docker
-
         # bucket
         if self.config["storage_bucket"] is not None:
-            # invoke rclone inside docker to create bucket-backed FUSE filesystem
+            canine_logging.info1(f"Saving workflow results to bucket {self.config['storage_bucket']} mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
+
+            # TODO: check if bucket exists; create it if not
+
             # generate cache disk if it doesn't exist
-            pass
+            rc, stdout, stderr = self.invoke(
+              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone}".format(
+                disk_name = f'cache-disk-{self.config["worker_prefix"]}',
+                disk_size = 100,
+                mount_prefix = "/tmp/rclone_cache",
+                node_name = self.config["worker_prefix"],
+                node_zone = get_default_gcp_zone()
+              )
+            )
+            if rc != 0:
+                canine_logging.error(f"Could not generate bucket mountpoint; see error log for details:")
+                raise subprocess.CalledProcessError(stderr.read().decode())
+
+            # invoke rclone inside docker to create bucket-backed FUSE filesystem
+            rc, stdout, stderr = self.invoke(
+              "[ ! -d {mountpoint} ] && mkdir {mountpoint} || :"
+            )
+            rc, stdout, stderr = self.invoke(
+              "df -t fuse.rclone /mnt/nfs/bucket_mount || rclone mount gcs:{bucket_name} {mountpoint} --daemon --links --vfs-cache-mode full --cache-dir /tmp/rclone_cache --config /sgcpd/conf/rclone.conf".format(
+                bucket_name = self.config["storage_bucket"][5:] if self.config["storage_bucket"].startswith("gs://") else self.config["storage_bucket"],
+                mountpoint = f'/mnt/nfs/{self.config["storage_namespace"]}'
+              )
+            )
+            if rc != 0:
+                canine_logging.error(f"Could not mount bucket; see error log for details:")
+                raise RuntimeError(stderr.read().decode())
 
         # disk
         # note that bucket takes priority if both are specified
         elif self.config["storage_disk"] is not None:
-            canine_logging.info1("Attaching workflow results disk ...")
+            canine_logging.info1(f"Saving workflow results to persistent disk {self.config['storage_disk']} ({self.config['storage_disk_size']}GB) mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
             # use procedure to create RW disk from localization, inside docker
             rc, stdout, stderr = self.invoke(
-              "/sgcpd/docker_bin/gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone}".format(
+              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone}".format(
                 disk_name = self.config["storage_disk"],
-                disk_size = f"{self.config['storage_disk_size']}GB",
+                disk_size = f"{self.config['storage_disk_size']}",
                 mount_prefix = f"/mnt/nfs/{self.config['storage_namespace']}",
                 node_name = self.config["worker_prefix"],
                 node_zone = get_default_gcp_zone()
               )
             )
+            if rc != 0:
+                canine_logging.error("Error attaching workflow results disk!")
+                raise RuntimeError(stderr.read().decode())
 
     def copy_cloud_credentials(self):
         ## gcloud
