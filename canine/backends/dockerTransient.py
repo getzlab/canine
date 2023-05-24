@@ -280,16 +280,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 canine_logging.error("Could not create NFS mountpoint; see stack trace for details")
                 raise
 
-        ## Check disk usage and warn user if it is small
-        free_space_gb = int(shutil.disk_usage("/mnt/nfs").free/(1024**3))
-        if free_space_gb < 300:
-            canine_logging.warning(
-                "Available disk storage at /mnt/nfs is small ({} GB remaining)".format(free_space_gb)
-            )
-
-        # TODO: add warnings if overall disk is small (bad disk IO) or node core
-        #       count is low (bad network IO)
-        
         ## Expose NFS (we won't unexport in __exit__)
         subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
 
@@ -354,6 +344,17 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             if rc != 0:
                 canine_logging.error("Error attaching workflow results disk!")
                 raise RuntimeError(stderr.read().decode())
+
+        ## Check disk usage and warn user if it is small
+        free_space_gb = int(shutil.disk_usage(f"/mnt/nfs/{self.config['storage_namespace']}").free/(1024**3))
+        if free_space_gb < 300:
+            canine_logging.warning(
+                f"Workflow results disk low on space ({free_space_gb} GB remaining)"
+            )
+
+        # TODO: add warnings if overall disk is small (bad disk IO) or node core
+        #       count is low (bad network IO)
+
 
     def copy_cloud_credentials(self):
         ## gcloud
