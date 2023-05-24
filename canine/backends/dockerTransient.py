@@ -17,7 +17,7 @@ import time
 import shutil
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
-from ..utils import get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
+from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
 
 from requests.exceptions import ConnectionError as RConnectionError, ReadTimeout
 from urllib3.exceptions import ProtocolError
@@ -35,11 +35,15 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         image_family = "slurm-gcp-docker-v1",
         image_project = "broad-getzlab-workflows",
         image = None,
+        storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
         clust_frac = 1.0, user = os.environ["USER"], shutdown_on_exit = False, **kwargs
     ):
         if user is None:
             # IE: USER was not set
             raise ValueError("USER not set in environment. Must explicitly pass user argument")
+
+        if storage_bucket is not None and storage_disk is not None:
+            canine_logging.warning("You specified both a persistent disk and cloud bucket to store workflow outputs; will only store to bucket!")
 
         if "image" not in kwargs:
             kwargs["image"] = image
@@ -54,6 +58,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "image_project" : image_project,
           "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
           "user" : user,
+          "storage_namespace" : storage_namespace,
+          "storage_bucket" : storage_bucket,
+          "storage_disk" : storage_disk,
+          "storage_disk_size" : storage_disk_size,
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
         self.config["image"] = self.get_latest_image(
@@ -149,6 +157,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # wait until the container is fully started, or error out if it failed
         # to start
         self.wait_for_container_to_be_ready(timeout = 60)
+
+        #
+        # initialize storage
+        self.init_storage()
 
         #
         # save the configuration to disk so that Slurm knows how to configure
@@ -262,7 +274,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 # TODO: be more specific about exception catching
                 canine_logging.error("Could not create NFS mountpoint; see stack trace for details")
                 raise
-        
+
         ## Check disk usage and warn user if it is small
         free_space_gb = int(shutil.disk_usage("/mnt/nfs").free/(1024**3))
         if free_space_gb < 300:
@@ -282,6 +294,32 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # actual filesystem as /mnt/nfs
         subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
           sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
+
+    def init_storage(self):
+        ## Create shared volume, if specified
+
+        # all scripts should be embedded in docker
+
+        # bucket
+        if self.config["storage_bucket"] is not None:
+            # invoke rclone inside docker to create bucket-backed FUSE filesystem
+            # generate cache disk if it doesn't exist
+            pass
+
+        # disk
+        # note that bucket takes priority if both are specified
+        elif self.config["storage_disk"] is not None:
+            canine_logging.info1("Attaching workflow results disk ...")
+            # use procedure to create RW disk from localization, inside docker
+            rc, stdout, stderr = self.invoke(
+              "/sgcpd/docker_bin/gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone}".format(
+                disk_name = self.config["storage_disk"],
+                disk_size = f"{self.config['storage_disk_size']}GB",
+                mount_prefix = f"/mnt/nfs/{self.config['storage_namespace']}",
+                node_name = self.config["worker_prefix"],
+                node_zone = get_default_gcp_zone()
+              )
+            )
 
     def copy_cloud_credentials(self):
         ## gcloud
