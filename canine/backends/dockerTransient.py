@@ -135,9 +135,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
             self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
-              mounts = [docker.types.Mount(
-                target = "/mnt/nfs", source = "/mnt/nfs", type = "bind", propagation = "rshared"
-              )],
+              mounts = [
+                docker.types.Mount(
+                  target = "/mnt/nfs", source = "/mnt/nfs", type = "bind", propagation = "rshared"
+                ),
+                docker.types.Mount(
+                  target = "/dev", source = "/dev", type = "bind", propagation = "rshared"
+                )
+              ],
               name = self.config["cluster_name"], command = "/bin/bash",
               stdin_open = True, remove = True, privileged = True,
               environment = { "HOST_USER" : self.config["user"], "HOST_UID" : uid, "HOST_GID" : gid }
