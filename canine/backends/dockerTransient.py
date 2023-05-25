@@ -188,24 +188,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # TODO: deal with nodes that already exist
         allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
 
-        # we only care about nodes that Slurm will actually dispatch jobs to;
-        # the rest will be set to "drain" (i.e., blacklisted) below.
-        self.nodes = allnodes.groupby("machine_type").apply(
-          lambda x : x.iloc[0:math.ceil(len(x)*self.config["clust_frac"])]
-        )
-        if self.nodes.index.nlevels > 1: 
-            self.nodes = self.nodes.droplevel(0)
-
-        # set nodes that will never be used to drain
-        for _, g in allnodes.loc[~allnodes.index.isin(self.nodes.index)].groupby("machine_type"):
-            node_expr = re.sub(
-                          r"(.*worker)(\d+)\1(\d+)", r"\1[\2-\3]",
-                          "".join(g.iloc[[0, -1]].index.tolist())
-                        )
-            (ret, _, _) = self.invoke("scontrol update nodename={} state=drain reason=unused".format(node_expr), user = "root")
-            if ret != 0:
-                raise RuntimeError("Could not drain nodes!")
-
     def stop(self): 
         # if the Docker was not spun up by this context manager, do not tear
         # anything down -- we don't want to clobber an already running cluster
