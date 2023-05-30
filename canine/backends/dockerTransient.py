@@ -138,7 +138,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
               image = image.tags[0], detach = True, network_mode = "host",
               mounts = [
                 docker.types.Mount(
-                  target = "/mnt/nfs", source = "/mnt/nfs", type = "bind", propagation = "rshared"
+                  target = "/mnt", source = "/mnt", type = "bind", propagation = "rshared"
                 ),
                 docker.types.Mount(
                   target = "/dev", source = "/dev", type = "bind", propagation = "rshared"
