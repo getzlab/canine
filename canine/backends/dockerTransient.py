@@ -326,21 +326,28 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             )
             if rc != 0:
                 canine_logging.error(f"Could not generate bucket mountpoint; see error log for details:")
-                raise subprocess.CalledProcessError(stderr.read().decode())
+                canine_logging.error(stderr.read().decode())
+                raise RuntimeError()
 
             # invoke rclone inside docker to create bucket-backed FUSE filesystem
             rc, stdout, stderr = self.invoke(
-              "[ ! -d {mountpoint} ] && mkdir {mountpoint} || :"
-            )
-            rc, stdout, stderr = self.invoke(
-              "df -t fuse.rclone /mnt/nfs/bucket_mount || rclone mount gcs:{bucket_name} {mountpoint} --daemon --links --vfs-cache-mode full --cache-dir /tmp/rclone_cache --config /sgcpd/conf/rclone.conf".format(
+              "bash -c '[ ! -d {mountpoint} ] && mkdir {mountpoint}; [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; df -t fuse.rclone {mountpoint} || sudo rclone mount gcs:{bucket_name} {mountpoint} --daemon --links --uid $HOST_UID --gid $HOST_GID --allow-other --vfs-cache-mode full --cache-dir /tmp/rclone_cache --config /sgcpd/conf/rclone.conf; df -t fuse.rclone {bind_mountpoint} || sudo mount --bind {mountpoint} {bind_mountpoint}'".format(
                 bucket_name = self.config["storage_bucket"][5:] if self.config["storage_bucket"].startswith("gs://") else self.config["storage_bucket"],
-                mountpoint = f'/mnt/nfs/{self.config["storage_namespace"]}'
+                mountpoint = f'/mnt/rclone/{self.config["storage_namespace"]}',
+                bind_mountpoint = f'/mnt/nfs/{self.config["storage_namespace"]}'
               )
             )
             if rc != 0:
                 canine_logging.error(f"Could not mount bucket; see error log for details:")
-                raise RuntimeError(stderr.read().decode())
+                canine_logging.error(stderr.read().decode())
+                raise RuntimeError()
+
+            # export mount
+            subprocess.check_call(f"sudo exportfs -o fsid=1,rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/rclone/{self.config['storage_namespace']}", shell=True)
+
+            # save rclone mountpoint list (worker nodes will subsequently read this in to know what directories to mount after starting up)
+            with open(f"/mnt/nfs/.rclone_mounts_{}", "w") as f:
+                f.write("[ ! mountpoint -q /mnt/nfs/{mount_dir} ] && sudo mount -o defaults,hard,intr ${CONTROLLER_NAME}:/mnt/rclone/{mount_dir} /mnt/nfs/{mount_dir}".format(mount_dir = self.config['storage_namespace']))
 
         # disk
         # note that bucket takes priority if both are specified
@@ -357,8 +364,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
               )
             )
             if rc != 0:
-                canine_logging.error("Error attaching workflow results disk!")
-                raise RuntimeError(stderr.read().decode())
+                canine_logging.error("Error attaching workflow results disk; see error log for details:")
+                canine_logging.error(stderr.read().decode())
+                raise RuntimeError()
 
         ## Check disk usage and warn user if it is small
         free_space_gb = int(shutil.disk_usage(f"/mnt/nfs/{self.config['storage_namespace']}").free/(1024**3))
