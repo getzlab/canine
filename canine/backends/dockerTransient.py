@@ -85,6 +85,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.nodes = pd.DataFrame()
 
     def init_slurm(self):
+        # query /etc/passwd for UID/GID information if we are running as a different user
+        # FIXME: how should this work for OS Login/LDAP/etc.?
+        uid = None; gid = None
+        if self.config["user"] != os.getlogin():
+            uinfo = pwd.getpwnam(self.config["user"])
+            uid = uinfo.pw_uid; gid = uinfo.pw_gid
+        else:
+            uid = os.getuid(); gid = os.getgid()
+
+        # initialize Docker API
         self.dkr = docker.from_env()
 
         #
@@ -106,8 +116,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             ))
 
         #
-        # export the NFS mountpoint
-        self.export_NFS()
+        # create NFS/rclone bucket mountpoints
+        self.create_filesystem(uid, gid)
 
         # copy credential files to NFS
         self.copy_cloud_credentials()
@@ -124,15 +134,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # create the Slurm container if it's not already present
         canine_logging.info1("Starting Slurm controller ...")
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
-            # query /etc/passwd for UID/GID information if we are running as a different user
-            # FIXME: how should this work for OS Login/LDAP/etc.?
-            uid = None; gid = None
-            if self.config["user"] != os.getlogin():
-                uinfo = pwd.getpwnam(self.config["user"])
-                uid = uinfo.pw_uid; gid = uinfo.pw_gid
-            else:
-                uid = os.getuid(); gid = os.getgid()
-
             self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
               mounts = [
@@ -251,6 +252,28 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # docker object cannot be reused between processes due to socket connections
         self.dkr = docker.from_env()
 
+    def create_filesystem(self, uid, gid):
+        ## create main NFS mountpoint
+        if not os.path.exists("/mnt/nfs"):
+            try:
+                subprocess.check_call("sudo mkdir /mnt/nfs", shell=True)
+                subprocess.check_call(f"sudo chown {uid}:{gid} /mnt/nfs", shell=True)
+            except:
+                # TODO: be more specific about exception catching
+                canine_logging.error("Could not create NFS mountpoint; see stack trace for details")
+                raise
+
+        ## create root mountpoint for rclone bucket filesystems (will be bind mounted
+        #  into main mountpoint; for some reason, these cannot be nested in /mnt/nfs)
+        if not os.path.exists("/mnt/rclone"):
+            try:
+                subprocess.check_call("sudo mkdir /mnt/rclone", shell=True)
+                subprocess.check_call(f"sudo chown {uid}:{gid} /mnt/rclone", shell=True)
+            except:
+                # TODO: be more specific about exception catching
+                canine_logging.error("Could not create rclone; see stack trace for details")
+                raise
+
     def export_NFS(self):
         ## Check if /mnt/nfs is created
         if not os.path.exists("/mnt/nfs"):
@@ -273,6 +296,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 
     def init_storage(self):
+        ## export NFS
+        subprocess.check_call("sudo exportfs -o fsid=0,rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
+
+        ## make NFS its own virtual filesystem
+        # this is so that Canine's system for detecting whether files to be
+        # localized won't symlink things that reside outside /mnt/nfs but on the same
+        # actual filesystem as /mnt/nfs
+        subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
+          sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
+
         ## Create shared volume, if specified
 
         # bucket
