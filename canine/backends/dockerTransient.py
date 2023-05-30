@@ -182,13 +182,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def init_nodes(self):
         self.wait_for_cluster_ready(elastic = True, timeout=60)
 
-        # list all the nodes that Slurm is aware of
-
-        # although this backend does not manage starting/stopping nodes
-        # -- this is handled by Slurm's elastic scaling, it will stop any
-        # nodes still running when __exit__() is called.
-        # TODO: deal with nodes that already exist
-        allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
+        # list all the nodes that Slurm is aware of; this may be useful subsequently?
+        #allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
 
     def stop(self): 
         # if the Docker was not spun up by this context manager, do not tear
