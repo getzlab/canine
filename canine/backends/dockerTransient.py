@@ -15,6 +15,7 @@ import math
 import threading
 import time
 import shutil
+import uuid
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
 from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
@@ -62,6 +63,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "storage_bucket" : storage_bucket,
           "storage_disk" : storage_disk,
           "storage_disk_size" : storage_disk_size,
+          "storage_uuid" : str(uuid.uuid4().hex[0:4]),
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
         self.config["image"] = self.get_latest_image(
@@ -186,6 +188,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
 
     def stop(self): 
+        # remove any bucket mount commands created by this instance 
+        if os.path.exists(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh"):
+            os.remove(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh")
+
         # if the Docker was not spun up by this context manager, do not tear
         # anything down -- we don't want to clobber an already running cluster
         if self.shutdown_on_exit and not self.preexisting_container:
@@ -342,8 +348,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             subprocess.check_call(f"sudo exportfs -o fsid=1,rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/rclone/{self.config['storage_namespace']}", shell=True)
 
             # save rclone mountpoint list (worker nodes will subsequently read this in to know what directories to mount after starting up)
-            with open(f"/mnt/nfs/.rclone_mounts_{}", "w") as f:
-                f.write("[ ! mountpoint -q /mnt/nfs/{mount_dir} ] && sudo mount -o defaults,hard,intr ${CONTROLLER_NAME}:/mnt/rclone/{mount_dir} /mnt/nfs/{mount_dir}".format(mount_dir = self.config['storage_namespace']))
+            # this file will be erased when backend is torn down
+            # TODO: use flock to remove file if backend crashes; when starting backend, check for unlocked files and remove them
+            # will need try/except on worker nodes to avoid them freezing up if they inadvertently attempt to mount non-exported buckets
+            with open(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh", "w") as f:
+                f.write("if ! mountpoint -q /mnt/nfs/{mount_dir}; then sudo timeout -k 30 30 mount -o defaults,hard,intr ${{CONTROLLER_NAME}}:/mnt/rclone/{mount_dir} /mnt/nfs/{mount_dir} || echo 'Could not mount rclone mountpoint /mnt/rclone/{mount_dir}'; fi".format(mount_dir = self.config['storage_namespace']))
 
         # disk
         # note that bucket takes priority if both are specified
