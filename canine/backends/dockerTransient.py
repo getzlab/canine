@@ -332,12 +332,25 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 raise RuntimeError()
 
             # invoke rclone inside docker to create bucket-backed FUSE filesystem
+            # this is complicated, because NFS cannot export a nested FUSE filesystem.
+            # we thus mount it outside of the NFS to /mnt/rclone/<bucket> (which will be exported to workers),
+            # and bind mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> (in order to access it on the controller)
+            # workers will NFS mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> for consistent paths.
             rc, stdout, stderr = self.invoke(
-              "bash -c '[ ! -d {mountpoint} ] && mkdir {mountpoint}; [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; df -t fuse.rclone {mountpoint} || sudo rclone mount gcs:{bucket_name} {mountpoint} --daemon --links --uid $HOST_UID --gid $HOST_GID --file-perms 0755 --allow-other --vfs-cache-mode full --cache-dir /tmp/rclone_cache --config /sgcpd/conf/rclone.conf; df -t fuse.rclone {bind_mountpoint} || sudo mount --bind {mountpoint} {bind_mountpoint}'".format(
+              """bash -c \
+                'export GOOGLE_APPLICATION_CREDENTIALS=$CLOUDSDK_CONFIG/application_default_credentials.json; \
+                 [ ! -d {mountpoint} ] && mkdir {mountpoint}; \
+                 [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; \
+                 df -t fuse.rclone {mountpoint} || \
+                  rclone mount gcs:{bucket_name} {mountpoint} --daemon --links --uid $HOST_UID --gid $HOST_GID \
+                   --file-perms 0755 --allow-other --vfs-cache-mode full --cache-dir /tmp/rclone_cache --config /sgcpd/conf/rclone.conf; \
+                 df -t fuse.rclone {bind_mountpoint} || \
+                  mount --bind {mountpoint} {bind_mountpoint}'""".format(
                 bucket_name = self.config["storage_bucket"][5:] if self.config["storage_bucket"].startswith("gs://") else self.config["storage_bucket"],
                 mountpoint = f'/mnt/rclone/{self.config["storage_namespace"]}',
                 bind_mountpoint = f'/mnt/nfs/{self.config["storage_namespace"]}'
-              )
+              ),
+              user = "root"
             )
             if rc != 0:
                 canine_logging.error(f"Could not mount bucket; see error log for details:")
