@@ -333,7 +333,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
             # invoke rclone inside docker to create bucket-backed FUSE filesystem
             rc, stdout, stderr = self.invoke(
-              "bash -c '[ ! -d {mountpoint} ] && mkdir {mountpoint}; [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; df -t fuse.rclone {mountpoint} || sudo rclone mount gcs:{bucket_name} {mountpoint} --daemon --links --uid $HOST_UID --gid $HOST_GID --allow-other --vfs-cache-mode full --cache-dir /tmp/rclone_cache --config /sgcpd/conf/rclone.conf; df -t fuse.rclone {bind_mountpoint} || sudo mount --bind {mountpoint} {bind_mountpoint}'".format(
+              "bash -c '[ ! -d {mountpoint} ] && mkdir {mountpoint}; [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; df -t fuse.rclone {mountpoint} || sudo rclone mount gcs:{bucket_name} {mountpoint} --daemon --links --uid $HOST_UID --gid $HOST_GID --file-perms 0755 --allow-other --vfs-cache-mode full --cache-dir /tmp/rclone_cache --config /sgcpd/conf/rclone.conf; df -t fuse.rclone {bind_mountpoint} || sudo mount --bind {mountpoint} {bind_mountpoint}'".format(
                 bucket_name = self.config["storage_bucket"][5:] if self.config["storage_bucket"].startswith("gs://") else self.config["storage_bucket"],
                 mountpoint = f'/mnt/rclone/{self.config["storage_namespace"]}',
                 bind_mountpoint = f'/mnt/nfs/{self.config["storage_namespace"]}'
