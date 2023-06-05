@@ -102,8 +102,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # check if image exists
         try:
-            #image = self.dkr.images.get('gcr.io/broad-getzlab-workflows/slurm_gcp_docker:latest')
-            image = self.dkr.images.get('broadinstitute/slurm_gcp_docker:latest')
+            image = self.dkr.images.get('gcr.io/broad-getzlab-workflows/slurm_gcp_docker:latest')
         except docker.errors.ImageNotFound:
             raise Exception("You have not yet built or pulled the Slurm Docker image!")
         except RConnectionError as e:
