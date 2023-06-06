@@ -337,7 +337,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             # workers will NFS mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> for consistent paths.
             rc, stdout, stderr = self.invoke(
               """bash -c \
-                'export GOOGLE_APPLICATION_CREDENTIALS=$CLOUDSDK_CONFIG/application_default_credentials.json; \
+                'set -e; export GOOGLE_APPLICATION_CREDENTIALS=$CLOUDSDK_CONFIG/application_default_credentials.json; \
                  [ ! -d {mountpoint} ] && mkdir {mountpoint}; \
                  [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; \
                  df -t fuse.rclone {mountpoint} || \
