@@ -431,7 +431,7 @@ class HandleGDCHTTPURL(FileType):
 
         # ensure that file downloaded properly
         if self.check_md5:
-            cmd += [f"[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]"]
+            cmd += [f"[[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]] || {{ echo 'deleting corrupted file' ; rm -f {self.localized_path} ; exit 1 ; }}"]
 
         return "\n".join(cmd)
 
