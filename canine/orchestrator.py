@@ -44,10 +44,15 @@ export CANINE="{version}"
 export CANINE_BACKEND="{{backend}}"
 export CANINE_ADAPTER="{{adapter}}"
 export CANINE_RETRY_LIMIT={{retry_limit}}
+export CANINE_PREEMPT_LIMIT=5 # hardcoded to 5 for now, since preemptible VMs are ~1/5 the cost of nonpreemptible
 export CANINE_ROOT="{{CANINE_ROOT}}"
 export CANINE_COMMON="{{CANINE_COMMON}}"
 export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
+if [ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_PREEMPT_LIMIT ]; then
+  echo "Preemption limit exceeded; suspending job for requeue on non-preemptible nodes" >&2
+  sudo -E scontrol suspend $SLURM_JOB_ID
+fi
 echo -n '---- STARTING JOB SETUP ... ' >&2
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 rm -f $CANINE_JOB_ROOT/.*exit_code || :
