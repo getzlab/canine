@@ -14,7 +14,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.13.8'
+version = '0.14.1'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
