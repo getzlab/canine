@@ -49,14 +49,14 @@ export CANINE_ROOT="{{CANINE_ROOT}}"
 export CANINE_COMMON="{{CANINE_COMMON}}"
 export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
-if [ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_PREEMPT_LIMIT ]; then
-  echo "Preemption limit exceeded; suspending job for requeue on non-preemptible nodes" >&2
-  sudo -E scontrol suspend $SLURM_JOB_ID
-fi
 echo -n '---- STARTING JOB SETUP ... ' >&2
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 rm -f $CANINE_JOB_ROOT/.*exit_code || :
 echo 'COMPLETE ----' >&2
+if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0))) -ge $CANINE_PREEMPT_LIMIT ]; then
+  echo "Preemption limit exceeded; requeueing on non-preemptible nodes" >&2
+  exit 123 # special exit code indicating excessive preemption
+fi
 echo '~~~~ STARTING JOB LOCALIZATION ~~~~' >&2
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh >&2
 export LOCALIZER_JOB_RC=$?
@@ -91,6 +91,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo "INFO: Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
       [ -f $CANINE_JOB_ROOT/stdout ] && mv $CANINE_JOB_ROOT/stdout $CANINE_JOB_ROOT/stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       [ -f $CANINE_JOB_ROOT/stderr ] && mv $CANINE_JOB_ROOT/stderr $CANINE_JOB_ROOT/stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
+      echo $(($([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.failure_count
       scontrol requeue $SLURM_JOB_ID
     fi
   done
