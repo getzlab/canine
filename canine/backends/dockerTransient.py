@@ -15,9 +15,10 @@ import math
 import threading
 import time
 import shutil
+import uuid
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
-from ..utils import get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
+from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
 
 from requests.exceptions import ConnectionError as RConnectionError, ReadTimeout
 from urllib3.exceptions import ProtocolError
@@ -35,11 +36,15 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         image_family = "slurm-gcp-docker-v1",
         image_project = "broad-getzlab-workflows",
         image = None,
+        storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
         clust_frac = 1.0, user = os.environ["USER"], shutdown_on_exit = False, **kwargs
     ):
         if user is None:
             # IE: USER was not set
             raise ValueError("USER not set in environment. Must explicitly pass user argument")
+
+        if storage_bucket is not None and storage_disk is not None:
+            canine_logging.warning("You specified both a persistent disk and cloud bucket to store workflow outputs; will only store to bucket!")
 
         if "image" not in kwargs:
             kwargs["image"] = image
@@ -52,8 +57,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "action_on_stop" : action_on_stop,
           "image_family" : image_family,
           "image_project" : image_project,
-          "clust_frac" : max(min(clust_frac, 1.0), 1e-6),
+          "clust_frac" : 1.0,
           "user" : user,
+          "storage_namespace" : storage_namespace,
+          "storage_bucket" : storage_bucket,
+          "storage_disk" : storage_disk,
+          "storage_disk_size" : storage_disk_size,
+          "storage_uuid" : str(uuid.uuid4().hex[0:4]),
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
         self.config["image"] = self.get_latest_image(
@@ -77,6 +87,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.nodes = pd.DataFrame()
 
     def init_slurm(self):
+        # query /etc/passwd for UID/GID information if we are running as a different user
+        # FIXME: how should this work for OS Login/LDAP/etc.?
+        uid = None; gid = None
+        if self.config["user"] != os.getlogin():
+            uinfo = pwd.getpwnam(self.config["user"])
+            uid = uinfo.pw_uid; gid = uinfo.pw_gid
+        else:
+            uid = os.getuid(); gid = os.getgid()
+
+        # initialize Docker API
         self.dkr = docker.from_env()
 
         #
@@ -98,8 +118,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             ))
 
         #
-        # export the NFS mountpoint
-        self.export_NFS()
+        # create NFS/rclone bucket mountpoints
+        self.create_filesystem(uid, gid)
 
         # copy credential files to NFS
         self.copy_cloud_credentials()
@@ -116,20 +136,16 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # create the Slurm container if it's not already present
         canine_logging.info1("Starting Slurm controller ...")
         if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
-            # query /etc/passwd for UID/GID information if we are running as a different user
-            # FIXME: how should this work for OS Login/LDAP/etc.?
-            uid = None; gid = None
-            if self.config["user"] != os.getlogin():
-                uinfo = pwd.getpwnam(self.config["user"])
-                uid = uinfo.pw_uid; gid = uinfo.pw_gid
-            else:
-                uid = os.getuid(); gid = os.getgid()
-
             self.dkr.containers.run(
               image = image.tags[0], detach = True, network_mode = "host",
-              volumes = {
-                "/mnt/nfs" : { "bind" : "/mnt/nfs", "mode" : "rw" }
-               },
+              mounts = [
+                docker.types.Mount(
+                  target = "/mnt", source = "/mnt", type = "bind", propagation = "rshared"
+                ),
+                docker.types.Mount(
+                  target = "/dev", source = "/dev", type = "bind", propagation = "rshared"
+                )
+              ],
               name = self.config["cluster_name"], command = "/bin/bash",
               stdin_open = True, remove = True, privileged = True,
               environment = { "HOST_USER" : self.config["user"], "HOST_UID" : uid, "HOST_GID" : gid }
@@ -151,6 +167,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.wait_for_container_to_be_ready(timeout = 60)
 
         #
+        # initialize storage
+        self.init_storage()
+
+        #
         # save the configuration to disk so that Slurm knows how to configure
         # the nodes it creates
         subprocess.check_call("""
@@ -163,33 +183,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def init_nodes(self):
         self.wait_for_cluster_ready(elastic = True, timeout=60)
 
-        # list all the nodes that Slurm is aware of
-
-        # although this backend does not manage starting/stopping nodes
-        # -- this is handled by Slurm's elastic scaling, it will stop any
-        # nodes still running when __exit__() is called.
-        # TODO: deal with nodes that already exist
-        allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
-
-        # we only care about nodes that Slurm will actually dispatch jobs to;
-        # the rest will be set to "drain" (i.e., blacklisted) below.
-        self.nodes = allnodes.groupby("machine_type").apply(
-          lambda x : x.iloc[0:math.ceil(len(x)*self.config["clust_frac"])]
-        )
-        if self.nodes.index.nlevels > 1: 
-            self.nodes = self.nodes.droplevel(0)
-
-        # set nodes that will never be used to drain
-        for _, g in allnodes.loc[~allnodes.index.isin(self.nodes.index)].groupby("machine_type"):
-            node_expr = re.sub(
-                          r"(.*worker)(\d+)\1(\d+)", r"\1[\2-\3]",
-                          "".join(g.iloc[[0, -1]].index.tolist())
-                        )
-            (ret, _, _) = self.invoke("scontrol update nodename={} state=drain reason=unused".format(node_expr), user = "root")
-            if ret != 0:
-                raise RuntimeError("Could not drain nodes!")
+        # list all the nodes that Slurm is aware of; this may be useful subsequently?
+        #allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
 
     def stop(self): 
+        # remove any bucket mount commands created by this instance 
+        if os.path.exists(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh"):
+            os.remove(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh")
+
         # if the Docker was not spun up by this context manager, do not tear
         # anything down -- we don't want to clobber an already running cluster
         if self.shutdown_on_exit and not self.preexisting_container:
@@ -252,6 +253,28 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # docker object cannot be reused between processes due to socket connections
         self.dkr = docker.from_env()
 
+    def create_filesystem(self, uid, gid):
+        ## create main NFS mountpoint
+        if not os.path.exists("/mnt/nfs"):
+            try:
+                subprocess.check_call("sudo mkdir /mnt/nfs", shell=True)
+                subprocess.check_call(f"sudo chown {uid}:{gid} /mnt/nfs", shell=True)
+            except:
+                # TODO: be more specific about exception catching
+                canine_logging.error("Could not create NFS mountpoint; see stack trace for details")
+                raise
+
+        ## create root mountpoint for rclone bucket filesystems (will be bind mounted
+        #  into main mountpoint; for some reason, these cannot be nested in /mnt/nfs)
+        if not os.path.exists("/mnt/rclone"):
+            try:
+                subprocess.check_call("sudo mkdir /mnt/rclone", shell=True)
+                subprocess.check_call(f"sudo chown {uid}:{gid} /mnt/rclone", shell=True)
+            except:
+                # TODO: be more specific about exception catching
+                canine_logging.error("Could not create rclone; see stack trace for details")
+                raise
+
     def export_NFS(self):
         ## Check if /mnt/nfs is created
         if not os.path.exists("/mnt/nfs"):
@@ -262,19 +285,112 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 # TODO: be more specific about exception catching
                 canine_logging.error("Could not create NFS mountpoint; see stack trace for details")
                 raise
-        
+
+        ## Expose NFS (we won't unexport in __exit__)
+        subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
+
+        ## make NFS its own virtual filesystem
+        # this is so that Canine's system for detecting whether files to be
+        # localized won't symlink things that reside outside /mnt/nfs but on the same
+        # actual filesystem as /mnt/nfs
+        subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
+          sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
+
+    def init_storage(self):
+        ## Create shared volume, if specified
+
+        # bucket
+        if self.config["storage_bucket"] is not None:
+            canine_logging.info1(f"Saving workflow results to bucket {self.config['storage_bucket']} mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
+
+            # TODO: check if bucket exists; create it if not
+
+            # generate cache disk if it doesn't exist
+            rc, stdout, stderr = self.invoke(
+              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone}".format(
+                disk_name = f'cache-disk-{self.config["worker_prefix"]}',
+                disk_size = 100,
+                mount_prefix = "/tmp/rclone_cache",
+                node_name = self.config["worker_prefix"],
+                node_zone = get_default_gcp_zone()
+              )
+            )
+            if rc != 0:
+                canine_logging.error(f"Could not generate bucket mountpoint; see error log for details:")
+                canine_logging.error(stderr.read().decode())
+                raise RuntimeError()
+
+            # invoke rclone inside docker to create bucket-backed FUSE filesystem
+            # this is complicated, because NFS cannot export a nested FUSE filesystem.
+            # we thus mount it outside of the NFS to /mnt/rclone/<bucket> (which will be exported to workers),
+            # and bind mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> (in order to access it on the controller)
+            # workers will NFS mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> for consistent paths.
+            rc, stdout, stderr = self.invoke(
+              """bash -c \
+                'set -e; export GOOGLE_APPLICATION_CREDENTIALS=$CLOUDSDK_CONFIG/application_default_credentials.json; \
+                 [ ! -d {mountpoint} ] && mkdir {mountpoint}; \
+                 [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; \
+                 df -t fuse.rclone {mountpoint} || \
+                  rclone mount gcs:{bucket_name} {mountpoint} --daemon --links \
+                   --uid $HOST_UID --gid $HOST_GID --file-perms 0755 --allow-other \
+                   --vfs-cache-mode full --cache-dir /tmp/rclone_cache/ --vfs-cache-max-size 95Gi \
+                   --vfs-write-back 10m --vfs-cache-poll-interval 10m --vfs-fast-fingerprint \
+                   --vfs-cache-max-age 48h --dir-cache-time 2h --poll-interval 10m --no-modtime \
+                   --config /sgcpd/conf/rclone.conf; \
+                 df -t fuse.rclone {bind_mountpoint} || \
+                  mount --bind {mountpoint} {bind_mountpoint}'""".format(
+                bucket_name = self.config["storage_bucket"][5:] if self.config["storage_bucket"].startswith("gs://") else self.config["storage_bucket"],
+                mountpoint = f'/mnt/rclone/{self.config["storage_namespace"]}',
+                bind_mountpoint = f'/mnt/nfs/{self.config["storage_namespace"]}'
+              ),
+              user = "root"
+            )
+            if rc != 0:
+                canine_logging.error(f"Could not mount bucket; see error log for details:")
+                canine_logging.error(stderr.read().decode())
+                raise RuntimeError()
+
+            # export mount
+            subprocess.check_call(f"sudo exportfs -o fsid=1,rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/rclone/{self.config['storage_namespace']}", shell=True)
+
+            # save rclone mountpoint list (worker nodes will subsequently read this in to know what directories to mount after starting up)
+            # this file will be erased when backend is torn down
+            # TODO: use flock to remove file if backend crashes; when starting backend, check for unlocked files and remove them
+            # will need try/except on worker nodes to avoid them freezing up if they inadvertently attempt to mount non-exported buckets
+            with open(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh", "w") as f:
+                f.write("if ! mountpoint -q /mnt/nfs/{mount_dir}; then sudo timeout -k 30 30 mount -o defaults,hard,intr ${{CONTROLLER_NAME}}:/mnt/rclone/{mount_dir} /mnt/nfs/{mount_dir} || echo 'Could not mount rclone mountpoint /mnt/rclone/{mount_dir}'; fi".format(mount_dir = self.config['storage_namespace']))
+
+        # disk
+        # note that bucket takes priority if both are specified
+        elif self.config["storage_disk"] is not None:
+            canine_logging.info1(f"Saving workflow results to persistent disk {self.config['storage_disk']} ({self.config['storage_disk_size']}GB) mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
+            # use procedure to create RW disk from localization, inside docker
+            rc, stdout, stderr = self.invoke(
+              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone}".format(
+                disk_name = self.config["storage_disk"],
+                disk_size = f"{self.config['storage_disk_size']}",
+                mount_prefix = f"/mnt/nfs/{self.config['storage_namespace']}",
+                node_name = self.config["worker_prefix"],
+                node_zone = get_default_gcp_zone()
+              )
+            )
+            if rc != 0:
+                canine_logging.error("Error attaching workflow results disk; see error log for details:")
+                canine_logging.error(stderr.read().decode())
+                raise RuntimeError()
+
         ## Check disk usage and warn user if it is small
-        free_space_gb = int(shutil.disk_usage("/mnt/nfs").free/(1024**3))
+        free_space_gb = int(shutil.disk_usage(f"/mnt/nfs/{self.config['storage_namespace']}").free/(1024**3))
         if free_space_gb < 300:
             canine_logging.warning(
-                "Available disk storage at /mnt/nfs is small ({} GB remaining)".format(free_space_gb)
+                f"Workflow results disk low on space ({free_space_gb} GB remaining)"
             )
 
         # TODO: add warnings if overall disk is small (bad disk IO) or node core
         #       count is low (bad network IO)
-        
-        ## Expose NFS (we won't unexport in __exit__)
-        subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
+
+        ## export NFS
+        subprocess.check_call("sudo exportfs -o fsid=0,rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
 
         ## make NFS its own virtual filesystem
         # this is so that Canine's system for detecting whether files to be
@@ -355,7 +471,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                     # since this may indicate something is wrong
                     else:
                         # TODO: when we implement verbosity, this should be "verbose"
-                        canine_logging.info1(
+                        canine_logging.debug(
                           'Command {cmd} returned stderr "{err}"'.format(
                             cmd = command,
                             err = stderr_str
