@@ -276,9 +276,14 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 raise
 
     def init_storage(self):
-        ## Create shared volume, if specified
+        ## make /mnt/nfs NFS its own virtual filesystem
+        # this is so that Canine's system for detecting whether files to be
+        # localized won't symlink things that reside outside /mnt/nfs but on the same
+        # actual filesystem as /mnt/nfs
+        subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
+          sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 
-        # bucket
+        ## mount bucket via rclone (unstable!)
         if self.config["storage_bucket"] is not None:
             canine_logging.info1(f"Saving workflow results to bucket {self.config['storage_bucket']} mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
 
@@ -370,13 +375,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         ## export NFS
         subprocess.check_call("sudo exportfs -o fsid=0,rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
-
-        ## make NFS its own virtual filesystem
-        # this is so that Canine's system for detecting whether files to be
-        # localized won't symlink things that reside outside /mnt/nfs but on the same
-        # actual filesystem as /mnt/nfs
-        subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
-          sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 
     def copy_cloud_credentials(self):
         ## gcloud
