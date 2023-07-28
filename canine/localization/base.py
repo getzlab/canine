@@ -5,6 +5,7 @@ import typing
 import glob
 import shlex
 import tempfile
+import random
 import subprocess
 import threading
 import time
@@ -751,7 +752,7 @@ class AbstractLocalizer(abc.ABC):
         ## Check if the disk already exists
         disk_client = gcloud_disk_client()
         disk_exists = False
-        backoff = 1
+        backoff = 60 + random.randint(0, 10)
         while True:
             try:
                 disk_attrs = disk_client.get(disk = disk_name, zone = ZONE, project = PROJECT)
@@ -764,7 +765,7 @@ class AbstractLocalizer(abc.ABC):
                 if "Quota exceeded" in e.message:
                     time.sleep(backoff)
                     backoff *= 2
-                    if backoff > 120:
+                    if backoff > 1200:
                         raise RuntimeError("Persistent disk {} cannot be queried due to gcloud quota limit.".format(disk_name))
 
         # disk exists
