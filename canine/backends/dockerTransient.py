@@ -344,9 +344,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             with open(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh", "w") as f:
                 f.write("if ! mountpoint -q /mnt/nfs/{mount_dir}; then sudo timeout -k 30 30 mount -o defaults,hard,intr ${{CONTROLLER_NAME}}:/mnt/rclone/{mount_dir} /mnt/nfs/{mount_dir} || echo 'Could not mount rclone mountpoint /mnt/rclone/{mount_dir}'; fi".format(mount_dir = self.config['storage_namespace']))
 
-        # disk
+        ## create disk
         # note that bucket takes priority if both are specified
         elif self.config["storage_disk"] is not None:
+            # GCP disks must match regex '^[a-z]([a-z0-9-]*[a-z0-9])?'; raise error if not
+            if re.match('^[a-z]([a-z0-9-]*[a-z0-9])?$', self.config["storage_disk"]) is None:
+                raise ValueError(f"\"{self.config['storage_disk']}\" is an invalid storage namespace. Storage namespaces can only contain lowercase letters, numbers, and dashes, must start with a letter, and must end with a letter/number.")
+
             canine_logging.info1(f"Saving workflow results to persistent disk {self.config['storage_disk']} ({self.config['storage_disk_size']}GB) mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
             # use procedure to create RW disk from localization, inside docker
             rc, stdout, stderr = self.invoke(
