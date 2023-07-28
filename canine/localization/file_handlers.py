@@ -415,8 +415,9 @@ class HandleGDCHTTPURL(FileType):
             self._size = int(headers["Content-Length"])
             self._hash = headers["Content-MD5"]
         except:
-            canine_logging.error("Error parsing GDC filename; see stack trace for details")
-            raise 
+            canine_logging.error("Error resolving GDC file; see details:")
+            canine_logging.error(resp_headers.stdout.decode())
+            raise
         self.localized_path = self.path
 
     def localization_command(self, dest):
