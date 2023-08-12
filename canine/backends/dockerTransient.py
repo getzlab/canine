@@ -275,20 +275,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 canine_logging.error("Could not create rclone; see stack trace for details")
                 raise
 
-    def export_NFS(self):
-        ## Check if /mnt/nfs is created
-        if not os.path.exists("/mnt/nfs"):
-            try:
-                subprocess.check_call("sudo mkdir /mnt/nfs", shell=True)
-                subprocess.check_call("sudo chmod 777 /mnt/nfs", shell=True)
-            except:
-                # TODO: be more specific about exception catching
-                canine_logging.error("Could not create NFS mountpoint; see stack trace for details")
-                raise
-
-        ## Expose NFS (we won't unexport in __exit__)
-        subprocess.check_call("sudo exportfs -o rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
-
+    def init_storage(self): 
         ## make NFS its own virtual filesystem
         # this is so that Canine's system for detecting whether files to be
         # localized won't symlink things that reside outside /mnt/nfs but on the same
@@ -296,7 +283,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
           sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 
-    def init_storage(self):
         ## Create shared volume, if specified
 
         # bucket
@@ -391,13 +377,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         ## export NFS
         subprocess.check_call("sudo exportfs -o fsid=0,rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
-
-        ## make NFS its own virtual filesystem
-        # this is so that Canine's system for detecting whether files to be
-        # localized won't symlink things that reside outside /mnt/nfs but on the same
-        # actual filesystem as /mnt/nfs
-        subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
-          sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 
     def copy_cloud_credentials(self):
         ## gcloud
