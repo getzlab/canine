@@ -1323,6 +1323,9 @@ class AbstractLocalizer(abc.ABC):
               # we need to verify that the mount actually exists
               "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; cat $DIAG_FILE >&2; exit 1; }",
 
+              # also verify that the filesystem is OK
+              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'Read-only disk filesystem is bad!' >&2; cat $DIAG_FILE >&2; exit 1; }",
+
               # lock the disk; will be unlocked during teardown script (or if script crashes)
               # this is to ensure that we don't unmount the disk during teardown
               # if other processes are still using it
