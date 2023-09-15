@@ -90,7 +90,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # query /etc/passwd for UID/GID information if we are running as a different user
         # FIXME: how should this work for OS Login/LDAP/etc.?
         uid = None; gid = None
-        if self.config["user"] != os.getlogin():
+        if self.config["user"] != os.environ["USER"]:
             uinfo = pwd.getpwnam(self.config["user"])
             uid = uinfo.pw_uid; gid = uinfo.pw_gid
         else:
