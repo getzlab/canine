@@ -451,7 +451,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                     # warn the user that the command had stuff written to stderr,
                     # since this may indicate something is wrong
                     else:
-                        # TODO: when we implement verbosity, this should be "verbose"
                         canine_logging.debug(
                           'Command {cmd} returned stderr "{err}"'.format(
                             cmd = command,
