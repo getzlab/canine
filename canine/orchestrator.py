@@ -778,8 +778,8 @@ class Orchestrator(object):
 
                     n_avoided += (js_df["noop"] | js_df["re_deloc"]).sum()
                 except (ValueError, OSError) as e:
-                    canine_logging.warning("Cannot recover preexisting task outputs: " + str(e))
-                    canine_logging.warning("Overwriting output and aborting job avoidance.")
+                    canine_logging.debug("Cannot recover preexisting task outputs: " + str(e))
+                    canine_logging.debug("Overwriting output and aborting job avoidance.")
                     self.job_spec = old_job_spec
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
