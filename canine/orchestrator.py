@@ -96,7 +96,12 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     fi
   done
   echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
-elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # this is a special exit code that localization.sh can explicitly return
+# these are special exit codes that localization.sh can explicitly return
+elif [ $LOCALIZER_JOB_RC -eq 5 ]; then # localization failed due to recoverable reason (e.g. quota); requeue the job
+  echo "INFO: localization will be retried" >&2
+  scontrol requeue $SLURM_JOB_ID
+  scontrol update $SLURM_JOB_ID starttime=now+10m
+elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization can be skipped (e.g. localization disk already exists)
   echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2
   export CANINE_JOB_RC=0
   echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code

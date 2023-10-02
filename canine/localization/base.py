@@ -812,7 +812,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
-            'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
+            'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || { [ $? == 5 ] && exit 5 || true; }',
             'fi',
 
             ## wait for disk to attach, with exponential backoff up to 2 minutes
@@ -1285,8 +1285,9 @@ class AbstractLocalizer(abc.ABC):
               "if [[ ! -e /dev/disk/by-id/google-${CANINE_RODISK} ]]; then",
               # we can run into a race condition here if other tasks are
               # attempting to mount the same disk simultaneously, so we
-              # force a 0 exit
-              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || true",
+              # force a 0 exit, unless gcloud returned exit code 5 (quota exceeded),
+              # which we explicitly propagate to cause localization to be retried
+              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || { [ $? == 5 ] && exit 5 || true; }",
               "fi",
 
               # mount the disk if it's not already
@@ -1312,7 +1313,7 @@ class AbstractLocalizer(abc.ABC):
               "done",
 
               # mount within Slurm worker container
-              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
+              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || { [ $? == 5 ] && exit 5 || true; }",
 #              # mount on host (so that task dockers can access it)
 #              "if [[ -f /.dockerenv ]]; then",
 #              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
