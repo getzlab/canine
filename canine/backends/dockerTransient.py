@@ -432,9 +432,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
                     # stderr corresponds to a known Docker failure mode than can
                     # be recovered from
-                    if any([stderr_str.startswith(reason) for reason in [
+                    if any([reason in stderr_str for reason in [
                       "Error response from daemon: No such exec instance",
-                      "OCI runtime exec failed: exec failed"
+                      "OCI runtime exec failed: exec failed",
+                      "Unable to contact slurm controller (connect failure)",
+                      "Socket timed out on send/recv operation"
                     ]]):
                         canine_logging.warning(
                           'Command {cmd} failed with known recoverable error reason "{err}"; retrying in {timeout} seconds up to {tries} more times'.format(
