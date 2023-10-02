@@ -1278,16 +1278,13 @@ class AbstractLocalizer(abc.ABC):
               "sudo mkdir -p ${CANINE_RODISK_DIR}",
               "fi",
 
-              # create tempfile to hold diagnostic information
-              "DIAG_FILE=$(mktemp)",
-
               # attach the disk if it's not already
               "if [[ ! -e /dev/disk/by-id/google-${CANINE_RODISK} ]]; then",
               # we can run into a race condition here if other tasks are
               # attempting to mount the same disk simultaneously, so we
               # force a 0 exit, unless gcloud returned exit code 5 (quota exceeded),
               # which we explicitly propagate to cause localization to be retried
-              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || { [ $? == 5 ] && exit 5 || true; }",
+              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro || { [ $? == 5 ] && exit 5 || true; }",
               "fi",
 
               # mount the disk if it's not already
@@ -1306,22 +1303,22 @@ class AbstractLocalizer(abc.ABC):
                     'exit 1',
                   'fi',
                   # otherwise, it didn't attach for some other reason
-                  'echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:" >&2; cat $DIAG_FILE >&2',
+                  'echo "Timeout exceeded for disk to attach" >&2',
                   'exit 1',
                 'fi',
                 "sleep 10; ((++tries))",
               "done",
 
               # mount within Slurm worker container
-              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || { [ $? == 5 ] && exit 5 || true; }",
+              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} || { [ $? == 5 ] && exit 5 || true; }",
               "fi",
 
               # because we forced zero exits for the previous commands,
               # we need to verify that the mount actually exists
-              "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; cat $DIAG_FILE >&2; exit 1; }",
+              "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; exit 1; }",
 
               # also verify that the filesystem is OK
-              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'Read-only disk filesystem is bad!' >&2; cat $DIAG_FILE >&2; exit 1; }",
+              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'Read-only disk mount is bad!' >&2; exit 1; }",
 
               # lock the disk; will be unlocked during teardown script (or if script crashes)
               # this is to ensure that we don't unmount the disk during teardown
