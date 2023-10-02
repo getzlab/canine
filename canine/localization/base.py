@@ -1314,10 +1314,6 @@ class AbstractLocalizer(abc.ABC):
 
               # mount within Slurm worker container
               "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || { [ $? == 5 ] && exit 5 || true; }",
-#              # mount on host (so that task dockers can access it)
-#              "if [[ -f /.dockerenv ]]; then",
-#              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
-#              "fi",
               "fi",
 
               # because we forced zero exits for the previous commands,
@@ -1429,10 +1425,6 @@ class AbstractLocalizer(abc.ABC):
                 '  CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}',
                 '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
                 '  if flock -n ${CANINE_RODISK_DIR} true && mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
-#                # unmount on container host too
-#                '    if [[ -f /.dockerenv ]]; then',
-#                '      sudo nsenter -t 1 -m umount ${CANINE_RODISK_DIR} || true',
-#                '    fi',
                 '    gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK || echo "Error detaching disk ${CANINE_RODISK}" >&2',
                 '  else',
                 '    echo "RODISK ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
