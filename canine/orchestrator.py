@@ -101,7 +101,7 @@ elif [ $LOCALIZER_JOB_RC -eq 5 ]; then # localization failed due to recoverable 
   echo "INFO: localization will be retried" >&2
   scontrol requeue $SLURM_JOB_ID
   scontrol update $SLURM_JOB_ID starttime=now+10m
-elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization can be skipped (e.g. localization disk already exists)
+elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization and job can be skipped (to facilitate avoidance of scratch disk tasks)
   echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2
   export CANINE_JOB_RC=0
   echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code

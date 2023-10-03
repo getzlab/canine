@@ -841,7 +841,7 @@ class AbstractLocalizer(abc.ABC):
                     '[ $TRIES -ge 120 ] && { echo "Exceeded timeout waiting for another node to finish making scratch disk" >&2; exit 1; } || :',
                     '((++TRIES))',
                   'done',
-                  'exit 1 #DEBUG_OMIT', # fail localizer -> requeue task -> job avoid 
+                  'exit 1 #DEBUG_OMIT', # fail localizer -> retry task via Prefect -> job avoid. TODO: should this be exit code 5 (fail localizer -> auto-requeue via slurm?)
                 'fi',
               'fi',
               # TODO: what if the task exited on the other
