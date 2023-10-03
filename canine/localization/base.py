@@ -1322,7 +1322,7 @@ class AbstractLocalizer(abc.ABC):
               "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; exit 1; }",
 
               # also verify that the filesystem is OK
-              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'Read-only disk mount is bad!' >&2; exit 1; }",
+              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'Read-only disk mount is bad!' >&2; exit 5; }",
 
               # lock the disk; will be unlocked during teardown script (or if script crashes)
               # this is to ensure that we don't unmount the disk during teardown
