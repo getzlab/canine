@@ -1310,7 +1310,7 @@ class AbstractLocalizer(abc.ABC):
               "done",
 
               # mount within Slurm worker container
-              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} || { [ $? == 5 ] && exit 5 || true; }",
+              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} || true",
               "fi",
 
               # because we forced zero exits for the previous commands,
