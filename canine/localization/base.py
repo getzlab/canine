@@ -1329,7 +1329,7 @@ class AbstractLocalizer(abc.ABC):
               # if other processes are still using it
               "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.rodisk_lock_pids",
 
-              'echo "Successfully attached read-only disk ${CANINE_RODISK} ..." >&2',
+              'echo "Successfully attached read-only disk ${CANINE_RODISK}." >&2',
 
               "done",
             ]
