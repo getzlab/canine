@@ -79,6 +79,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo -e "!!!! JOB FAILED! (EXIT CODE                 !!!!\e[29G$CANINE_JOB_RC)" >&2
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      echo $(($([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.failure_count
       echo '++++ STARTING JOB CLEANUP ++++' >&2
       $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
       TEARDOWN_RC=$?
@@ -91,7 +92,6 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo "INFO: Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
       [ -f $CANINE_JOB_ROOT/stdout ] && mv $CANINE_JOB_ROOT/stdout $CANINE_JOB_ROOT/stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       [ -f $CANINE_JOB_ROOT/stderr ] && mv $CANINE_JOB_ROOT/stderr $CANINE_JOB_ROOT/stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
-      echo $(($([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.failure_count
       scontrol requeue $SLURM_JOB_ID
     fi
   done
@@ -99,6 +99,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
 # these are special exit codes that localization.sh can explicitly return
 elif [ $LOCALIZER_JOB_RC -eq 5 ]; then # localization failed due to recoverable reason (e.g. quota); requeue the job
   echo "INFO: localization will be retried" >&2
+  echo $(($([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.failure_count
   scontrol requeue $SLURM_JOB_ID
 elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization and job can be skipped (to facilitate avoidance of scratch disk tasks)
   echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2
