@@ -79,9 +79,18 @@ def compute_crc32c(path, fast = False):
     return hash_alg.hexdigest().decode().upper()
 
 def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
+    # (re)create output directory
     jobdir = os.path.join(output_dir, str(jobId))
-    if not os.path.isdir(jobdir):
-        os.makedirs(jobdir)
+    if os.path.exists(jobdir):
+        if os.path.isfile(jobdir):
+            print("WARNING: {jobdir} is not a directory", file = sys.stderr, flush = True)
+            os.remove(jobdir)
+        elif os.path.isdir(jobdir):
+            shutil.remove(jobdir)
+        else:
+            raise ValueError(f"{jobdir} is neither a directory nor a file")
+    os.makedirs(jobdir)
+
     matched_files = []
     with open(os.path.join(jobdir, '.canine_job_manifest'), 'w') as manifest:
         for name, pattern in patterns:
