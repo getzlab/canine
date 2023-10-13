@@ -111,9 +111,14 @@ echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
 cd $CANINE_JOB_ROOT
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
 DELOC_RC=$?
-[ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
 echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
-exit $CANINE_JOB_RC
+if [ $DELOC_RC == 0 ]; then
+  echo '++++ DELOCALIZATION COMPLETE ++++' >&2
+  exit $CANINE_JOB_RC
+else
+  echo '!+++ DELOCALIZATION FAILURE +++!' >&2
+  exit $DELOC_RC
+fi
 """.format(version=version)
 
 def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
