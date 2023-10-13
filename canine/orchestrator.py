@@ -98,7 +98,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
 # these are special exit codes that localization.sh can explicitly return
 elif [ $LOCALIZER_JOB_RC -eq 5 ]; then # localization failed due to recoverable reason (e.g. quota); requeue the job
-  echo "INFO: localization will be retried" >&2
+  echo "WARNING: localization will be retried" >&2
   echo $(($([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.failure_count
   scontrol requeue $SLURM_JOB_ID
 elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization and job can be skipped (to facilitate avoidance of scratch disk tasks)

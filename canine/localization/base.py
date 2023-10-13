@@ -1276,11 +1276,14 @@ class AbstractLocalizer(abc.ABC):
               "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
               "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
 
-              'echo "Attaching read-only disk ${CANINE_RODISK} ..." >&2',
+              'echo "INFO: Attaching read-only disk ${CANINE_RODISK} ..." >&2',
 
               "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then",
               "sudo mkdir -p ${CANINE_RODISK_DIR}",
               "fi",
+
+              # create tempfile to hold diagnostic information
+              "DIAG_FILE=$(mktemp)",
 
               # attach the disk if it's not already
               "if [[ ! -e /dev/disk/by-id/google-${CANINE_RODISK} ]]; then",
@@ -1288,7 +1291,7 @@ class AbstractLocalizer(abc.ABC):
               # attempting to mount the same disk simultaneously, so we
               # force a 0 exit, unless gcloud returned exit code 5 (quota exceeded),
               # which we explicitly propagate to cause localization to be retried
-              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &> /dev/null || { [ $? == 5 ] && exit 5 || true; }",
+              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || { [ $? == 5 ] && exit 5 || true; }",
               "fi",
 
               # mount the disk if it's not already
@@ -1303,11 +1306,11 @@ class AbstractLocalizer(abc.ABC):
                   # this means the node is likely bad
                   'if [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ] && gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\'; then',
                     'sudo touch /.fatal_disk_issue_sentinel',
-                    'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
+                    'echo "ERROR: Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
                     'exit 1',
                   'fi',
                   # otherwise, it didn't attach for some other reason
-                  'echo "Read-only disk did not successfully attach!" >&2',
+                  'echo "ERROR: Read-only disk could not be attached!" >&2; [ -s $DIAG_FILE ] && { echo "The following error message may contain insight:" >&2; cat $DIAG_FILE >&2; } || :',
                   'exit 1',
                 'fi',
                 "sleep 10; ((++tries))",
@@ -1319,17 +1322,17 @@ class AbstractLocalizer(abc.ABC):
 
               # because we forced zero exits for the previous commands,
               # we need to verify that the mount actually exists
-              "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; exit 1; }",
+              'mountpoint -q ${CANINE_RODISK_DIR} || { echo "ERROR: Read-only disk mount failed!" >&2; [ -s $DIAG_FILE ] && { echo "The following error message may contain insight:" >&2; cat $DIAG_FILE >&2; } || :; exit 1; }',
 
               # also verify that the filesystem is OK
-              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'Read-only disk mount is bad!' >&2; exit 5; }",
+              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'WARNING: Read-only disk did not properly mount on this node; retrying.' >&2; exit 5; }",
 
               # lock the disk; will be unlocked during teardown script (or if script crashes)
               # this is to ensure that we don't unmount the disk during teardown
               # if other processes are still using it
               "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.rodisk_lock_pids",
 
-              'echo "Successfully attached read-only disk ${CANINE_RODISK}." >&2',
+              'echo "INFO: Successfully attached read-only disk ${CANINE_RODISK}." >&2',
 
               "done",
             ]
