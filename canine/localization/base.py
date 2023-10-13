@@ -1388,7 +1388,6 @@ class AbstractLocalizer(abc.ABC):
             line.rstrip()
             for line in [
                 '#!/bin/bash',
-                'set -e',
                 'shopt -s expand_aliases #DEBUG_OMIT',
                 'alias gcloud=gcloud_exp_backoff #DEBUG_OMIT',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
@@ -1409,6 +1408,9 @@ class AbstractLocalizer(abc.ABC):
                     scratchflag = "--scratch" if self.use_scratch_disk else "",
                     finishedflag = "--finished_scratch" if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else "",
                 ),
+
+                # save exit code of delocalizer
+                "DELOC_RC=$?",
 
                 # remove stream dir
                 'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi',
@@ -1439,6 +1441,7 @@ class AbstractLocalizer(abc.ABC):
                 'done)'
             ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
               + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
+              + ['exit $DELOC_RC']
         )
         return setup_script, localization_script, teardown_script, array_exports
 
