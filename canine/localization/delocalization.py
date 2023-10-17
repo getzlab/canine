@@ -86,7 +86,7 @@ def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
             print("WARNING: {jobdir} is not a directory", file = sys.stderr, flush = True)
             os.remove(jobdir)
         elif os.path.isdir(jobdir):
-            shutil.remove(jobdir)
+            shutil.rmtree(jobdir)
         else:
             raise ValueError(f"{jobdir} is neither a directory nor a file")
     os.makedirs(jobdir)
