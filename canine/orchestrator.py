@@ -53,7 +53,11 @@ echo -n '---- STARTING JOB SETUP ... ' >&2
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 echo 'COMPLETE ----' >&2
 if [ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_PREEMPT_LIMIT ]; then
-  if [[ ( -e $CANINE_JOB_ROOT/.job_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0 ) || ! -e $CANINE_JOB_ROOT/.job_exit_code ]]; then
+  # localization must have completed successfully and job must not have exited with a failure
+  if [[ ( -e $CANINE_JOB_ROOT/.localizer_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0) && \
+        (( -e $CANINE_JOB_ROOT/.job_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0 ) || \
+         ! -e $CANINE_JOB_ROOT/.job_exit_code) \
+  ]]; then
     echo "Preemption limit exceeded; requeueing on non-preemptible nodes" >&2
     exit 123 # special exit code indicating excessive preemption
   fi
