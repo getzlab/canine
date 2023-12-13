@@ -51,12 +51,18 @@ export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
 echo -n '---- STARTING JOB SETUP ... ' >&2
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
-rm -f $CANINE_JOB_ROOT/.*exit_code || :
 echo 'COMPLETE ----' >&2
-if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0))) -ge $CANINE_PREEMPT_LIMIT ]; then
-  echo "Preemption limit exceeded; requeueing on non-preemptible nodes" >&2
-  exit 123 # special exit code indicating excessive preemption
+if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0))) -ge $CANINE_PREEMPT_LIMIT ]; then
+  # localization must have completed successfully and job must not have exited with a failure
+  if [[ ( -e $CANINE_JOB_ROOT/.localizer_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0) && \
+        (( -e $CANINE_JOB_ROOT/.job_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0 ) || \
+         ! -e $CANINE_JOB_ROOT/.job_exit_code) \
+  ]]; then
+    echo "Preemption limit exceeded; requeueing on non-preemptible nodes" >&2
+    exit 123 # special exit code indicating excessive preemption
+  fi
 fi
+rm -f $CANINE_JOB_ROOT/.*exit_code || :
 echo '~~~~ STARTING JOB LOCALIZATION ~~~~' >&2
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh >&2
 export LOCALIZER_JOB_RC=$?
@@ -79,7 +85,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo -e "!!!! JOB FAILED! (EXIT CODE                 !!!!\e[29G$CANINE_JOB_RC)" >&2
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
-      echo $(($([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.failure_count
+      echo $(($([ -f $CANINE_JOB_ROOT/.job_failure_count ] && cat $CANINE_JOB_ROOT/.job_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.job_failure_count
       echo '++++ STARTING JOB CLEANUP ++++' >&2
       $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
       TEARDOWN_RC=$?
@@ -99,7 +105,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
 # these are special exit codes that localization.sh can explicitly return
 elif [ $LOCALIZER_JOB_RC -eq 5 ]; then # localization failed due to recoverable reason (e.g. quota); requeue the job
   echo "WARNING: localization will be retried" >&2
-  echo $(($([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.failure_count
+  echo $(($([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.localization_failure_count
   scontrol requeue $SLURM_JOB_ID
 elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization and job can be skipped (to facilitate avoidance of scratch disk tasks)
   echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2

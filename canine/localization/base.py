@@ -822,29 +822,8 @@ class AbstractLocalizer(abc.ABC):
             'while [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; do',
               ## check if disk is being created by _another_ instance (grep -qv $CANINE_NODE_NAME)
               'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -qv "$CANINE_NODE_NAME"\'$\'; then',
-                # if disk is a localization disk (i.e. not a scratch disk), wait approximately how long it would take to transfer files to it
-                'if ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
-                  'TRIES=0',
-                  # wait until disk is marked "finished"
-                  'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
-                    'echo "Waiting for localization disk to become available ..." >&2',
-                    '[ $TRIES == 0 ] && sleep {} || sleep 300'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer for first timeout; 5 minutes thereafter up to 10 times
-                    '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
-                    '((++TRIES))',
-                  'done',
-                  'exit 15 #DEBUG_OMIT', # special exit code to cause the script to be skipped in entrypoint.sh
-                # if disk is a scratch disk, wait up to two hours for it to finish. once it's finished, fail the localizer, to cause task to be requeued and avoided.
-                'else',
-                  'TRIES=0',
-                  # wait until disk is marked "finished"
-                  'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
-                    'echo "Waiting for scratch disk to become available ..." >&2',
-                    'sleep 60',
-                    '[ $TRIES -ge 120 ] && { echo "Exceeded timeout waiting for another node to finish making scratch disk" >&2; exit 1; } || :',
-                    '((++TRIES))',
-                  'done',
-                  'exit 1 #DEBUG_OMIT', # fail localizer -> retry task via Prefect -> job avoid. TODO: should this be exit code 5 (fail localizer -> auto-requeue via slurm?)
-                'fi',
+                'echo "ERROR: Disk being created by another instances. Will retry when finished." >&2',
+                'exit 5', # cause task to be requeued
               'fi',
               # TODO: what if the task exited on the other
               #       instance without running the teardown script
@@ -853,7 +832,7 @@ class AbstractLocalizer(abc.ABC):
               #       are there any scenarios in which this would be a bad idea?
 
               ## if disk is not being created by another instance, it might just be taking a bit to attach. give it a chance to appear in /dev
-              '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
+              '[ $DELAY -gt 128 ] && { echo "ERROR: Exceeded timeout trying to attach disk" >&2; exit 5; } || :',
               'sleep $DELAY; ((DELAY *= 2))',
 
               # try attaching again if delay has exceeded 8 seconds
@@ -863,8 +842,8 @@ class AbstractLocalizer(abc.ABC):
                 'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :',
                 'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\' && [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; then',
                   'sudo touch /.fatal_disk_issue_sentinel',
-                  'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
-                  'exit 1',
+                  'echo "ERROR: Node cannot attach disk; node is likely bad. Tagging for deletion. Will retry localization on another node." >&2',
+                  'exit 5',
                 'fi',
               'fi',
             'done',
@@ -1306,8 +1285,8 @@ class AbstractLocalizer(abc.ABC):
                   # this means the node is likely bad
                   'if [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ] && gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\'; then',
                     'sudo touch /.fatal_disk_issue_sentinel',
-                    'echo "ERROR: Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
-                    'exit 1',
+                    'echo "ERROR: Node cannot attach disk; node is likely bad. Tagging for deletion. Will retry on another node." >&2',
+                    'exit 5', # retry on another node
                   'fi',
                   # otherwise, it didn't attach for some other reason
                   'echo "ERROR: Read-only disk could not be attached!" >&2; [ -s $DIAG_FILE ] && { echo "The following error message may contain insight:" >&2; cat $DIAG_FILE >&2; } || :',
