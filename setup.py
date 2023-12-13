@@ -58,7 +58,7 @@ setup(
         'google-crc32c>=1.5.0',
         'google-cloud-compute>=1.6.1',
         #'slurm_gcp_docker>=0.12',
-        'slurm_gcp_docker @ git+https://github.com/getzlab/slurm_gcp_docker@v0.16.0',
+        'slurm_gcp_docker @ git+https://github.com/getzlab/slurm_gcp_docker@v0.16.0' if not os.path.exists("/.dockerenv") else None, # avoid circular dependency of slurm_gcp_docker -> wolf -> canine
     ],
     python_requires = ">3.7",
     classifiers = [
