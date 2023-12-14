@@ -37,11 +37,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         image_project = "broad-getzlab-workflows",
         image = None,
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
-        clust_frac = 1.0, user = os.environ["USER"], shutdown_on_exit = False, **kwargs
+        clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
     ):
         if user is None:
-            # IE: USER was not set
-            raise ValueError("USER not set in environment. Must explicitly pass user argument")
+            if "USER" in os.environ:
+                user = os.environ["USER"]
+            else:
+                raise ValueError("$USER not set in environment. Must explicitly pass user argument")
 
         if storage_bucket is not None and storage_disk is not None:
             canine_logging.warning("You specified both a persistent disk and cloud bucket to store workflow outputs; will only store to bucket!")
