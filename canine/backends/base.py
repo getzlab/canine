@@ -403,7 +403,9 @@ class AbstractSlurmBackend(abc.ABC):
 
         if status != 0:
             # explicitly catch error if user requested impossibly high resources
-            if stderr is not None and "Requested node configuration is not available" in stderr.read().decode():
+            stderr_str = stderr.read().decode()
+            stderr.seek(0)
+            if stderr is not None and "Requested node configuration is not available" in stderr_str:
                 canine_logging.error(f"Requested CPU/memory resources exceed maximum cluster capacity. Please request fewer resources, or add a suitable node to /mnt/nfs/clust_conf/slurm/nodetypes.json")
                 raise ResourceWarning
             # all other errors are handled generically
