@@ -1290,8 +1290,10 @@ class AbstractLocalizer(abc.ABC):
               # we can run into a race condition here if other tasks are
               # attempting to mount the same disk simultaneously, so we
               # force a 0 exit, unless gcloud returned exit code 5 (quota exceeded),
-              # which we explicitly propagate to cause localization to be retried
-              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || { [ $? == 5 ] && exit 5 || true; }",
+              # which we explicitly propagate to cause localization to be retried.
+              # mounting the disk can also hang (exit 124), in which case we
+              # also cause localization to be retried by returning exit 5
+              "timeout -k 30 30 gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || { ec=$?; [[ $ec == 5 || $ec == 124 ]] && exit 5 || true; }",
               "fi",
 
               # mount the disk if it's not already
@@ -1432,7 +1434,7 @@ class AbstractLocalizer(abc.ABC):
                 '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
                 '  echo "Unmounting read-only disk ${CANINE_RODISK}" >&2',
                 '  if flock -n ${CANINE_RODISK_DIR} true && mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
-                '    gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK && echo "Unmounted ${CANINE_RODISK}" >&2 || echo "Error detaching disk ${CANINE_RODISK}" >&2',
+                '    timeout -k 30 30 gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK && echo "Unmounted ${CANINE_RODISK}" >&2 || echo "Error detaching disk ${CANINE_RODISK}" >&2',
                 '  else',
                 '    echo "Read-only disk ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
                 '  fi',
