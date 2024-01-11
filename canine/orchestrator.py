@@ -14,7 +14,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.15.1'
+version = '0.15.4'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -85,6 +85,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo -e "!!!! JOB FAILED! (EXIT CODE                 !!!!\e[29G$CANINE_JOB_RC)" >&2
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
+      echo $(($([ -f $CANINE_JOB_ROOT/.job_failure_count ] && cat $CANINE_JOB_ROOT/.job_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.job_failure_count
       echo '++++ STARTING JOB CLEANUP ++++' >&2
       $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
       TEARDOWN_RC=$?
@@ -97,12 +98,16 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo "INFO: Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
       [ -f $CANINE_JOB_ROOT/stdout ] && mv $CANINE_JOB_ROOT/stdout $CANINE_JOB_ROOT/stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       [ -f $CANINE_JOB_ROOT/stderr ] && mv $CANINE_JOB_ROOT/stderr $CANINE_JOB_ROOT/stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
-      echo $(($([ -f $CANINE_JOB_ROOT/.failure_count ] && cat $CANINE_JOB_ROOT/.failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.failure_count
       scontrol requeue $SLURM_JOB_ID
     fi
   done
   echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
-elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # this is a special exit code that localization.sh can explicitly return
+# these are special exit codes that localization.sh can explicitly return
+elif [ $LOCALIZER_JOB_RC -eq 5 ]; then # localization failed due to recoverable reason (e.g. quota); requeue the job
+  echo "WARNING: localization will be retried" >&2
+  echo $(($([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.localization_failure_count
+  scontrol requeue $SLURM_JOB_ID
+elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization and job can be skipped (to facilitate avoidance of scratch disk tasks)
   echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2
   export CANINE_JOB_RC=0
   echo -n "DNR" > $CANINE_JOB_ROOT/.job_exit_code
