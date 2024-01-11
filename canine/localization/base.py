@@ -802,6 +802,8 @@ class AbstractLocalizer(abc.ABC):
             'GCP_DISK_SIZE={}'.format(disk_size),
             'GCP_TSNT_DISKS_DIR={}'.format(mount_prefix),
 
+            'echo "Saving outputs to scratch disk ${GCP_DISK_NAME}" >&2' if is_scratch_disk else 'echo "Localizing inputs to cache disk ${GCP_DISK_NAME} (${GCP_DISK_SIZE}GB)" >&2',
+
             ## create disk
             'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
             'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-standard --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
@@ -812,7 +814,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## attach as read-write, using same device-name as disk-name
             'if [[ ! -e /dev/disk/by-id/google-${GCP_DISK_NAME} ]]; then',
-            'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || true',
+            'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || { [ $? == 5 ] && exit 5 || true; }',
             'fi',
 
             ## wait for disk to attach, with exponential backoff up to 2 minutes
@@ -820,29 +822,8 @@ class AbstractLocalizer(abc.ABC):
             'while [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; do',
               ## check if disk is being created by _another_ instance (grep -qv $CANINE_NODE_NAME)
               'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -qv "$CANINE_NODE_NAME"\'$\'; then',
-                # if disk is a localization disk (i.e. not a scratch disk), wait approximately how long it would take to transfer files to it
-                'if ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "scratch=yes"; then',
-                  'TRIES=0',
-                  # wait until disk is marked "finished"
-                  'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
-                    'echo "Waiting for localization disk to become available ..." >&2',
-                    '[ $TRIES == 0 ] && sleep {} || sleep 300'.format(int(disk_size/0.1)), # assume 100 MB/sec transfer for first timeout; 5 minutes thereafter up to 10 times
-                    '[ $TRIES -ge 10 ] && { echo "Exceeded timeout waiting for disk to become available" >&2; exit 1; } || :',
-                    '((++TRIES))',
-                  'done',
-                  'exit 15 #DEBUG_OMIT', # special exit code to cause the script to be skipped in entrypoint.sh
-                # if disk is a scratch disk, wait up to two hours for it to finish. once it's finished, fail the localizer, to cause task to be requeued and avoided.
-                'else',
-                  'TRIES=0',
-                  # wait until disk is marked "finished"
-                  'while ! gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(labels)" | grep -q "finished=yes"; do',
-                    'echo "Waiting for scratch disk to become available ..." >&2',
-                    'sleep 60',
-                    '[ $TRIES -ge 120 ] && { echo "Exceeded timeout waiting for another node to finish making scratch disk" >&2; exit 1; } || :',
-                    '((++TRIES))',
-                  'done',
-                  'exit 1 #DEBUG_OMIT', # fail localizer -> requeue task -> job avoid 
-                'fi',
+                'echo "ERROR: Disk being created by another instances. Will retry when finished." >&2',
+                'exit 5', # cause task to be requeued
               'fi',
               # TODO: what if the task exited on the other
               #       instance without running the teardown script
@@ -851,7 +832,7 @@ class AbstractLocalizer(abc.ABC):
               #       are there any scenarios in which this would be a bad idea?
 
               ## if disk is not being created by another instance, it might just be taking a bit to attach. give it a chance to appear in /dev
-              '[ $DELAY -gt 128 ] && { echo "Exceeded timeout trying to attach disk" >&2; exit 1; } || :',
+              '[ $DELAY -gt 128 ] && { echo "ERROR: Exceeded timeout trying to attach disk" >&2; exit 5; } || :',
               'sleep $DELAY; ((DELAY *= 2))',
 
               # try attaching again if delay has exceeded 8 seconds
@@ -861,8 +842,8 @@ class AbstractLocalizer(abc.ABC):
                 'gcloud compute instances attach-disk "$CANINE_NODE_NAME" --zone "$CANINE_NODE_ZONE" --disk "$GCP_DISK_NAME" --device-name "$GCP_DISK_NAME" || :',
                 'if gcloud compute disks describe $GCP_DISK_NAME --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\' && [ ! -b /dev/disk/by-id/google-${GCP_DISK_NAME} ]; then',
                   'sudo touch /.fatal_disk_issue_sentinel',
-                  'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
-                  'exit 1',
+                  'echo "ERROR: Node cannot attach disk; node is likely bad. Tagging for deletion. Will retry localization on another node." >&2',
+                  'exit 5',
                 'fi',
               'fi',
             'done',
@@ -1274,6 +1255,8 @@ class AbstractLocalizer(abc.ABC):
               "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
               "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
 
+              'echo "INFO: Attaching read-only disk ${CANINE_RODISK} ..." >&2',
+
               "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then",
               "sudo mkdir -p ${CANINE_RODISK_DIR}",
               "fi",
@@ -1285,8 +1268,11 @@ class AbstractLocalizer(abc.ABC):
               "if [[ ! -e /dev/disk/by-id/google-${CANINE_RODISK} ]]; then",
               # we can run into a race condition here if other tasks are
               # attempting to mount the same disk simultaneously, so we
-              # force a 0 exit
-              "gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || true",
+              # force a 0 exit, unless gcloud returned exit code 5 (quota exceeded),
+              # which we explicitly propagate to cause localization to be retried.
+              # mounting the disk can also hang (exit 124), in which case we
+              # also cause localization to be retried by returning exit 5
+              "timeout -k 30 30 gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || { ec=$?; [[ $ec == 5 || $ec == 124 ]] && exit 5 || true; }",
               "fi",
 
               # mount the disk if it's not already
@@ -1301,35 +1287,33 @@ class AbstractLocalizer(abc.ABC):
                   # this means the node is likely bad
                   'if [ ! -b /dev/disk/by-id/google-${CANINE_RODISK} ] && gcloud compute disks describe ${CANINE_RODISK} --zone $CANINE_NODE_ZONE --format "csv(users)[no-heading]" | grep \'^http\' | grep -q $CANINE_NODE_NAME\'$\'; then',
                     'sudo touch /.fatal_disk_issue_sentinel',
-                    'echo "Node cannot attach disk; node is likely bad. Tagging for deletion." >&2',
-                    'exit 1',
+                    'echo "ERROR: Node cannot attach disk; node is likely bad. Tagging for deletion. Will retry on another node." >&2',
+                    'exit 5', # retry on another node
                   'fi',
                   # otherwise, it didn't attach for some other reason
-                  'echo "Timeout exceeded for disk to attach; perhaps the stderr of \`gcloud compute instances attach disk\` might contain insight:" >&2; cat $DIAG_FILE >&2',
+                  'echo "ERROR: Read-only disk could not be attached!" >&2; [ -s $DIAG_FILE ] && { echo "The following error message may contain insight:" >&2; cat $DIAG_FILE >&2; } || :',
                   'exit 1',
                 'fi',
                 "sleep 10; ((++tries))",
               "done",
 
               # mount within Slurm worker container
-              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
-#              # mount on host (so that task dockers can access it)
-#              "if [[ -f /.dockerenv ]]; then",
-#              "sudo nsenter -t 1 -m mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} &>> $DIAG_FILE || true",
-#              "fi",
+              "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} || true",
               "fi",
 
               # because we forced zero exits for the previous commands,
               # we need to verify that the mount actually exists
-              "mountpoint -q ${CANINE_RODISK_DIR} || { echo 'Read-only disk mount failed!' >&2; cat $DIAG_FILE >&2; exit 1; }",
+              'mountpoint -q ${CANINE_RODISK_DIR} || { echo "ERROR: Read-only disk mount failed!" >&2; [ -s $DIAG_FILE ] && { echo "The following error message may contain insight:" >&2; cat $DIAG_FILE >&2; } || :; exit 1; }',
 
               # also verify that the filesystem is OK
-              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'Read-only disk filesystem is bad!' >&2; cat $DIAG_FILE >&2; exit 1; }",
+              "timeout -k 30 30 ls ${CANINE_RODISK_DIR} > /dev/null || { echo 'WARNING: Read-only disk did not properly mount on this node; retrying.' >&2; exit 5; }",
 
               # lock the disk; will be unlocked during teardown script (or if script crashes)
               # this is to ensure that we don't unmount the disk during teardown
               # if other processes are still using it
               "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.rodisk_lock_pids",
+
+              'echo "INFO: Successfully attached read-only disk ${CANINE_RODISK}." >&2',
 
               "done",
             ]
@@ -1427,14 +1411,11 @@ class AbstractLocalizer(abc.ABC):
                 '  CANINE_RODISK=${!CANINE_RODISK}',
                 '  CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}',
                 '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
+                '  echo "Unmounting read-only disk ${CANINE_RODISK}" >&2',
                 '  if flock -n ${CANINE_RODISK_DIR} true && mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
-#                # unmount on container host too
-#                '    if [[ -f /.dockerenv ]]; then',
-#                '      sudo nsenter -t 1 -m umount ${CANINE_RODISK_DIR} || true',
-#                '    fi',
-                '    gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK || echo "Error detaching disk ${CANINE_RODISK}" >&2',
+                '    timeout -k 30 30 gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK && echo "Unmounted ${CANINE_RODISK}" >&2 || echo "Error detaching disk ${CANINE_RODISK}" >&2',
                 '  else',
-                '    echo "RODISK ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
+                '    echo "Read-only disk ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
                 '  fi',
                 'done)'
             ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
