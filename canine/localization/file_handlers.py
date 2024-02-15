@@ -242,6 +242,8 @@ class HandleGSURLStream(HandleGSURL):
         )])
 
 # }}}
+class GSFileNotExists(Exception):
+    pass
 
 ## GCP Authorized Session {{{
 
@@ -259,8 +261,6 @@ def gcp_auth_session():
     return GCP_AUTH_SESSION
 
 # }}}
-class GSFileNotExists(Exception):
-    pass
 
 ## AWS S3 {{{
 
