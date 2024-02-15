@@ -1,8 +1,10 @@
 import abc
 import google.cloud.storage
+import google.auth
 import glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading
 import pandas as pd
 
+from google.auth.transport.requests import AuthorizedSession
 from ..utils import sha1_base32, canine_logging
 
 class FileType(abc.ABC):
@@ -240,6 +242,25 @@ class HandleGSURLStream(HandleGSURL):
         )])
 
 # }}}
+
+## GCP Authorized Session {{{
+
+GCP_AUTH_SESSION = None
+gcp_auth_session_creation_lock = threading.Lock()
+
+def gcp_auth_session():
+    global GCP_AUTH_SESSION
+    with gcp_auth_session_creation_lock:
+        if GCP_AUTH_SESSION is None:
+            # this is the expensive operation
+            GCP_AUTH_SESSION = AuthorizedSession(
+                google.auth.default(['https://www.googleapis.com/auth/userinfo.profile',
+                                     'https://www.googleapis.com/auth/userinfo.email'])[0])
+    return GCP_AUTH_SESSION
+
+# }}}
+class GSFileNotExists(Exception):
+    pass
 
 ## AWS S3 {{{
 
