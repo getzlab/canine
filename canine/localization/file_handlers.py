@@ -486,6 +486,85 @@ class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
 
 # }}}
 
+class HandleDRSURI(FileType):
+    localization_mode = "url"
+    drs_resolver = "https://drshub.dsde-prod.broadinstitute.org/api/v4/drs/resolve"
+
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+
+        self.check_md5 = self.extra_args["check_md5"] if "check_md5" in self.extra_args else False
+
+        # parse URL
+        self.uri = self.path
+        uri_parse = re.match(r"^drs://(?:[A-Za-z0-9._]+/)?[A-Za-z0-9._]+:[A-Za-z0-9.-_~%]+",
+                             self.uri)
+        if uri_parse is None:
+            raise ValueError(f"Invalid DRS URI '{self.uri}'")
+
+        fields = ["size", "fileName", "accessUrl"]
+        if self.check_md5:
+            fields += ["hashes"]
+        data = {"url": self.uri, "fields": fields}
+
+        drshub_session = gcp_auth_session()
+        resp = drshub_session.post(type(self).drs_resolver,
+                                   headers={"Content-type": "application/json"}, data=data)
+
+        try:
+            metadata = resp.json()
+            self.path = metadata["fileName"]
+            self.url = metadata["accessUrl"]["url"]
+            self._size = metadata["size"]
+            self._hash = metadata.get("hashes", {}).get("md5")
+        except:
+            try:
+                msg = json.dumps(resp.json())
+            except:
+                msg = resp.text
+            canine_logging.error("Error resolving DRS URI; see details:")
+            canine_logging.error(f"Response code: {resp.status_code}")
+            canine_logging.error(msg)
+            raise
+        self.localized_path = self.path
+
+    def localization_command(self, dest):
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+        cmd = ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+
+        # ensure that file downloaded properly
+        if self.check_md5:
+            cmd += [f"[[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]] || {{ echo 'deleting corrupted file' ; rm -f {self.localized_path} ; exit 1 ; }}"]
+
+        return "\n".join(cmd)
+
+class HandleDRSURIStream(HandleDRSURI):
+    localization_mode = "stream"
+
+    def localization_command(self, dest):
+
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+        cmd = []
+
+        # clean existing file if it exists
+        cmd += ['if [[ -e {0} ]]; then rm {0}; fi'.format(dest)]
+
+        # create dir if it doesn't exist
+        cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :;".format(dest_dir=dest_dir)]
+
+        # create fifo object
+        cmd += ['mkfifo {}'.format(dest)]
+
+        # stream into fifo object
+        cmd += ["curl -C - -o {path} '{url}' &".format(dest_dir=dest_dir, path=self.localized_path, url=self.url)]
+
+        return "\n".join(cmd)
+
+
 class HandleOtherURL(FileType):
     localization_mode = "url"
 
