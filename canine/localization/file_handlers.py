@@ -242,8 +242,6 @@ class HandleGSURLStream(HandleGSURL):
         )])
 
 # }}}
-class GSFileNotExists(Exception):
-    pass
 
 ## GCP Authorized Session {{{
 
