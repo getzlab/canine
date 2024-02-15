@@ -397,6 +397,7 @@ class HandleAWSURLStream(HandleAWSURL):
 ## GDC HTTPS URLs {{{
 class HandleGDCHTTPURL(FileType):
     localization_mode = "url"
+    gdc_drs_root = "drs://dg.4dfc:"
 
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
@@ -414,31 +415,44 @@ class HandleGDCHTTPURL(FileType):
         self.prefix = url_parse[1]
         self.uuid = url_parse[2]
 
-        # the actual filename is encoded in the content-disposition header;
-        # save this to self.path
-        # since the filesize and hashes are also encoded in the header, populate
-        # these fields now
-        resp_headers = subprocess.run(
-          'curl -s -D - -o /dev/full {token_flag} {file}'.format(
-            token_flag = self.token_flag,
-            file = self.path
-          ),
-          shell = True,
-          capture_output = True
-        )
         try:
-            headers = pd.DataFrame(
-              [x.split(": ") for x in resp_headers.stdout.decode().split("\r\n")[1:]],
-              columns=["header", "value"],
-            ).set_index("header")["value"]
-
-            self.path = re.match(".*filename=(.*)$", headers["Content-Disposition"])[1]
-            self._size = int(headers["Content-Length"])
-            self._hash = headers["Content-MD5"]
+            self.uri = type(self).gdc_drs_root + self.uuid
+            self.drs_obj = HandleDRSURI(self.uri, **self.extra_args)
         except:
-            canine_logging.error("Error resolving GDC file; see details:")
-            canine_logging.error(resp_headers.stdout.decode())
-            raise
+            canine_logging.warning("Re-attempting with GDC API")
+            self.drs_obj = None
+
+            # the actual filename is encoded in the content-disposition header;
+            # save this to self.path
+            # since the filesize and hashes are also encoded in the header, populate
+            # these fields now
+            resp_headers = subprocess.run(
+              'curl -s -D - -o /dev/full {token_flag} {file}'.format(
+                token_flag = self.token_flag,
+                file = self.path
+              ),
+              shell = True,
+              capture_output = True
+            )
+            try:
+                headers = pd.DataFrame(
+                  [x.split(": ") for x in resp_headers.stdout.decode().split("\r\n")[1:]],
+                  columns=["header", "value"],
+                ).set_index("header")["value"]
+
+                self.path = re.match(".*filename=(.*)$", headers["Content-Disposition"])[1]
+                self._size = int(headers["Content-Length"])
+                self._hash = headers["Content-MD5"]
+            except:
+                canine_logging.error("Error resolving GDC file; see details:")
+                canine_logging.error(resp_headers.stdout.decode())
+                raise
+        if self.drs_obj is not None:
+            self.path = self.drs_obj.path
+            self._size = self.drs_obj.size
+            self._hash = self.drs_obj.hash
+            self.url = self.drs_obj.url
+            self.token = None
         self.localized_path = self.path
 
     def localization_command(self, dest):
