@@ -718,8 +718,9 @@ class HandleRODISKURL(FileType):
 
 def get_file_handler(path, url_map = None, **kwargs):
     url_map = {
-      r"^gs://" : HandleGSURL, 
-      r"^s3://" : HandleAWSURL, 
+      r"^gs://" : HandleGSURL,
+      r"^s3://" : HandleAWSURL,
+      r"^drs://" : HandleDRSURI,
       r"^https://api.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^rodisk://" : HandleRODISKURL,
