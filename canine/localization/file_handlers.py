@@ -521,7 +521,7 @@ class HandleDRSURI(FileType):
 
         drshub_session = gcp_auth_session()
         resp = drshub_session.post(type(self).drs_resolver,
-                                   headers={"Content-type": "application/json"}, data=data)
+                                   headers={"Content-type": "application/json"}, json=data)
 
         try:
             metadata = resp.json()
