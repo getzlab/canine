@@ -527,7 +527,6 @@ class Orchestrator(object):
         while len(waiting_jobs):
             backoff_factor = 1
             while True:
-                time.sleep(30*backoff_factor)
                 acct = self.backend.sacct(
                   "D",
                   job = batch_id,
@@ -541,6 +540,7 @@ class Orchestrator(object):
                     raise Exception("Timeout exceeded waiting to query job accounting information; cluster is likely under extreme load!")
                 else:
                     backoff_factor *= 1.1
+                time.sleep(30*backoff_factor)
             acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))]
             acct.loc[acct["ResvCPURAW"].isna(), "ResvCPURAW"] = 0
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
@@ -669,6 +669,16 @@ class Orchestrator(object):
         flags = [k for k, v in extra_sbatch_args.items() if v is None]
         params = { k : v for k, v in extra_sbatch_args.items() if v is not None }
 
+        # print to log
+        n_jobs = np.array([v is not None for v in job_spec.values()])
+        n_submitted = n_jobs.sum()
+        n_avoided = (~n_jobs).sum()
+        canine_logging.print("{n_submitted} job{plural} submitted{avoid_string}.".format(
+          n_submitted = n_submitted,
+          plural = "s" if n_submitted > 1 else "",
+          avoid_string = f" ({n_avoided} avoided)" if n_avoided > 0 else ""
+        ))
+
         # submit to sbatch
         batch_id = self.backend.sbatch(
             entrypoint_path,
@@ -683,15 +693,6 @@ class Orchestrator(object):
                 **stringify(params)
             }
         )
-
-        n_jobs = np.array([v is not None for v in job_spec.values()])
-        n_submitted = n_jobs.sum()
-        n_avoided = (~n_jobs).sum()
-        canine_logging.print("{n_submitted} job{plural} submitted{avoid_string}.".format(
-          n_submitted = n_submitted,
-          plural = "s" if n_submitted > 1 else "",
-          avoid_string = f" ({n_avoided} avoided)" if n_avoided > 0 else ""
-        ))
 
         return batch_id
 

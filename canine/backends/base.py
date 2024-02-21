@@ -395,7 +395,7 @@ class AbstractSlurmBackend(abc.ABC):
         Additional arguments and keyword arguments provided are passed as slurm arguments to sbatch
         Returns the jobID of the batch request
         """
-        command = 'sbatch {} -- {}'.format(
+        command = 'sbatch --wait {} -- {}'.format(
             ArgumentHelper(*slurmopts, **slurmparams).commandline,
             command
         )
