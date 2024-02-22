@@ -408,8 +408,9 @@ class AbstractSlurmBackend(abc.ABC):
             if stderr is not None and "Requested node configuration is not available" in stderr_str:
                 canine_logging.error(f"Requested CPU/memory resources exceed maximum cluster capacity. Please request fewer resources, or add a suitable node to /mnt/nfs/clust_conf/slurm/nodetypes.json")
                 raise ResourceWarning
-            # all other errors are handled generically
-            check_call(command, status, stdout, stderr)
+            # FIXME: all other errors are handled generically -- but with --wait invoked, this will be the highest exit code of any job in the array, which will mean that any failing task will raise an exception.
+            # need to consider more carefully how to handle this ...
+            # check_call(command, status, stdout, stderr)
 
         out = stdout.read().decode()
         err = stderr.read().decode()
