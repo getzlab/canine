@@ -127,7 +127,7 @@ class HandleGSURL(FileType):
         bucket = re.match(r"gs://(.*?)/.*", self.path)[1]
 
         gcs_cl = gcloud_storage_client()
-        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"] if "project" in self.extra_args else None)
+        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args.get("project"))
 
         return bucket_obj.requester_pays
 
@@ -170,7 +170,7 @@ class HandleGSURL(FileType):
 
         gcs_cl = gcloud_storage_client()
 
-        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"] if "project" in self.extra_args else None)
+        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args.get("project"))
 
         # check whether this path exists, and whether it's a directory
         exists = False
@@ -283,13 +283,13 @@ class HandleAWSURL(FileType):
 
         # keys get passed via environment variable
         self.command_env = {}
-        self.command_env["AWS_ACCESS_KEY_ID"] = self.extra_args["aws_access_key_id"] if "aws_access_key_id" in self.extra_args else None 
-        self.command_env["AWS_SECRET_ACCESS_KEY"] = self.extra_args["aws_secret_access_key"] if "aws_secret_access_key" in self.extra_args else None 
+        self.command_env["AWS_ACCESS_KEY_ID"] = self.extra_args.get("aws_access_key_id")
+        self.command_env["AWS_SECRET_ACCESS_KEY"] = self.extra_args.get("aws_secret_access_key")
         self.command_env_str = " ".join([f"{k}={v}" for k, v in self.command_env.items() if v is not None])
 
         # compute extra arguments for s3 commands
         # TODO: add requester pays check here
-        self.aws_endpoint_url = self.extra_args["aws_endpoint_url"] if "aws_endpoint_url" in self.extra_args else None 
+        self.aws_endpoint_url = self.extra_args.get("aws_endpoint_url")
 
         self.s3_extra_args = []
         if self.command_env["AWS_ACCESS_KEY_ID"] is None and self.command_env["AWS_SECRET_ACCESS_KEY"] is None:
@@ -400,9 +400,9 @@ class HandleGDCHTTPURL(FileType):
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
 
-        self.token = self.extra_args["token"] if "token" in self.extra_args else None 
+        self.token = self.extra_args.get("token")
         self.token_flag = f'--header  "X-Auth-Token: {self.token}"' if self.token is not None else ''
-        self.check_md5 = self.extra_args["check_md5"] if "check_md5" in self.extra_args else False
+        self.check_md5 = self.extra_args.get("check_md5", False)
 
         # parse URL
         self.url = self.path
@@ -505,7 +505,7 @@ class HandleDRSURI(FileType):
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
 
-        self.check_md5 = self.extra_args["check_md5"] if "check_md5" in self.extra_args else False
+        self.check_md5 = self.extra_args.get("check_md5", False)
 
         # parse URL
         self.uri = self.path
