@@ -445,6 +445,13 @@ class HandleGDCHTTPURL(FileType):
                 canine_logging.error("Error resolving GDC file; see details:")
                 canine_logging.error(resp_headers.stdout.decode())
                 raise
+        if self.drs_obj is not None:
+            # if we have a DRS object, use its properties
+            self.path = self.drs_obj.path
+            self._size = self.drs_obj.size
+            self._hash = self.drs_obj.hash
+            self.url = self.drs_obj.uri
+            self.token = None
         self.localized_path = self.path
 
     def localization_command(self, dest):
