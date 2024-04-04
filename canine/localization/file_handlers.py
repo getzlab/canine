@@ -544,7 +544,7 @@ class HandleDRSURI(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         data_str = json.dumps({"url": self.uri, "fields": ["accessUrl"]})
-        signed_url = f'$(curl -S -X POST --url {type(self).drs_resolver} ' + \
+        signed_url = f'$(curl -S -X POST --url "{type(self).drs_resolver}" ' + \
                      '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
                      f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
                      'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
@@ -578,7 +578,7 @@ class HandleDRSURIStream(HandleDRSURI):
 
         # get signed URL
         data_str = json.dumps({"url": self.uri, "fields": ["accessUrl"]})
-        signed_url = f'$(curl -S -X POST --url {type(self).drs_resolver} ' + \
+        signed_url = f'$(curl -S -X POST --url "{type(self).drs_resolver}" ' + \
                      '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
                      f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
                      'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
