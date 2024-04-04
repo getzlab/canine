@@ -514,7 +514,7 @@ class HandleDRSURI(FileType):
         if uri_parse is None:
             raise ValueError(f"Invalid DRS URI '{self.uri}'")
 
-        fields = ["size", "fileName", "accessUrl"]
+        fields = ["size", "fileName"]
         if self.check_md5:
             fields += ["hashes"]
         data = {"url": self.uri, "fields": fields}
@@ -526,7 +526,6 @@ class HandleDRSURI(FileType):
         try:
             metadata = resp.json()
             self.path = metadata["fileName"]
-            self.url = metadata["accessUrl"]["url"]
             self._size = metadata["size"]
             self._hash = metadata.get("hashes", {}).get("md5")
         except:
@@ -544,7 +543,13 @@ class HandleDRSURI(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
-        cmd = ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+        data_str = json.dumps({"url": self.uri, "fields": ["accessUrl"]})
+        signed_url = f'$(curl -S -X POST --url {type(self).drs_resolver} ' + \
+                     '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
+                     f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
+                     'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
+        cmd = [f'signed_url={signed_url}',
+               f'[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {self.localized_path} "$signed_url"']
 
         # ensure that file downloaded properly
         if self.check_md5:
@@ -571,8 +576,15 @@ class HandleDRSURIStream(HandleDRSURI):
         # create fifo object
         cmd += ['mkfifo {}'.format(dest)]
 
+        # get signed URL
+        data_str = json.dumps({"url": self.uri, "fields": ["accessUrl"]})
+        signed_url = f'$(curl -S -X POST --url {type(self).drs_resolver} ' + \
+                     '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
+                     f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
+                     'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
+
         # stream into fifo object
-        cmd += ["curl -C - -o {path} '{url}' &".format(dest_dir=dest_dir, path=self.localized_path, url=self.url)]
+        cmd += ['curl -C - -o {path} "{url}" &'.format(path=self.localized_path, url=signed_url)]
 
         return "\n".join(cmd)
 
