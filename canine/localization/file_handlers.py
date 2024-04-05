@@ -585,9 +585,10 @@ class HandleDRSURIStream(HandleDRSURI):
                      '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
                      f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
                      'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
+        cmd += [f'signed_url={signed_url}']
 
         # stream into fifo object
-        cmd += ['curl -C - -o {path} "{url}" &'.format(path=self.localized_path, url=signed_url)]
+        cmd += ['curl -C - -o {path} "$signed_url" &'.format(path=self.localized_path)]
 
         return "\n".join(cmd)
 
