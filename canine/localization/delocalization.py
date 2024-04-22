@@ -47,17 +47,17 @@ def allocate_to_bins(capacities, total):
     # Go until total == 0 or remaining capacities are all 0
     while (total > 0) & (len(remaining_capacities[0]) < n_bins):
         # Add a unit to a bin with maximal remaining capacity
-        max_cap = max(d.keys())
-        max_bin = d[max_cap].pop()
+        max_cap = max(remaining_capacities.keys())
+        max_bin = remaining_capacities[max_cap].pop()
         allocation[max_bin] += 1
         # Decrement that bin's capacity
-        d[max_cap - 1].add(max_bin)
+        remaining_capacities[max_cap - 1].add(max_bin)
         # Decrement the total unallocated units
         total -= 1
         # If no more bins have this capacity, then
         # remove the corresponding set
-        if len(d[max_cap]) == 0:
-            d.pop(max_cap)
+        if len(remaining_capacities[max_cap]) == 0:
+            remaining_capacities.pop(max_cap)
 
     return allocation
 
