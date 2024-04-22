@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import shlex
 import sys
+from collections import defaultdict
 
 """
 This is not actually part of the canine package
@@ -29,54 +30,118 @@ def same_volume(a, b):
     )
     return len(set(vols.decode("utf-8").rstrip().split("\n"))) == 1
 
+
+def allocate_to_bins(capacities, total):
+    """
+    Helper function -- solves a simple allocation problem.
+    Assigns some integer `total` to bins, roughly proportional
+    to the bins' capacities
+    """
+    n_bins = len(capacities)
+    allocation = [0]*n_bins
+
+    remaining_capacities = defaultdict(set)
+    for i, cap in enumerate(capacities):
+        remaining_capacities[int(cap)].add(i)
+
+    # Go until total == 0 or remaining capacities are all 0
+    while (total > 0) & (len(remaining_capacities[0]) < n_bins):
+        # Add a unit to a bin with maximal remaining capacity
+        max_cap = max(d.keys())
+        max_bin = d[max_cap].pop()
+        allocation[max_bin] += 1
+        # Decrement that bin's capacity
+        d[max_cap - 1].add(max_bin)
+        # Decrement the total unallocated units
+        total -= 1
+        # If no more bins have this capacity, then
+        # remove the corresponding set
+        if len(d[max_cap]) == 0:
+            d.pop(max_cap)
+
+    return allocation
+
+
 def compute_crc32c(path, fast = False):
     """
     Adapted from localization/file_handlers.py.
     """
-    hash_alg = google_crc32c.Checksum()
-    buffer_size = 1024 * 1024
+    buffer_size = 1024*1024
 
     if os.path.isdir(path):
-        files = glob.iglob(path + "/**", recursive = True)
+        files = glob.glob(path + "/**", recursive = True)
+        # Filter out intermediate directories
+        files = [f for f in files if not os.path.isdir(f)] 
     else:
         files = [path]
+    n_files = len(files)
 
-    for f in files:
-        if os.path.isdir(f):
-            continue
+    # Get sizes of all files
+    file_sizes = [int(os.path.getsize(f)) for f in files]
+    file_sizes_MiB = [max(int(fs/1024**2), 1) for fs in file_sizes]
 
-        file_size = int(os.path.getsize(f))
-        file_size_MiB = int(file_size/1024**2)
-        print(f"Hashing file {f} ({file_size_MiB} MiB)", file = sys.stderr, flush = True)
+    # We want to update the checksum at most max(n_files, 1024) times.
+    # That is, if we have many files then we should hash them shallowly;
+    # and if we have few files then we can hash them more deeply.
+    capacities = [max(fs_MiB-1, 0) for fs_MiB in file_sizes_MiB]
+    to_allocate = 1024-n_files
+    n_updates = allocate_to_bins(capacities, to_allocate)
+    total_updates = sum(n_updates)
 
-        # if fast mode is enabled, only compute hash at 1024 locations in each
-        # file (equivalent to number of iterations to hash a 1 GiB file)
-        skip_size = 0
-        if file_size_MiB > 1024 and fast:
-            skip_size = int(file_size//(1024**3/buffer_size) - buffer_size)
-            print(f"{f} is >1 GiB; using fast mode", file = sys.stderr, flush = True)
+    # Now, compute the checksum using an appropriate number
+    # of updates from each file
+    hash_alg = google_crc32c.Checksum()
+    ct = 0
+    for f, n_u in zip(files, n_updates):
+        if ct % 100 == 0:
+            print(f"Hashing file {f}; {ct}/{total_updates} hashes computed", file = sys.stderr, flush = True)
 
-        c = 0
-        ct = 0
         with open(f, "rb") as fp:
-            while True:
-                # in slow mode: output message every ~100 MB (1 GiB/(10*buffer size))
-                # in fast mode: output message every 100 hash operations
-                if c > 0 and ((not fast and not c % int(1024/10)) or (fast and not c % 100)):
-                    print(f"Hashing file {f}; {int(buffer_size*ct/1024**2)}/{file_size_MiB} MiB completed", file = sys.stderr, flush = True)
-
+            for i in range(n_u):
+                fp.seek(i*buffer_size, 1)
                 data = fp.read(buffer_size)
-                if not data:
-                    break
                 hash_alg.update(data)
-                if fast and skip_size > 0:
-                    fp.seek(skip_size, 1)
-                    ct += (skip_size + buffer_size)//buffer_size
-                else:
-                    ct += 1
-                c += 1
+                ct += 1
 
-    return hash_alg.hexdigest().decode().upper()
+    return hash_alg.hexdigest.decode().upper()
+
+
+#    for f in files:
+#        if os.path.isdir(f):
+#            continue
+#
+#        file_size = int(os.path.getsize(f))
+#        file_size_MiB = int(file_size/1024**2)
+#        print(f"Hashing file {f} ({file_size_MiB} MiB)", file = sys.stderr, flush = True)
+#
+#        # if fast mode is enabled, only compute hash at 1024 locations in each
+#        # file (equivalent to number of iterations to hash a 1 GiB file)
+#        skip_size = 0
+#        if file_size_MiB > 1024 and fast:
+#            skip_size = int(file_size//(1024**3/buffer_size) - buffer_size)
+#            print(f"{f} is >1 GiB; using fast mode", file = sys.stderr, flush = True)
+#
+#        c = 0
+#        ct = 0
+#        with open(f, "rb") as fp:
+#            while True:
+#                # in slow mode: output message every ~100 MB (1 GiB/(10*buffer size))
+#                # in fast mode: output message every 100 hash operations
+#                if c > 0 and ((not fast and not c % int(1024/10)) or (fast and not c % 100)):
+#                    print(f"Hashing file {f}; {int(buffer_size*ct/1024**2)}/{file_size_MiB} MiB completed", file = sys.stderr, flush = True)
+#
+#                data = fp.read(buffer_size)
+#                if not data:
+#                    break
+#                hash_alg.update(data)
+#                if fast and skip_size > 0:
+#                    fp.seek(skip_size, 1)
+#                    ct += (skip_size + buffer_size)//buffer_size
+#                else:
+#                    ct += 1
+#                c += 1
+#
+#    return hash_alg.hexdigest().decode().upper()
 
 def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
     jobdir = os.path.join(output_dir, str(jobId))
