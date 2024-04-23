@@ -103,7 +103,7 @@ def compute_crc32c(path, fast = False):
                 hash_alg.update(data)
                 ct += 1
 
-    return hash_alg.hexdigest.decode().upper()
+    return hash_alg.hexdigest().decode().upper()
 
 
 #    for f in files:
