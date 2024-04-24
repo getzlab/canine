@@ -86,6 +86,7 @@ def compute_crc32c(path, fast = False):
     capacities = [max(fs_MiB-1, 0) for fs_MiB in file_sizes_MiB]
     to_allocate = 1024-n_files
     n_updates = allocate_to_bins(capacities, to_allocate)
+    n_updates = [1 + nu for nu in n_updates]
     total_updates = sum(n_updates)
 
     # Now, compute the checksum using an appropriate number
