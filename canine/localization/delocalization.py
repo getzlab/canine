@@ -94,8 +94,7 @@ def compute_crc32c(path, fast = False):
     hash_alg = google_crc32c.Checksum()
     ct = 0
     for f, n_u in zip(files, n_updates):
-        if ct % 100 == 0:
-            print(f"Hashing file {f}; {ct}/{total_updates} hashes computed", file = sys.stderr, flush = True)
+        print(f"Hashing file {f}; {ct}/{total_updates} hashes computed", file = sys.stderr, flush = True)
 
         with open(f, "rb") as fp:
             for i in range(n_u):
@@ -103,6 +102,8 @@ def compute_crc32c(path, fast = False):
                 data = fp.read(buffer_size)
                 hash_alg.update(data)
                 ct += 1
+                if ct % 100 == 0:
+                    print(f"Hashing file {f}; {ct}/{total_updates} hashes computed", file = sys.stderr, flush = True)
 
     return hash_alg.hexdigest().decode().upper()
 
