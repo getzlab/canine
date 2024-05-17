@@ -178,7 +178,7 @@ class AbstractLocalizer(abc.ABC):
                 # Try again ls-ing the object itself
                 # sometimes permissions can disallow bucket inspection
                 # but allow object inspection
-                command = 'gsutil ls gs://{}'.format(path)
+                command = 'gcloud storage ls gs://{}'.format(path)
                 rc, sout, serr = self.backend.invoke(command)
                 text = serr.read()
                 self.requester_pays[bucket] = b'requester pays bucket but no user project provided' in text
@@ -192,8 +192,8 @@ class AbstractLocalizer(abc.ABC):
         Returns the total number of bytes of the given gsutil object.
         If a directory is given, this will return the total space used by all objects in the directory
         """
-        cmd = 'gsutil {} du -s {}'.format(
-            '-u {}'.format(self.project) if self.get_requester_pays(path) else '',
+        cmd = 'gcloud storage {} du -s {}'.format(
+            '--billing-project={}'.format(self.project) if self.get_requester_pays(path) else '',
             path
         )
         rc, sout, serr = self.backend.invoke(cmd)
@@ -263,8 +263,8 @@ class AbstractLocalizer(abc.ABC):
                 self.backend.invoke('touch {}/.canine_dir_marker'.format(src))
             else:
                 subprocess.run(['touch', '{}/.canine_dir_marker'.format(src)])
-        command = "gsutil -m -o GSUtil:check_hashes=if_fast_else_skip -o GSUtil:parallel_composite_upload_threshold=150M {} cp -r {} {}".format(
-            '-u {}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
+        command = "gcloud config set storage/check_hashes if_fast_else_skip && gcloud config set storage/parallel_composite_upload_threshold 150M && gcloud storage {} cp -r {} {}".format(
+            '--billing-project={}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
         )
@@ -308,8 +308,8 @@ class AbstractLocalizer(abc.ABC):
             # Procede as a regular gs_copy
             traceback.print_exc()
 
-        command = "gsutil -o GSUtil:check_hashes=if_fast_else_skip -o GSUtil:parallel_composite_upload_threshold=150M {} cp {} {}".format(
-            '-u {}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
+        command = "gcloud config set storage/check_hashes if_fast_else_skip && gcloud config set storage/parallel_composite_upload_threshold 150M && gcloud storage {} cp {} {}".format(
+            '--billing-project={}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
         )
@@ -361,8 +361,8 @@ class AbstractLocalizer(abc.ABC):
                         file=sys.stderr, type = "error"
                     )
                     raise
-                cmd = "gsutil -m {} rm -r gs://{}/{}".format(
-                    '-u {}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
+                cmd = "gcloud storage {} rm -r gs://{}/{}".format(
+                    '--billing-project={}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
@@ -417,8 +417,8 @@ class AbstractLocalizer(abc.ABC):
                         file=sys.stderr, type="error"
                     )
                     raise
-                cmd = "gsutil -m {} rm -r gs://{}/{}".format(
-                    '-u {}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
+                cmd = "gcloud storage {} rm -r gs://{}/{}".format(
+                    '--billing-project={}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )

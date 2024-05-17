@@ -155,7 +155,7 @@ class HandleGSURL(FileType):
         if self.get_requester_pays():
             if "project" not in self.extra_args:
                 raise ValueError(f"File {self.path} resides in a requester-pays bucket but no user project provided")
-            self.rp_string = f' -u {self.extra_args["project"]}'
+            self.rp_string = f' --billing-project={self.extra_args["project"]}'
 
         # is this URL a directory?
         self.is_dir = False
@@ -224,16 +224,16 @@ class HandleGSURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
-        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'gsutil {self.rp_string} -o "GSUtil:state_dir={dest_dir}/.gsutil_state_dir" cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
+        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'gcloud config set storage/tracker_files_directory {dest_dir}/.gsutil_state_dir && gcloud storage {self.rp_string} cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
 
 class HandleGSURLStream(HandleGSURL):
     localization_mode = "stream"
 
     def localization_command(self, dest):
-        return "\n".join(['gsutil {} ls {} > /dev/null'.format(self.rp_string, shlex.quote(self.path)),
+        return "\n".join(['gcloud storage {} ls {} > /dev/null'.format(self.rp_string, shlex.quote(self.path)),
         'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
         'mkfifo {}'.format(dest),
-        "gsutil {} cat {} > {} &".format(
+        "gcloud storage {} cat {} > {} &".format(
             self.rp_string,
             shlex.quote(self.path),
             dest

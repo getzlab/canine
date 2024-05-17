@@ -307,7 +307,7 @@ class TestIntegration(unittest.TestCase):
                                         self.assertIn(
                                             'if [[ -e {dest} ]]; then rm {dest}; fi\n'
                                             'mkfifo {dest}\n'
-                                            'gsutil  cat {src} > {dest} &'.format(
+                                            'gcloud storage cat {src} > {dest} &'.format(
                                                 src=src,
                                                 dest=path
                                             ),
@@ -317,9 +317,9 @@ class TestIntegration(unittest.TestCase):
                                         src = path
                                         path = localizer.reserve_path('jobs', str(jid), 'inputs', os.path.basename(os.path.abspath(src))).remotepath
                                         self.assertIn(
-                                            'if [[ ! -e {dest}.fin ]]; then gsutil  '
-                                            '-o GSUtil:check_hashes=if_fast_else_skip'
-                                            ' cp {src} {dest} && touch {dest}.fin'.format(
+                                            'if [[ ! -e {dest}.fin ]]; then gcloud config '
+                                            'set storage/check_hashes if_fast_else_skip &&'
+                                            ' gcloud storage cp {src} {dest} && touch {dest}.fin'.format(
                                                 src=src,
                                                 dest=path
                                             ),
