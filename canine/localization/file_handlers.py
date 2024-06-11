@@ -226,7 +226,7 @@ class HandleGSURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
-        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'gcloud config set storage/tracker_files_directory {dest_dir}/.gsutil_state_dir &&' + (f'gcloud storage {self.rp_string} cp -r -n -J -L "{dest_dir}/.gsutil_manifest" {self.path}.tar.gz {self.localized_path}.tar.gz && tar -xzf {self.localized_path}.tar.gz || 'if self.is_dir else "") + f'gcloud storage {self.rp_string} cp -r -n -J -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
+        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'gcloud config set storage/tracker_files_directory {dest_dir}/.gsutil_state_dir &&' + (f'gcloud storage {self.rp_string} cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path}.tar.gz {self.localized_path}.tar.gz && tar -xzf {self.localized_path}.tar.gz || 'if self.is_dir else "") + f'gcloud storage {self.rp_string} cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
 
 class HandleGSURLStream(HandleGSURL):
     localization_mode = "stream"
