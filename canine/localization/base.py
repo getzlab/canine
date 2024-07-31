@@ -624,7 +624,8 @@ class AbstractLocalizer(abc.ABC):
             # with the file type
             if mode is not False: 
                 # user wants to stream a URL, rather than download it
-                if mode == 'stream':
+                if mode == 'stream' and value.localization_mode != "stream":
+                    # if handler itself does not have localization_mode == "stream",
                     # check if we can stream this, by seeing if any subclasses
                     # implement localization_mode == "stream"
                     stream_subclass = None
