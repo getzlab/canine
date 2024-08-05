@@ -171,24 +171,30 @@ class HandleGSURL(FileType):
         bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args["project"] if "project" in self.extra_args else None)
 
         # check whether this path exists, and whether it's a directory
-        exists = False
-        blob_obj = None
-        # list_blobs is completely ignorant of "/" as a delimiter
-        # prefix = "dir/b" will list
-        # dir/b (may not even exist as a standalone "directory")
-        # dir/b/file1
-        # dir/b/file2
-        # dir/boy
-        for b in gcs_cl.list_blobs(bucket_obj, prefix = obj_name):
-            if b.name == obj_name:
-                exists = True
-                blob_obj = b
-            # a blob starting with <obj_name>/ is a directory
-            if b.name.startswith(obj_name + "/"):
-                exists = True
-                self.is_dir = True
-                blob_obj = b
-                break
+        
+        # check whether object exists
+        blob_obj = google.cloud.storage.Blob(bucket=bucket_obj, name=obj_name)
+        exists = blob_obj.exists(gcs_cl)
+
+        if exists:
+            # Need to do this so we have the hash attribute later
+            blob_obj.reload()
+        else:
+            ## If not, try checking to see if it's a directory
+        
+            # list_blobs is completely ignorant of "/" as a delimiter
+            # prefix = "dir/b" will list
+            # dir/b (may not even exist as a standalone "directory")
+            # dir/b/file1
+            # dir/b/file2
+            # dir/boy
+            for b in gcs_cl.list_blobs(bucket_obj, prefix = obj_name):
+                # a blob starting with <obj_name>/ is a directory
+                if b.name.startswith(obj_name + "/"):
+                    exists = True
+                    self.is_dir = True
+                    blob_obj = b
+                    break
 
         if not exists:
             raise GSFileNotExists("{} does not exist.".format(self.path))
