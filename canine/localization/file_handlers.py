@@ -128,7 +128,7 @@ class HandleGSURL(FileType):
 
         gcs_cl = gcloud_storage_client()
         bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args.get("project"))
-
+        bucket_obj.reload() 
         return bucket_obj.requester_pays
 
 # TODO: handle case where permissions disallow bucket inspection?
