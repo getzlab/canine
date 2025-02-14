@@ -164,9 +164,43 @@ class StringifyTypeError(TypeError):
     pass
 
 class Orchestrator(object):
-    """
-    Main class
-    Parses a configuration object, initializes, runs, and cleans up a Canine Pipeline
+    """Orchestrates the execution of computational jobs on a Slurm cluster.
+
+    This class handles job submission, resource management, and file localization
+    for computational tasks running on Slurm. Instances of this class are initialized
+    in the Task class. It serves as the bridge between the Task class and the Slurm backend.
+
+    Parameters
+    ----------
+    config : dict
+        Configuration dictionary containing:
+        - name: Name of the job
+        - script: Script to execute
+        - resources: Resource requirements 
+        - inputs: Input parameters
+        - outputs: Expected output files
+        - localization: File localization settings
+    backend : AbstractSlurmBackend, optional
+        Slurm backend to use. If None, uses the backend from config.
+
+    Attributes
+    ----------
+    name : str
+        Name of the job
+    script : str or list
+        Script to execute
+    resources : dict
+        Resource requirements that will be passed to Slurm.
+        Common keys include:
+        - cpus-per-task: Number of CPUs per task
+        - mem: Memory per node (e.g. "16G") 
+        - time: Time limit (e.g. "24:00:00")
+    inputs : dict
+        Input parameters
+    outputs : dict
+        Expected output files
+    backend : AbstractSlurmBackend
+        Slurm backend instance
     """
 
     @staticmethod
@@ -652,6 +686,38 @@ class Orchestrator(object):
         return df
 
     def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}, job_spec = None) -> int:
+        """Submits a batch job to Slurm with the specified resources and configuration.
+
+        This method handles submitting the job to Slurm via sbatch, passing in:
+            - Script to execute
+            - Resource requirements (from Task.resources via Orchestrator.resources)
+            - Slurm arguments (from Task.extra_slurm_args passed in as extra_sbatch_args)
+            - Job name (from Task.name via Orchestrator.name)
+            - Job array configuration for multiple shards
+            - Output/error file paths
+
+        This method is called by Task.run() when running wolF and is called by Orchestrator.run_pipeline() when running canine directly.
+        
+        Parameters
+        ----------
+        entrypoint_path : str
+            Path to the script that will be executed
+        compute_env : dict
+            Environment variables to set for the job, including CANINE_JOBS
+        extra_sbatch_args : dict, optional
+            Additional arguments to pass to sbatch. Can include:
+            - Flags (value=None): Added as --flag
+            - Parameters (value=str): Added as --param=value
+        job_spec : dict, optional
+            Job specification dictionary. If None, uses self.job_spec
+            
+        Returns
+        -------
+        int
+            Slurm batch job ID, or:
+            -2 if all jobs were avoided
+            -1 if submission failed
+        """
         if job_spec is None:
             job_spec = self.job_spec
 
