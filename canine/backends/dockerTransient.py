@@ -39,6 +39,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
         clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
     ):
+        image_family = "n4-hyperdisk-docker-test"
+        image_project = "broad-tcga-thca-pran-3"
         if user is None:
             if "USER" in os.environ:
                 user = os.environ["USER"]
