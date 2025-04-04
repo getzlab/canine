@@ -48,8 +48,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
 
     def __init__(
         self, name: str = 'slurm-canine', *, max_node_count: int = 10, compute_zone: typing.Optional[str] = None,
-        controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1', preemptible: bool = True,
-        worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
+        controller_type: str = 'n4-standard-16', login_type: str = 'n4-standard-1', preemptible: bool = True,
+        worker_type: str = 'n4-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
         external_compute_ips: bool = False, **kwargs : typing.Any
@@ -75,9 +75,9 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "cidr": "10.10.0.0/16",
           "controller_machine_type": controller_type,
           "compute_machine_type": worker_type,
-          "compute_disk_type": "pd-standard",
+          "compute_disk_type": "hyperdisk-standard",
           "compute_disk_size_gb": int(compute_disk_size),
-          "controller_disk_type": "pd-ssd",
+          "controller_disk_type": "hyperdisk-standard",
           "controller_disk_size_gb": int(controller_disk_size),
           "controller_secondary_disk": secondary_disk_size > 0,
           "external_compute_ips": True,
@@ -102,7 +102,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             self.config['gpu_count'] = gpu_count
 
         if secondary_disk_size > 0:
-            self.config['controller_secondary_disk_type'] = 'pd-standard'
+            self.config['controller_secondary_disk_type'] = 'hyperdisk-standard' # slw disk type for transient slurm
             self.config['controller_secondary_disk_size_gb'] = secondary_disk_size
 
         self.startup_script = """
@@ -300,7 +300,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 'mtype': self.config['compute_machine_type'],
                 'preemptible': self.config['preemptible_bursting']
             }
-            if self.config['compute_disk_type'] == 'pd-ssd':
+            if self.config['compute_disk_type'] == 'pd-ssd': # slw ignoring for now
                 worker_info['ssd_size'] = self.config['compute_disk_size_gb']
             else:
                 worker_info['hdd_size'] = self.config['compute_disk_size_gb']

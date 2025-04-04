@@ -74,7 +74,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
     def __init__(
         self, *, image: str, worker_prefix: str = 'slurm-canine', tot_node_count: int = 50,
         init_node_count: typing.Optional[int] = None, compute_zone: typing.Optional[str] = None,
-        worker_type: str = 'n1-highcpu-2', preemptible: bool = True,
+        worker_type: str = 'n4-highcpu-2', preemptible: bool = True,
         gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         startup_script_file: typing.Optional[str] = None,
         startup_script: typing.Optional[str] = None,
