@@ -51,12 +51,12 @@ def boot_transient():
     parser.add_argument(
         '-c', '--controller-type',
         help="Instance type for controller node",
-        default="n1-standard-16"
+        default="n4-balanced-16"
     )
     parser.add_argument(
         '-w', '--worker-type',
         help="Instance type for compute node",
-        default="n1-highcpu-2"
+        default="n4-highcpu-2"
     )
     parser.add_argument(
         '-s', '--controller-disk-size',
