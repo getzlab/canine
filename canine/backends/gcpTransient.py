@@ -75,7 +75,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "cidr": "10.10.0.0/16",
           "controller_machine_type": controller_type,
           "compute_machine_type": worker_type,
-          "compute_disk_type": "hyperdisk-balanced",
+          "compute_disk_type": "pd-standard",
           "compute_disk_size_gb": int(compute_disk_size),
           "controller_disk_type": "hyperdisk-balanced",
           "controller_disk_size_gb": int(controller_disk_size),

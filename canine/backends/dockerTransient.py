@@ -39,7 +39,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
         clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
     ):
-        image_family = "n4-hyperdisk-docker-test"
+        image_family = "n4-standard-docker-test"
         image_project = "broad-tcga-wgs-thca-pran-3"
         if user is None:
             if "USER" in os.environ:
@@ -106,7 +106,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # check if image exists
         try:
-            image = self.dkr.images.get(f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker_n4:latest')
+            image = self.dkr.images.get(f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker_n4_s:latest')
         except docker.errors.ImageNotFound:
             raise Exception("You have not yet built or pulled the Slurm Docker image!")
         except RConnectionError as e:
