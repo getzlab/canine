@@ -925,10 +925,10 @@ class AbstractLocalizer(abc.ABC):
           'kill $(cat .diskresizedaemon_pid) || : &> /dev/null'
         ]
 
-        # scratch disks get labeled "finalized" if the task ran OK.
+        # scratch disks get labeled "finalized" if the task ran OK. also get explicitly marked as read-only, which is necessary for hyperdisks
         if is_scratch_disk:
             teardown_script += [
-              'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}; fi'.format(
+              'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string} && gcloud compute disks update {disk_name} --access-mode=READ_ONLY_MANY; fi'.format(
                 disk_name = disk_name,
                 protect_string = (",protect=yes" if self.protect_disk else "")
               )
