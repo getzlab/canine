@@ -14,7 +14,7 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.15.6'
+version = '0.16.0'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -531,8 +531,8 @@ class Orchestrator(object):
                 acct = self.backend.sacct(
                   "D",
                   job = batch_id,
-                  format = "JobId%50,State,ExitCode,CPUTimeRAW,ResvCPURAW,Submit"
-                ).astype({'CPUTimeRAW': int, "ResvCPURAW" : float, "Submit" : np.datetime64})
+                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit"
+                ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : np.datetime64})
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
@@ -542,9 +542,9 @@ class Orchestrator(object):
                 else:
                     backoff_factor *= 1.1
             acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))]
-            acct.loc[acct["ResvCPURAW"].isna(), "ResvCPURAW"] = 0
-            acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "ResvCPURAW"].astype(int)
-            acct = acct.drop(columns = ["ResvCPURAW"])
+            acct.loc[acct["PlannedCPURAW"].isna(), "PlannedCPURAW"] = 0
+            acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "PlannedCPURAW"].astype(int)
+            acct = acct.drop(columns = ["PlannedCPURAW"])
             acct = acct.groupby(acct.index).apply(grouper)
 
             for jid in [*waiting_jobs]:

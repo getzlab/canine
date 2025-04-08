@@ -33,7 +33,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
         action_on_stop = "delete",
-        image_family = "slurm-gcp-docker-v1",
+        image_family = "slurm-gcp-docker-v2",
         image_project = "broad-getzlab-workflows",
         image = None,
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
