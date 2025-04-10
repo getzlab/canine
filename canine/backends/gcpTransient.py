@@ -48,7 +48,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
 
     def __init__(
         self, name: str = 'slurm-canine', *, max_node_count: int = 10, compute_zone: typing.Optional[str] = None,
-        controller_type: str = 'n1-standard-16', login_type: str = 'n1-standard-1', preemptible: bool = True,
+        controller_type: str = 'n4-standard-16', login_type: str = 'n1-standard-1', preemptible: bool = True,
         worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
@@ -75,9 +75,9 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "cidr": "10.10.0.0/16",
           "controller_machine_type": controller_type,
           "compute_machine_type": worker_type,
-          "compute_disk_type": "pd-standard",
+          "compute_disk_type": "pd-balanced",
           "compute_disk_size_gb": int(compute_disk_size),
-          "controller_disk_type": "pd-ssd",
+          "controller_disk_type": "hyperdisk-balanced",
           "controller_disk_size_gb": int(controller_disk_size),
           "controller_secondary_disk": secondary_disk_size > 0,
           "external_compute_ips": True,
@@ -102,7 +102,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             self.config['gpu_count'] = gpu_count
 
         if secondary_disk_size > 0:
-            self.config['controller_secondary_disk_type'] = 'pd-standard'
+            self.config['controller_secondary_disk_type'] = 'hyperdisk-balanced'
             self.config['controller_secondary_disk_size_gb'] = secondary_disk_size
 
         self.startup_script = """
