@@ -807,7 +807,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## create disk
             'if ! gcloud compute disks describe "${GCP_DISK_NAME}" --zone ${CANINE_NODE_ZONE}; then',
-            'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type pd-ssd --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
+            'gcloud compute disks create "${GCP_DISK_NAME}" --size "${GCP_DISK_SIZE}GB" --type hyperdisk-ml --zone "${CANINE_NODE_ZONE}" --labels wolf=canine',
             'fi',
 
             ## if this is a scratch disk, label it as such

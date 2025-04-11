@@ -48,8 +48,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
 
     def __init__(
         self, name: str = 'slurm-canine', *, max_node_count: int = 10, compute_zone: typing.Optional[str] = None,
-        controller_type: str = 'n4-standard-16', login_type: str = 'n1-standard-1', preemptible: bool = True,
-        worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
+        controller_type: str = 'n4-standard-16', login_type: str = 'n4-standard-2', preemptible: bool = True,
+        worker_type: str = 'c3-highcpu-4', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
         external_compute_ips: bool = False, **kwargs : typing.Any
@@ -75,7 +75,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           "cidr": "10.10.0.0/16",
           "controller_machine_type": controller_type,
           "compute_machine_type": worker_type,
-          "compute_disk_type": "pd-ssd",
+          "compute_disk_type": "hyperdisk-ml",
           "compute_disk_size_gb": int(compute_disk_size),
           "controller_disk_type": "hyperdisk-balanced",
           "controller_disk_size_gb": int(controller_disk_size),
@@ -162,7 +162,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
 
         # User may also provide an NFS server IP
 
-        # 1) create NFS: (n1-highcpu-16 [16CPU, 14GB, 4GB SW], SSD w/ user GB)
+        # 1) create NFS: (n4-highcpu-16 [16CPU, 14GB, 4GB SW], SSD w/ user GB)
         # 2) SCP setup script to NFS
         # 3) SSH into NFS, run script
         try:
@@ -300,7 +300,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 'mtype': self.config['compute_machine_type'],
                 'preemptible': self.config['preemptible_bursting']
             }
-            if self.config['compute_disk_type'] == 'pd-ssd':
+            if self.config['compute_disk_type'] == 'hyperdisk-ml':
                 worker_info['ssd_size'] = self.config['compute_disk_size_gb']
             else:
                 worker_info['hdd_size'] = self.config['compute_disk_size_gb']
@@ -323,7 +323,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 'mtype': self.config['controller_machine_type'],
                 'preemptible': False,
             }
-            if self.config['controller_disk_type'] == 'pd-ssd':
+            if self.config['controller_disk_type'] == 'hyperdisk-ml':
                 controller_info['ssd_size'] = self.config['controller_disk_size_gb']
             else:
                 controller_info['hdd_size'] = self.config['controller_disk_size_gb']
