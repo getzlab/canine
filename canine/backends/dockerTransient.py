@@ -40,7 +40,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
     ):
         image_family = "n4-h-n1-ssd"
-        image_project = "broad-tcga-wgs-thca-pran-5"
+        image_project = "broad-tcga-wgs-thca-pran-6"
         if user is None:
             if "USER" in os.environ:
                 user = os.environ["USER"]
