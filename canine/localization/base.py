@@ -928,10 +928,10 @@ class AbstractLocalizer(abc.ABC):
         # scratch disks get labeled "finalized" if the task ran OK.
         if is_scratch_disk:
             teardown_script += [
-              'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}; fi'.format(
-                disk_name = disk_name,
-                protect_string = (",protect=yes" if self.protect_disk else "")
-              )
+                'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string} && gcloud compute disks update {disk_name} --access-mode=READ_ONLY_MANY; fi'.format(
+                    disk_name = disk_name,
+                    protect_string = (",protect=yes" if self.protect_disk else "")
+                )
             ]
 
             # we also need to leave the job workspace directory before anything else
