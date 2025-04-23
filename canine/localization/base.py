@@ -725,7 +725,10 @@ class AbstractLocalizer(abc.ABC):
 
             ## Calculate disk size
             disk_size = F.loc[F["localize"], "size"].sum()
-            disk_size = max(10, 1 + int(disk_size/1022611260)) # bytes -> gib with 5% safety margin
+            #There used to be a bug here: Note that GB is 10^9, while gibibyte is 2^30, so when 
+            #a disk is allocated in google cloud, the size is in GB. So, don't divide the size by
+            #0.95*2**30 (as was done before) but instead with 0.95*10**9
+            disk_size = max(10, 1 + int(disk_size / (0.95*10**9))) # bytes -> gib with 5% safety margin
 
             ## Save RODISK paths for subsequent use by downstream tasks
             rodisk_paths = F.loc[F["localize"], :].groupby("input")["disk_path"].apply(list).to_dict()
@@ -1043,9 +1046,12 @@ class AbstractLocalizer(abc.ABC):
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
         if local_download_size > 0 and self.temporary_disk_type is not None:
+            #There used to be a bug here: Note that GB is 10^9, while gibibyte is 2^30, so when 
+            #the size is calculated, don't divide the size by
+            #0.95*2**30 (as was done before) but instead with 0.95*10**9
             local_download_size = max(
                 10,
-                1+int(local_download_size / 1022611260) # bytes -> gib with 5% safety margin
+                1+int(local_download_size / (0.95*10**9)) # bytes -> gib with 5% safety margin
             )
             if local_download_size > 65535:
                 raise ValueError("Cannot provision {} GB disk for job {}".format(local_download_size, jobId))
