@@ -663,7 +663,7 @@ class Orchestrator(object):
             return -2
 
         # remove noop'd jobs from array spec
-        op_idx = sorted(k for k, v in job_spec.items() if v is not None)
+        op_idx = sorted(int(k) for k, v in job_spec.items() if v is not None)
         array_range = []
         for k, g in groupby(enumerate(op_idx), lambda i: i[0]-i[1]):
             group = list(map(itemgetter(1), g))
