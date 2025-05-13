@@ -14,7 +14,10 @@ import yaml
 import numpy as np
 import pandas as pd
 from agutil import status_bar
-version = '0.16.1'
+from operator import itemgetter
+from itertools import groupby
+
+version = '0.16.2'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -660,10 +663,15 @@ class Orchestrator(object):
             return -2
 
         # remove noop'd jobs from array spec
-        noop_idx = np.r_[-1, np.array([k for k, v in job_spec.items() if v is None], dtype = int), len(job_spec)]
-        array_range = np.c_[noop_idx[:-1] + 1, noop_idx[1:] - 1]
-        array_range = array_range[(np.diff(array_range, 1) >= 0).ravel(), :].astype(str).astype(object)
-        array_str = ",".join(array_range[:, 0] + "-" + array_range[:, 1])
+        op_idx = sorted(int(k) for k, v in job_spec.items() if v is not None)
+        array_range = []
+        for k, g in groupby(enumerate(op_idx), lambda i: i[0]-i[1]):
+            group = list(map(itemgetter(1), g))
+            if len(group) > 1:
+                array_range += [f"{group[0]}-{group[-1]}"]
+            else:
+                array_range += [str(group[0])]
+        array_str = ",".join(array_range)
 
         # parse out flags vs. params in extra_sbatch_args
         flags = [k for k, v in extra_sbatch_args.items() if v is None]
