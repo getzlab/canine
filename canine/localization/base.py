@@ -671,7 +671,6 @@ class AbstractLocalizer(abc.ABC):
     def create_persistent_disk(self,
       file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
       disk_name: str = None,
-      disk_size: int = 0,
       dry_run = False
     ):
         """
@@ -724,11 +723,11 @@ class AbstractLocalizer(abc.ABC):
             F.loc[F["localize"], "disk_path"] = "rodisk://" + disk_name + "/" + F.loc[F["localize"], ["input", "file_basename"]].apply(lambda x: "/".join(x), axis = 1)
 
             ## Calculate disk size
-            disk_size = F.loc[F["localize"], "size"].sum()
+            raw_disk_size = F.loc[F["localize"], "size"].sum()
             #There used to be a bug here: Note that GB is 10^9, while gibibyte is 2^30, so when 
             #a disk is allocated in google cloud, the size is in GB. So, don't divide the size by
             #0.95*2**30 (as was done before) but instead with 0.95*10**9
-            disk_size = max(10, 1 + int(disk_size / (0.95*10**9))) # bytes -> gigabytes (not gibibytes) with 5% safety margin
+            disk_size = max(self.scratch_disk_size, 1 + int(raw_disk_size / (0.95*10**9))) # bytes -> gigabytes (not gibibytes) with 5% safety margin
 
             ## Save RODISK paths for subsequent use by downstream tasks
             rodisk_paths = F.loc[F["localize"], :].groupby("input")["disk_path"].apply(list).to_dict()
@@ -741,8 +740,8 @@ class AbstractLocalizer(abc.ABC):
         # otherwise, we create a blank disk with a given name (if specified),
         # otherwise random
         else:
-            disk_name = "canine-scratch-{}".format(disk_name if disk_name is not None else os.urandom(4).hex())
-            disk_size = max(10, disk_size)
+            disk_name = "canine-scratch-{}".format(disk_name if disk_name is not None else os.urandom(16).hex())
+            disk_size = self.scratch_disk_size
             rodisk_paths = None
 
         ## this is a dry run (i.e., don't actually make disk, just return paths)
@@ -1025,7 +1024,6 @@ class AbstractLocalizer(abc.ABC):
             scratch_disk_teardown_script, \
             finished_scratch_disk_url = self.create_persistent_disk(
               disk_name = self.scratch_disk_name + "-" + jobId, # one scratch disk per shard
-              disk_size = self.scratch_disk_size
             )
 
             localization_tasks += scratch_disk_creation_script
