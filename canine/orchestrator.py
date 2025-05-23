@@ -211,7 +211,7 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
-        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "n_preempted" : -1, "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-"}
+        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1}
 
         with localizer.transport_context() as tr:
             for j, v in job_spec.items():
@@ -224,7 +224,7 @@ class Orchestrator(object):
                           header = None,
                           sep = "\t",
                           names = [
-                            "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted","NodeList","Partition","ReqCPUS","NCPUS","ReqMem"
+                            "State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"
                           ]
                         ).astype({
                           'CPUTimeRAW': int,
