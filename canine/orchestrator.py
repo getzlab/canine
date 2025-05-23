@@ -211,7 +211,7 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
-        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "n_preempted" : -1 }
+        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "n_preempted" : -1, "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-"}
 
         with localizer.transport_context() as tr:
             for j, v in job_spec.items():
@@ -224,11 +224,13 @@ class Orchestrator(object):
                           header = None,
                           sep = "\t",
                           names = [
-                            "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"
+                            "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted","NodeList","Partition","ReqCPUS","NCPUS","ReqMem"
                           ]
                         ).astype({
                           'CPUTimeRAW': int,
-                          "Submit" : np.datetime64
+                          "Submit" : np.datetime64,
+                          "ReqCPUS" : int,
+                          "NCPUS" : int,
                         })
 
                     # sacct info is blank (write error?)
@@ -534,8 +536,8 @@ class Orchestrator(object):
                 acct = self.backend.sacct(
                   "D",
                   job = batch_id,
-                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit"
-                ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : np.datetime64})
+                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList,Partition,ReqCPUS,NCPUS,ReqMem"
+                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : np.datetime64, "ReqCPUS" : int, "NCPUS" : int})
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
