@@ -536,7 +536,7 @@ class Orchestrator(object):
                 acct = self.backend.sacct(
                   "D",
                   job = batch_id,
-                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList,Partition,ReqCPUS,NCPUS,ReqMem"
+                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem"
                   ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : np.datetime64, "ReqCPUS" : int, "NCPUS" : int})
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
