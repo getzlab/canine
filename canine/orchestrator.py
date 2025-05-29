@@ -86,7 +86,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       break
     else
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
-      echo -e "!!!! JOB FAILED! (EXIT CODE                 !!!!\e[29G$CANINE_JOB_RC)" >&2
+      printf  "!!!! JOB FAILED! (EXIT CODE %-16s!!!!" "$CANINE_JOB_RC)" >&2
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo $(($([ -f $CANINE_JOB_ROOT/.job_failure_count ] && cat $CANINE_JOB_ROOT/.job_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.job_failure_count
       echo '++++ STARTING JOB CLEANUP ++++' >&2
