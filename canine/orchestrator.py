@@ -86,7 +86,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       break
     else
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
-      printf  "!!!! JOB FAILED! (EXIT CODE %-16s!!!!" "$CANINE_JOB_RC)" >&2
+      printf  "!!!! JOB FAILED! (EXIT CODE %-16s!!!!\n" "$CANINE_JOB_RC)" >&2
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo $(($([ -f $CANINE_JOB_ROOT/.job_failure_count ] && cat $CANINE_JOB_ROOT/.job_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.job_failure_count
       echo '++++ STARTING JOB CLEANUP ++++' >&2
@@ -555,8 +555,6 @@ class Orchestrator(object):
             for jid in [*waiting_jobs]:
                 if jid in acct.index: 
                     job = jid.split('_')[1]
-                    print("JID:", jid)
-                    print("State:", acct['State'][jid])
 
                     # job has completed
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL', 'REQUEUED'} or self.job_spec[job] is None:
