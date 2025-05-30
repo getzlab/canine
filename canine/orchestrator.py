@@ -555,6 +555,8 @@ class Orchestrator(object):
             for jid in [*waiting_jobs]:
                 if jid in acct.index: 
                     job = jid.split('_')[1]
+                    print("JID:", jid)
+                    print("State:", acct['State'][jid])
 
                     # job has completed
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL', 'REQUEUED'} or self.job_spec[job] is None:
