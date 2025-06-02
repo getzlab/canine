@@ -1382,7 +1382,7 @@ class AbstractLocalizer(abc.ABC):
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
                 # 'mv ../stderr ../stdout .',
                 # do not run delocalization script if we're in debug mode
-                'if [[ -z $CANINE_DEBUG_MODE ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag}; fi; fi'.format(
+                'if [[ -z $CANINE_DEBUG_MODE ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag} {retryFlag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag} {retryFlag}; fi; fi'.format(
                     script_path = os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     output_root = compute_env['CANINE_OUTPUT'],
                     shard = jobId,
@@ -1396,6 +1396,7 @@ class AbstractLocalizer(abc.ABC):
                     ),
                     scratchflag = "--scratch" if self.use_scratch_disk else "",
                     finishedflag = "--finished_scratch" if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else "",
+                    retryFlag = "-r "+str(2)
                 ),
 
                 # remove stream dir
