@@ -219,19 +219,38 @@ class Orchestrator(object):
                 jid = str(batch_id) + "_" + j
                 if tr.exists(sacct_path):
                     with tr.open(sacct_path, "r") as f:
-                        acct[jid] = pd.read_csv(
-                          f,
-                          header = None,
-                          sep = "\t",
-                          names = [
-                            "State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"
-                          ]
-                        ).astype({
-                          'CPUTimeRAW': int,
-                          "Submit" : np.datetime64,
-                          "ReqCPUS" : int,
-                          "NCPUS" : int,
-                        })
+                        try:
+                            acct[jid] = pd.read_csv(
+                              f,
+                              header = None,
+                              sep = "\t",
+                              names = [
+                                "State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"
+                              ]
+                            ).astype({
+                              'CPUTimeRAW': int,
+                              "Submit" : np.datetime64,
+                              "ReqCPUS" : int,
+                              "NCPUS" : int,
+                            })
+                        except:
+                            a = pd.read_csv(
+                              f,
+                              header = None,
+                              sep = "\t",
+                              names = [
+                                "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"
+                              ]
+                            ).astype({
+                              'CPUTimeRAW': int,
+                              "Submit" : np.datetime64,
+                            })
+                            a["NodeList"] = "-"
+                            a["Partition"] = "-"
+                            a["ReqCPUS"] = -1
+                            a["NCPUS"] = -1
+                            a["ReqMem"] = "-"
+                            acct[jid] = a["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"]
 
                     # sacct info is blank (write error?)
                     if acct[jid].empty:
