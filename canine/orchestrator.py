@@ -250,7 +250,7 @@ class Orchestrator(object):
                             a["ReqCPUS"] = -1
                             a["NCPUS"] = -1
                             a["ReqMem"] = "-"
-                            acct[jid] = a["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"]
+                            acct[jid] = a[["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"]]
 
                     # sacct info is blank (write error?)
                     if acct[jid].empty:
