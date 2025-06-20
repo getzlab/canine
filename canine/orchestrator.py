@@ -167,9 +167,43 @@ class StringifyTypeError(TypeError):
     pass
 
 class Orchestrator(object):
-    """
-    Main class
-    Parses a configuration object, initializes, runs, and cleans up a Canine Pipeline
+    """Orchestrates the execution of computational jobs on a Slurm cluster.
+
+    This class handles job submission, resource management, and file localization
+    for computational tasks running on Slurm. Instances of this class are initialized
+    in the Task class. It serves as the bridge between the Task class and the Slurm backend.
+
+    Parameters
+    ----------
+    config : dict
+        Configuration dictionary containing:
+        - name: Name of the job
+        - script: Script to execute
+        - resources: Resource requirements 
+        - inputs: Input parameters
+        - outputs: Expected output files
+        - localization: File localization settings
+    backend : AbstractSlurmBackend, optional
+        Slurm backend to use. If None, uses the backend from config.
+
+    Attributes
+    ----------
+    name : str
+        Name of the job
+    script : str or list
+        Script to execute
+    resources : dict
+        Resource requirements that will be passed to Slurm.
+        Common keys include:
+        - cpus-per-task: Number of CPUs per task
+        - mem: Memory per node (e.g. "16G") 
+        - time: Time limit (e.g. "24:00:00")
+    inputs : dict
+        Input parameters
+    outputs : dict
+        Expected output files
+    backend : AbstractSlurmBackend
+        Slurm backend instance
     """
 
     @staticmethod
@@ -585,6 +619,69 @@ class Orchestrator(object):
         return completed_jobs, uptime, acct
 
     def make_output_DF(self, batch_id, job_spec, outputs, acct, localizer = None) -> pd.DataFrame:
+        """Creates a DataFrame containing comprehensive information about job execution and results.
+
+        This function aggregates job execution data, inputs, and outputs into a multi-level column DataFrame.
+        The DataFrame provides a complete view of the job batch execution, including performance metrics,
+        execution states, and all input/output data.
+
+        Parameters
+        ----------
+        batch_id : int or str
+            The Slurm batch job ID, or -2 if all jobs were avoided
+        job_spec : dict
+            Dictionary of job specifications containing input parameters for each job
+        outputs : dict
+            Dictionary of job outputs containing paths or values for each job's output files
+        acct : pd.DataFrame
+            Slurm accounting information containing job states and resource usage
+        localizer : AbstractLocalizer, optional
+            Localizer instance used to save the DataFrame to disk
+
+        Returns
+        -------
+        pd.DataFrame
+            A DataFrame with multi-level columns containing:
+            
+            job level columns:
+                slurm_state : str
+                    Final state of the Slurm job (e.g., 'COMPLETED', 'FAILED')
+                exit_code : str
+                    Exit code of the job (e.g., '0:0' for success)
+                cpu_seconds : int
+                    Total CPU time used by the job
+                submit_time : datetime64
+                    When the job was submitted
+                n_preempted : int
+                    Number of times the job was preempted
+            
+            inputs level columns:
+                Contains all input parameters passed to each job
+                Column names match the parameter names
+            
+            outputs level columns:
+                Contains all output files/data from each job
+                Includes standard stdout/stderr and any specified outputs
+                Single-item lists are automatically unpacked to scalar values
+            
+            Additional columns:
+                est_cost : float
+                    Estimated cost of the job based on CPU time and backend costs
+
+        Notes
+        -----
+        - The DataFrame is indexed by job ID ('_job_id')
+        - Failed jobs or jobs with incomplete delocalization will have empty output sections
+        - The DataFrame is saved to disk as 'results.k9df.hdf5' if a localizer is provided
+        - Output values can be transformed using the output_map dictionary before being added to the DataFrame
+
+        Examples
+        --------
+        Example DataFrame structure:
+            job_id  ('job', 'slurm_state')  ('job', 'exit_code')  ('inputs', 'param1')  ('outputs', 'result')
+            0       'COMPLETED'              '0:0'                 'value1'              'path/to/result1'
+            1       'FAILED'                 '1:0'                 'value2'              null
+        """
         df = pd.DataFrame()
 
         try:
@@ -655,6 +752,38 @@ class Orchestrator(object):
         return df
 
     def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}, job_spec = None) -> int:
+        """Submits a batch job to Slurm with the specified resources and configuration.
+
+        This method handles submitting the job to Slurm via sbatch, passing in:
+            - Script to execute
+            - Resource requirements (from Task.resources via Orchestrator.resources)
+            - Slurm arguments (from Task.extra_slurm_args passed in as extra_sbatch_args)
+            - Job name (from Task.name via Orchestrator.name)
+            - Job array configuration for multiple shards
+            - Output/error file paths
+
+        This method is called by Task.run() when running wolF and is called by Orchestrator.run_pipeline() when running canine directly.
+        
+        Parameters
+        ----------
+        entrypoint_path : str
+            Path to the script that will be executed
+        compute_env : dict
+            Environment variables to set for the job, including CANINE_JOBS
+        extra_sbatch_args : dict, optional
+            Additional arguments to pass to sbatch. Can include:
+            - Flags (value=None): Added as --flag
+            - Parameters (value=str): Added as --param=value
+        job_spec : dict, optional
+            Job specification dictionary. If None, uses self.job_spec
+            
+        Returns
+        -------
+        int
+            Slurm batch job ID, or:
+            -2 if all jobs were avoided
+            -1 if submission failed
+        """
         if job_spec is None:
             job_spec = self.job_spec
 
