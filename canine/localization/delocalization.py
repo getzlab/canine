@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import shlex
 import sys
+import time
 
 """
 This is not actually part of the canine package
@@ -78,15 +79,12 @@ def compute_crc32c(path, fast = False):
 
     return hash_alg.hexdigest().decode().upper()
 
-def safe_symlink(num_retries=2, *symlink_args):
-    num_tries = 0
-    for t in range(num_retries):
-        try:
-            os.symlink(*symlink_args)
-            return
-        except:
-            time.sleep(5)
-    os.symlink(**symlink_args)
+def safe_symlink(*symlink_args):
+    try:
+        os.symlink(*symlink_args)
+        return
+    except:
+        print("Symlink failed for args", *symlink_args, file=sys.stderr)
 
 
 def main(output_dir, jobId, patterns, copy, scratch, finished_scratch, max_retries):
@@ -96,7 +94,7 @@ def main(output_dir, jobId, patterns, copy, scratch, finished_scratch, max_retri
     matched_files = []
     n_retries = 0
     with open(os.path.join(jobdir, '.canine_job_manifest'), 'w') as manifest:
-        while len(retry_patterns) > 0:
+        while len(patterns) > 0:
             retry_patterns = []
             for name, pattern in patterns:
                 n_matched = 0
@@ -123,9 +121,9 @@ def main(output_dir, jobId, patterns, copy, scratch, finished_scratch, max_retri
                                 shutil.copytree(target, dest)
                         # TODO: is st_dev check equivalent to same_volume?
                         elif os.stat(target).st_dev == os.stat(os.path.dirname(dest)).st_dev:
-                            safe_symlink(max_retries, os.path.relpath(target, os.path.dirname(dest)), dest)
+                            safe_symlink(os.path.relpath(target, os.path.dirname(dest)), dest)
                         else:
-                            safe_symlink(max_retries, os.path.abspath(target), dest)
+                            safe_symlink(os.path.abspath(target), dest)
 
                     # write job manifest
                     manifest.write("{}\t{}\t{}\t{}\n".format(
@@ -213,4 +211,4 @@ if __name__ == '__main__':
         help="Scratch disk was finished; delocalizer is only running to (re)generate output directory. Will skip computing CRC32 hashes if they were precomputed to save time."
     )
     args = parser.parse_args()
-    main(args.dest, args.jobId, args.pattern, set(args.copy), args.scratch, args.finished_scratch)
+    main(args.dest, args.jobId, args.pattern, set(args.copy), args.scratch, args.finished_scratch, 2)
