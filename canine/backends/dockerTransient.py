@@ -36,7 +36,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         image_family = "slurm-gcp-docker-v2",
         image_project = "broad-getzlab-workflows",
         image = None,
-        storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
+        storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100", nfs_disk_type = "pd-standard",
         clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
     ):
         if user is None:
@@ -66,6 +66,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "storage_disk" : storage_disk,
           "storage_disk_size" : storage_disk_size,
           "storage_uuid" : str(uuid.uuid4().hex[0:4]),
+          "nfs_disk_type" : nfs_disk_type,
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
         self.config["image"] = self.get_latest_image(
@@ -293,12 +294,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
             # generate cache disk if it doesn't exist
             rc, stdout, stderr = self.invoke(
-              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone}".format(
+              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone} {nfs_disk_type}".format(
                 disk_name = f'cache-disk-{self.config["worker_prefix"]}',
                 disk_size = 100,
                 mount_prefix = "/tmp/rclone_cache",
                 node_name = self.config["worker_prefix"],
-                node_zone = get_default_gcp_zone()
+                node_zone = get_default_gcp_zone(),
+                nfs_disk_type = self.config["nfs_disk_type"]
               )
             )
             if rc != 0:
@@ -356,12 +358,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             canine_logging.info1(f"Saving workflow results to persistent disk {self.config['storage_disk']} ({self.config['storage_disk_size']}GB) mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
             # use procedure to create RW disk from localization, inside docker
             rc, stdout, stderr = self.invoke(
-              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone}".format(
+              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone} {nfs_disk_type}".format(
                 disk_name = self.config["storage_disk"],
                 disk_size = f"{self.config['storage_disk_size']}",
                 mount_prefix = f"/mnt/nfs/{self.config['storage_namespace']}",
                 node_name = self.config["worker_prefix"],
-                node_zone = get_default_gcp_zone()
+                node_zone = get_default_gcp_zone(),
+                nfs_disk_type = self.config["nfs_disk_type"]
               )
             )
             if rc != 0:
