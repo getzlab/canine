@@ -36,6 +36,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         image_family = "slurm-gcp-docker-v2",
         image_project = "broad-getzlab-workflows",
         image = None,
+        docker_tag = "latest",
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100", nfs_disk_type = "pd-standard",
         clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
     ):
@@ -59,6 +60,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "action_on_stop" : action_on_stop,
           "image_family" : image_family,
           "image_project" : image_project,
+          "docker_tag" : docker_tag,
           "clust_frac" : 1.0,
           "user" : user,
           "storage_namespace" : storage_namespace,
@@ -105,9 +107,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # check if image exists
         try:
-            image = self.dkr.images.get(f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:latest')
+            image = self.dkr.images.get(f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:{self.config["docker_tag"]}')
         except docker.errors.ImageNotFound:
-            raise Exception("You have not yet built or pulled the Slurm Docker image!")
+            raise Exception(f"You have not yet built or pulled the Slurm Docker image with tag '{self.config['docker_tag']}'!")
         except RConnectionError as e:
             if isinstance(e.args[0], ProtocolError):
                 if isinstance(e.args[0].args[1], PermissionError):
