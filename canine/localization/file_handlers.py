@@ -124,27 +124,49 @@ class HandleGSURL(FileType):
         Returns True if the requested gs:// object or bucket resides in a
         requester pays bucket
         """
-        bucket = re.match(r"gs://(.*?)/.*", self.path)[1]
-
-        gcs_cl = gcloud_storage_client()
-        bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args.get("project"))
-        bucket_obj.reload() 
-        return bucket_obj.requester_pays
-
-# TODO: handle case where permissions disallow bucket inspection?
-#        ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
-#        if b'requester pays bucket but no user project provided' in ret.stderr:
-#            return True
-#        else:
-#            # Try again ls-ing the object itself
-#            # sometimes permissions can disallow bucket inspection
-#            # but allow object inspection
-#            ret = subprocess.run('gsutil ls {}'.format(self.path), shell = True, capture_output = True)
-#            return b'requester pays bucket but no user project provided' in ret.stderr
-#
-#        if ret.returncode == 1 and b'BucketNotFoundException: 404' in ret.stderr:
-#            canine_logging.error(ret.stderr.decode())
-#            raise subprocess.CalledProcessError(ret.returncode, "")
+        # Try GCS API first (fastest)
+        try:
+            bucket = re.match(r"gs://(.*?)/.*", self.path)[1]
+            gcs_cl = gcloud_storage_client()
+            bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args.get("project"))
+            bucket_obj.reload() 
+            return bucket_obj.requester_pays
+        except Exception as e:
+            # Fallback to gsutil approach when GCS API fails (e.g., 403 permissions)
+            canine_logging.info1(f"GCS API failed for bucket {bucket}, falling back to gsutil: {e}")
+            
+            # Extract bucket and path like base class does
+            if self.path.startswith('gs://'):
+                path = self.path[5:]
+            else:
+                path = self.path
+            bucket = path.split('/')[0]
+            
+            # Try gsutil requesterpays get command
+            command = 'gsutil requesterpays get gs://{}'.format(bucket)
+            ret = subprocess.run(command, shell = True, capture_output = True)
+            text = ret.stderr
+            
+            if ret.returncode == 0 or b'BucketNotFoundException: 404' not in text:
+                # Check both stderr (for error messages) and stdout (for success messages)
+                return (
+                    b'requester pays bucket but no user project provided' in text
+                    or 'gs://{}: Enabled'.format(bucket).encode() in ret.stdout
+                )
+            else:
+                # Try again ls-ing the object itself
+                # sometimes permissions can disallow bucket inspection
+                # but allow object inspection
+                command = 'gsutil ls gs://{}'.format(path)
+                ret = subprocess.run(command, shell = True, capture_output = True)
+                text = ret.stderr
+                
+                if ret.returncode == 1 and b'BucketNotFoundException: 404' in text:
+                    canine_logging.error(text.decode())
+                    raise subprocess.CalledProcessError(ret.returncode, command)
+                
+                # Check if this indicates requester pays
+                return b'requester pays bucket but no user project provided' in text
 
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
