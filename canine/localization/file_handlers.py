@@ -1,4 +1,5 @@
 import abc
+from google.cloud.exceptions import Forbidden
 import google.cloud.storage
 import google.auth
 import glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading
@@ -128,8 +129,12 @@ class HandleGSURL(FileType):
 
         gcs_cl = gcloud_storage_client()
         bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args.get("project"))
-        bucket_obj.reload() 
-        return bucket_obj.requester_pays
+        try:
+            bucket_obj.reload() 
+            return bucket_obj.requester_pays
+        except Forbidden:
+            print(f'Warning: Unable to check requester-pays status for bucket={bucket}')
+            return False
 
 # TODO: handle case where permissions disallow bucket inspection?
 #        ret = subprocess.run('gsutil requesterpays get gs://{}'.format(bucket), shell = True, capture_output = True)
