@@ -6,6 +6,7 @@ import pandas as pd
 import urllib.parse
 
 from google.auth.transport.requests import AuthorizedSession
+from google.cloud.exceptions import Forbidden
 from ..utils import sha1_base32, canine_logging
 
 class FileType(abc.ABC):
@@ -132,7 +133,7 @@ class HandleGSURL(FileType):
             bucket_obj = google.cloud.storage.Bucket(gcs_cl, bucket, user_project = self.extra_args.get("project"))
             bucket_obj.reload() 
             return bucket_obj.requester_pays
-        except Exception as e:
+        except (Exception, Forbidden) as e: # explicit Forbidden catch to handle 403 case for bucket metadata
             # Fallback to gsutil approach when GCS API fails (e.g., 403 permissions)
             canine_logging.info1(f"GCS API failed for bucket {bucket}, falling back to gsutil: {e}")
             
