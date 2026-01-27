@@ -17,7 +17,7 @@ from agutil import status_bar
 from operator import itemgetter
 from itertools import groupby
 
-version = '0.16.2'
+version = '0.17.0'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -86,7 +86,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       break
     else
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
-      echo -e "!!!! JOB FAILED! (EXIT CODE                 !!!!\e[29G$CANINE_JOB_RC)" >&2
+      printf  "!!!! JOB FAILED! (EXIT CODE %-16s!!!!\n" "$CANINE_JOB_RC)" >&2
       echo    "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!" >&2
       echo $(($([ -f $CANINE_JOB_ROOT/.job_failure_count ] && cat $CANINE_JOB_ROOT/.job_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.job_failure_count
       echo '++++ STARTING JOB CLEANUP ++++' >&2
@@ -211,7 +211,7 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
-        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "n_preempted" : -1 }
+        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1}
 
         with localizer.transport_context() as tr:
             for j, v in job_spec.items():
@@ -219,17 +219,38 @@ class Orchestrator(object):
                 jid = str(batch_id) + "_" + j
                 if tr.exists(sacct_path):
                     with tr.open(sacct_path, "r") as f:
-                        acct[jid] = pd.read_csv(
-                          f,
-                          header = None,
-                          sep = "\t",
-                          names = [
-                            "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"
-                          ]
-                        ).astype({
-                          'CPUTimeRAW': int,
-                          "Submit" : np.datetime64
-                        })
+                        try:
+                            acct[jid] = pd.read_csv(
+                              f,
+                              header = None,
+                              sep = "\t",
+                              names = [
+                                "State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"
+                              ]
+                            ).astype({
+                              'CPUTimeRAW': int,
+                              "Submit" : np.datetime64,
+                              "ReqCPUS" : int,
+                              "NCPUS" : int,
+                            })
+                        except:
+                            a = pd.read_csv(
+                              f,
+                              header = None,
+                              sep = "\t",
+                              names = [
+                                "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"
+                              ]
+                            ).astype({
+                              'CPUTimeRAW': int,
+                              "Submit" : np.datetime64,
+                            })
+                            a["NodeList"] = "-"
+                            a["Partition"] = "-"
+                            a["ReqCPUS"] = -1
+                            a["NCPUS"] = -1
+                            a["ReqMem"] = "-"
+                            acct[jid] = a[["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"]]
 
                     # sacct info is blank (write error?)
                     if acct[jid].empty:
@@ -534,8 +555,8 @@ class Orchestrator(object):
                 acct = self.backend.sacct(
                   "D",
                   job = batch_id,
-                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit"
-                ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : np.datetime64})
+                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem"
+                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : np.datetime64, "ReqCPUS" : int, "NCPUS" : int})
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
