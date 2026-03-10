@@ -307,6 +307,8 @@ class HandleAWSURL(FileType):
         """
         super().__init__(path, **kwargs)
 
+        self.check_md5 = self.extra_args.get("check_md5", False)
+
         # remove any trailing slashes, in case path refers to a directory
         self.path = path.rstrip("/")
 
@@ -371,9 +373,26 @@ class HandleAWSURL(FileType):
                 raise ValueError(f"Error accessing S3 file:\n{head_resp.stderr.decode()}")
         elif head_resp.returncode != 0:
             raise ValueError(f"Unknown AWS S3 error occurred:\n{head_resp.stderr.decode()}")
-                
+
         self.headers = json.loads(head_resp.stdout)
 
+        # Check for multiple parts to enable local hash calculation
+        if self.headers.get("PartsCount", 1) > 1:
+            part1_head_resp = subprocess.run(
+              "{env} aws s3api {extra_args} head-object --bucket {bucket} --key {obj} --part-number 1".format(
+                env = self.command_env_str,
+                extra_args = self.s3_extra_args_str,
+                bucket = bucket,
+                obj = obj
+              ),
+              shell = True,
+              capture_output = True
+            )
+            if head_resp.returncode == 254:
+                raise ValueError(f"Error accessing S3 file:\n{head_resp.stderr.decode()}")
+            if head_resp.returncode != 0:
+                raise ValueError(f"Unknown AWS S3 error occurred:\n{head_resp.stderr.decode()}")
+            self.headers["PartLength"] = json.loads(part1_head_resp.stdout)["ContentLength"]
     def _get_hash(self):
         return self.headers["ETag"].replace('"', '')
 
@@ -385,11 +404,11 @@ class HandleAWSURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
 
-        return "\n".join([
+        cmd = [
           f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
           f"[ -f {self.localized_path} ] && SZ=$(stat --printf '%s' {self.localized_path}) || SZ=0",
           f"if [ $SZ != {self.size} ]; then",
-          "{env} aws s3api {extra_args} get-object --bucket {bucket} --key {file} --range \"bytes=$SZ-\" >(cat >> {dest}) > /dev/null".format(
+          '{env} aws s3api {extra_args} get-object --bucket {bucket} --key {file} --range "bytes=$SZ-" >(cat >> {dest}) > /dev/null'.format(
             env = self.command_env_str,
             extra_args = self.s3_extra_args_str,
             bucket = self.path.split("/")[2],
@@ -397,8 +416,25 @@ class HandleAWSURL(FileType):
             dest = self.localized_path
           ),
           "fi"
-        ])
-        
+        ]
+        if self.check_md5:
+            if "PartLength" in self.headers:
+                chunk_size_mb = int(self.headers["PartLength"] / (1024 * 1024))
+                chunks = self.headers["PartsCount"]
+                cmd += [
+                  "CHECKSUMS=$(mktemp)",
+                  """trap 'rm -f "$CHECKSUMS"' EXIT""",
+                  f"for i in {{0..{chunks - 1}}}; do",
+                  f"    dd bs=1M count={chunk_size_mb} skip=$((i * {chunk_size_mb})) if={self.localized_path} | md5sum | cut -d ' ' -f 1 >> $CHECKSUMS",
+                  "done",
+                  f"""md5hash=$(python3 -c "import sys, binascii; sys.stdout.buffer.write(binascii.unhexlify(''.join(sys.stdin.read().split())))" < $CHECKSUMS | md5sum | cut -d ' ' -f 1)-{chunks}""",
+                ]
+            else:
+                cmd += [f"md5hash=$(md5sum {self.localized_path} | cut -d ' ' -f 1)"]
+            cmd += [f'[[ "$md5hash" == "{self.hash}" ]] || {{ echo "deleting corrupted file" 1>&2 ; rm -f {self.localized_path} ; exit 1 ; }}']
+
+        return "\n".join(cmd)
+
 class HandleAWSURLStream(HandleAWSURL):
     localization_mode = "stream"
 
