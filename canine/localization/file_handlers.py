@@ -423,17 +423,18 @@ class HandleAWSURL(FileType):
                 chunks = self.headers["PartsCount"]
                 cmd += [
                   "md5hash=$(python3 << CODE",
-                  "import hashlib",
-                  "from concurrent.futures import ThreadPoolExecutor",
-                  "def hash_chunk(i, cs, f):",
+                  "import hashlib, multiprocessing",
+                   "def hash_chunk(args):",
+                  "    i, cs, f = args",
                   "    fh = open(f, 'rb')",
                   "    fh.seek(i * cs)",
                   "    return hashlib.md5(fh.read(cs)).digest()",
                   f"chunk_size = {chunk_size}",
                   f"chunks = {chunks}",
                   f"fp = '{self.localized_path}'",
-                  "with ThreadPoolExecutor() as pool:",
-                  "    results = pool.map(lambda i: hash_chunk(i, chunk_size, fp), range(chunks))",
+                  "pool = multiprocessing.Pool()",
+                  "results = pool.map(hash_chunk, [(i, chunk_size, fp) for i in range(chunks)])",
+                  "pool.close()",
                   "print(hashlib.md5(b''.join(results)).hexdigest() + '-' + str(chunks))",
                   "CODE",
                   ")"
