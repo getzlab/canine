@@ -388,10 +388,10 @@ class HandleAWSURL(FileType):
               shell = True,
               capture_output = True
             )
-            if head_resp.returncode == 254:
-                raise ValueError(f"Error accessing S3 file:\n{head_resp.stderr.decode()}")
-            if head_resp.returncode != 0:
-                raise ValueError(f"Unknown AWS S3 error occurred:\n{head_resp.stderr.decode()}")
+            if part1_head_resp.returncode == 254:
+                raise ValueError(f"Error accessing S3 file:\n{part1_head_resp.stderr.decode()}")
+            if part1_head_resp.returncode != 0:
+                raise ValueError(f"Unknown AWS S3 error occurred:\n{part1_head_resp.stderr.decode()}")
             self.headers["PartLength"] = json.loads(part1_head_resp.stdout)["ContentLength"]
     def _get_hash(self):
         return self.headers["ETag"].replace('"', '')
