@@ -419,15 +419,24 @@ class HandleAWSURL(FileType):
         ]
         if self.check_md5:
             if "PartLength" in self.headers:
-                chunk_size_mb = int(self.headers["PartLength"] / (1024 * 1024))
+                chunk_size = self.headers["PartLength"]
                 chunks = self.headers["PartsCount"]
                 cmd += [
-                  "CHECKSUMS=$(mktemp)",
-                  """trap 'rm -f "$CHECKSUMS"' EXIT""",
-                  f"for i in {{0..{chunks - 1}}}; do",
-                  f"    dd bs=1M count={chunk_size_mb} skip=$((i * {chunk_size_mb})) if={self.localized_path} | md5sum | cut -d ' ' -f 1 >> $CHECKSUMS",
-                  "done",
-                  f"""md5hash=$(python3 -c "import sys, binascii; sys.stdout.buffer.write(binascii.unhexlify(''.join(sys.stdin.read().split())))" < $CHECKSUMS | md5sum | cut -d ' ' -f 1)-{chunks}""",
+                  "md5hash=$(python3 << CODE",
+                  "import hashlib",
+                  "from concurrent.futures import ThreadPoolExecutor",
+                  "def hash_chunk(i, cs, f):",
+                  "    fh = open(f, 'rb')",
+                  "    fh.seek(i * cs)",
+                  "    return hashlib.md5(fh.read(cs)).digest()",
+                  f"chunk_size = {chunk_size}",
+                  f"chunks = {chunks}",
+                  f"fp = '{self.localized_path}'",
+                  "with ThreadPoolExecutor() as pool:",
+                  "    results = pool.map(lambda i: hash_chunk(i, chunk_size, fp), range(chunks))",
+                  "print(hashlib.md5(b''.join(results)).hexdigest() + '-' + str(chunks))",
+                  "CODE",
+                  ")"
                 ]
             else:
                 cmd += [f"md5hash=$(md5sum {self.localized_path} | cut -d ' ' -f 1)"]
