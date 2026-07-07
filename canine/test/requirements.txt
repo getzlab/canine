@@ -1,1 +1,30 @@
+# Legacy integration test deps
 timeout-decorator
+
+# Pure unit test deps (no slurm_gcp_docker, no dalmatian — stubbed by conftest.py)
+# Setup:
+#   uv venv --python 3.9 .venv-test
+#   uv pip install --python .venv-test/bin/python -r canine/test/requirements.txt
+#
+# Run:
+#   .venv-test/bin/python -m pytest canine/test/test_adapters.py \
+#     canine/test/test_file_handlers.py canine/test/test_orchestrator_pure.py \
+#     canine/test/test_utils_pure.py -v
+pandas==1.4.2
+numpy>=1.18.0,<2
+PyYAML>=5.1
+paramiko>=2.5.0
+google-auth>=1.6.3
+google-cloud-storage
+google-cloud-compute>=1.6.1
+google-api-python-client>=1.7.11
+google-crc32c>=1.5.0
+docker>=4.1.0
+psutil>=5.6.7
+port-for>=0.4
+agutil>=4.1.0
+hound>=0.2.0
+tables>=3.6.1
+requests
+crayons
+pytest

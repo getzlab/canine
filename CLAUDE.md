@@ -41,6 +41,28 @@ Install canine inside Docker skips `slurm_gcp_docker` (detected via `/.dockerenv
 
 ## Running Tests
 
+### Pure unit tests (no cluster, no GCP credentials) — run locally
+
+Regression baseline against the current production environment.
+
+```bash
+# One-time venv setup:
+uv venv --python 3.9 .venv-test
+uv pip install --python .venv-test/bin/python -r canine/test/requirements.txt
+
+# Run (from the canine/ repo root):
+.venv-test/bin/python -m pytest \
+  canine/test/test_adapters.py \
+  canine/test/test_file_handlers.py \
+  canine/test/test_orchestrator_pure.py \
+  canine/test/test_utils_pure.py \
+  -v
+```
+
+Baseline: **138 passed** (Python 3.9, pandas 1.4.2).
+
+### Legacy integration tests (requires Docker/SLURM)
+
 ```bash
 # Full test suite with coverage
 coverage run --source=canine \

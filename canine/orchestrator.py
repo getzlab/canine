@@ -130,6 +130,20 @@ echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=version)
 
+def _job_indices_to_array_str(indices: typing.List[int]) -> str:
+    """Convert a sorted list of job indices into a compact SLURM array range string.
+
+    e.g. [0, 1, 2, 5, 6, 9] -> "0-2,5-6,9"
+    """
+    array_range = []
+    for _, g in groupby(enumerate(indices), lambda i: i[0] - i[1]):
+        group = list(map(itemgetter(1), g))
+        if len(group) > 1:
+            array_range.append(f"{group[0]}-{group[-1]}")
+        else:
+            array_range.append(str(group[0]))
+    return ",".join(array_range)
+
 def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
     """
     Recurses through the dictionary, converting objects to strings
@@ -685,14 +699,7 @@ class Orchestrator(object):
 
         # remove noop'd jobs from array spec
         op_idx = sorted(int(k) for k, v in job_spec.items() if v is not None)
-        array_range = []
-        for k, g in groupby(enumerate(op_idx), lambda i: i[0]-i[1]):
-            group = list(map(itemgetter(1), g))
-            if len(group) > 1:
-                array_range += [f"{group[0]}-{group[-1]}"]
-            else:
-                array_range += [str(group[0])]
-        array_str = ",".join(array_range)
+        array_str = _job_indices_to_array_str(op_idx)
 
         # parse out flags vs. params in extra_sbatch_args
         flags = [k for k, v in extra_sbatch_args.items() if v is None]
