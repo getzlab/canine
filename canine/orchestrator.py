@@ -17,7 +17,7 @@ from agutil import status_bar
 from operator import itemgetter
 from itertools import groupby
 
-version = '0.17.1'
+version = '0.17.2'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
