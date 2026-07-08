@@ -24,7 +24,6 @@ psutil>=5.6.7
 port-for>=0.4
 agutil>=4.1.0
 hound>=0.2.0
-tables>=3.6.1
 requests
 crayons
 pytest
