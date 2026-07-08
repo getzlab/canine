@@ -9,11 +9,10 @@ from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer, file_handlers
-from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered, canine_logging
+from .utils import check_call, pandas_write_hdf5_buffered, canine_logging
 import yaml
 import numpy as np
 import pandas as pd
-from agutil import status_bar
 from operator import itemgetter
 from itertools import groupby
 

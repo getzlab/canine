@@ -1,6 +1,6 @@
 import abc
 import typing
-from itertools import product, repeat
+from itertools import product
 from functools import reduce
 
 class AbstractAdapter(abc.ABC):

@@ -22,7 +22,6 @@ from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
 from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging
 from hound.client import _getblob_bucket
-from agutil import status_bar
 import pandas as pd
 import google.cloud.compute_v1, google.api_core.exceptions
 

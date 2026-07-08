@@ -2,7 +2,6 @@ import os
 import sys
 import warnings
 import typing
-import fnmatch
 import shlex
 import tempfile
 import subprocess

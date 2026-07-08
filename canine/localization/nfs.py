@@ -12,7 +12,6 @@ from .local import BatchedLocalizer
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project
-from agutil import status_bar
 import pandas as pd
 
 

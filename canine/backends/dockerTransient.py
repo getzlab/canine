@@ -11,7 +11,6 @@ import socket
 import psutil
 import io
 import pickle
-import math
 import threading
 import time
 import shutil
@@ -37,7 +36,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         image_project = "broad-getzlab-workflows",
         image = None,
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
-        clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
+        user = None, shutdown_on_exit = False, **kwargs
     ):
         if user is None:
             if "USER" in os.environ:
