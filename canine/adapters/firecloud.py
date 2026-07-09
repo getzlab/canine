@@ -148,7 +148,7 @@ class FirecloudAdapter(AbstractAdapter):
                         [self.entities[int(i)] for i in outputs],
                         name='{}_id'.format(self.etype)
                     )
-                ).applymap(
+                ).map(
                     lambda cell: cell if not isinstance(cell, list) else (
                         cell[0] if len(cell) > 0 else np.nan
                     )

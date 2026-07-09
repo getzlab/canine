@@ -158,10 +158,8 @@ class TestGetMtypeCost:
         assert non_pre == pytest.approx(expected_non)
 
     def test_custom_n1_bare_form(self):
-        # BUG (pre-existing): track is computed before components gets the 'n1' prefix,
-        # so 'custom-4-16384' raises KeyError('custom-4') instead of resolving to n1-custom.
-        with pytest.raises(KeyError):
-            _get_mtype_cost("custom-4-16384")
+        # Bare 'custom-X-Y' form should resolve to n1-custom pricing, identical to 'n1-custom-X-Y'.
+        assert _get_mtype_cost("custom-4-16384") == _get_mtype_cost("n1-custom-4-16384")
 
     def test_unknown_family_raises(self):
         with pytest.raises(ValueError):

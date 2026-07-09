@@ -139,17 +139,14 @@ class TestManualAdapterParseInputs:
             a.parse_inputs({"x": [1, 2]})
 
     def test_alias_as_string_uses_input_value_as_alias(self):
-        # BUG (pre-existing): the str-alias branch uses variable `i` which is only
-        # defined in the list-alias branch above it; this raises UnboundLocalError.
-        # Test documents current behavior — do NOT fix without an upgrade context.
         a = ManualAdapter(alias="x")
-        with pytest.raises(UnboundLocalError):
-            a.parse_inputs({"x": ["alpha", "beta"]})
+        spec = a.parse_inputs({"x": ["alpha", "beta"]})
+        assert spec["0"]["CANINE_JOB_ALIAS"] == "alpha"
+        assert spec["1"]["CANINE_JOB_ALIAS"] == "beta"
 
     def test_alias_as_string_duplicate_values_raise(self):
-        # Same pre-existing UnboundLocalError (hit before the duplicate check).
         a = ManualAdapter(alias="x")
-        with pytest.raises(UnboundLocalError):
+        with pytest.raises(ValueError):
             a.parse_inputs({"x": ["dup", "dup"]})
 
     # -- output type --

@@ -3,15 +3,15 @@ timeout-decorator
 
 # Pure unit test deps (no slurm_gcp_docker, no dalmatian — stubbed by conftest.py)
 # Setup:
-#   uv venv --python 3.9 .venv-test
+#   uv venv --python 3.14 .venv-test
 #   uv pip install --python .venv-test/bin/python -r canine/test/requirements.txt
 #
 # Run:
 #   .venv-test/bin/python -m pytest canine/test/test_adapters.py \
 #     canine/test/test_file_handlers.py canine/test/test_orchestrator_pure.py \
 #     canine/test/test_utils_pure.py -v
-pandas==1.4.2
-numpy>=1.18.0,<2
+pandas>=2.2
+numpy>=2.0
 PyYAML>=5.1
 paramiko>=2.5.0
 google-auth>=1.6.3

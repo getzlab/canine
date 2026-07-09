@@ -279,6 +279,7 @@ def _get_mtype_cost(mtype: str) -> typing.Tuple[float, float]:
         # (n1-|n2-)?custom-(\d+)-(\d+)(-ext)?
         if components[0] == 'custom':
             components = ['n1'] + components
+            track = '{}-{}'.format(components[0], components[1])
         if len(components) not in {4, 5}:
             raise ValueError("Custom mtype {} not in expected format".format(mtype))
         cores = int(components[2])

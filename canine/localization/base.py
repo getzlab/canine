@@ -706,7 +706,7 @@ class AbstractLocalizer(abc.ABC):
 
             ## handle special case if we are only passing through rodisk URLs; this is like a dry run
             if F["rdpassthru"].any() and not F["localize"].any():
-                return None, [], [], F.loc[F["rdpassthru"], :].groupby("input")["path"].apply(list).to_dict()
+                return None, [], [], F.loc[F["rdpassthru"], :].groupby("input")["path"].agg(list).to_dict()
 
             ## Disk name is determined by input names, files' basenames, and hashes
             disk_name = "canine-" + \
@@ -730,11 +730,11 @@ class AbstractLocalizer(abc.ABC):
             disk_size = max(10, 1 + int(disk_size / (0.95*10**9))) # bytes -> gigabytes (not gibibytes) with 5% safety margin
 
             ## Save RODISK paths for subsequent use by downstream tasks
-            rodisk_paths = F.loc[F["localize"], :].groupby("input")["disk_path"].apply(list).to_dict()
+            rodisk_paths = F.loc[F["localize"], :].groupby("input")["disk_path"].agg(list).to_dict()
 
             # if we are passing through any rodisk paths, add them to the rodisk_paths dict
             if F["rdpassthru"].any():
-                rodisk_paths = {**rodisk_paths, **F.loc[F["rdpassthru"], :].groupby("input")["path"].apply(list).to_dict()}
+                rodisk_paths = {**rodisk_paths, **F.loc[F["rdpassthru"], :].groupby("input")["path"].agg(list).to_dict()}
 
         #
         # otherwise, we create a blank disk with a given name (if specified),

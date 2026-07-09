@@ -5,6 +5,7 @@ import time
 import sys
 import warnings
 import traceback
+from importlib.metadata import version as _pkg_version
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
@@ -16,7 +17,6 @@ import pandas as pd
 from operator import itemgetter
 from itertools import groupby
 
-version = '0.17.1'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -127,7 +127,7 @@ DELOC_RC=$?
 [ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
 echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
-""".format(version=version)
+""".format(version=_pkg_version("canine"))
 
 def _job_indices_to_array_str(indices: typing.List[int]) -> str:
     """Convert a sorted list of job indices into a compact SLURM array range string.
@@ -224,7 +224,7 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
-        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1}
+        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": pd.NaT, "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1}
 
         with localizer.transport_context() as tr:
             for j, v in job_spec.items():
@@ -242,7 +242,7 @@ class Orchestrator(object):
                               ]
                             ).astype({
                               'CPUTimeRAW': int,
-                              "Submit" : np.datetime64,
+                              "Submit" : "datetime64[ns]",
                               "ReqCPUS" : int,
                               "NCPUS" : int,
                             })
@@ -256,7 +256,7 @@ class Orchestrator(object):
                               ]
                             ).astype({
                               'CPUTimeRAW': int,
-                              "Submit" : np.datetime64,
+                              "Submit" : "datetime64[ns]",
                             })
                             a["NodeList"] = "-"
                             a["Partition"] = "-"
@@ -498,8 +498,7 @@ class Orchestrator(object):
             df['est_cost'] = [job_cost[job_id] for job_id in df.index] if job_cost is not None else [0] * len(df)
         except:
             traceback.print_exc()
-        finally:
-            return df
+        return df
 
     def localize_inputs_and_script(self, localizer) -> str:
         canine_logging.info1("Localizing inputs...")
@@ -539,7 +538,7 @@ class Orchestrator(object):
     def wait_for_jobs_to_finish(self, batch_id, localizer = None, track_uptime = False):
         def grouper(g):
             g = g.sort_values("Submit")
-            final = g.iloc[-1]
+            final = g.iloc[-1].copy()
             final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
             final.at["Submit"] = g.loc[:, "Submit"].iloc[0]
             final["n_preempted"] = len(g) - 1
@@ -569,7 +568,7 @@ class Orchestrator(object):
                   "D",
                   job = batch_id,
                   format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem"
-                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : np.datetime64, "ReqCPUS" : int, "NCPUS" : int})
+                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int})
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
@@ -578,7 +577,7 @@ class Orchestrator(object):
                     raise Exception("Timeout exceeded waiting to query job accounting information; cluster is likely under extreme load!")
                 else:
                     backoff_factor *= 1.1
-            acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))]
+            acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))].copy()
             acct.loc[acct["PlannedCPURAW"].isna(), "PlannedCPURAW"] = 0
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "PlannedCPURAW"].astype(int)
             acct = acct.drop(columns = ["PlannedCPURAW"])

@@ -177,7 +177,8 @@ class ManualAdapter(AbstractAdapter):
                     self.__spec[str(i)]['CANINE_JOB_ALIAS'] = alias
             elif isinstance(self.alias, str):
                 assert self.alias in inputs, "User provided alias variable not provided in inputs"
-                self.__spec[str(i)]['CANINE_JOB_ALIAS'] = self.__spec[str(i)][self.alias]
+                for i in range(self._job_length):
+                    self.__spec[str(i)]['CANINE_JOB_ALIAS'] = self.__spec[str(i)][self.alias]
             else:
                 raise TypeError("alias must be a string of list of strings")
             if len({job['CANINE_JOB_ALIAS'] for job in self.__spec.values()}) != len(self.__spec):
