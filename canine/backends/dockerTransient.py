@@ -24,6 +24,8 @@ from urllib3.exceptions import ProtocolError
 
 import pandas as pd
 
+from src.test_controller_environment import check_all as _slurm_gcp_check_all  # `src` is the package name pip-installs from slurm_gcp_docker — rename to `slurm_gcp_docker` in a follow-up (see UPGRADE_PLAN.md Phase 1 note)
+
 import threading
 
 gce_lock = threading.Lock()
@@ -88,6 +90,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.nodes = pd.DataFrame()
 
     def init_slurm(self):
+        _slurm_gcp_check_all()
+
         # query /etc/passwd for UID/GID information if we are running as a different user
         # FIXME: how should this work for OS Login/LDAP/etc.?
         uid = None; gid = None
@@ -101,11 +105,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.dkr = docker.from_env()
 
         #
-        # check if image exists
+        # check if image exists; pull it if not
+        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:latest'
         try:
-            image = self.dkr.images.get(f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:latest')
+            image = self.dkr.images.get(image_ref)
         except docker.errors.ImageNotFound:
-            raise Exception("You have not yet built or pulled the Slurm Docker image!")
+            canine_logging.info1(f"Slurm Docker image not found locally; pulling {image_ref} ...")
+            image = self.dkr.images.pull(image_ref)
         except RConnectionError as e:
             if isinstance(e.args[0], ProtocolError):
                 if isinstance(e.args[0].args[1], PermissionError):
