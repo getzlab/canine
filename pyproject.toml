@@ -29,7 +29,7 @@ dependencies = [
     "google-auth>=1.6.3",
     "PyYAML>=5.1",
     "agutil>=4.1.0",
-    "hound>=0.2.0",
+    "hound @ git+https://github.com/getzlab/hound.git@4f2e9c2",
     "firecloud-dalmatian @ git+https://github.com/getzlab/dalmatian@d39177e",
     "google-api-python-client>=1.7.11",
     "docker>=4.1.0",
