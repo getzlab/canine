@@ -24,7 +24,7 @@ from urllib3.exceptions import ProtocolError
 
 import pandas as pd
 
-from slurm_gcp_docker.src.test_controller_environment import check_all as _slurm_gcp_check_all
+from slurm_gcp_docker.test_controller_environment import check_all as _slurm_gcp_check_all
 
 import threading
 
