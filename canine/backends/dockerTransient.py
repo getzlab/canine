@@ -24,7 +24,7 @@ from urllib3.exceptions import ProtocolError
 
 import pandas as pd
 
-from src.test_controller_environment import check_all as _slurm_gcp_check_all  # `src` is the package name pip-installs from slurm_gcp_docker — rename to `slurm_gcp_docker` in a follow-up (see UPGRADE_PLAN.md Phase 1 note)
+from slurm_gcp_docker.src.test_controller_environment import check_all as _slurm_gcp_check_all
 
 import threading
 
