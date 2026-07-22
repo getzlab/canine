@@ -670,9 +670,12 @@ class Orchestrator(object):
                 # columns that receive no (i.e., identity) transformation
                 identity_map = { x : lambda y : y for x in set(df.columns.get_loc_level("outputs")[1]) - self.output_map.keys() }
 
-                # we get back all columns from the dataframe by aggregating columns
-                # that don't receive any transformation with transformed columns
-                df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
+                # we get back all columns from the dataframe by combining columns
+                # that don't receive any transformation with transformed columns.
+                # transform() (not agg()) since every function here is elementwise,
+                # not a reduction -- pandas 2.x deprecated relying on agg() to fall
+                # back to transform()-like behavior for this case.
+                df["outputs"] = df["outputs"].transform({ **self.output_map, **identity_map })
         except:
             canine_logging.error("There were some errors generating output dataframe; see stack trace for details.")
             canine_logging.error(traceback.format_exc())
