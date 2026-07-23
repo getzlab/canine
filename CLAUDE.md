@@ -97,7 +97,7 @@ Most tests in `canine/test/` can run without GCP credentials. The remote/NFS tes
 
 ## Python Version Constraint
 
-`python_requires = ">3.7"` — update to `>=3.14` to match wolF.
+`python_requires = ">3.7"` — update to `>=3.14, <3.15` to match wolF.
 
 ## pandas 2.x Migration Notes
 
