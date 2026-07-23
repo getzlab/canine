@@ -37,14 +37,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         image_family = "slurm-gcp-docker-v3",
         image_project = "broad-getzlab-workflows",
         image = None,
-<<<<<<< HEAD
-        docker_tag = "latest",
-        storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100", nfs_disk_type = "pd-standard",
-        clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
-=======
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
         user = None, shutdown_on_exit = False, **kwargs
->>>>>>> wolf-2.0-update
     ):
         if user is None:
             if "USER" in os.environ:
