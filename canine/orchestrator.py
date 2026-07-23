@@ -5,19 +5,18 @@ import time
 import sys
 import warnings
 import traceback
+from importlib.metadata import version as _pkg_version
 from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer, file_handlers
-from .utils import check_call, pandas_read_hdf5_buffered, pandas_write_hdf5_buffered, canine_logging
+from .utils import check_call, pandas_write_hdf5_buffered, canine_logging
 import yaml
 import numpy as np
 import pandas as pd
-from agutil import status_bar
 from operator import itemgetter
 from itertools import groupby
 
-version = '0.16.2'
 
 ADAPTERS = {
     'Manual': ManualAdapter,
@@ -128,7 +127,21 @@ DELOC_RC=$?
 [ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
 echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
-""".format(version=version)
+""".format(version=_pkg_version("canine"))
+
+def _job_indices_to_array_str(indices: typing.List[int]) -> str:
+    """Convert a sorted list of job indices into a compact SLURM array range string.
+
+    e.g. [0, 1, 2, 5, 6, 9] -> "0-2,5-6,9"
+    """
+    array_range = []
+    for _, g in groupby(enumerate(indices), lambda i: i[0] - i[1]):
+        group = list(map(itemgetter(1), g))
+        if len(group) > 1:
+            array_range.append(f"{group[0]}-{group[-1]}")
+        else:
+            array_range.append(str(group[0]))
+    return ",".join(array_range)
 
 def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
     """
@@ -211,7 +224,7 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
-        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": np.datetime64('nat'), "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1}
+        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": pd.NaT, "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1}
 
         with localizer.transport_context() as tr:
             for j, v in job_spec.items():
@@ -229,7 +242,7 @@ class Orchestrator(object):
                               ]
                             ).astype({
                               'CPUTimeRAW': int,
-                              "Submit" : np.datetime64,
+                              "Submit" : "datetime64[ns]",
                               "ReqCPUS" : int,
                               "NCPUS" : int,
                             })
@@ -243,7 +256,7 @@ class Orchestrator(object):
                               ]
                             ).astype({
                               'CPUTimeRAW': int,
-                              "Submit" : np.datetime64,
+                              "Submit" : "datetime64[ns]",
                             })
                             a["NodeList"] = "-"
                             a["Partition"] = "-"
@@ -485,8 +498,7 @@ class Orchestrator(object):
             df['est_cost'] = [job_cost[job_id] for job_id in df.index] if job_cost is not None else [0] * len(df)
         except:
             traceback.print_exc()
-        finally:
-            return df
+        return df
 
     def localize_inputs_and_script(self, localizer) -> str:
         canine_logging.info1("Localizing inputs...")
@@ -526,7 +538,7 @@ class Orchestrator(object):
     def wait_for_jobs_to_finish(self, batch_id, localizer = None, track_uptime = False):
         def grouper(g):
             g = g.sort_values("Submit")
-            final = g.iloc[-1]
+            final = g.iloc[-1].copy()
             final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
             final.at["Submit"] = g.loc[:, "Submit"].iloc[0]
             final["n_preempted"] = len(g) - 1
@@ -556,7 +568,7 @@ class Orchestrator(object):
                   "D",
                   job = batch_id,
                   format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem"
-                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : np.datetime64, "ReqCPUS" : int, "NCPUS" : int})
+                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int})
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
@@ -565,7 +577,7 @@ class Orchestrator(object):
                     raise Exception("Timeout exceeded waiting to query job accounting information; cluster is likely under extreme load!")
                 else:
                     backoff_factor *= 1.1
-            acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))]
+            acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))].copy()
             acct.loc[acct["PlannedCPURAW"].isna(), "PlannedCPURAW"] = 0
             acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "PlannedCPURAW"].astype(int)
             acct = acct.drop(columns = ["PlannedCPURAW"])
@@ -658,9 +670,12 @@ class Orchestrator(object):
                 # columns that receive no (i.e., identity) transformation
                 identity_map = { x : lambda y : y for x in set(df.columns.get_loc_level("outputs")[1]) - self.output_map.keys() }
 
-                # we get back all columns from the dataframe by aggregating columns
-                # that don't receive any transformation with transformed columns
-                df["outputs"] = df["outputs"].agg({ **self.output_map, **identity_map })
+                # we get back all columns from the dataframe by combining columns
+                # that don't receive any transformation with transformed columns.
+                # transform() (not agg()) since every function here is elementwise,
+                # not a reduction -- pandas 2.x deprecated relying on agg() to fall
+                # back to transform()-like behavior for this case.
+                df["outputs"] = df["outputs"].transform({ **self.output_map, **identity_map })
         except:
             canine_logging.error("There were some errors generating output dataframe; see stack trace for details.")
             canine_logging.error(traceback.format_exc())
@@ -685,14 +700,7 @@ class Orchestrator(object):
 
         # remove noop'd jobs from array spec
         op_idx = sorted(int(k) for k, v in job_spec.items() if v is not None)
-        array_range = []
-        for k, g in groupby(enumerate(op_idx), lambda i: i[0]-i[1]):
-            group = list(map(itemgetter(1), g))
-            if len(group) > 1:
-                array_range += [f"{group[0]}-{group[-1]}"]
-            else:
-                array_range += [str(group[0])]
-        array_str = ",".join(array_range)
+        array_str = _job_indices_to_array_str(op_idx)
 
         # parse out flags vs. params in extra_sbatch_args
         flags = [k for k, v in extra_sbatch_args.items() if v is None]

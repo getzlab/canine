@@ -11,7 +11,6 @@ import socket
 import psutil
 import io
 import pickle
-import math
 import threading
 import time
 import shutil
@@ -25,6 +24,8 @@ from urllib3.exceptions import ProtocolError
 
 import pandas as pd
 
+from slurm_gcp_docker.test_controller_environment import check_all as _slurm_gcp_check_all
+
 import threading
 
 gce_lock = threading.Lock()
@@ -33,12 +34,17 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
         action_on_stop = "delete",
-        image_family = "slurm-gcp-docker-v2",
+        image_family = "slurm-gcp-docker-v3",
         image_project = "broad-getzlab-workflows",
         image = None,
+<<<<<<< HEAD
         docker_tag = "latest",
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100", nfs_disk_type = "pd-standard",
         clust_frac = 1.0, user = None, shutdown_on_exit = False, **kwargs
+=======
+        storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
+        user = None, shutdown_on_exit = False, **kwargs
+>>>>>>> wolf-2.0-update
     ):
         if user is None:
             if "USER" in os.environ:
@@ -92,6 +98,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.nodes = pd.DataFrame()
 
     def init_slurm(self):
+        _slurm_gcp_check_all()
+
         # query /etc/passwd for UID/GID information if we are running as a different user
         # FIXME: how should this work for OS Login/LDAP/etc.?
         uid = None; gid = None
@@ -105,11 +113,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         self.dkr = docker.from_env()
 
         #
-        # check if image exists
+        # check if image exists; pull it if not
+        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.0'
         try:
-            image = self.dkr.images.get(f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:{self.config["docker_tag"]}')
+            image = self.dkr.images.get(image_ref)
         except docker.errors.ImageNotFound:
-            raise Exception(f"You have not yet built or pulled the Slurm Docker image with tag '{self.config['docker_tag']}'!")
+            canine_logging.info1(f"Slurm Docker image not found locally; pulling {image_ref} ...")
+            image = self.dkr.images.pull(image_ref)
         except RConnectionError as e:
             if isinstance(e.args[0], ProtocolError):
                 if isinstance(e.args[0].args[1], PermissionError):

@@ -12,7 +12,6 @@ from .utils import check_call
 from .orchestrator import Orchestrator, BACKENDS, version
 import yaml
 import pandas as pd
-from agutil import status_bar
 
 class Xargs(Orchestrator):
     """

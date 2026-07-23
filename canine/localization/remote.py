@@ -7,7 +7,6 @@ from .base import AbstractLocalizer, PathType, Localization
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project, check_call
-from agutil import status_bar
 
 class RemoteLocalizer(AbstractLocalizer):
     """

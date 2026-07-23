@@ -279,6 +279,7 @@ def _get_mtype_cost(mtype: str) -> typing.Tuple[float, float]:
         # (n1-|n2-)?custom-(\d+)-(\d+)(-ext)?
         if components[0] == 'custom':
             components = ['n1'] + components
+            track = '{}-{}'.format(components[0], components[1])
         if len(components) not in {4, 5}:
             raise ValueError("Custom mtype {} not in expected format".format(mtype))
         cores = int(components[2])
@@ -339,7 +340,12 @@ def pandas_write_hdf5_buffered(df: pd.DataFrame, key: str, buf: io.BufferedWrite
           driver = "H5FD_CORE",
           driver_core_backing_store = 0
         ) as store:
-            store["results"] = df
+            # output columns routinely hold Python lists (e.g. multiple output files
+            # per job), which PyTables' fixed HDF5 format can only store by pickling --
+            # a performance-only tradeoff we're accepting, not a bug (see comment history)
+            with warnings.catch_warnings():
+                warnings.filterwarnings("ignore", category = pd.errors.PerformanceWarning)
+                store["results"] = df
             buf.write(store._handle.get_file_image())
 
 def pandas_read_hdf5_buffered(key: str, buf: io.BufferedReader) -> pd.DataFrame:

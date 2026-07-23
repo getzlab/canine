@@ -3,6 +3,7 @@ import google.cloud.storage
 import google.auth
 import glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading
 import pandas as pd
+import urllib.parse
 
 from google.auth.transport.requests import AuthorizedSession
 from ..utils import sha1_base32, canine_logging
@@ -306,6 +307,8 @@ class HandleAWSURL(FileType):
         """
         super().__init__(path, **kwargs)
 
+        self.check_md5 = self.extra_args.get("check_md5", False)
+
         # remove any trailing slashes, in case path refers to a directory
         self.path = path.rstrip("/")
 
@@ -370,9 +373,26 @@ class HandleAWSURL(FileType):
                 raise ValueError(f"Error accessing S3 file:\n{head_resp.stderr.decode()}")
         elif head_resp.returncode != 0:
             raise ValueError(f"Unknown AWS S3 error occurred:\n{head_resp.stderr.decode()}")
-                
+
         self.headers = json.loads(head_resp.stdout)
 
+        # Check for multiple parts to enable local hash calculation
+        if self.headers.get("PartsCount", 1) > 1:
+            part1_head_resp = subprocess.run(
+              "{env} aws s3api {extra_args} head-object --bucket {bucket} --key {obj} --part-number 1".format(
+                env = self.command_env_str,
+                extra_args = self.s3_extra_args_str,
+                bucket = bucket,
+                obj = obj
+              ),
+              shell = True,
+              capture_output = True
+            )
+            if part1_head_resp.returncode == 254:
+                raise ValueError(f"Error accessing S3 file:\n{part1_head_resp.stderr.decode()}")
+            if part1_head_resp.returncode != 0:
+                raise ValueError(f"Unknown AWS S3 error occurred:\n{part1_head_resp.stderr.decode()}")
+            self.headers["PartLength"] = json.loads(part1_head_resp.stdout)["ContentLength"]
     def _get_hash(self):
         return self.headers["ETag"].replace('"', '')
 
@@ -384,11 +404,11 @@ class HandleAWSURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
 
-        return "\n".join([
+        cmd = [
           f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
           f"[ -f {self.localized_path} ] && SZ=$(stat --printf '%s' {self.localized_path}) || SZ=0",
           f"if [ $SZ != {self.size} ]; then",
-          "{env} aws s3api {extra_args} get-object --bucket {bucket} --key {file} --range \"bytes=$SZ-\" >(cat >> {dest}) > /dev/null".format(
+          '{env} aws s3api {extra_args} get-object --bucket {bucket} --key {file} --range "bytes=$SZ-" >(cat >> {dest}) > /dev/null'.format(
             env = self.command_env_str,
             extra_args = self.s3_extra_args_str,
             bucket = self.path.split("/")[2],
@@ -396,8 +416,35 @@ class HandleAWSURL(FileType):
             dest = self.localized_path
           ),
           "fi"
-        ])
-        
+        ]
+        if self.check_md5:
+            if "PartLength" in self.headers:
+                chunk_size = self.headers["PartLength"]
+                chunks = self.headers["PartsCount"]
+                cmd += [
+                  "md5hash=$(python3 << CODE",
+                  "import hashlib, multiprocessing",
+                   "def hash_chunk(args):",
+                  "    i, cs, f = args",
+                  "    fh = open(f, 'rb')",
+                  "    fh.seek(i * cs)",
+                  "    return hashlib.md5(fh.read(cs)).digest()",
+                  f"chunk_size = {chunk_size}",
+                  f"chunks = {chunks}",
+                  f"fp = '{self.localized_path}'",
+                  "pool = multiprocessing.Pool()",
+                  "results = pool.map(hash_chunk, [(i, chunk_size, fp) for i in range(chunks)])",
+                  "pool.close()",
+                  "print(hashlib.md5(b''.join(results)).hexdigest() + '-' + str(chunks))",
+                  "CODE",
+                  ")"
+                ]
+            else:
+                cmd += [f"md5hash=$(md5sum {self.localized_path} | cut -d ' ' -f 1)"]
+            cmd += [f'[[ "$md5hash" == "{self.hash}" ]] || {{ echo "deleting corrupted file" 1>&2 ; rm -f {self.localized_path} ; exit 1 ; }}']
+
+        return "\n".join(cmd)
+
 class HandleAWSURLStream(HandleAWSURL):
     localization_mode = "stream"
 
@@ -556,16 +603,74 @@ class HandleDRSURI(FileType):
 
         try:
             metadata = resp.json()
-            self.path = metadata["fileName"]
-            self._size = metadata["size"]
+            
+            # Extract the actual filename from the metadata
+            if "fileName" in metadata and metadata["fileName"]:
+                provided_filename = metadata["fileName"]
+                canine_logging.info1(f"DRShub-provided fileName: {provided_filename}")
+                
+                # Check if the fileName is just the UUID (common issue with DRShub)
+                # Extract UUID from the DRS URI for comparison
+                uri_uuid = self.uri.split(':')[-1] if ':' in self.uri else None
+                
+                if provided_filename == uri_uuid:
+                    # DRShub gave us the UUID as filename, try to extract real filename from accessUrl
+                    canine_logging.warning(f"DRShub returned UUID as fileName for {self.uri}, attempting to extract real filename from accessUrl")
+                    
+                    # Make another call to get the accessUrl
+                    access_data = {"url": self.uri, "fields": ["accessUrl"]}
+                    access_resp = drshub_session.post(type(self).drs_resolver,
+                                                    headers={"Content-type": "application/json"}, json=access_data)
+                    
+                    try:
+                        access_metadata = access_resp.json()
+                        if "accessUrl" in access_metadata and ("url" in access_metadata["accessUrl"]):
+                            signed_url = access_metadata["accessUrl"]["url"]
+                            
+                            # Extract filename from the signed URL path
+                            # URLs typically look like: https://domain.com/bucket/uuid/actual_filename.ext?params
+                            parsed_url = urllib.parse.urlparse(signed_url)
+                            url_path = parsed_url.path
+                            
+                            # Split path and get the last part (should be the real filename)
+                            path_parts = url_path.strip('/').split('/')
+                            if len(path_parts) >= 2:
+                                real_filename = path_parts[-1]  # Last part should be the real filename
+                                if real_filename and (real_filename != uri_uuid):
+                                    canine_logging.info1(f"Extracted real filename from accessUrl: {real_filename}")
+                                    self.path = real_filename
+                                else:
+                                    canine_logging.warning(f"Could not extract valid filename from accessUrl path: {url_path}")
+                                    self.path = provided_filename  # Fall back to UUID
+                            else:
+                                canine_logging.warning(f"Unexpected accessUrl path format: {url_path}")
+                                self.path = provided_filename  # Fall back to UUID
+                        else:
+                            canine_logging.warning(f"No accessUrl in DRShub response, using provided fileName: {provided_filename}")
+                            self.path = provided_filename
+                    except Exception as e:
+                        canine_logging.warning(f"Error extracting filename from accessUrl: {e}, using provided fileName: {provided_filename}")
+                        self.path = provided_filename
+                else:
+                    # DRShub gave us a proper filename
+                    self.path = provided_filename
+            else:
+                # This should not happen - if DRShub doesn't provide fileName, something is wrong
+                canine_logging.error(f"DRShub did not provide fileName for {self.uri}")
+                canine_logging.error(f"Available fields: {list(metadata.keys())}")
+                raise ValueError(f"DRShub response missing fileName for {self.uri}")
+            
+            self._size = metadata.get("size")
             self._hash = metadata.get("hashes", {}).get("md5")
-        except:
+            
+        except Exception as e:
             try:
                 msg = json.dumps(resp.json())
             except:
                 msg = resp.text
             canine_logging.error("Error resolving DRS URI; see details:")
             canine_logging.error(f"Response code: {resp.status_code}")
+            canine_logging.error(f"Error: {e}")
             canine_logging.error(msg)
             raise
         self.localized_path = self.path
@@ -620,6 +725,45 @@ class HandleDRSURIStream(HandleDRSURI):
 
         return "\n".join(cmd)
 
+
+class HandleGCSSignedURL(FileType):
+    localization_mode = "url"
+
+    def __init__(self, path, **kwargs):
+        super().__init__(path, **kwargs)
+        
+        self.url = self.path
+        # Extract the object path from signed GCS URLs to preserve the original filename
+        # Signed URLs look like: https://storage.googleapis.com/bucket/path/to/file.ext?GoogleAccessId=...
+        # or: https://storage.cloud.google.com/bucket/path/to/file.ext?GoogleAccessId=...
+        url_parse = re.match(r"https://storage\.(?:googleapis|cloud\.google)\.com/[^/]+/(.+?)(?:\?|$)", self.url)
+        if url_parse is None:
+            raise ValueError(f"Signed GCS URL format not recognized: {self.url}")
+        
+        # Keep the full object path to preserve directory structure and original filename
+        object_path = url_parse[1]
+        self.path = os.path.basename(object_path)  # Use just the filename for localization
+        self.localized_path = self.path
+        
+        # get file size from server
+        try:
+            resp_size = subprocess.run("curl -sIL {url} | grep -i Content-Length".format(url=self.url), shell=True, capture_output=True)
+            self._size = int(re.match("[cC]ontent.[lL]ength.*?(\d+)", resp_size.stdout.decode())[1])
+        except:
+            raise ValueError("Could not get file header size")
+            
+    def _get_hash(self):
+        return sha1_base32(bytearray(self.url, "utf-8"), 4)
+    
+    def localization_command(self, dest):
+        dest_dir = shlex.quote(os.path.dirname(dest))
+        dest_file = shlex.quote(os.path.basename(dest))
+        self.localized_path = os.path.join(dest_dir, dest_file)
+        cmd = []
+        cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+        
+        # md5 checking currently not supported
+        return "\n".join(cmd)
 
 class HandleOtherURL(FileType):
     localization_mode = "url"
@@ -767,6 +911,7 @@ def get_file_handler(path, url_map = None, **kwargs):
       r"^drs://" : HandleDRSURI,
       r"^https://api.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
+      r"^https://storage\.(?:googleapis|cloud\.google)\.com/" : HandleGCSSignedURL,
       r"^rodisk://" : HandleRODISKURL,
       r"^(?:ftp|https|http)://" : HandleOtherURL
     } if url_map is None else url_map
