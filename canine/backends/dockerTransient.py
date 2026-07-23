@@ -60,7 +60,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "action_on_stop" : action_on_stop,
           "image_family" : image_family,
           "image_project" : image_project,
-          "docker_tag" : docker_tag,
           "clust_frac" : 1.0,
           "user" : user,
           "storage_namespace" : storage_namespace,
@@ -68,7 +67,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
           "storage_disk" : storage_disk,
           "storage_disk_size" : storage_disk_size,
           "storage_uuid" : str(uuid.uuid4().hex[0:4]),
-          "nfs_disk_type" : nfs_disk_type,
+          "nfs_disk_type" : kwargs["nfs_disk_type"] if "nfs_disk_type" in kwargs else "pd-standard",
           **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
         }
         self.config["image"] = self.get_latest_image(
