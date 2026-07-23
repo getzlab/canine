@@ -42,7 +42,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gcp = [
-    "slurm_gcp_docker @ git+https://github.com/getzlab/slurm_gcp_docker@wolf-2.0-update",
+    "slurm_gcp_docker @ git+https://github.com/getzlab/slurm_gcp_docker@configure-nfs",
 ]
 
 [project.scripts]
