@@ -198,7 +198,7 @@ Here is the equivalent command line option:
 ```
 
 **Warning:** Do not specify `localization.transfer_bucket` when using a `LocalSlurmBackend`.
-This may result in redundant gsutil file transfers. Without a transfer bucket defined,
+This may result in redundant gcloud storage file transfers. Without a transfer bucket defined,
 a `LocalSlurmBackend` will use file copies and symlinks to stage inputs, even though
 a message about "SFTP" is displayed
 
@@ -446,7 +446,7 @@ for any given input is as follows:
 and `localization.common` is enabled, the file will be localized to the `$CANINE_COMMON`
 directory instead of the job's input. Actual handling of the file follows the remaining rules:
 * If the file starts with `gs://`, the file
-will be treated as a Google Storage file and will be copied by invoking `gsutil cp`
+will be treated as a Google Storage file and will be copied by invoking `gcloud storage cp`
 though the current backend
 * If the file is a valid file path on the local system, it will be copied using
 the current backend's transport system (SFTP for Remote and TransientGCP backends)
@@ -459,7 +459,7 @@ be streamed into the job via a named pipe. The input's environment variable will
 point to the pipe. This only works for `gs://` files, and will override default
 common behavior (file will always be streamed to job-specific input directory)
 **Warning:** Streams are included as part of a job's resource allocation. Having too
-many streamed files may adversely affect job performance as gsutil competes with
+many streamed files may adversely affect job performance as gcloud storage competes with
 the main job script for the CPU. If you stream more than ~3 files per job, consider increasing
 `resources.cpus-per-task`
 * `Localize`: Force the input to be localized. This will override default

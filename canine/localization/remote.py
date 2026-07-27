@@ -38,7 +38,7 @@ class RemoteLocalizer(AbstractLocalizer):
         if src.localization_mode == "url":
             cmd = src.localization_command(dest.localpath)
             rc, sout, serr = self.backend.invoke(cmd, True)
-            check_call(command, rc, sout, serr)
+            check_call(cmd, rc, sout, serr)
 
         # it's a local file
         elif os.path.exists(src.path):
@@ -62,7 +62,7 @@ class RemoteLocalizer(AbstractLocalizer):
         2) Begin localizing job inputs. For each job, check the predetermined strategy
         and set up the job's setup and teardown scripts
         3) Finally, finalize the localization. This may include broadcasting the
-        staging directory or copying a batch of gsutil files
+        staging directory or copying a batch of gcloud storage files
         Returns the remote staging directory, which is now ready for final startup
         """
         if overrides is None:

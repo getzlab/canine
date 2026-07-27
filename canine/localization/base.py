@@ -162,37 +162,38 @@ class AbstractLocalizer(abc.ABC):
             path = path[5:]
         bucket = path.split('/')[0]
         if bucket not in self.requester_pays:
-            command = 'gsutil requesterpays get gs://{}'.format(bucket)
+            command = 'gcloud storage buckets describe gs://{} --format="value(requester_pays)"'.format(bucket)
             # We check on the remote host because scope differences may cause
-            # a requester pays bucket owned by this account to require -u on the controller
-            # better safe than sorry
+            # a requester pays bucket owned by this account to require
+            # --billing-project on the controller. Better safe than sorry.
+            #
             rc, sout, serr = self.backend.invoke(command)
             text = serr.read()
-            if rc == 0 or b'BucketNotFoundException: 404' not in text:
+            if rc == 0 or b'404' not in text:
                 self.requester_pays[bucket] = (
                     b'requester pays bucket but no user project provided' in text
-                    or 'gs://{}: Enabled'.format(bucket).encode() in sout.read()
+                    or sout.read().strip() == b'True'
                 )
             else:
                 # Try again ls-ing the object itself
                 # sometimes permissions can disallow bucket inspection
                 # but allow object inspection
-                command = 'gsutil ls gs://{}'.format(path)
+                command = 'gcloud storage ls gs://{}'.format(path)
                 rc, sout, serr = self.backend.invoke(command)
                 text = serr.read()
                 self.requester_pays[bucket] = b'requester pays bucket but no user project provided' in text
-            if rc == 1 and b'BucketNotFoundException: 404' in text:
+            if rc != 0 and b'404' in text:
                 canine_logging.error(text.decode())
                 raise subprocess.CalledProcessError(rc, command)
         return bucket in self.requester_pays and self.requester_pays[bucket]
 
     def get_object_size(self, path: str) -> int:
         """
-        Returns the total number of bytes of the given gsutil object.
+        Returns the total number of bytes of the given gs:// object.
         If a directory is given, this will return the total space used by all objects in the directory
         """
-        cmd = 'gsutil {} du -s {}'.format(
-            '-u {}'.format(self.project) if self.get_requester_pays(path) else '',
+        cmd = 'gcloud storage du -s {} {}'.format(
+            '--billing-project={}'.format(self.project) if self.get_requester_pays(path) else '',
             path
         )
         rc, sout, serr = self.backend.invoke(cmd)
@@ -262,8 +263,8 @@ class AbstractLocalizer(abc.ABC):
                 self.backend.invoke('touch {}/.canine_dir_marker'.format(src))
             else:
                 subprocess.run(['touch', '{}/.canine_dir_marker'.format(src)])
-        command = "gsutil -m -o GSUtil:check_hashes=if_fast_else_skip -o GSUtil:parallel_composite_upload_threshold=150M {} cp -r {} {}".format(
-            '-u {}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
+        command = "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_THRESHOLD=150M gcloud storage cp -r {} {} {}".format(
+            '--billing-project={}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
         )
@@ -307,8 +308,8 @@ class AbstractLocalizer(abc.ABC):
             # Procede as a regular gs_copy
             traceback.print_exc()
 
-        command = "gsutil -o GSUtil:check_hashes=if_fast_else_skip -o GSUtil:parallel_composite_upload_threshold=150M {} cp {} {}".format(
-            '-u {}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
+        command = "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_THRESHOLD=150M gcloud storage cp {} {} {}".format(
+            '--billing-project={}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
             src,
             dest
         )
@@ -360,8 +361,8 @@ class AbstractLocalizer(abc.ABC):
                         file=sys.stderr, type = "error"
                     )
                     raise
-                cmd = "gsutil -m {} rm -r gs://{}/{}".format(
-                    '-u {}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
+                cmd = "gcloud storage rm -r {} gs://{}/{}".format(
+                    '--billing-project={}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
@@ -416,8 +417,8 @@ class AbstractLocalizer(abc.ABC):
                         file=sys.stderr, type="error"
                     )
                     raise
-                cmd = "gsutil -m {} rm -r gs://{}/{}".format(
-                    '-u {}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
+                cmd = "gcloud storage rm -r {} gs://{}/{}".format(
+                    '--billing-project={}'.format(self.project) if self.get_requester_pays(self.transfer_bucket) else '',
                     self.transfer_bucket,
                     os.path.dirname(path),
                 )
@@ -1466,7 +1467,7 @@ class AbstractLocalizer(abc.ABC):
         2) Begin localizing job inputs. For each job, check the predetermined strategy
         and set up the job's setup, localization, and teardown scripts
         3) Finally, finalize the localization. This may include broadcasting the
-        staging directory or copying a batch of gsutil files
+        staging directory or copying a batch of gcloud storage files
         Returns the remote staging directory, which is now ready for final startup
         """
         pass

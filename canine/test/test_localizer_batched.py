@@ -307,7 +307,7 @@ class TestIntegration(unittest.TestCase):
                                         self.assertIn(
                                             'if [[ -e {dest} ]]; then rm {dest}; fi\n'
                                             'mkfifo {dest}\n'
-                                            'gsutil  cat {src} > {dest} &'.format(
+                                            'gcloud storage cat  {src} > {dest} &'.format(
                                                 src=src,
                                                 dest=path
                                             ),

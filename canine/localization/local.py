@@ -84,7 +84,7 @@ class BatchedLocalizer(AbstractLocalizer):
         2) Begin localizing job inputs. For each job, check the predetermined strategy
         and set up the job's setup, localization, and teardown scripts
         3) Finally, finalize the localization. This may include broadcasting the
-        staging directory or copying a batch of gsutil files
+        staging directory or copying a batch of gcloud storage files
         Returns the remote staging directory, which is now ready for final startup
         """
         if overrides is None:
@@ -177,7 +177,7 @@ class LocalLocalizer(BatchedLocalizer):
     EXCEPT:
     Unlike BatchedLocalizer, gs:// files are copied into the local staging directory
     prior to it being copied to the slurm node. This is less efficient (as it
-    increases the size of the staging transfer) but utilizes local gsutil credentials
+    increases the size of the staging transfer) but utilizes local gcloud credentials
     """
     def localize_file(self, src: file_handlers.FileType, dest: PathType, transport: typing.Optional[AbstractTransport] = None):
         """

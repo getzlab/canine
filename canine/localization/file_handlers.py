@@ -133,39 +133,39 @@ class HandleGSURL(FileType):
             bucket_obj.reload() 
             return bucket_obj.requester_pays
         except Exception as e:
-            # Fallback to gsutil approach when GCS API fails (e.g., 403 permissions)
-            canine_logging.info1(f"GCS API failed for bucket {bucket}, falling back to gsutil: {e}")
-            
+            # Fallback to gcloud storage approach when GCS API fails (e.g., 403 permissions)
+            canine_logging.info1(f"GCS API failed for bucket {bucket}, falling back to gcloud storage: {e}")
+
             # Extract bucket and path like base class does
             if self.path.startswith('gs://'):
                 path = self.path[5:]
             else:
                 path = self.path
             bucket = path.split('/')[0]
-            
-            # Try gsutil requesterpays get command
-            command = 'gsutil requesterpays get gs://{}'.format(bucket)
+
+            # Try gcloud storage buckets describe command
+            command = 'gcloud storage buckets describe gs://{} --format="value(requester_pays)"'.format(bucket)
             ret = subprocess.run(command, shell = True, capture_output = True)
             text = ret.stderr
-            
-            if ret.returncode == 0 or b'BucketNotFoundException: 404' not in text:
+
+            if ret.returncode == 0 or b'404' not in text:
                 # Check both stderr (for error messages) and stdout (for success messages)
                 return (
                     b'requester pays bucket but no user project provided' in text
-                    or 'gs://{}: Enabled'.format(bucket).encode() in ret.stdout
+                    or ret.stdout.strip() == b'True'
                 )
             else:
                 # Try again ls-ing the object itself
                 # sometimes permissions can disallow bucket inspection
                 # but allow object inspection
-                command = 'gsutil ls gs://{}'.format(path)
+                command = 'gcloud storage ls gs://{}'.format(path)
                 ret = subprocess.run(command, shell = True, capture_output = True)
                 text = ret.stderr
-                
-                if ret.returncode == 1 and b'BucketNotFoundException: 404' in text:
+
+                if ret.returncode != 0 and b'404' in text:
                     canine_logging.error(text.decode())
                     raise subprocess.CalledProcessError(ret.returncode, command)
-                
+
                 # Check if this indicates requester pays
                 return b'requester pays bucket but no user project provided' in text
 
@@ -180,7 +180,7 @@ class HandleGSURL(FileType):
         if self.get_requester_pays():
             if "project" not in self.extra_args:
                 raise ValueError(f"File {self.path} resides in a requester-pays bucket but no user project provided")
-            self.rp_string = f' -u {self.extra_args["project"]}'
+            self.rp_string = f' --billing-project={self.extra_args["project"]}'
 
         # is this URL a directory?
         self.is_dir = False
@@ -255,16 +255,16 @@ class HandleGSURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
-        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'gsutil {self.rp_string} -o "GSUtil:state_dir={dest_dir}/.gsutil_state_dir" cp -r -n -L "{dest_dir}/.gsutil_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
+        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'CLOUDSDK_STORAGE_TRACKER_DIR="{dest_dir}/.gcloud_tracker_dir" gcloud storage cp {self.rp_string} -r -n -L "{dest_dir}/.gcloud_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
 
 class HandleGSURLStream(HandleGSURL):
     localization_mode = "stream"
 
     def localization_command(self, dest):
-        return "\n".join(['gsutil {} ls {} > /dev/null'.format(self.rp_string, shlex.quote(self.path)),
+        return "\n".join(['gcloud storage ls {} {} > /dev/null'.format(self.rp_string, shlex.quote(self.path)),
         'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
         'mkfifo {}'.format(dest),
-        "gsutil {} cat {} > {} &".format(
+        "gcloud storage cat {} {} > {} &".format(
             self.rp_string,
             shlex.quote(self.path),
             dest

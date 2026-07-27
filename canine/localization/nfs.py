@@ -91,7 +91,7 @@ class NFSLocalizer(BatchedLocalizer):
         2) Begin localizing job inputs. For each job, check the predetermined strategy
         and set up the job's setup, localization, and teardown scripts
         3) Finally, finalize the localization. This may include broadcasting the
-        staging directory or copying a batch of gsutil files
+        staging directory or copying a batch of gcloud storage files
         Returns the remote staging directory, which is now ready for final startup
         """
         if overrides is None:
