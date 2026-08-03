@@ -69,6 +69,7 @@ class AbstractLocalizer(abc.ABC):
         files_to_copy_to_outputs = {},
         persistent_disk_dry_run = False,
         cleanup_job_workdir = False,
+        allow_requester_pays: bool = False,
         **kwargs
     ):
         """
@@ -96,6 +97,8 @@ class AbstractLocalizer(abc.ABC):
           return the paths to the files on the disk that would be created
         cleanup_job_workdir: remove files in the job working directory that aren't
           denoted as outputs
+        allow_requester_pays: if False (default), downloading from a requester-pays
+          GCS bucket raises instead of silently billing self.project
         """
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
@@ -141,6 +144,8 @@ class AbstractLocalizer(abc.ABC):
         self.persistent_disk_dry_run = persistent_disk_dry_run
 
         self.cleanup_job_workdir = cleanup_job_workdir
+
+        self.allow_requester_pays = allow_requester_pays
 
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
@@ -263,8 +268,12 @@ class AbstractLocalizer(abc.ABC):
                 self.backend.invoke('touch {}/.canine_dir_marker'.format(src))
             else:
                 subprocess.run(['touch', '{}/.canine_dir_marker'.format(src)])
+        requester_pays = self.get_requester_pays(gs_obj)
+        if requester_pays and not dest.startswith('gs://') and not self.allow_requester_pays:
+            raise ValueError(f"{gs_obj} resides in a requester-pays bucket, but access to "
+                              "requester-pays buckets is disabled (allow_requester_pays=False)")
         command = "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_THRESHOLD=150M gcloud storage cp -r {} {} {}".format(
-            '--billing-project={}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
+            '--billing-project={}'.format(self.project) if requester_pays else '',
             src,
             dest
         )
@@ -308,8 +317,12 @@ class AbstractLocalizer(abc.ABC):
             # Procede as a regular gs_copy
             traceback.print_exc()
 
+        requester_pays = self.get_requester_pays(gs_obj)
+        if requester_pays and not dest.startswith('gs://') and not self.allow_requester_pays:
+            raise ValueError(f"{gs_obj} resides in a requester-pays bucket, but access to "
+                              "requester-pays buckets is disabled (allow_requester_pays=False)")
         command = "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_THRESHOLD=150M gcloud storage cp {} {} {}".format(
-            '--billing-project={}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
+            '--billing-project={}'.format(self.project) if requester_pays else '',
             src,
             dest
         )
@@ -535,7 +548,7 @@ class AbstractLocalizer(abc.ABC):
                     if arg not in overrides:
                         for p in paths:
                             # TODO: pass through other file handler arguments here
-                            fh = file_handlers.get_file_handler(p, project = self.project, token = self.token)
+                            fh = file_handlers.get_file_handler(p, project = self.project, token = self.token, allow_requester_pays = self.allow_requester_pays)
 
                             # only pick common inputs that are URLs; it does not
                             # save time for any other input types, and only leads
@@ -616,7 +629,7 @@ class AbstractLocalizer(abc.ABC):
             ## if input is a string, convert it to the appropriate FileType object
             if isinstance(value, str):
                 # TODO: pass through other file handler arguments here
-                value = file_handlers.get_file_handler(value, project = self.project, token = self.token)
+                value = file_handlers.get_file_handler(value, project = self.project, token = self.token, allow_requester_pays = self.allow_requester_pays)
             else:
                 assert isinstance(value, file_handlers.FileType)
 

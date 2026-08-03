@@ -182,3 +182,35 @@ class TestGetFileHandler:
         h = get_file_handler(42)
         assert isinstance(h, StringLiteral)
         assert h.path == "42"
+
+
+# ---------------------------------------------------------------------------
+# HandleGSURL — requester-pays access gate
+# ---------------------------------------------------------------------------
+
+class TestHandleGSURLRequesterPays:
+
+    def test_denied_by_default_raises(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=True):
+            with pytest.raises(ValueError, match="disabled"):
+                HandleGSURL("gs://bucket/file.txt", project="my-project")
+
+    def test_denied_explicitly_raises(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=True):
+            with pytest.raises(ValueError, match="disabled"):
+                HandleGSURL("gs://bucket/file.txt", project="my-project", allow_requester_pays=False)
+
+    def test_allowed_with_project_sets_billing_flag(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=True):
+            h = HandleGSURL("gs://bucket/file.txt", project="my-project", allow_requester_pays=True)
+        assert h.rp_string == " --billing-project=my-project"
+
+    def test_allowed_without_project_raises_no_project(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=True):
+            with pytest.raises(ValueError, match="no user project provided"):
+                HandleGSURL("gs://bucket/file.txt", allow_requester_pays=True)
+
+    def test_non_requester_pays_bucket_unaffected_by_flag(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=False):
+            h = HandleGSURL("gs://bucket/file.txt")
+        assert h.rp_string == ""

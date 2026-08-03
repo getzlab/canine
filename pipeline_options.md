@@ -399,6 +399,11 @@ the controller and compute nodes have a shared NFS mounted at `staging_dir`
 * `project` : The Google Cloud Project to charge when interacting with requester pays buckets.
 If the `transfer_bucket` or any declared inputs are requester pays, this project will
 be billed for the charges
+* `allow_requester_pays`: If False (default), attempting to download from a requester-pays
+GCS bucket raises a `ValueError` instead of billing `project` for the transfer. Set to True
+to allow requester-pays downloads. This is checked before every `gcloud storage cp`/`cat`
+download in the localization subsystem, so it must be set to True (in addition to `project`)
+for a pipeline that reads from requester-pays buckets to succeed.
 * `transfer_bucket`: A Google Cloud Storage bucket to use when executing batch directory
 transfers between the slurm cluster and the local filesystem. Providing a `transfer_bucket`
 _vastly_ improves file transfer performance when copying directories, however there

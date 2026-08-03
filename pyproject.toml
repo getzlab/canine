@@ -29,7 +29,7 @@ dependencies = [
     "google-auth>=1.6.3",
     "PyYAML>=5.1",
     "agutil>=4.1.0",
-    "hound @ git+https://github.com/getzlab/hound.git@gsutil-to-gcloud",
+    "hound @ git+https://github.com/getzlab/hound.git@wolf-2.0-update",
     "dalmatian @ git+https://github.com/getzlab/dalmatian@wolf-2.0-update",
     "google-api-python-client>=1.7.11",
     "docker>=4.1.0",
@@ -42,7 +42,7 @@ dependencies = [
 
 [project.optional-dependencies]
 gcp = [
-    "slurm_gcp_docker @ git+https://github.com/getzlab/slurm_gcp_docker@gsutil-to-gcloud",
+    "slurm_gcp_docker @ git+https://github.com/getzlab/slurm_gcp_docker@wolf-2.0-update",
 ]
 
 [project.scripts]

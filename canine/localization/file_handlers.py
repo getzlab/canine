@@ -178,6 +178,9 @@ class HandleGSURL(FileType):
         # check if this bucket is requester pays
         self.rp_string = ""
         if self.get_requester_pays():
+            if not self.extra_args.get("allow_requester_pays", False):
+                raise ValueError(f"File {self.path} resides in a requester-pays bucket, but access to "
+                                  "requester-pays buckets is disabled (allow_requester_pays=False)")
             if "project" not in self.extra_args:
                 raise ValueError(f"File {self.path} resides in a requester-pays bucket but no user project provided")
             self.rp_string = f' --billing-project={self.extra_args["project"]}'
