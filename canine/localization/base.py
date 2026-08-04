@@ -174,7 +174,7 @@ class AbstractLocalizer(abc.ABC):
             #
             rc, sout, serr = self.backend.invoke(command)
             text = serr.read()
-            if rc == 0 or b'404' not in text:
+            if rc == 0:
                 self.requester_pays[bucket] = (
                     b'requester pays bucket but no user project provided' in text
                     or sout.read().strip() == b'True'
@@ -182,7 +182,9 @@ class AbstractLocalizer(abc.ABC):
             else:
                 # Try again ls-ing the object itself
                 # sometimes permissions can disallow bucket inspection
-                # but allow object inspection
+                # (e.g. missing storage.buckets.get, as with many third-party
+                # requester-pays buckets) but allow object inspection -- retry
+                # regardless of why the describe call failed, not just on 404
                 command = 'gcloud storage ls gs://{}'.format(path)
                 rc, sout, serr = self.backend.invoke(command)
                 text = serr.read()

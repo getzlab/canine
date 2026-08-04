@@ -148,7 +148,7 @@ class HandleGSURL(FileType):
             ret = subprocess.run(command, shell = True, capture_output = True)
             text = ret.stderr
 
-            if ret.returncode == 0 or b'404' not in text:
+            if ret.returncode == 0:
                 # Check both stderr (for error messages) and stdout (for success messages)
                 return (
                     b'requester pays bucket but no user project provided' in text
@@ -157,7 +157,9 @@ class HandleGSURL(FileType):
             else:
                 # Try again ls-ing the object itself
                 # sometimes permissions can disallow bucket inspection
-                # but allow object inspection
+                # (e.g. missing storage.buckets.get, as with many third-party
+                # requester-pays buckets) but allow object inspection -- retry
+                # regardless of why the describe call failed, not just on 404
                 command = 'gcloud storage ls gs://{}'.format(path)
                 ret = subprocess.run(command, shell = True, capture_output = True)
                 text = ret.stderr
