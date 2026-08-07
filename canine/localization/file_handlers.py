@@ -728,7 +728,9 @@ class HandleAWSURLStream(HandleAWSURL):
         self.localized_path = os.path.join(dest_dir, dest_file)
 
         return "\n".join([
-          f"if [[ -e {0} ]]; then rm {0}; fi".format(dest),
+          # NB: not an f-string. {0} must survive to .format(dest) below — as an
+          # f-string it is evaluated first and substitutes the literal 0.
+          'if [[ -e {0} ]]; then rm {0}; fi'.format(dest),
           f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
           'mkfifo {}'.format(dest),
           "{env} aws s3 {extra_args} cp {url} {path} &".format(

@@ -14,6 +14,10 @@ from canine.localization.file_handlers import (
     HandleGCSSignedURL,
     HandleGDCHTTPURL,
     HandleOtherURL,
+    HandleGSURLStream,
+    HandleAWSURLStream,
+    HandleGDCHTTPURLStream,
+    HandleDRSURIStream,
 )
 
 
@@ -570,3 +574,79 @@ class TestHashCheckCommandIsValidShell:
     def test_no_gate_when_handler_never_probed(self):
         """Handlers that do no HTTP probe have no content_checksum attribute at all."""
         assert StringLiteral("x", check_hash=True)._hash_check_command() == []
+
+
+# ---------------------------------------------------------------------------
+# stream handlers: stale-FIFO guard
+# ---------------------------------------------------------------------------
+
+class TestStreamHandlerStaleFifoGuard:
+    """
+    Each *Stream handler creates a FIFO at `dest`, so it must first clear anything
+    already there — a leftover FIFO from a previous attempt would otherwise make
+    `mkfifo` fail under `set -e` and abort localization.
+
+    HandleAWSURLStream had this guard written as an f-string:
+
+        f"if [[ -e {0} ]]; then rm {0}; fi".format(dest)
+
+    The f-string is evaluated before .format() runs, so `{0}` became the literal `0`
+    and the emitted line was `if [[ -e 0 ]]; then rm 0; fi` — testing and removing a
+    file named "0" in the cwd instead of the FIFO. Parameterised over every stream
+    handler so the same slip cannot reappear in a sibling.
+    """
+
+    DEST = "/mnt/nfs/jobs/1/inputs/sample.bam"
+
+    def _command(self, cls):
+        """Build the localization command without running any handler __init__."""
+        handler = cls.__new__(cls)          # bypass network-dependent __init__
+        handler.path = "s3://bucket/sample.bam"
+        handler.url = "https://example.com/sample.bam"
+        handler.uri = "drs://dg.4dfc:abc-123"
+        handler.localized_path = self.DEST
+        handler.command_env_str = ""
+        handler.s3_extra_args_str = ""
+        handler.token_flag = ""
+        handler.token = None
+        handler.rp_string = ""
+        # size/hash/check_hash are read-only properties, so seed their backing fields
+        handler._size = 1024
+        handler._hash = "d41d8cd98f00b204e9800998ecf8427e"
+        handler._check_hash = False
+        handler.extra_args = {}
+        return handler.localization_command(self.DEST)
+
+    @pytest.mark.parametrize("cls", [
+        HandleGSURLStream,
+        HandleAWSURLStream,
+        HandleGDCHTTPURLStream,
+        HandleDRSURIStream,
+    ])
+    def test_guard_references_the_real_destination(self, cls):
+        cmd = self._command(cls)
+        assert "if [[ -e {0} ]]".format(self.DEST) in cmd, \
+            "stale-FIFO guard does not reference dest:\n" + cmd
+
+    @pytest.mark.parametrize("cls", [
+        HandleGSURLStream,
+        HandleAWSURLStream,
+        HandleGDCHTTPURLStream,
+        HandleDRSURIStream,
+    ])
+    def test_guard_does_not_degenerate_to_a_literal_zero(self, cls):
+        cmd = self._command(cls)
+        assert "if [[ -e 0 ]]" not in cmd
+        assert "rm 0;" not in cmd
+
+    @pytest.mark.parametrize("cls", [
+        HandleGSURLStream,
+        HandleAWSURLStream,
+        HandleGDCHTTPURLStream,
+        HandleDRSURIStream,
+    ])
+    def test_emitted_command_is_valid_bash(self, cls):
+        import subprocess as sp
+        cmd = self._command(cls)
+        r = sp.run(["bash", "-n"], input=cmd, text=True, capture_output=True)
+        assert r.returncode == 0, r.stderr + "\n---\n" + cmd
