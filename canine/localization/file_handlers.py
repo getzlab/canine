@@ -8,6 +8,132 @@ import urllib.parse
 from google.auth.transport.requests import AuthorizedSession
 from ..utils import sha1_base32, canine_logging
 
+# Checksum algorithms we can verify on a compute node, mapped to how we verify them.
+# The coreutils tools are guaranteed present; google_crc32c is in the worker image
+# (and is already a canine dependency), and python3 is relied on unconditionally by
+# other emitted commands, so a crc32c gate is safe to emit.
+_CHECKSUM_DIGEST_BYTES = {"md5": 16, "sha1": 20, "sha256": 32, "crc32c": 4}
+_CHECKSUM_COREUTILS = {"md5": "md5sum", "sha1": "sha1sum", "sha256": "sha256sum"}
+
+# Preference order when a server advertises more than one. md5 first because it is
+# what the other handlers already gate on; crc32c last because it needs python3
+# rather than coreutils — but it is not optional, since a GCS composite object
+# advertises *only* crc32c.
+_CHECKSUM_PREFERENCE = ("md5", "sha256", "sha1", "crc32c")
+
+
+def parse_header_block(raw):
+    """
+    Parse the headers out of `curl -I` output.
+
+    With `-L`, curl emits one header block per response in the redirect chain,
+    separated by blank lines. Only the final block describes the object that will
+    actually be downloaded, so intermediate 301/302 blocks must be discarded —
+    grepping the whole output can otherwise pick up a redirect's Content-Length.
+
+    Returns a dict with lowercased header names. Repeated headers are collected into a
+    comma-joined value, which is how x-goog-hash arrives when a server emits it twice.
+    """
+    blocks = [b for b in re.split(r"\r?\n\r?\n", raw.strip()) if b.strip()]
+    headers = {}
+    for line in (blocks[-1].splitlines() if blocks else []):
+        if ":" not in line:
+            continue  # the "HTTP/1.1 200 OK" status line
+        k, v = line.split(":", 1)
+        k = k.strip().lower()
+        v = v.strip()
+        headers[k] = "{},{}".format(headers[k], v) if k in headers else v
+    return headers
+
+
+def _b64_to_hex(value, algorithm):
+    """
+    Convert a base64 digest to lowercase hex, or return None if it is not a
+    well-formed digest of the expected length for `algorithm`.
+    """
+    try:
+        raw = base64.b64decode(value, validate = True)
+    except (binascii.Error, ValueError):
+        return None
+    if len(raw) != _CHECKSUM_DIGEST_BYTES[algorithm]:
+        return None
+    return binascii.hexlify(raw).decode()
+
+
+def extract_content_checksum(headers):
+    """
+    Find a content checksum in HTTP response headers that can be verified against the
+    downloaded file. Returns `(algorithm, hex_digest)`, or `(None, None)`.
+
+    Recognised sources, since no single one is universal:
+      * `x-goog-hash: crc32c=...,md5=...`  — GCS, including signed URLs
+      * `content-md5: <base64>`            — RFC 9110
+      * `digest` / `repr-digest`           — RFC 3230 / RFC 9530
+      * `x-amz-checksum-<algo>: <base64>`  — S3
+      * `etag: "<32 hex>"`                 — only when it is a bare hex md5
+
+    A digest is deliberately *not* returned when the response is content-encoded: the
+    digest then covers the encoded bytes while the file lands decoded, so gating on it
+    would fail on every correct download. This is the gzip decompressive-transcoding
+    case, where checksums cannot validate the localized file at all.
+    """
+    encoding = headers.get("content-encoding", "").strip().lower()
+    if encoding and encoding != "identity":
+        return None, None
+
+    candidates = {}
+
+    # GCS: x-goog-hash: crc32c=AAAAAA==,md5=1B2M2Y8AsgTpgAmY7PhCfg==
+    for part in headers.get("x-goog-hash", "").split(","):
+        if "=" not in part:
+            continue
+        algo, _, value = part.strip().partition("=")
+        algo = algo.strip().lower()
+        if algo in _CHECKSUM_DIGEST_BYTES:
+            hexed = _b64_to_hex(value.strip(), algo)
+            if hexed is not None:
+                candidates.setdefault(algo, hexed)
+
+    if "content-md5" in headers:
+        hexed = _b64_to_hex(headers["content-md5"], "md5")
+        if hexed is not None:
+            candidates.setdefault("md5", hexed)
+
+    # RFC 3230 `digest: md5=<b64>`; RFC 9530 `repr-digest: sha-256=:<b64>:`
+    for header in ("repr-digest", "digest"):
+        for part in headers.get(header, "").split(","):
+            if "=" not in part:
+                continue
+            algo, _, value = part.strip().partition("=")
+            algo = algo.strip().lower().replace("-", "")
+            value = value.strip().strip(":")
+            if algo in _CHECKSUM_DIGEST_BYTES:
+                hexed = _b64_to_hex(value, algo)
+                if hexed is not None:
+                    candidates.setdefault(algo, hexed)
+
+    for algo in _CHECKSUM_DIGEST_BYTES:
+        header = "x-amz-checksum-{}".format(algo)
+        if header in headers:
+            hexed = _b64_to_hex(headers[header], algo)
+            if hexed is not None:
+                candidates.setdefault(algo, hexed)
+
+    # ETag is only an md5 when it is a bare 32-hex string. A "-N" suffix means a
+    # multipart/composite object, where the ETag is an md5-of-md5s and does not match
+    # the file's own md5; weak validators and opaque tags are not digests at all.
+    etag = headers.get("etag", "").strip()
+    if not etag.startswith("W/"):
+        etag = etag.strip('"')
+        if re.fullmatch(r"[0-9a-fA-F]{32}", etag):
+            candidates.setdefault("md5", etag.lower())
+
+    for algo in _CHECKSUM_PREFERENCE:
+        if algo in candidates:
+            return algo, candidates[algo]
+    return None, None
+
+
 class FileType(abc.ABC):
     """
     Stores properties of and instructions for handling a given file type:
@@ -37,8 +163,158 @@ class FileType(abc.ABC):
         self.transport = transport # currently not used
         self.extra_args = kwargs
 
+        # Resolved once here rather than per-handler: the flag has to be consulted
+        # from a single place so that route-dependent verification (which method is
+        # sound for a given destination) has exactly one decision point.
+        self.check_hash = self._resolve_check_hash(kwargs)
+
         self._size = None
         self._hash = None
+
+    @staticmethod
+    def _resolve_check_hash(kwargs):
+        """
+        Resolve the integrity-check flag from either spelling.
+
+        `check_hash` is the preferred name. The check is not necessarily an md5: a
+        multipart S3 object is verified against its md5-of-md5s ETag, and a composite
+        object on a bucket destination has no md5 at all. So the flag means "verify
+        integrity by the best method available", not "compute an md5".
+
+        `check_md5` is the original name and is used extensively by downstream wolF
+        pipelines, so it must keep working indefinitely. It is a silent alias — no
+        DeprecationWarning, since every existing caller uses it and warning would put
+        noise on essentially every localization for no benefit.
+
+        Supplying both spellings with conflicting values is a caller bug rather than
+        something to guess at: silently picking one could disable integrity checking
+        without anyone noticing.
+        """
+        has_hash = "check_hash" in kwargs
+        has_md5 = "check_md5" in kwargs
+
+        if has_hash and has_md5 and bool(kwargs["check_hash"]) != bool(kwargs["check_md5"]):
+            raise ValueError(
+                "Conflicting integrity check flags: check_hash = {!r} but check_md5 = {!r}. "
+                "`check_md5` is a deprecated alias for `check_hash`; pass only one of "
+                "them, or give both the same value.".format(
+                    kwargs["check_hash"], kwargs["check_md5"]
+                )
+            )
+
+        if has_hash:
+            return bool(kwargs["check_hash"])
+        if has_md5:
+            return bool(kwargs["check_md5"])
+        return False
+
+    @property
+    def check_hash(self):
+        """
+        Whether this file's integrity must be verified after localization.
+        """
+        return self._check_hash
+
+    @check_hash.setter
+    def check_hash(self, value):
+        self._check_hash = bool(value)
+
+        # Keep extra_args carrying both spellings with the resolved value. extra_args
+        # is passed around as a plain dict (e.g. wolF's get_file_handler(**extra_args))
+        # and call sites may index either name, so leaving them inconsistent would let
+        # two call sites disagree about whether to verify.
+        extra_args = getattr(self, "extra_args", None)
+        if extra_args is not None:
+            extra_args["check_hash"] = self._check_hash
+            extra_args["check_md5"] = self._check_hash
+
+    @property
+    def check_md5(self):
+        """
+        Deprecated alias for `check_hash`; see `_resolve_check_hash`. Readable and
+        assignable so that any subclass, test or downstream consumer touching
+        `handler.check_md5` behaves exactly as it did before.
+        """
+        return self.check_hash
+
+    @check_md5.setter
+    def check_md5(self, value):
+        self.check_hash = value
+
+    def _probe_http_metadata(self, curl_args = ""):
+        """
+        Fetch response headers for `self.url` once and record both the size and any
+        verifiable content checksum.
+
+        Sets `self._size` and `self.content_checksum` — a `(algorithm, hex_digest)`
+        tuple, `(None, None)` when the server advertises nothing usable. Raises
+        ValueError if no Content-Length is available, matching prior behaviour.
+
+        Deliberately separate from `hash`/`_get_hash()`: those identify the *input*
+        (and for URL handlers are derived from the URL, precisely because the server
+        cannot be trusted to name the content), whereas this is a digest of the bytes
+        used to verify a completed download.
+        """
+        resp = subprocess.run(
+          "curl -sIL {args} {url}".format(args = curl_args, url = shlex.quote(self.url)),
+          shell = True, capture_output = True
+        )
+        headers = parse_header_block(resp.stdout.decode(errors = "replace"))
+
+        if "content-length" not in headers:
+            raise ValueError("Could not get file header size")
+        try:
+            self._size = int(headers["content-length"])
+        except ValueError:
+            raise ValueError("Could not get file header size")
+
+        self.content_checksum = extract_content_checksum(headers)
+
+        if self.check_hash and self.content_checksum[0] is None:
+            canine_logging.warning(
+              "check_hash was requested for {}, but the server advertises no usable "
+              "content checksum, so the download cannot be verified. Recognised "
+              "headers are x-goog-hash, Content-MD5, Digest/Repr-Digest, "
+              "x-amz-checksum-*, and a bare hex ETag.".format(self.url)
+            )
+
+        return headers
+
+    def _hash_check_command(self):
+        """
+        Emit the shell gate that verifies a localized file against the checksum the
+        server advertised. Returns [] when there is nothing to verify.
+
+        Same shape as the md5 gates the GDC/DRS handlers already emit: compare, and on
+        mismatch delete the corrupt file and exit 1.
+        """
+        if not self.check_hash:
+            return []
+
+        algorithm, digest = getattr(self, "content_checksum", (None, None))
+        if algorithm is None:
+            return []
+
+        fail = "{{ echo 'deleting corrupted file' ; rm -f {path} ; exit 1 ; }}".format(
+          path = self.localized_path
+        )
+
+        if algorithm in _CHECKSUM_COREUTILS:
+            return ["[[ $({prog} {path} | sed -r 's/  .*$//') == {digest} ]] || {fail}".format(
+              prog = _CHECKSUM_COREUTILS[algorithm],
+              path = self.localized_path,
+              digest = digest,
+              fail = fail,
+            )]
+
+        # crc32c has no coreutils equivalent; google_crc32c is in the worker image
+        return ['python3 -c "import sys,google_crc32c;h=google_crc32c.Checksum();'
+                "f=open(sys.argv[1],'rb');"
+                "[h.update(c) for c in iter(lambda: f.read(1048576), b'')];"
+                'sys.exit(0 if h.hexdigest().decode() == sys.argv[2] else 1)" '
+                '{path} {digest} || {fail}'.format(
+                  path = self.localized_path, digest = digest, fail = fail
+                )]
 
     @property
     def size(self):
@@ -307,8 +583,6 @@ class HandleAWSURL(FileType):
         """
         super().__init__(path, **kwargs)
 
-        self.check_md5 = self.extra_args.get("check_md5", False)
-
         # remove any trailing slashes, in case path refers to a directory
         self.path = path.rstrip("/")
 
@@ -417,7 +691,7 @@ class HandleAWSURL(FileType):
           ),
           "fi"
         ]
-        if self.check_md5:
+        if self.check_hash:
             if "PartLength" in self.headers:
                 chunk_size = self.headers["PartLength"]
                 chunks = self.headers["PartsCount"]
@@ -477,7 +751,6 @@ class HandleGDCHTTPURL(FileType):
 
         self.token = self.extra_args.get("token")
         self.token_flag = f'--header  "X-Auth-Token: {self.token}"' if self.token is not None else ''
-        self.check_md5 = self.extra_args.get("check_md5", False)
 
         # parse URL
         self.url = self.path
@@ -542,7 +815,7 @@ class HandleGDCHTTPURL(FileType):
             cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
 
         # ensure that file downloaded properly
-        if self.check_md5:
+        if self.check_hash:
             cmd += [f"[[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]] || {{ echo 'deleting corrupted file' ; rm -f {self.localized_path} ; exit 1 ; }}"]
 
         return "\n".join(cmd)
@@ -583,8 +856,6 @@ class HandleDRSURI(FileType):
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
 
-        self.check_md5 = self.extra_args.get("check_md5", False)
-
         # parse URL
         self.uri = self.path
         uri_parse = re.match(r"^drs://(?:[A-Za-z0-9._]+/)?[A-Za-z0-9._]+:[A-Za-z0-9.-_~%]+",
@@ -592,8 +863,12 @@ class HandleDRSURI(FileType):
         if uri_parse is None:
             raise ValueError(f"Invalid DRS URI '{self.uri}'")
 
-        fields = ["size", "fileName"]
-        if self.check_md5:
+        # NB: this is read during __init__, so it relies on super().__init__() above
+        # having already resolved the flag. It does more than gate a later md5 check —
+        # it decides whether to ask drshub for hashes at all, so it cannot be dropped
+        # in favour of only checking the flag at localization time.
+        fields = ["size", "fileName", "accessUrl"]
+        if self.check_hash:
             fields += ["hashes"]
         data = {"url": self.uri, "fields": fields}
 
@@ -617,16 +892,10 @@ class HandleDRSURI(FileType):
                     # DRShub gave us the UUID as filename, try to extract real filename from accessUrl
                     canine_logging.warning(f"DRShub returned UUID as fileName for {self.uri}, attempting to extract real filename from accessUrl")
                     
-                    # Make another call to get the accessUrl
-                    access_data = {"url": self.uri, "fields": ["accessUrl"]}
-                    access_resp = drshub_session.post(type(self).drs_resolver,
-                                                    headers={"Content-type": "application/json"}, json=access_data)
-                    
                     try:
-                        access_metadata = access_resp.json()
-                        if "accessUrl" in access_metadata and ("url" in access_metadata["accessUrl"]):
-                            signed_url = access_metadata["accessUrl"]["url"]
-                            
+                        if "accessUrl" in metadata and ("url" in metadata["accessUrl"]):
+                            signed_url = metadata["accessUrl"]["url"]
+
                             # Extract filename from the signed URL path
                             # URLs typically look like: https://domain.com/bucket/uuid/actual_filename.ext?params
                             parsed_url = urllib.parse.urlparse(signed_url)
@@ -688,7 +957,7 @@ class HandleDRSURI(FileType):
                f'[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {self.localized_path} "$signed_url"']
 
         # ensure that file downloaded properly
-        if self.check_md5:
+        if self.check_hash:
             cmd += [f"[[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]] || {{ echo 'deleting corrupted file' ; rm -f {self.localized_path} ; exit 1 ; }}"]
 
         return "\n".join(cmd)
@@ -744,25 +1013,24 @@ class HandleGCSSignedURL(FileType):
         object_path = url_parse[1]
         self.path = os.path.basename(object_path)  # Use just the filename for localization
         self.localized_path = self.path
-        
-        # get file size from server
-        try:
-            resp_size = subprocess.run("curl -sIL {url} | grep -i Content-Length".format(url=self.url), shell=True, capture_output=True)
-            self._size = int(re.match("[cC]ontent.[lL]ength.*?(\d+)", resp_size.stdout.decode())[1])
-        except:
-            raise ValueError("Could not get file header size")
-            
+
+        # get file size and any advertised content checksum from server. GCS returns
+        # x-goog-hash on signed URLs, so check_hash is verifiable here — a composite
+        # object advertises crc32c only, a plain one both crc32c and md5.
+        self._probe_http_metadata()
+
     def _get_hash(self):
         return sha1_base32(bytearray(self.url, "utf-8"), 4)
-    
+
     def localization_command(self, dest):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
         cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
-        
-        # md5 checking currently not supported
+
+        # ensure that file downloaded properly, if the server gave us a checksum
+        cmd += self._hash_check_command()
         return "\n".join(cmd)
 
 class HandleOtherURL(FileType):
@@ -777,28 +1045,26 @@ class HandleOtherURL(FileType):
             raise ValueError(f"URL {self.url} format not recognized")
         self.path = url_parse[1]
         self.localized_path = self.path
-        
-        # get file size from server
-        try:
-            resp_size = subprocess.run("curl -sIL {url} | grep -i Content-Length".format(url=self.url), shell=True, capture_output=True)
-            self._size = int(re.match("[cC]ontent.[lL]ength.*?(\d+)", resp_size.stdout.decode())[1])
-        except:
-            raise ValueError("Could not get file header size")
-        
-        # cannot trust server to provide the proper hash so we instead just used the hashed url
-            
+
+        # get file size and any advertised content checksum from server
+        self._probe_http_metadata()
+
     def _get_hash(self):
+        # cannot trust the server to provide a stable identity for this input, so the
+        # hashed URL is used instead. Note this is separate from content_checksum,
+        # which *is* taken from the server and is only used to verify a download.
         return sha1_base32(bytearray(self.url, "utf-8"), 4)
-    
+
     def localization_command(self, dest):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
         cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
-        
-        # md5 checking currently not supported
-        return "\n".join(cmd) 
+
+        # ensure that file downloaded properly, if the server gave us a checksum
+        cmd += self._hash_check_command()
+        return "\n".join(cmd)
 
 ## Regular files {{{
 
