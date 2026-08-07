@@ -668,6 +668,102 @@ class AbstractLocalizer(abc.ABC):
             for i, v in enumerate(value):
                 self.inputs[jobId][arg][i] = handle_input(v, mode)
 
+    @staticmethod
+    def _disk_resize_daemon_lines(
+      disk_kind: str,
+      poll_interval_sec: int = 10,
+      min_free_pct: int = 30,
+      headroom_sec: int = 0,
+      grow_pct: int = 160,
+      min_grow_gb: int = 0,
+      max_grow_gb: int = 0,
+    ) -> typing.List[str]:
+        """
+        Emit the shell lines that write and background a disk-autoresize daemon on
+        the compute node.
+
+        The daemon grows the disk when either trigger fires:
+          * free space falls below `min_free_pct`, or
+          * (only when `headroom_sec` > 0) the observed write rate projects the disk
+            filling within `headroom_sec` seconds.
+
+        The rate trigger exists for the localization disk. Parallel download streams
+        can consume 30% of a 100GB disk in ~15s, comparable to one poll interval plus
+        a control-plane resize, so a free-percentage trigger alone loses the race.
+        `min_grow_gb`/`max_grow_gb` (0 = unset) bound each step: the localization disk
+        persists as a RODISK for downstream tasks, so overshoot is a permanent storage
+        cost and it is better to resize repeatedly than to over-provision once.
+
+        The heredoc is deliberately unquoted (`<<EOF`) so that GCP_DISK_NAME and
+        GCP_TSNT_DISKS_DIR are baked in at file-write time: they are plain shell
+        assignments rather than exports (see the localization_script preamble above),
+        so a backgrounded child `bash` would not inherit them. Everything the daemon
+        evaluates at run time is therefore escaped as `\\$`.
+        """
+        return [
+          'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
+          'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
+          'POLL={}'.format(poll_interval_sec),
+          'MIN_FREE_PCT={}'.format(min_free_pct),
+          'HEADROOM_SEC={}'.format(headroom_sec),
+          'GROW_PCT={}'.format(grow_pct),
+          'MIN_GROW_GB={}'.format(min_grow_gb),
+          'MAX_GROW_GB={}'.format(max_grow_gb),
+          'PREV_FREE_MB=-1',
+          'while true; do',
+          '  sleep \$POLL',
+          '  if ! mountpoint "\$DISK_DIR" &> /dev/null; then',
+          '    echo "No disk mounted to \$DISK_DIR" >&2',
+          '    PREV_FREE_MB=-1',
+          '    continue',
+          '  fi',
+          '  TOTAL_MB=\$(df -B1M "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
+          '  FREE_MB=\$(df -B1M "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
+          '  if [[ -z \$TOTAL_MB || \$TOTAL_MB -le 0 ]]; then continue; fi',
+          '  NEED_RESIZE=0; REASON=; RATE_MB_S=0',
+          '  if [[ \$((100*FREE_MB/TOTAL_MB)) -lt \$MIN_FREE_PCT ]]; then',
+          '    NEED_RESIZE=1; REASON="free space below \${MIN_FREE_PCT}%"',
+          '  fi',
+          '  if [[ \$HEADROOM_SEC -gt 0 && \$PREV_FREE_MB -ge 0 ]]; then',
+          '    DELTA_MB=\$((PREV_FREE_MB - FREE_MB))',
+          '    if [[ \$DELTA_MB -gt 0 ]]; then',
+          '      RATE_MB_S=\$((DELTA_MB / POLL))',
+          # guarded as a nested if, not `&&` inside [[ ]]: arithmetic expansion happens
+          # during word expansion, before [[ short-circuits, so an inline
+          # $((FREE_MB / RATE_MB_S)) would still divide by zero
+          '      if [[ \$RATE_MB_S -gt 0 ]]; then',
+          '        ETA_SEC=\$((FREE_MB / RATE_MB_S))',
+          '        if [[ \$ETA_SEC -lt \$HEADROOM_SEC ]]; then',
+          '          NEED_RESIZE=1; REASON="projected full in \${ETA_SEC}s at \${RATE_MB_S}MB/s"',
+          '        fi',
+          '      fi',
+          '    fi',
+          '  fi',
+          '  PREV_FREE_MB=\$FREE_MB',
+          '  if [[ \$NEED_RESIZE -eq 1 ]]; then',
+          '    TOTAL_GB=\$(( (TOTAL_MB + 1023) / 1024 ))',
+          '    NEW_GB=\$(( TOTAL_GB * GROW_PCT / 100 ))',
+          '    if [[ \$RATE_MB_S -gt 0 && \$HEADROOM_SEC -gt 0 ]]; then',
+          '      RATE_GB=\$(( TOTAL_GB + (RATE_MB_S * HEADROOM_SEC + 1023) / 1024 ))',
+          '      if [[ \$RATE_GB -gt \$NEW_GB ]]; then NEW_GB=\$RATE_GB; fi',
+          '    fi',
+          '    if [[ \$MIN_GROW_GB -gt 0 && \$((NEW_GB - TOTAL_GB)) -lt \$MIN_GROW_GB ]]; then NEW_GB=\$((TOTAL_GB + MIN_GROW_GB)); fi',
+          '    if [[ \$MAX_GROW_GB -gt 0 && \$((NEW_GB - TOTAL_GB)) -gt \$MAX_GROW_GB ]]; then NEW_GB=\$((TOTAL_GB + MAX_GROW_GB)); fi',
+          '    echo "' + disk_kind + ' disk $GCP_DISK_NAME: \$REASON (\${FREE_MB}MB free of \${TOTAL_MB}MB); resizing \${TOTAL_GB}GB -> \${NEW_GB}GB" >&2',
+          '    if gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$NEW_GB; then',
+          '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+          '    else',
+          '      echo "' + disk_kind + ' disk $GCP_DISK_NAME: resize failed; retrying next poll" >&2',
+          '    fi',
+          '    PREV_FREE_MB=-1',
+          '  fi',
+          'done',
+          'EOF',
+          'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
+          'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
+          'set -e',
+        ]
+
     def create_persistent_disk(self,
       file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
       disk_name: str = None,
@@ -873,29 +969,34 @@ class AbstractLocalizer(abc.ABC):
             'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
         ]
 
-        # scratch disks dynamically resize as they get full.
-        # if disk has <30% free space remaining, increase its size by 60%
+        # Disks dynamically resize as they get full.
+        #
+        # Scratch disks have always done this. The *localization* disk needs it too:
+        # it is sized from `disk_size` above with only a 5% margin, and that estimate
+        # comes from GCS `size` metadata — which for an object stored with
+        # `Content-Encoding: gzip` is the *stored, compressed* byte count, while
+        # `gcloud storage cp` writes the object back out decompressed. Genomics text
+        # (VCF/BED/GTF/FASTA) routinely compresses 4-10x, so the margin is nowhere
+        # near enough and localization dies on ENOSPC partway through. Growing on
+        # demand is correct without having to predict the decompressed size at all.
         if is_scratch_disk:
-            localization_script += [
-              'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
-              'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
-              'while true; do',
-              '  sleep 10',
-              '  if ! mountpoint \$DISK_DIR &> /dev/null; then echo "No disk mounted to \$DISK_DIR" >&2; continue; else',
-              '    DISK_SIZE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
-              '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
-              '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
-              '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
-              '      gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
-              '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
-              '    fi',
-              '  fi',
-              'done',
-              'EOF',
-              'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
-              'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
-              'set -e',
-            ]
+            # Preserves the long-standing scratch-disk tuning: 10s poll, grow 60% when
+            # under 30% free, rate trigger disabled (headroom_sec = 0).
+            localization_script += self._disk_resize_daemon_lines("scratch")
+        else:
+            # The localization disk persists as a RODISK consumed by downstream tasks
+            # (optionally protect=yes), so overshoot is a permanent storage cost:
+            # prefer a smaller step with a faster poll and a per-step cap, resizing
+            # repeatedly rather than over-provisioning once.
+            localization_script += self._disk_resize_daemon_lines(
+              "localization",
+              poll_interval_sec = 5,
+              min_free_pct = 25,
+              headroom_sec = 60,
+              grow_pct = 125,
+              min_grow_gb = 20,
+              max_grow_gb = 100,
+            )
 
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
@@ -925,7 +1026,12 @@ class AbstractLocalizer(abc.ABC):
           # TODO: add command to optionally delete disk
 
           ## kill disk resizing daemon, if running
-          'kill $(cat .diskresizedaemon_pid) || : &> /dev/null'
+          # NB: absolute path. The daemon writes $CANINE_JOB_ROOT/.diskresizedaemon_pid,
+          # but this kill used a bare relative path, so it only ever worked if the
+          # teardown script happened to be running with $CANINE_JOB_ROOT as its cwd —
+          # which the scratch-disk path arranges ('cd $CANINE_JOB_ROOT' is prepended
+          # below) but the localization-disk path does not.
+          'kill $(cat $CANINE_JOB_ROOT/.diskresizedaemon_pid) || : &> /dev/null'
         ]
 
         # scratch disks get labeled "finalized" if the task ran OK.
