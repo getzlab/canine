@@ -714,6 +714,29 @@ class Manifest:
             record["offset"] = offset
             self.flush(data_fd)
 
+    def record_session(self, index, session_uri):
+        """
+        Persist a resumable upload session URI (Route B).
+
+        This MUST happen before any bytes are sent to that session, because the URI is
+        the only handle to the partially-uploaded data: losing it means the part has to
+        start over, and losing it after sending bytes means paying for bytes nothing can
+        ever reach.
+        """
+        with self._lock:
+            record = self.state.setdefault("chunks", {}).setdefault(str(index), {})
+            record["session"] = session_uri
+            self.flush(None)
+
+    def session_uri(self, index):
+        return self.chunk_record(index).get("session")
+
+    def record_part_digest(self, index, md5_hex):
+        with self._lock:
+            record = self.state.setdefault("chunks", {}).setdefault(str(index), {})
+            record["md5"] = md5_hex
+            self.flush(None)
+
     @property
     def tmp_path(self):
         """
@@ -1032,6 +1055,303 @@ class _ProcessStream:
 
 
 # --------------------------------------------------------------------------------
+# GCS JSON API client (Route B)
+# --------------------------------------------------------------------------------
+
+GCS_API_ROOT = "https://storage.googleapis.com/storage/v1"
+GCS_UPLOAD_ROOT = "https://storage.googleapis.com/upload/storage/v1"
+METADATA_TOKEN_URL = (
+    "http://metadata.google.internal/computeMetadata/v1/"
+    "instance/service-accounts/default/token"
+)
+
+# GCS persists resumable-upload bytes at this granularity, and every non-final PUT in a
+# session must be a multiple of it. This is what bounds discarded work on Route B.
+GCS_UPLOAD_GRANULARITY = 256 * 1024
+
+# A single compose call accepts at most this many sources; more are tree-composed.
+GCS_COMPOSE_MAX_SOURCES = 32
+
+
+class GcsClient:
+    """
+    Minimal GCS JSON API client over urllib, so Route B needs nothing beyond the
+    standard library.
+
+    Writes deliberately bypass the gcsfuse mount and go straight to the API. That
+    sidesteps staged-write re-uploads, the close()-only durability rule, the metadata
+    cache and non-atomic rename in one move.
+    """
+
+    def __init__(self, timeout=DEFAULT_TIMEOUT):
+        self.timeout = timeout
+        self._token = None
+        self._token_expiry = 0.0
+        self._lock = threading.Lock()
+
+    # -- auth ---------------------------------------------------------------
+
+    def token(self):
+        with self._lock:
+            if self._token and time.monotonic() < self._token_expiry:
+                return self._token
+            token, lifetime = self._fetch_token()
+            self._token = token
+            # renew early; a token expiring mid-upload would fail a whole part
+            self._token_expiry = time.monotonic() + max(60, lifetime - 300)
+            return self._token
+
+    def _fetch_token(self):
+        """
+        Prefer the GCE metadata server (no subprocess, and workers are GCE VMs), then
+        fall back to gcloud, which canine already relies on elsewhere.
+        """
+        request = urllib.request.Request(
+            METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"}
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            return payload["access_token"], int(payload.get("expires_in", 3600))
+        except Exception:
+            pass
+
+        try:
+            out = subprocess.run(
+                ["gcloud", "auth", "print-access-token"],
+                capture_output=True, timeout=60,
+            )
+            if out.returncode == 0:
+                token = out.stdout.decode("utf-8").strip()
+                if token:
+                    return token, 3600
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+        raise PermanentError(
+            "could not obtain a GCS access token from the metadata server or gcloud"
+        )
+
+    # -- plumbing -----------------------------------------------------------
+
+    def request(self, method, url, body=None, headers=None, expect=(200, 201)):
+        """
+        Issue a request and return (status, headers, body).
+
+        Unlike urlopen this does not raise for the status codes the resumable-upload
+        protocol uses as ordinary signals -- notably 308, which means "session alive,
+        here is how far I have persisted".
+        """
+        all_headers = {"Authorization": "Bearer " + self.token()}
+        all_headers.update(headers or {})
+        request = urllib.request.Request(
+            url, data=body, headers=all_headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                return response.status, dict(response.headers), response.read()
+        except urllib.error.HTTPError as e:
+            payload = b""
+            try:
+                payload = e.read()
+            except Exception:
+                pass
+            status = e.code
+            if status in expect:
+                return status, dict(e.headers or {}), payload
+            if status in (401, 403, 404, 410):
+                raise PermanentError("{} {} -> HTTP {}: {}".format(
+                    method, _strip_query(url), status,
+                    payload[:200].decode("utf-8", "replace")))
+            raise TransientError("{} {} -> HTTP {}".format(
+                method, _strip_query(url), status))
+        except (urllib.error.URLError, OSError) as e:
+            raise TransientError("{} {} -> {}".format(method, _strip_query(url), e))
+
+    # -- objects ------------------------------------------------------------
+
+    def start_resumable_upload(self, bucket, name):
+        """Returns the session URI. Must be persisted before any bytes are sent."""
+        url = "{}/b/{}/o?uploadType=resumable&name={}".format(
+            GCS_UPLOAD_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(name, safe=""),
+        )
+        status, headers, _ = self.request(
+            "POST", url, body=json.dumps({"name": name}).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+        )
+        session = headers.get("Location") or headers.get("location")
+        if not session:
+            raise TransientError("resumable upload session had no Location header")
+        return session
+
+    def session_offset(self, session_uri, total):
+        """
+        Ask the session how far it has durably persisted.
+
+        This is Route B's frontier oracle, exactly analogous to SEEK_HOLE: the answer
+        comes from the storage rather than from a counter we kept. `None` means the
+        upload already finished; 0 means nothing is persisted yet.
+        """
+        status, headers, _ = self.request(
+            "PUT", session_uri,
+            headers={"Content-Range": "bytes */{}".format(total), "Content-Length": "0"},
+            expect=(200, 201, 308),
+        )
+        if status in (200, 201):
+            return None
+        header_range = headers.get("Range") or headers.get("range")
+        if not header_range:
+            return 0
+        match = re.match(r"bytes=(\d+)-(\d+)", header_range.strip())
+        if not match:
+            return 0
+        return int(match.group(2)) + 1
+
+    def upload_range(self, session_uri, chunk, offset, total):
+        """
+        Send `chunk` at `offset`. Returns `(metadata, committed)`:
+
+          * `metadata` is the object metadata once the session completes, else None;
+          * `committed` is how far GCS says it has persisted, which is NOT necessarily
+            offset + len(chunk). Never assume the local byte count is authoritative --
+            a chunk marked complete on that basis leaves a part that does not exist.
+
+        Persisted bytes can never be overwritten, so re-sending an already-committed
+        range is harmless, which is what makes a retry safe.
+        """
+        end = offset + len(chunk) - 1
+        status, headers, body = self.request(
+            "PUT", session_uri, body=chunk,
+            headers={
+                "Content-Length": str(len(chunk)),
+                "Content-Range": "bytes {}-{}/{}".format(offset, end, total),
+            },
+            expect=(200, 201, 308),
+        )
+        if status in (200, 201):
+            try:
+                return json.loads(body.decode("utf-8")), total
+            except ValueError:
+                return {}, total
+
+        header_range = headers.get("Range") or headers.get("range")
+        committed = 0
+        if header_range:
+            match = re.match(r"bytes=(\d+)-(\d+)", header_range.strip())
+            if match:
+                committed = int(match.group(2)) + 1
+        return None, committed
+
+    def get_object(self, bucket, name):
+        url = "{}/b/{}/o/{}".format(
+            GCS_API_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(name, safe=""),
+        )
+        _, _, body = self.request("GET", url)
+        return json.loads(body.decode("utf-8"))
+
+    def delete_object(self, bucket, name):
+        url = "{}/b/{}/o/{}".format(
+            GCS_API_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(name, safe=""),
+        )
+        try:
+            self.request("DELETE", url, expect=(200, 204, 404))
+        except PermanentError:
+            pass  # already gone
+
+    def compose(self, bucket, destination, sources):
+        """
+        Concatenate `sources` into `destination` server-side.
+
+        compose transfers no object data at all -- it is a metadata operation billed as
+        one Class A op -- so unlike a POSIX merge there is no sequential tail to pay for
+        and the whole transfer stays parallel end to end.
+        """
+        url = "{}/b/{}/o/{}/compose".format(
+            GCS_API_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(destination, safe=""),
+        )
+        body = json.dumps({
+            "sourceObjects": [{"name": name} for name in sources],
+            "destination": {"name": destination},
+        }).encode("utf-8")
+        _, _, payload = self.request(
+            "POST", url, body=body,
+            headers={"Content-Type": "application/json"},
+        )
+        return json.loads(payload.decode("utf-8"))
+
+    def download_range(self, bucket, name, start, end):
+        """Ranged read of an object, used for the read-back verification pass."""
+        url = "{}/b/{}/o/{}?alt=media".format(
+            GCS_API_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(name, safe=""),
+        )
+        _, _, body = self.request(
+            "GET", url,
+            headers={"Range": "bytes={}-{}".format(start, end - 1)},
+            expect=(200, 206),
+        )
+        return body
+
+
+def _strip_query(url):
+    """Session URIs carry an upload_id; keep it out of logs."""
+    split = urllib.parse.urlsplit(url)
+    return urllib.parse.urlunsplit((split.scheme, split.netloc, split.path, "", ""))
+
+
+def split_gs_url(url):
+    """gs://bucket/path/to/object -> ('bucket', 'path/to/object')."""
+    if not url.startswith("gs://"):
+        raise ValueError("not a gs:// URL: {}".format(url))
+    remainder = url[len("gs://"):]
+    bucket, _, name = remainder.partition("/")
+    if not bucket or not name:
+        raise ValueError("gs:// URL has no object name: {}".format(url))
+    return bucket, name
+
+
+def compose_tree(client, bucket, destination, parts, max_sources=GCS_COMPOSE_MAX_SOURCES):
+    """
+    Compose `parts` (in order) into `destination`, tree-composing when there are more
+    than one call can take.
+
+    Sources may themselves be composite, so 800 parts become 25 intermediates and then
+    one object. Intermediates are deleted as soon as they have been consumed.
+    """
+    level = list(parts)
+    generation = 0
+    created = []
+
+    while len(level) > max_sources:
+        next_level = []
+        for index in range(0, len(level), max_sources):
+            group = level[index:index + max_sources]
+            if len(group) == 1:
+                next_level.append(group[0])
+                continue
+            intermediate = "{}.k9pdl.compose/{}-{:05d}".format(
+                destination, generation, index // max_sources)
+            client.compose(bucket, intermediate, group)
+            created.append(intermediate)
+            next_level.append(intermediate)
+        level = next_level
+        generation += 1
+
+    result = client.compose(bucket, destination, level) if len(level) > 1 else None
+    if result is None:
+        # a single source: compose still gives the destination the right name
+        result = client.compose(bucket, destination, level)
+
+    for name in created:
+        client.delete_object(bucket, name)
+    return result
+
+
+# --------------------------------------------------------------------------------
 # download
 # --------------------------------------------------------------------------------
 
@@ -1057,47 +1377,242 @@ class Progress:
                 pct, self.done, self.total, self.transferred))
 
 
-class Downloader:
-    def __init__(self, source, fd, manifest, chunks, options, progress):
-        self.source = source
+class PosixChunkSink:
+    """
+    Writes chunks in place into the sparse destination file (Route A).
+
+    Durable progress comes from the file's own extents, so there is nothing to keep in
+    sync -- see the module docstring.
+    """
+
+    needs_local_file = True
+
+    # 1 MiB balances memory against write granularity; pwrite is durable as soon as the
+    # filesystem commits, so there is no un-acknowledged window to bound.
+    read_block = READ_BLOCK
+
+    def __init__(self, fd, manifest, chunks, dest):
         self.fd = fd
+        self.manifest = manifest
+        self.chunks = chunks
+        self.dest = dest
+        self.use_checkpoints = not manifest.state.get("seek_hole", True)
+        self.checkpoint_interval = (
+            manifest.state.get("checkpoint_interval") or FALLBACK_CHECKPOINT_INTERVAL
+        )
+        self._last_checkpoint = {}
+
+    def resume_offset(self, index):
+        start, end = self.chunks[index]
+        if self.manifest.is_complete(index):
+            return end
+        if self.use_checkpoints:
+            recorded = self.manifest.checkpoint_offset(index)
+            offset = min(max(start, recorded), end)
+        else:
+            offset = chunk_frontier(self.fd, start, end)
+            # a frontier must be monotonic and within the chunk; anything else means the
+            # derivation cannot be trusted, so rewind to the chunk start
+            if not start <= offset <= end:
+                log("chunk {}: implausible frontier {}, restarting chunk".format(
+                    index, offset))
+                offset = start
+        self._last_checkpoint[index] = offset
+        return offset
+
+    def write(self, index, offset, buf):
+        view = memoryview(buf)
+        while view:
+            written = os.pwrite(self.fd, view, offset)
+            if written <= 0:
+                raise TransientError("pwrite returned {}".format(written))
+            view = view[written:]
+            offset += written
+
+        if self.use_checkpoints:
+            last = self._last_checkpoint.get(index, 0)
+            if offset - last >= self.checkpoint_interval:
+                self.manifest.record_checkpoint(index, offset, self.fd)
+                self._last_checkpoint[index] = offset
+
+        # None means "the caller's own byte count is authoritative", which it is for a
+        # local file: pwrite either wrote the bytes or raised.
+        return None
+
+    def chunk_done(self, index):
+        self.manifest.record_chunk_done(index, self.fd)
+
+    def sync(self):
+        os.fsync(self.fd)
+
+
+class BucketChunkSink:
+    """
+    Uploads each chunk as its own GCS object through a resumable upload session, then
+    composes them server-side (Route B).
+
+    The VM is a pure relay here: bytes arrive from the source and leave again to GCS
+    with no local file at all, which is why this route needs no staging disk and no
+    concatenation transfer.
+
+    Resumability is preserved by the same principle as Route A -- ask the storage where
+    its durable frontier is rather than trusting a stored counter. A resumable session
+    answers that with a 308 plus a Range header, at 256 KiB granularity, so worst-case
+    discarded work is under 256 KiB per in-flight chunk. Sessions live 7 days, uploads
+    within one must be sequential (which is how chunks are streamed anyway), persisted
+    bytes can never be overwritten (so a retry re-sending a committed range is
+    harmless), and an incomplete upload is invisible in the bucket -- a preempted part
+    leaves no partial object and no ambiguity about what exists.
+    """
+
+    needs_local_file = False
+
+    # Deliberately the GCS commit granularity rather than the larger local read block.
+    # Bytes that have been read from the source but not yet acknowledged by GCS are lost
+    # if the attempt dies, so this is what bounds discarded work to <256 KiB per
+    # in-flight part. A bigger block would trade that guarantee for fewer requests.
+    read_block = GCS_UPLOAD_GRANULARITY
+
+    def __init__(self, client, bucket, parts_prefix, manifest, chunks):
+        self.client = client
+        self.bucket = bucket
+        self.parts_prefix = parts_prefix
+        self.manifest = manifest
+        self.chunks = chunks
+        self._digests = {}
+        self._completed = set()
+        self._lock = threading.Lock()
+
+    def part_name(self, index):
+        return "{}/{:05d}".format(self.parts_prefix, index)
+
+    def part_names(self):
+        return [self.part_name(i) for i in range(len(self.chunks))]
+
+    def _session_for(self, index):
+        """
+        Get or create this part's session, persisting the URI *before* any bytes are
+        sent to it.
+        """
+        session = self.manifest.session_uri(index)
+        if session:
+            return session
+        with self._lock:
+            session = self.manifest.session_uri(index)
+            if session:
+                return session
+            session = self.client.start_resumable_upload(
+                self.bucket, self.part_name(index)
+            )
+            self.manifest.record_session(index, session)
+            return session
+
+    def resume_offset(self, index):
+        start, end = self.chunks[index]
+        if self.manifest.is_complete(index):
+            return end
+
+        session = self._session_for(index)
+        total = end - start
+        try:
+            persisted = self.client.session_offset(session, total)
+        except PermanentError as e:
+            # 404/410 mean the session is gone or expired; only this part restarts
+            log("chunk {}: session unusable ({}); starting this part over".format(index, e))
+            self.manifest.record_session(index, None)
+            return start
+
+        if persisted is None:
+            # the session already completed
+            self.manifest.record_chunk_done(index, None)
+            return end
+        # session offsets are relative to the part; the download works in absolute
+        # offsets into the source object
+        return start + persisted
+
+    def write(self, index, offset, buf):
+        start, end = self.chunks[index]
+        session = self._session_for(index)
+
+        # Track a running md5 of the part, but only while it stays contiguous from the
+        # part's start within this process. A part resumed from a previous attempt
+        # cannot be hashed without re-reading it, so the digest is simply unavailable
+        # then and verification falls back to the read-back pass.
+        with self._lock:
+            tracker = self._digests.get(index)
+            if tracker is None and offset == start:
+                tracker = self._digests[index] = {"md5": hashlib.md5(), "next": start}
+            if tracker is not None:
+                if tracker["next"] == offset:
+                    tracker["md5"].update(buf)
+                    tracker["next"] = offset + len(buf)
+                else:
+                    self._digests[index] = False   # no longer contiguous
+
+        metadata, committed = self.client.upload_range(
+            session, buf, offset - start, end - start
+        )
+        if metadata is not None:
+            with self._lock:
+                self._completed.add(index)
+        # Report GCS's own view of how far it has persisted. The caller must not
+        # advance on the local byte count: if a PUT was interrupted, fewer bytes are
+        # durable than were sent, and treating the chunk as finished would compose a
+        # part that does not exist.
+        return start + committed
+
+    def part_digest(self, index):
+        """Hex md5 of this part if it was hashed contiguously, else None."""
+        tracker = self._digests.get(index)
+        if not tracker:
+            return None
+        start, end = self.chunks[index]
+        if tracker["next"] != end:
+            return None
+        return tracker["md5"].hexdigest()
+
+    def chunk_done(self, index):
+        # Only GCS can say a part is finished. If the session never returned a
+        # completion, the part is not durable and must not be recorded done -- it would
+        # be composed as a missing object.
+        if self.manifest.is_complete(index):
+            return
+        with self._lock:
+            completed = index in self._completed
+        if not completed:
+            raise TransientError(
+                "part {} sent all its bytes but the upload session did not "
+                "complete".format(index)
+            )
+        digest = self.part_digest(index)
+        if digest:
+            self.manifest.record_part_digest(index, digest)
+        self.manifest.record_chunk_done(index, None)
+
+    def sync(self):
+        return None
+
+
+class Downloader:
+    def __init__(self, source, sink, manifest, chunks, options, progress):
+        self.source = source
+        self.sink = sink
         self.manifest = manifest
         self.chunks = chunks
         self.options = options
         self.progress = progress
         self.made_progress = False
         self._progress_lock = threading.Lock()
-        self.use_checkpoints = not manifest.state.get("seek_hole", True)
-        self.checkpoint_interval = (
-            manifest.state.get("checkpoint_interval") or FALLBACK_CHECKPOINT_INTERVAL
-        )
 
     def resume_offset(self, index):
-        """
-        Where this chunk should continue from. Derived from the file's own extents
-        where SEEK_HOLE works, and only from a stored counter where it does not.
-        """
-        start, end = self.chunks[index]
-        if self.manifest.is_complete(index):
-            return end
-        if self.use_checkpoints:
-            recorded = self.manifest.checkpoint_offset(index)
-            return min(max(start, recorded), end)
-        frontier = chunk_frontier(self.fd, start, end)
-        # a frontier must be monotonic and within the chunk; anything else means the
-        # derivation cannot be trusted, so rewind to the chunk start
-        if not start <= frontier <= end:
-            log("chunk {}: implausible frontier {}, restarting chunk".format(index, frontier))
-            return start
-        return frontier
+        return self.sink.resume_offset(index)
 
     def download_chunk(self, index):
         start, end = self.chunks[index]
         offset = self.resume_offset(index)
 
         if offset >= end:
-            if not self.manifest.is_complete(index):
-                self.manifest.record_chunk_done(index, self.fd)
+            self.sink.chunk_done(index)
             self.progress.add(end - start, resumed=True)
             return
 
@@ -1105,7 +1620,6 @@ class Downloader:
             self.progress.add(offset - start, resumed=True)
 
         attempts = 0
-        last_checkpoint = offset
         while offset < end:
             try:
                 stream = self.source.open_range(offset, end)
@@ -1118,22 +1632,29 @@ class Downloader:
 
             try:
                 while offset < end:
-                    want = min(READ_BLOCK, end - offset)
+                    want = min(self.sink.read_block, end - offset)
                     buf = stream.read(want)
                     if not buf:
                         raise TransientError(
                             "short read at {} ({} bytes short)".format(offset, end - offset)
                         )
-                    self._pwrite_all(buf, offset)
-                    offset += len(buf)
+                    durable = self.sink.write(index, offset, buf)
+                    sent_to = offset + len(buf)
                     self.progress.add(len(buf))
                     with self._progress_lock:
                         self.made_progress = True
 
-                    if (self.use_checkpoints
-                            and offset - last_checkpoint >= self.checkpoint_interval):
-                        self.manifest.record_checkpoint(index, offset, self.fd)
-                        last_checkpoint = offset
+                    if durable is None or durable >= sent_to:
+                        offset = sent_to
+                    else:
+                        # The sink persisted less than was sent (an interrupted upload
+                        # session). Its answer is authoritative, so rewind to it and
+                        # re-open the source there rather than carrying on from a
+                        # position the storage never reached.
+                        offset = max(offset, durable)
+                        raise TransientError(
+                            "sink persisted to {} of {} sent".format(durable, sent_to)
+                        )
                 attempts = 0
             except TransientError as e:
                 attempts += 1
@@ -1154,16 +1675,7 @@ class Downloader:
                 except (IOError, OSError):
                     pass
 
-        self.manifest.record_chunk_done(index, self.fd)
-
-    def _pwrite_all(self, buf, offset):
-        view = memoryview(buf)
-        while view:
-            written = os.pwrite(self.fd, view, offset)
-            if written <= 0:
-                raise TransientError("pwrite returned {}".format(written))
-            view = view[written:]
-            offset += written
+        self.sink.chunk_done(index)
 
     def _await_space(self, index):
         """
@@ -1295,6 +1807,165 @@ def verify(path, options):
     return None
 
 
+def gcs_object_md5(metadata):
+    """GCS reports md5Hash as base64; convert to hex, or None for a composite object."""
+    raw = metadata.get("md5Hash")
+    if not raw:
+        return None
+    try:
+        return binascii.hexlify(base64.b64decode(raw)).decode()
+    except (binascii.Error, ValueError):
+        return None
+
+
+def verify_bucket_object(client, bucket, name, size, options, block=READ_BUFFER):
+    """
+    Verify a composed object against the source's declared hash by reading it back.
+
+    This is the expensive case, and it is accepted rather than avoided: check_hash is an
+    absolute guarantee, so being unable to verify cheaply forces the read-back rather
+    than yielding a silent pass. Same-region GCS-to-GCE egress is free and fast, which
+    is what makes it tolerable.
+
+    A composite object has no md5Hash of its own, which is exactly why the stored
+    metadata cannot be used here.
+    """
+    digest = hashlib.md5()
+    offset = 0
+    while offset < size:
+        end = min(offset + block, size)
+        payload = client.download_range(bucket, name, offset, end)
+        if not payload:
+            raise TransientError("read-back returned nothing at {}".format(offset))
+        digest.update(payload)
+        offset += len(payload)
+
+    actual = digest.hexdigest()
+    expected = normalize_expected_md5(options.check_md5)
+    if actual != expected:
+        raise PermanentError(
+            "md5 mismatch after compose: expected {}, got {}".format(expected, actual)
+        )
+    return actual
+
+
+def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_path,
+                     marker_path):
+    """
+    Route B: upload each chunk as its own object through a resumable session, compose
+    them server-side, verify, then delete the parts.
+
+    Preferred over stage-then-publish whenever the destination bucket can be addressed,
+    because compose transfers no object data -- so there is no sequential tail and the
+    entire transfer stays parallel end to end.
+    """
+    bucket, object_name = split_gs_url(decision.gs_url)
+    client = GcsClient(timeout=options.timeout)
+    parts_prefix = "{}.k9pdl.parts".format(object_name)
+
+    # The manifest is an object write on this route rather than a tmp+rename, since
+    # rename is not atomic on a flat-namespace bucket. It still lands beside the
+    # destination so it travels with the data.
+    manifest = None if options.no_resume else Manifest.load(manifest_path)
+    chunk_size = (chunks[0][1] - chunks[0][0]) if chunks else size
+    if manifest is not None and manifest.state.get("plan_id") != plan_id:
+        log("manifest describes a different object or layout; restarting")
+        manifest.unlink()
+        manifest = None
+    if manifest is None:
+        manifest = Manifest.create(
+            manifest_path, plan_id, size, chunk_size, chunks, _FakeStat(size),
+            False, 0,
+        )
+        manifest.state["route"] = ROUTE_BUCKET
+    else:
+        log("resuming: {}/{} parts already complete".format(
+            sum(1 for i in range(len(chunks)) if manifest.is_complete(i)), len(chunks)))
+
+    sink = BucketChunkSink(client, bucket, parts_prefix, manifest, chunks)
+    downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
+
+    try:
+        downloader.run()
+    except PermanentError as e:
+        log("permanent failure: {}".format(e))
+        return EXIT_FAIL
+    except TransientError as e:
+        if downloader.made_progress:
+            log("transient failure after progress; requesting requeue: {}".format(e))
+            return EXIT_REQUEUE
+        log("no forward progress this attempt: {}".format(e))
+        return EXIT_FAIL
+
+    # Every part must exist at exactly its planned length before anything is composed.
+    # An incomplete resumable upload is invisible in the bucket, so a missing part here
+    # means that part never finished rather than that it is partially there.
+    part_names = sink.part_names()
+    for index, name in enumerate(part_names):
+        expected = chunks[index][1] - chunks[index][0]
+        try:
+            metadata = client.get_object(bucket, name)
+        except PermanentError:
+            log("part {} is missing after upload; requesting requeue".format(index))
+            return EXIT_REQUEUE
+        if int(metadata.get("size", -1)) != expected:
+            log("part {} is {} bytes, expected {}".format(
+                index, metadata.get("size"), expected))
+            return EXIT_FAIL
+        recorded = manifest.chunk_record(index).get("md5")
+        stored = gcs_object_md5(metadata)
+        if recorded and stored and recorded != stored:
+            log("part {} md5 differs from what GCS stored ({} vs {})".format(
+                index, recorded, stored))
+            return EXIT_FAIL
+
+    composed = compose_tree(client, bucket, object_name, part_names)
+    if int(composed.get("size", -1)) != size:
+        log("composed object is {} bytes, expected {}".format(composed.get("size"), size))
+        return EXIT_FAIL
+
+    digest = None
+    if options.check_md5:
+        try:
+            digest = verify_bucket_object(client, bucket, object_name, size, options)
+        except PermanentError as e:
+            log("verification failed: {}".format(e))
+            for name in part_names:
+                client.delete_object(bucket, name)
+            client.delete_object(bucket, object_name)
+            manifest.unlink()
+            return EXIT_FAIL
+    elif options.check_etag:
+        log("ETag verification is not available for a composed object; "
+            "pass --check-md5 to verify this destination")
+        return EXIT_FAIL
+
+    # Parts are deleted explicitly. The GCS JSON API's objects.compose has no
+    # deleteSourceObjects parameter (contrary to the design note), so a crash between
+    # compose and here leaves orphaned parts; the next run's cleanup below removes them,
+    # and they are under a dotted prefix so nothing globs them up meanwhile.
+    for name in part_names:
+        client.delete_object(bucket, name)
+
+    write_done_marker(marker_path, size, plan_id, digest)
+    manifest.unlink()
+    log("complete: {} bytes composed from {} parts{}".format(
+        size, len(part_names), " (verified)" if digest else ""))
+    return EXIT_OK
+
+
+class _FakeStat:
+    """
+    Stands in for os.stat on a route with no local file, so the manifest's identity
+    fields stay populated without pretending an inode exists.
+    """
+
+    def __init__(self, size):
+        self.st_dev = 0
+        self.st_ino = 0
+        self.st_size = size
+
+
 # --------------------------------------------------------------------------------
 # single-stream fallback
 # --------------------------------------------------------------------------------
@@ -1402,13 +2073,24 @@ def run(options):
     decision = select_route(dest)
     log("route {}: {}".format(decision.route, decision.reason))
 
+    chunks = plan_chunks(size, options.connections, options.min_chunk,
+                         options.part_length)
+    chunk_size = (chunks[0][1] - chunks[0][0]) if chunks else size
+    plan_id = compute_plan_id(
+        options.url or "", size, options.check_etag or options.check_md5, chunk_size
+    )
+
+    if decision.route == ROUTE_BUCKET:
+        return run_bucket_route(options, decision, source, size, chunks, plan_id,
+                                manifest_path, marker_path)
+
     if decision.route != ROUTE_POSIX:
-        # Routes B (parts + server-side compose) and C (stage-then-publish) are not
-        # implemented yet. Until they are, a non-POSIX destination takes the single
-        # sequential stream -- which is not merely a placeholder: it is the documented
-        # degradation for Route C when no staging directory qualifies, and for gcsfuse
-        # it is also the only access pattern that hits its streaming-write path.
-        # Anything else would force read-modify-write and a full-object re-upload.
+        # Route C (stage-then-publish) is not implemented yet. Until it is, such a
+        # destination takes the single sequential stream -- which is not merely a
+        # placeholder: it is the documented degradation for Route C when no staging
+        # directory qualifies, and for a FUSE object store it is also the only access
+        # pattern that reaches the streaming-write path. Anything else forces
+        # read-modify-write and a full-object re-upload.
         return single_stream_fallback(
             options,
             "route {} not yet implemented ({})".format(decision.route, decision.reason),
@@ -1417,12 +2099,6 @@ def run(options):
     seek_hole = decision.seek_hole
     if not seek_hole:
         log("SEEK_HOLE unsupported here; checkpointing instead of frontier recovery")
-
-    chunks = plan_chunks(size, options.connections, options.min_chunk, options.part_length)
-    chunk_size = (chunks[0][1] - chunks[0][0]) if chunks else size
-    plan_id = compute_plan_id(
-        options.url or "", size, options.check_etag or options.check_md5, chunk_size
-    )
 
     fd = open_destination(dest, size)
     manifest = None
@@ -1450,7 +2126,8 @@ def run(options):
 
         try_lock(fd)
 
-        downloader = Downloader(source, fd, manifest, chunks, options, Progress(size))
+        sink = PosixChunkSink(fd, manifest, chunks, dest)
+        downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
         try:
             downloader.run()
         except PermanentError as e:

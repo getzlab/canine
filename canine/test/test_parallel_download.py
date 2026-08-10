@@ -957,18 +957,18 @@ class TestNonPosixDestinationIsNotWrittenInPlace:
     zeros and re-upload the whole object per write.
     """
 
-    def test_no_ftruncate_or_pwrite_against_a_bucket_mount(self, tmp_path, monkeypatch):
+    def _run_with_route(self, tmp_path, monkeypatch, route, gs_url=None):
         calls = []
         monkeypatch.setattr(pdl.os, "ftruncate",
                             lambda *a: calls.append(("ftruncate",) + a))
         monkeypatch.setattr(pdl.os, "pwrite",
                             lambda *a: calls.append(("pwrite",) + a))
-        # make the destination look like it sits on a gcsfuse mount
         monkeypatch.setattr(
             pdl, "select_route",
             lambda dest, **kw: pdl.RouteDecision(
-                pdl.ROUTE_BUCKET, "test: pretend gcsfuse", gs_url="gs://b/o"),
+                route, "test: forced route", gs_url=gs_url),
         )
+        monkeypatch.setattr(pdl, "build_source", lambda opts: _StubSource())
 
         dest = str(tmp_path / "obj.bin")
         marker = str(tmp_path / "ran")
@@ -977,11 +977,30 @@ class TestNonPosixDestinationIsNotWrittenInPlace:
             "--connections", "4", "--min-chunk", str(MIB),
             "--legacy-cmd", "touch {}".format(marker),
         ])
-        # probe_range is reached before routing; stub the source so we get that far
-        monkeypatch.setattr(pdl, "build_source",
-                            lambda opts: _StubSource())
-
         rc = pdl.run(options)
+        return rc, calls, marker
+
+    def test_no_ftruncate_or_pwrite_on_the_bucket_route(self, tmp_path, monkeypatch):
+        """
+        Route B relays bytes straight from the source into resumable upload sessions, so
+        it must never touch a local file. Here it fails (nothing is listening), which is
+        fine -- what matters is that it failed without writing in place.
+        """
+        rc, calls, _ = self._run_with_route(
+            tmp_path, monkeypatch, pdl.ROUTE_BUCKET, gs_url="gs://b/o"
+        )
+        assert rc != 0
+        assert calls == [], "wrote in place to a bucket destination: {}".format(calls)
+
+    def test_staged_route_degrades_to_the_legacy_command(self, tmp_path, monkeypatch):
+        """
+        Route C is not implemented, so it takes the single sequential stream -- the
+        documented degradation, and for a FUSE object store the only access pattern
+        that reaches its streaming-write path.
+        """
+        rc, calls, marker = self._run_with_route(
+            tmp_path, monkeypatch, pdl.ROUTE_STAGED
+        )
         assert rc == 0
         assert os.path.exists(marker), "should have degraded to the legacy command"
         assert calls == [], "wrote in place to a non-POSIX destination: {}".format(calls)
