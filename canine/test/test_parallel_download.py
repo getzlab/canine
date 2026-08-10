@@ -1106,3 +1106,77 @@ class TestPreallocatedFileIsClearedBeforeFallback:
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert hashlib.md5(open(dest, "rb").read()).hexdigest() == payload_md5, \
             "fallback produced the wrong bytes"
+
+
+# ---------------------------------------------------------------------------
+# gzip decompressive transcoding (§12.6)
+# ---------------------------------------------------------------------------
+
+class TestTranscodedObject:
+    """
+    A GCS object stored with Content-Encoding: gzip is served decompressed to any client
+    that does not ask for gzip. The response omits BOTH Content-Encoding and
+    Content-Length, so transcoding cannot be detected by looking for the encoding header --
+    it is absent precisely when transcoding is happening.
+
+    Worse, Range is silently ignored and the whole object is returned, and Google bills for
+    the full object transfer rather than the requested range. With N workers issuing ranged
+    GETs that is N whole objects, with no error raised anywhere. This is the single largest
+    billing hazard in the design, and the mandatory probe is what bounds it.
+    """
+
+    def test_only_one_request_is_ever_issued(self, tmp_path, payload):
+        """
+        The bound that matters: one aborted probe, not one whole object per connection.
+        """
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            server.state.transcoding = True
+            proc = run_downloader(
+                server.url(), dest, len(payload), "--min-chunk", MIB,
+                "--connections", 8, "--legacy-cmd", "true",
+            )
+            snapshot = server.state.snapshot()
+
+        assert proc.returncode == 0, proc.stderr
+        assert snapshot["requests"] <= 2, (
+            "issued {} requests against a transcoding server; each one is billed as a "
+            "whole object".format(snapshot["requests"])
+        )
+
+    def test_falls_back_to_a_single_stream(self, tmp_path, payload):
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            server.state.transcoding = True
+            proc = run_downloader(
+                server.url(), dest, len(payload), "--min-chunk", MIB,
+                "--connections", 8,
+                "--legacy-cmd", "printf transcoded > {}".format(dest),
+            )
+        assert proc.returncode == 0, proc.stderr
+        assert "falling back to a single stream" in proc.stderr
+        assert open(dest).read() == "transcoded"
+
+    def test_billed_bytes_stay_bounded(self, tmp_path, payload):
+        """
+        Eight connections against a transcoding server would otherwise transfer -- and be
+        billed for -- eight copies of the object.
+        """
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            server.state.transcoding = True
+            run_downloader(server.url(), dest, len(payload), "--min-chunk", MIB,
+                           "--connections", 8, "--legacy-cmd", "true")
+            sent = server.state.snapshot()["sent"]
+        assert sent <= 2 * len(payload), (
+            "transferred {} bytes for a {}-byte object".format(sent, len(payload))
+        )
+
+    def test_no_compressed_flag_is_ever_emitted(self):
+        """
+        `curl --compressed` together with `-C -` is a silent-corruption hazard: the resume
+        offset is taken from the local *decompressed* size but interpreted by the server as
+        an offset into the *compressed* stream. It must never appear in an emitted command.
+        """
+        with open(PDL_PATH) as fh:
+            assert "--compressed" not in fh.read()

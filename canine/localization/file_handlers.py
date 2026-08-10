@@ -144,6 +144,12 @@ DEFAULT_DOWNLOAD_MIN_CHUNK = 64 * 1024 * 1024
 PDL_SCRIPT_NAME = "parallel_download.py"
 PDL_EOF_SENTINEL = "# k9pdl-eof"
 
+# Assumed decompression ratio when a gzip-transcoded object's real size cannot be
+# determined. Genomics text compresses 4-10x, so this is at the pessimistic end of
+# typical rather than a worst case -- the disk-resize daemon covers the rest, and
+# over-estimating costs permanent storage on a disk that only ever grows.
+GZIP_FALLBACK_RATIO = 5
+
 
 def _pdl_installed_path():
     """
@@ -763,10 +769,102 @@ class HandleGSURL(FileType):
             return [blob_obj]
 
     def _get_size(self):
-        sz = 0
-        for b in self.blob():
-            sz += b.size
-        return sz
+        """
+        Total size of the object(s), in the bytes that will actually land on disk.
+
+        This is not simply `sum(b.size)`. An object stored with
+        `Content-Encoding: gzip` is served *decompressed* to any client that does not ask
+        for gzip -- GCS calls this decompressive transcoding -- but its `size` metadata is
+        the **stored, compressed** byte count. `gcloud storage cp` writes the decompressed
+        bytes, so sizing the localization disk from `size` under-provisions it by the
+        compression ratio. Genomics text (VCF/BED/GTF/FASTA) routinely compresses 4-10x,
+        and the disk is sized from this number with only a 5% margin, so the failure mode
+        is ENOSPC partway through localization.
+
+        The disk-resize daemon is what makes that non-fatal; this estimate only decides how
+        good the starting point is. A wildly low guess still works, it just costs many
+        resizes and a slow start.
+        """
+        total = 0
+        for blob in self.blob():
+            total += self._blob_localized_size(blob)
+        return total
+
+    def _blob_localized_size(self, blob):
+        """
+        How many bytes this blob occupies once localized, accounting for transcoding.
+
+        Predicting a decompressed size is not reliably possible in general -- GCS exposes
+        no decompressed-size field -- so this tries the sources in descending order of
+        trustworthiness and says which one it used. Guessing silently would be worse than
+        guessing loudly.
+        """
+        encoding = (getattr(blob, "content_encoding", None) or "").strip().lower()
+        if encoding != "gzip":
+            return blob.size
+
+        # 1. An explicitly supplied size, or one recorded in the object's own custom
+        #    metadata. Authoritative, because a human or a producing pipeline said so.
+        override = self.extra_args.get("uncompressed_size")
+        if override is None:
+            metadata = getattr(blob, "metadata", None) or {}
+            override = metadata.get("uncompressed_size") or metadata.get("uncompressedSize")
+        if override is not None:
+            try:
+                size = int(override)
+                canine_logging.info1(
+                    "{} is gzip-transcoded; using the declared uncompressed size "
+                    "{} rather than the stored {}".format(self.path, size, blob.size)
+                )
+                return size
+            except (TypeError, ValueError):
+                canine_logging.warning(
+                    "Ignoring unparseable uncompressed_size {!r} for {}".format(
+                        override, self.path)
+                )
+
+        # 2. The gzip ISIZE trailer, read with a ranged GET of the last four bytes. Only
+        #    trustworthy below 4 GiB: ISIZE is the decompressed length mod 2**32, so a
+        #    larger object wraps, and a multi-member stream reports only its last member.
+        if blob.size is not None and blob.size < (1 << 32):
+            trailer = self._read_gzip_isize(blob)
+            if trailer is not None and trailer >= blob.size:
+                canine_logging.info1(
+                    "{} is gzip-transcoded; using the gzip ISIZE trailer {} rather than "
+                    "the stored {}".format(self.path, trailer, blob.size)
+                )
+                return trailer
+
+        # 3. A conservative multiplier. Deliberately last, and deliberately loud: it is a
+        #    guess, and the resize daemon is what makes being wrong survivable.
+        estimate = blob.size * GZIP_FALLBACK_RATIO
+        canine_logging.warning(
+            "{} is gzip-transcoded and its decompressed size is unknown; estimating "
+            "{} ({}x the stored {}). The localization disk will grow on demand if this "
+            "is too low.".format(self.path, estimate, GZIP_FALLBACK_RATIO, blob.size)
+        )
+        return estimate
+
+    @staticmethod
+    def _read_gzip_isize(blob):
+        """
+        Read the four-byte ISIZE trailer of a gzip member.
+
+        Requires the *stored* bytes, so the read must not be transcoded: the download_as
+        call below asks for a byte range, and GCS serves raw bytes for a ranged read of a
+        gzip object rather than decompressing it.
+        """
+        try:
+            tail = blob.download_as_bytes(start = blob.size - 4, end = blob.size - 1,
+                                          raw_download = True)
+        except Exception as e:
+            canine_logging.warning(
+                "Could not read the gzip trailer of {}: {}".format(blob.name, e)
+            )
+            return None
+        if not tail or len(tail) != 4:
+            return None
+        return int.from_bytes(tail, "little")
 
     def _get_hash(self):
         blob = self.blob()

@@ -36,6 +36,11 @@ class ServerState:
         self.omit_content_length = False
         self.drop_after = None         # close the connection after N bytes per response
         self.content_md5 = None        # advertise this base64 md5 in Content-MD5
+        # Mimic GCS decompressive transcoding: Range is silently ignored, the whole object
+        # comes back with 200, and BOTH Content-Encoding and Content-Length are omitted.
+        # That last part is why transcoding cannot be detected by looking for the encoding
+        # header -- it is absent precisely when transcoding is happening.
+        self.transcoding = False
         self.throttle_bytes = None     # write in blocks of this size...
         self.throttle_delay = 0.0      # ...sleeping this long between them
         self.fail_next = 0             # return 500 for the next N requests
@@ -78,6 +83,23 @@ def make_handler(state):
             total = len(state.payload)
             header_range = self.headers.get("Range")
             ranged = header_range is not None and state.support_range
+
+            if state.transcoding and "gzip" not in (
+                self.headers.get("Accept-Encoding") or ""
+            ):
+                # ignore Range entirely and stream the whole object, with no
+                # Content-Length -- and bill for all of it
+                body = state.payload
+                self.send_response(200)
+                self.end_headers()
+                try:
+                    self.wfile.write(body)
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+                self._count(len(body), False)
+                self.close_connection = True
+                return
 
             if ranged:
                 spec = header_range.split("=", 1)[1]

@@ -658,3 +658,137 @@ class TestStreamHandlerStaleFifoGuard:
         cmd = self._command(cls)
         r = sp.run(["bash", "-n"], input=cmd, text=True, capture_output=True)
         assert r.returncode == 0, r.stderr + "\n---\n" + cmd
+
+
+# ---------------------------------------------------------------------------
+# gzip-transcoded size estimation (§12.3)
+# ---------------------------------------------------------------------------
+
+class FakeBlob:
+    """Stands in for a google.cloud.storage.Blob."""
+
+    def __init__(self, size, content_encoding=None, metadata=None, trailer=None,
+                 name="obj.vcf", crc32c="AAAAAA=="):
+        self.size = size
+        self.content_encoding = content_encoding
+        self.metadata = metadata
+        self.name = name
+        self.crc32c = crc32c
+        self._trailer = trailer
+
+    def download_as_bytes(self, start=None, end=None, raw_download=False):
+        if self._trailer is None:
+            raise RuntimeError("no trailer available")
+        return self._trailer
+
+
+def gs_size_handler(blobs, **kwargs):
+    handler = HandleGSURL.__new__(HandleGSURL)
+    handler.extra_args = dict(kwargs)
+    handler.check_hash = FileType._resolve_check_hash(kwargs)
+    handler.path = "gs://bkt/data/obj.vcf"
+    handler.is_dir = False
+    handler._size = None
+    handler._hash = None
+    handler.blob = lambda: blobs
+    return handler
+
+
+class TestTranscodedSizeEstimation:
+    """
+    An object stored with Content-Encoding: gzip is served decompressed but reports its
+    *compressed* size, and the localization disk is sized from that number with a 5%
+    margin. Genomics text compresses 4-10x, so the failure mode is ENOSPC partway through.
+    The resize daemon makes that non-fatal; this estimate decides how good the starting
+    point is.
+    """
+
+    def test_plain_object_uses_its_reported_size(self):
+        assert gs_size_handler([FakeBlob(1000)]).size == 1000
+
+    def test_directory_sums_its_blobs(self):
+        assert gs_size_handler([FakeBlob(100), FakeBlob(250)]).size == 350
+
+    def test_explicit_override_wins(self):
+        """A human or producing pipeline said so, which beats any inference."""
+        blob = FakeBlob(1000, content_encoding="gzip", trailer=(7000).to_bytes(4, "little"))
+        assert gs_size_handler([blob], uncompressed_size=9999).size == 9999
+
+    def test_object_metadata_is_consulted(self):
+        blob = FakeBlob(1000, content_encoding="gzip",
+                        metadata={"uncompressed_size": "8888"})
+        assert gs_size_handler([blob]).size == 8888
+
+    def test_camel_case_metadata_key_is_accepted(self):
+        blob = FakeBlob(1000, content_encoding="gzip",
+                        metadata={"uncompressedSize": "7777"})
+        assert gs_size_handler([blob]).size == 7777
+
+    def test_gzip_trailer_is_used_when_available(self):
+        blob = FakeBlob(1000, content_encoding="gzip",
+                        trailer=(6000).to_bytes(4, "little"))
+        assert gs_size_handler([blob]).size == 6000
+
+    def test_trailer_is_not_trusted_above_four_gib(self):
+        """
+        ISIZE is the decompressed length mod 2**32, so beyond 4 GiB it wraps and is
+        meaningless.
+        """
+        size = (1 << 32) + 10
+        blob = FakeBlob(size, content_encoding="gzip",
+                        trailer=(12345).to_bytes(4, "little"))
+        assert gs_size_handler([blob]).size == size * 5
+
+    def test_a_trailer_smaller_than_the_stored_size_is_rejected(self):
+        """
+        Decompressed output cannot be smaller than the compressed input for the data this
+        matters for; such a value means the read did not return a real ISIZE.
+        """
+        blob = FakeBlob(1000, content_encoding="gzip", trailer=(10).to_bytes(4, "little"))
+        assert gs_size_handler([blob]).size == 5000
+
+    def test_falls_back_to_a_multiplier(self):
+        blob = FakeBlob(2000, content_encoding="gzip")
+        assert gs_size_handler([blob]).size == 2000 * 5
+
+    def test_unparseable_override_falls_through(self):
+        blob = FakeBlob(1000, content_encoding="gzip")
+        assert gs_size_handler([blob], uncompressed_size="not-a-number").size == 5000
+
+    def test_a_failed_trailer_read_falls_through(self):
+        """A ranged read can fail; it must not take the whole size estimate down with it."""
+        blob = FakeBlob(1000, content_encoding="gzip", trailer=None)
+        assert gs_size_handler([blob]).size == 5000
+
+    def test_non_gzip_encoding_is_left_alone(self):
+        blob = FakeBlob(1000, content_encoding="identity")
+        assert gs_size_handler([blob]).size == 1000
+
+    def test_estimate_is_never_smaller_than_the_stored_size(self):
+        """
+        The whole point is to stop under-provisioning, so no path may return less than
+        what is definitely on the wire.
+        """
+        for kwargs, blob in [
+            ({}, FakeBlob(1000, content_encoding="gzip")),
+            ({}, FakeBlob(1000, content_encoding="gzip",
+                          trailer=(10).to_bytes(4, "little"))),
+            ({}, FakeBlob(1000, content_encoding="gzip", metadata={})),
+        ]:
+            assert gs_size_handler([blob], **kwargs).size >= blob.size
+
+    def test_the_trailer_read_is_raw(self):
+        """
+        The trailer only exists in the *stored* bytes, so the read must not be transcoded
+        or it would return decompressed data.
+        """
+        recorded = {}
+
+        class Recording(FakeBlob):
+            def download_as_bytes(self, start=None, end=None, raw_download=False):
+                recorded.update(start=start, end=end, raw_download=raw_download)
+                return (6000).to_bytes(4, "little")
+
+        gs_size_handler([Recording(1000, content_encoding="gzip")]).size
+        assert recorded["raw_download"] is True
+        assert recorded["start"] == 996 and recorded["end"] == 999
