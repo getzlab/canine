@@ -745,3 +745,254 @@ class TestEndToEnd:
                                   "--header", "X-Auth-Token: secret-token")
         assert proc.returncode == 0, proc.stderr
         assert "secret-token" not in proc.stderr, "token must not be logged"
+
+
+# ---------------------------------------------------------------------------
+# destination filesystem gate and route selection (§4.7)
+# ---------------------------------------------------------------------------
+
+def mounts_from(text):
+    """Build a mount table from /proc/mounts-formatted text."""
+    import tempfile
+    with tempfile.NamedTemporaryFile("w", suffix=".mounts", delete=False) as fh:
+        fh.write(text)
+        path = fh.name
+    try:
+        return pdl.read_mounts(path)
+    finally:
+        os.unlink(path)
+
+
+ALWAYS = lambda directory: True
+NEVER = lambda directory: False
+
+
+class TestReadMounts:
+
+    def test_parses_fields(self):
+        mounts = mounts_from(
+            "/dev/sda1 / ext4 rw,relatime 0 0\n"
+            "mybucket /mnt/gcs fuse.gcsfuse rw,only_dir=sub 0 0\n"
+        )
+        assert [m.mountpoint for m in mounts] == ["/", "/mnt/gcs"]
+        assert mounts[1].fstype == "fuse.gcsfuse"
+        assert mounts[1].device == "mybucket"
+        assert mounts[1].option("only_dir") == "sub"
+
+    def test_unescapes_octal_in_mountpoints(self):
+        mounts = mounts_from("dev /mnt/my\\040disk ext4 rw 0 0\n")
+        assert mounts[0].mountpoint == "/mnt/my disk"
+
+    def test_skips_malformed_lines(self):
+        assert mounts_from("garbage\n/dev/sda1 / ext4 rw 0 0\n")[0].fstype == "ext4"
+
+    def test_missing_file_yields_empty_list(self):
+        assert pdl.read_mounts("/nonexistent/mounts") == []
+
+    def test_option_absent(self):
+        assert mounts_from("d /m ext4 rw 0 0\n")[0].option("only_dir") is None
+
+
+class TestResolveMount:
+
+    TABLE = (
+        "/dev/sda1 / ext4 rw 0 0\n"
+        "/dev/sdb1 /mnt ext4 rw 0 0\n"
+        "/dev/sdc1 /mnt/foo xfs rw 0 0\n"
+        "bucket /mnt/foobar fuse.gcsfuse rw 0 0\n"
+    )
+
+    def test_longest_prefix_wins(self):
+        mounts = mounts_from(self.TABLE)
+        assert pdl.resolve_mount("/mnt/foo/some/file", mounts).fstype == "xfs"
+
+    def test_component_wise_so_foo_does_not_match_foobar(self):
+        """A raw string prefix test would resolve /mnt/foobar to the /mnt/foo mount."""
+        mounts = mounts_from(self.TABLE)
+        assert pdl.resolve_mount("/mnt/foobar/obj", mounts).fstype == "fuse.gcsfuse"
+
+    def test_falls_back_to_root(self):
+        mounts = mounts_from(self.TABLE)
+        assert pdl.resolve_mount("/elsewhere/file", mounts).mountpoint == "/"
+
+    def test_exact_mountpoint(self):
+        mounts = mounts_from(self.TABLE)
+        assert pdl.resolve_mount("/mnt/foo", mounts).fstype == "xfs"
+
+    def test_empty_table(self):
+        assert pdl.resolve_mount("/anything", []) is None
+
+
+class TestGsUrlFor:
+
+    def test_plain_bucket_mount(self):
+        mount = mounts_from("mybucket /mnt/gcs fuse.gcsfuse rw 0 0\n")[0]
+        assert pdl.gs_url_for("/mnt/gcs/inputs/a.bam", mount) == \
+            "gs://mybucket/inputs/a.bam"
+
+    def test_only_dir_is_prepended(self):
+        """--only-dir mounts a subdirectory, which is part of the object name."""
+        mount = mounts_from("mybucket /mnt/gcs fuse.gcsfuse rw,only_dir=staging 0 0\n")[0]
+        assert pdl.gs_url_for("/mnt/gcs/a.bam", mount) == "gs://mybucket/staging/a.bam"
+
+    def test_bucket_from_options_when_device_is_a_placeholder(self):
+        mount = mounts_from("gcsfuse /mnt/gcs fuse.gcsfuse rw,bucket=realbucket 0 0\n")[0]
+        assert pdl.gs_url_for("/mnt/gcs/a.bam", mount) == "gs://realbucket/a.bam"
+
+    def test_unresolvable_bucket_yields_none(self):
+        """
+        None routes to stage-then-publish, which is correct for a bucket we cannot
+        address. Guessing would upload the parts somewhere wrong.
+        """
+        for table in (
+            "gcsfuse /mnt/gcs fuse.gcsfuse rw 0 0\n",              # placeholder, no option
+            "not/a/bucket /mnt/gcs fuse.gcsfuse rw 0 0\n",         # contains a slash
+            "A /mnt/gcs fuse.gcsfuse rw 0 0\n",                    # too short, uppercase
+        ):
+            mount = mounts_from(table)[0]
+            assert pdl.gs_url_for("/mnt/gcs/a.bam", mount) is None, table
+
+    def test_non_fuse_mount_yields_none(self):
+        mount = mounts_from("/dev/sda1 /mnt ext4 rw 0 0\n")[0]
+        assert pdl.gs_url_for("/mnt/a.bam", mount) is None
+
+    def test_path_outside_the_mount_yields_none(self):
+        mount = mounts_from("mybucket /mnt/gcs fuse.gcsfuse rw 0 0\n")[0]
+        assert pdl.gs_url_for("/somewhere/else/a.bam", mount) is None
+
+    def test_bare_mountpoint_yields_none(self):
+        """There is no object name for the mount root itself."""
+        mount = mounts_from("mybucket /mnt/gcs fuse.gcsfuse rw 0 0\n")[0]
+        assert pdl.gs_url_for("/mnt/gcs", mount) is None
+
+
+class TestSelectRoute:
+
+    def _select(self, table, dest="/mnt/data/obj.bin", random_write=ALWAYS,
+                seek_hole=ALWAYS):
+        return pdl.select_route(dest, mounts=mounts_from(table),
+                                random_write_probe=random_write,
+                                seek_hole_probe=seek_hole)
+
+    @pytest.mark.parametrize("fstype", sorted(pdl.POSIX_FSTYPE_ALLOWLIST))
+    def test_allowlisted_filesystems_take_route_a(self, fstype):
+        decision = self._select("/dev/sda1 /mnt {} rw 0 0\n".format(fstype))
+        assert decision.route == pdl.ROUTE_POSIX
+
+    def test_gcsfuse_with_a_resolvable_bucket_takes_route_b(self):
+        """
+        Preferred for a bucket destination: compose concatenates server-side with no
+        data transfer, so the whole transfer stays parallel end to end.
+        """
+        decision = self._select("mybucket /mnt fuse.gcsfuse rw 0 0\n")
+        assert decision.route == pdl.ROUTE_BUCKET
+        assert decision.gs_url == "gs://mybucket/data/obj.bin"
+
+    def test_gcsfuse_with_an_unresolvable_bucket_takes_route_c(self):
+        decision = self._select("gcsfuse /mnt fuse.gcsfuse rw 0 0\n")
+        assert decision.route == pdl.ROUTE_STAGED
+
+    def test_unrecognized_fstype_fails_safe(self):
+        """
+        The allowlist-not-denylist property: a filesystem nobody has evaluated must not
+        get the chunked fast path by default.
+        """
+        decision = self._select("/dev/x /mnt somefuturefs rw 0 0\n")
+        assert decision.route == pdl.ROUTE_STAGED
+
+    def test_any_fuse_filesystem_is_off_the_allowlist(self):
+        for fstype in ("fuse", "fuse.sshfs", "fuse.s3fs", "fuseblk"):
+            decision = self._select("dev /mnt {} rw 0 0\n".format(fstype))
+            assert decision.route != pdl.ROUTE_POSIX, fstype
+
+    def test_allowlisted_fstype_failing_the_probe_is_still_off_route_a(self):
+        """fstype strings lie; observed behavior overrides the name."""
+        decision = self._select("/dev/sda1 /mnt ext4 rw 0 0\n", random_write=NEVER)
+        assert decision.route == pdl.ROUTE_STAGED
+        assert "random-write probe" in decision.reason
+
+    def test_seek_hole_failure_does_not_change_the_route(self):
+        """
+        Failing SEEK_HOLE (NFSv3) only swaps frontier recovery for checkpointing. It is
+        still an in-place chunked write, so it must not be treated as a gate.
+        """
+        decision = self._select("/dev/sda1 /mnt nfs rw 0 0\n", seek_hole=NEVER)
+        assert decision.route == pdl.ROUTE_POSIX
+        assert decision.seek_hole is False
+
+    def test_seek_hole_result_is_reported(self):
+        decision = self._select("/dev/sda1 /mnt ext4 rw 0 0\n", seek_hole=ALWAYS)
+        assert decision.seek_hole is True
+
+    def test_populated_table_with_no_covering_entry_fails_safe(self):
+        decision = pdl.select_route(
+            "/mnt/data/obj.bin",
+            mounts=[pdl.Mount("/other", "ext4", "/dev/x", "rw")],
+            random_write_probe=ALWAYS, seek_hole_probe=ALWAYS,
+        )
+        assert decision.route == pdl.ROUTE_STAGED
+
+    def test_absent_mount_table_relies_on_probes(self, tmp_path):
+        """
+        A host with no /proc/mounts (a developer machine) cannot consult the allowlist,
+        so it falls back to the runtime probes, which are the stronger signal. Linux --
+        the production target -- always has the table, so the strict path applies there.
+        """
+        decision = pdl.select_route(str(tmp_path / "obj.bin"), mounts=[],
+                                    random_write_probe=ALWAYS, seek_hole_probe=ALWAYS)
+        assert decision.route == pdl.ROUTE_POSIX
+        assert "probes alone" in decision.reason
+
+    def test_absent_mount_table_still_honors_a_failing_probe(self, tmp_path):
+        decision = pdl.select_route(str(tmp_path / "obj.bin"), mounts=[],
+                                    random_write_probe=NEVER, seek_hole_probe=ALWAYS)
+        assert decision.route == pdl.ROUTE_STAGED
+
+
+class TestNonPosixDestinationIsNotWrittenInPlace:
+    """
+    The safety property that matters while routes B and C are unimplemented: a non-POSIX
+    destination must never see a full-size ftruncate or an out-of-order pwrite. Those
+    are precisely the operations that make a FUSE object store materialize gigabytes of
+    zeros and re-upload the whole object per write.
+    """
+
+    def test_no_ftruncate_or_pwrite_against_a_bucket_mount(self, tmp_path, monkeypatch):
+        calls = []
+        monkeypatch.setattr(pdl.os, "ftruncate",
+                            lambda *a: calls.append(("ftruncate",) + a))
+        monkeypatch.setattr(pdl.os, "pwrite",
+                            lambda *a: calls.append(("pwrite",) + a))
+        # make the destination look like it sits on a gcsfuse mount
+        monkeypatch.setattr(
+            pdl, "select_route",
+            lambda dest, **kw: pdl.RouteDecision(
+                pdl.ROUTE_BUCKET, "test: pretend gcsfuse", gs_url="gs://b/o"),
+        )
+
+        dest = str(tmp_path / "obj.bin")
+        marker = str(tmp_path / "ran")
+        options = pdl.build_parser().parse_args([
+            "--url", "http://127.0.0.1:1/obj", "--dest", dest, "--size", str(8 * MIB),
+            "--connections", "4", "--min-chunk", str(MIB),
+            "--legacy-cmd", "touch {}".format(marker),
+        ])
+        # probe_range is reached before routing; stub the source so we get that far
+        monkeypatch.setattr(pdl, "build_source",
+                            lambda opts: _StubSource())
+
+        rc = pdl.run(options)
+        assert rc == 0
+        assert os.path.exists(marker), "should have degraded to the legacy command"
+        assert calls == [], "wrote in place to a non-POSIX destination: {}".format(calls)
+
+
+class _StubSource:
+    def probe_range(self, size):
+        return None
+
+    def open_range(self, start, end):
+        raise AssertionError("must not fetch ranges on a non-POSIX destination")
+
+    def refresh_url(self):
+        return False

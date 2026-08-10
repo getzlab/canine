@@ -356,6 +356,226 @@ def probe_random_write(directory):
 
 
 # --------------------------------------------------------------------------------
+# destination filesystem gate and route selection
+# --------------------------------------------------------------------------------
+
+MOUNTS_PATH = "/proc/mounts"
+
+# An ALLOWLIST, not a denylist: an unrecognized future filesystem must fail safe to a
+# conservative route rather than silently take the chunked fast path. Every entry here
+# is one where sparse files, random writes and rename-atomicity behave as POSIX says.
+POSIX_FSTYPE_ALLOWLIST = frozenset({
+    "ext2", "ext3", "ext4", "xfs", "btrfs", "tmpfs", "nfs", "nfs4", "zfs",
+})
+
+# GCS bucket naming: 3-63 chars of lowercase alphanumerics, dashes, underscores, dots.
+_BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
+
+ROUTE_POSIX = "A"       # write chunks straight into dest (the dominant PD/NFS path)
+ROUTE_BUCKET = "B"      # upload parts, compose server-side (bucket-backed dest)
+ROUTE_STAGED = "C"      # stage on a real block device, then publish
+
+
+class Mount:
+    __slots__ = ("mountpoint", "fstype", "device", "options")
+
+    def __init__(self, mountpoint, fstype, device, options):
+        self.mountpoint = mountpoint
+        self.fstype = fstype
+        self.device = device
+        self.options = options
+
+    def option(self, name):
+        for item in self.options.split(","):
+            key, _, value = item.partition("=")
+            if key == name:
+                return value
+        return None
+
+    def __repr__(self):
+        return "Mount({!r}, {!r}, {!r})".format(self.mountpoint, self.fstype, self.device)
+
+
+class RouteDecision:
+    __slots__ = ("route", "reason", "mount", "gs_url", "seek_hole")
+
+    def __init__(self, route, reason, mount=None, gs_url=None, seek_hole=False):
+        self.route = route
+        self.reason = reason
+        self.mount = mount
+        self.gs_url = gs_url
+        self.seek_hole = seek_hole
+
+    def __repr__(self):
+        return "RouteDecision({}, {!r})".format(self.route, self.reason)
+
+
+def read_mounts(path=None):
+    """
+    Parse the mount table. Returns [] when it is unavailable (a non-Linux host), which
+    callers must distinguish from "parsed but nothing matched".
+    """
+    try:
+        with open(path or MOUNTS_PATH) as fh:
+            raw = fh.read()
+    except (IOError, OSError):
+        return []
+
+    mounts = []
+    for line in raw.splitlines():
+        fields = line.split()
+        if len(fields) < 4:
+            continue
+        device, mountpoint, fstype, options = fields[0], fields[1], fields[2], fields[3]
+        # mount(8) escapes spaces and friends as octal in both device and mountpoint
+        mountpoint = mountpoint.replace("\\040", " ").replace("\\011", "\t")
+        mounts.append(Mount(mountpoint, fstype, device, options))
+    return mounts
+
+
+def resolve_mount(path, mounts):
+    """
+    Find the mount that `path` lives on, by longest-prefix match after realpath.
+
+    Matching is component-wise, so /mnt/foo does not match a /mnt/foobar mount.
+
+    The path need not exist: realpath resolves symlinks in whatever components do exist
+    and leaves the rest lexically, which is what we want since the destination file is
+    about to be created. (Walking up to the nearest existing ancestor instead would
+    collapse a path under an unmounted tree all the way to /, and silently match the
+    root filesystem's fstype.)
+    """
+    if not mounts:
+        return None
+
+    target = os.path.realpath(os.path.abspath(path))
+
+    best = None
+    for mount in mounts:
+        mountpoint = mount.mountpoint.rstrip("/") or "/"
+        if target == mountpoint or mountpoint == "/" or target.startswith(
+            mountpoint + "/"
+        ):
+            if best is None or len(mountpoint) > len(best.mountpoint.rstrip("/") or "/"):
+                best = mount
+    return best
+
+
+def gs_url_for(path, mount):
+    """
+    Work out the gs:// URL a path on a gcsfuse mount corresponds to, or None when it
+    cannot be determined unambiguously.
+
+    Returning None is not a failure -- it routes to stage-then-publish instead, which
+    is correct for any bucket we cannot address directly. Guessing would be worse: the
+    parts would be uploaded to the wrong place.
+    """
+    if mount is None or not mount.fstype.startswith("fuse"):
+        return None
+
+    bucket = mount.device
+    if bucket in ("gcsfuse", "fuse", ""):
+        # some versions report a placeholder device and name the bucket in the options
+        bucket = mount.option("bucket") or ""
+    if "/" in bucket or not _BUCKET_RE.match(bucket):
+        return None
+
+    prefix = (mount.option("only_dir") or mount.option("only-dir") or "").strip("/")
+
+    mountpoint = mount.mountpoint.rstrip("/") or "/"
+    target = os.path.realpath(os.path.abspath(path))
+    if mountpoint == "/":
+        relative = target.lstrip("/")
+    elif target == mountpoint:
+        relative = ""
+    elif target.startswith(mountpoint + "/"):
+        relative = target[len(mountpoint) + 1:]
+    else:
+        return None
+
+    object_name = "/".join(part for part in (prefix, relative) if part)
+    if not object_name:
+        return None
+    return "gs://{}/{}".format(bucket, object_name)
+
+
+def select_route(dest, mounts=None, random_write_probe=None, seek_hole_probe=None):
+    """
+    Decide how to write `dest`, gating on what its filesystem can actually do.
+
+    The rule is "gate, don't adapt": rather than trying to make the chunked writer
+    behave on a FUSE object store -- where there are no sparse files, random writes
+    degrade to full-object re-uploads, nothing is durable before close(), and rename is
+    not atomic -- detect it up front and take a different route.
+
+    Two independent checks, because either alone is insufficient:
+      * the fstype allowlist, which catches known-bad filesystems by name;
+      * a random-write probe, because fstype strings lie and a FUSE mount will happily
+        accept the calls while quietly turning each into a read-modify-write.
+
+    SEEK_HOLE is deliberately NOT a gate. Failing it (NFSv3) only means the frontier
+    must be replaced by checkpointing, which is still an in-place chunked write.
+    """
+    random_write_probe = random_write_probe or probe_random_write
+    seek_hole_probe = seek_hole_probe or probe_seek_hole
+
+    directory = os.path.dirname(os.path.abspath(dest)) or "/"
+    mounts = read_mounts() if mounts is None else mounts
+    mount = resolve_mount(dest, mounts)
+
+    if mount is None:
+        # No mount table at all (a non-Linux host, e.g. a developer machine). The
+        # allowlist cannot be consulted, so fall back to the runtime probes, which are
+        # the stronger signal anyway. On the production target /proc/mounts always
+        # exists, so the strict path below is what actually runs there.
+        if mounts:
+            return RouteDecision(
+                ROUTE_STAGED,
+                "no mount table entry covers {}; failing safe".format(directory),
+            )
+        if not random_write_probe(directory):
+            return RouteDecision(
+                ROUTE_STAGED,
+                "destination does not support sparse random writes",
+            )
+        return RouteDecision(
+            ROUTE_POSIX, "mount table unavailable; accepted on probes alone",
+            seek_hole=seek_hole_probe(directory),
+        )
+
+    if mount.fstype in POSIX_FSTYPE_ALLOWLIST:
+        if not random_write_probe(directory):
+            # fstype says POSIX but behavior says otherwise; behavior wins
+            return RouteDecision(
+                ROUTE_STAGED,
+                "{} on {} failed the random-write probe".format(
+                    mount.fstype, mount.mountpoint),
+                mount=mount,
+            )
+        return RouteDecision(
+            ROUTE_POSIX, "{} on {}".format(mount.fstype, mount.mountpoint),
+            mount=mount, seek_hole=seek_hole_probe(directory),
+        )
+
+    # Off the allowlist. A bucket we can address directly is strictly better than
+    # staging, because GCS compose concatenates server-side with no data transfer.
+    gs_url = gs_url_for(dest, mount)
+    if gs_url:
+        return RouteDecision(
+            ROUTE_BUCKET,
+            "{} on {} resolves to {}".format(mount.fstype, mount.mountpoint, gs_url),
+            mount=mount, gs_url=gs_url,
+        )
+
+    return RouteDecision(
+        ROUTE_STAGED,
+        "{} on {} is not an allowlisted POSIX filesystem and no bucket could be "
+        "resolved".format(mount.fstype, mount.mountpoint),
+        mount=mount,
+    )
+
+
+# --------------------------------------------------------------------------------
 # durable frontier
 # --------------------------------------------------------------------------------
 
@@ -1177,14 +1397,26 @@ def run(options):
     if directory and not os.path.isdir(directory):
         os.makedirs(directory, exist_ok=True)
 
-    seek_hole = probe_seek_hole(directory)
-    if not seek_hole:
-        log("SEEK_HOLE unsupported here; using {} MiB checkpoints instead".format(
-            FALLBACK_CHECKPOINT_INTERVAL // (1024 * 1024)))
-    if not probe_random_write(directory):
+    # Gate on what the destination filesystem can actually do before writing anything,
+    # so no code below assumes dest is POSIX.
+    decision = select_route(dest)
+    log("route {}: {}".format(decision.route, decision.reason))
+
+    if decision.route != ROUTE_POSIX:
+        # Routes B (parts + server-side compose) and C (stage-then-publish) are not
+        # implemented yet. Until they are, a non-POSIX destination takes the single
+        # sequential stream -- which is not merely a placeholder: it is the documented
+        # degradation for Route C when no staging directory qualifies, and for gcsfuse
+        # it is also the only access pattern that hits its streaming-write path.
+        # Anything else would force read-modify-write and a full-object re-upload.
         return single_stream_fallback(
-            options, "destination does not support sparse random writes"
+            options,
+            "route {} not yet implemented ({})".format(decision.route, decision.reason),
         )
+
+    seek_hole = decision.seek_hole
+    if not seek_hole:
+        log("SEEK_HOLE unsupported here; checkpointing instead of frontier recovery")
 
     chunks = plan_chunks(size, options.connections, options.min_chunk, options.part_length)
     chunk_size = (chunks[0][1] - chunks[0][0]) if chunks else size
