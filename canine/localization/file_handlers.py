@@ -314,6 +314,16 @@ class FileType(abc.ABC):
         # sound for a given destination) has exactly one decision point.
         self.check_hash = self._resolve_check_hash(kwargs)
 
+        # Parallel-download options, arriving via extra_args from
+        # wolF task.conf["localization"] -> get_file_handler(**extra_args).
+        self.parallel_download = bool(kwargs.get("parallel_download", True))
+        self.download_connections = int(
+            kwargs.get("download_connections", DEFAULT_DOWNLOAD_CONNECTIONS)
+        )
+        self.download_min_chunk = int(
+            kwargs.get("download_min_chunk", DEFAULT_DOWNLOAD_MIN_CHUNK)
+        )
+
         self._size = None
         self._hash = None
 
@@ -425,6 +435,82 @@ class FileType(abc.ABC):
             )
 
         return headers
+
+    def _use_parallel_download(self, url=None):
+        """
+        Whether this input should go through the parallel downloader at all.
+
+        `download_connections` of 0 or 1, or `parallel_download=False`, emit the legacy
+        command directly rather than invoking the downloader only for it to fall back --
+        that keeps the opt-out byte-for-byte today's command with no interpreter startup.
+        ftp is declined for the same reason: it is not rangeable, so the fallback is a
+        foregone conclusion.
+        """
+        if not self.parallel_download or self.download_connections <= 1:
+            return False
+        target = url if url is not None else getattr(self, "url", None)
+        if target and urllib.parse.urlsplit(str(target)).scheme == "ftp":
+            return False
+        return True
+
+    def _download_and_verify_lines(self, legacy_cmd, prefix="", url=None, s3=None,
+                                   url_refresh_cmd=None, etag=None, part_length=None):
+        """
+        Emit the download for this input, plus whatever verification it still needs.
+
+        `prefix` is prepended to the first emitted line so a handler can keep its
+        directory guard on the same line as the download, leaving the surrounding shell
+        unchanged.
+
+        Verification is handed to the downloader when it can do it -- an md5, or a
+        multipart ETag with a known part length. It verifies before writing the
+        completion marker and deletes a corrupt file itself, so also emitting the shell
+        gate would re-read the whole object for no additional guarantee: a second full
+        pass over a 50 GB input. The gate is still emitted for algorithms the downloader
+        does not implement (sha1, sha256, crc32c) and for the legacy path, where nothing
+        else checks.
+        """
+        def with_prefix(lines):
+            if prefix and lines:
+                return [prefix + lines[0]] + list(lines[1:])
+            return list(lines)
+
+        if not self._use_parallel_download(url):
+            return with_prefix([legacy_cmd]) + self._hash_check_command()
+
+        algorithm, digest = getattr(self, "content_checksum", (None, None))
+        md5 = digest if (self.check_hash and algorithm == "md5") else None
+        if etag and part_length and self.check_hash:
+            downloader_verifies = True
+        else:
+            etag = part_length = None
+            downloader_verifies = md5 is not None
+
+        lines = _pdl_command(
+            url if url is not None else getattr(self, "url", None),
+            self.localized_path,
+            self.size,
+            headers=self._download_headers(),
+            md5=md5,
+            etag=etag,
+            part_length=part_length,
+            s3=s3,
+            url_refresh_cmd=url_refresh_cmd,
+            legacy_cmd=legacy_cmd,
+            connections=self.download_connections,
+            min_chunk=self.download_min_chunk,
+        )
+        lines = with_prefix(lines)
+        if not downloader_verifies:
+            lines += self._hash_check_command()
+        return lines
+
+    def _download_headers(self):
+        """
+        Request headers the downloader must send. Overridden where a handler needs an
+        auth header; the base case sends none.
+        """
+        return ()
 
     def _hash_check_command(self):
         """
@@ -1175,10 +1261,17 @@ class HandleGCSSignedURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
-        cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
-
-        # ensure that file downloaded properly, if the server gave us a checksum
-        cmd += self._hash_check_command()
+        # the legacy single-stream command, kept verbatim: it is both the
+        # parallel_download=False opt-out and the in-script no-range fallback
+        legacy = "curl -C - -o {path} '{url}'".format(
+            path = self.localized_path, url = self.url
+        )
+        cmd += self._download_and_verify_lines(
+            legacy,
+            prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
+                dest_dir = dest_dir
+            ),
+        )
         return "\n".join(cmd)
 
 class HandleOtherURL(FileType):
@@ -1208,10 +1301,15 @@ class HandleOtherURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
-        cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
-
-        # ensure that file downloaded properly, if the server gave us a checksum
-        cmd += self._hash_check_command()
+        legacy = "curl -C - -o {path} '{url}'".format(
+            path = self.localized_path, url = self.url
+        )
+        cmd += self._download_and_verify_lines(
+            legacy,
+            prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
+                dest_dir = dest_dir
+            ),
+        )
         return "\n".join(cmd)
 
 ## Regular files {{{

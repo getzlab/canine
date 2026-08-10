@@ -35,6 +35,7 @@ class ServerState:
         self.support_range = True      # False => ignore Range, return 200 + whole body
         self.omit_content_length = False
         self.drop_after = None         # close the connection after N bytes per response
+        self.content_md5 = None        # advertise this base64 md5 in Content-MD5
         self.throttle_bytes = None     # write in blocks of this size...
         self.throttle_delay = 0.0      # ...sleeping this long between them
         self.fail_next = 0             # return 500 for the next N requests
@@ -96,6 +97,8 @@ def make_handler(state):
 
             if state.support_range:
                 self.send_header("Accept-Ranges", "bytes")
+            if state.content_md5:
+                self.send_header("Content-MD5", state.content_md5)
 
             limit = len(body) if state.drop_after is None else min(len(body), state.drop_after)
 

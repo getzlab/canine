@@ -313,11 +313,19 @@ class TestCheckHashEmittedCommandsUnchanged:
         assert self._cmd() == self._cmd(check_hash=False)
 
     def test_flag_actually_changes_the_command(self):
-        """Sanity check that the tests above are not comparing two no-ops."""
+        """
+        Sanity check that the tests above are not comparing two no-ops.
+
+        Since this handler was converted to the parallel downloader, the md5 is verified
+        by passing --check-md5 rather than by a shell md5sum gate -- the downloader checks
+        before writing its completion marker, so emitting the gate too would re-read the
+        whole object for nothing. Either way the flag has to change the command.
+        """
         with_check = self._cmd(check_hash=True)
         without = self._cmd(check_hash=False)
         assert with_check != without
-        assert "md5sum" in with_check and "md5sum" not in without
+        assert "--check-md5" in with_check and "--check-md5" not in without
+        assert "md5sum" not in with_check, "gate emitted on top of --check-md5"
 
     def test_no_gate_emitted_when_server_advertises_no_checksum(self):
         """
