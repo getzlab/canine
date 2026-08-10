@@ -62,6 +62,7 @@ import re
 import shlex
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -1954,6 +1955,211 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     return EXIT_OK
 
 
+# --------------------------------------------------------------------------------
+# Route C: stage on a real block device, then publish
+# --------------------------------------------------------------------------------
+
+# The staged file plus the published copy coexist briefly, and the plan's own disk
+# sizing uses a 5% margin, so require the same headroom before committing to a
+# work directory.
+STAGING_HEADROOM = 1.05
+
+STAGING_SUBDIR = ".k9pdl.staging"
+
+
+def free_bytes(directory):
+    try:
+        stats = os.statvfs(directory)
+    except OSError:
+        return 0
+    return stats.f_bavail * stats.f_frsize
+
+
+def work_directory_candidates(options):
+    """
+    Where a staged copy could live, in preference order.
+
+    The localization persistent disk comes first because it is the ONLY candidate whose
+    staged file survives a preemption -- CANINE_LOCAL_DISK_DIR and TMPDIR are on the
+    ephemeral local disk, which dies with the VM, so a staged file there means a clean
+    restart from zero rather than a resume. The handler passes the PD explicitly with
+    --work-dir when localize_to_persistent_disk is set.
+    """
+    candidates = list(options.work_dir or [])
+    for variable in ("CANINE_LOCAL_DISK_DIR", "TMPDIR"):
+        value = os.environ.get(variable)
+        if value:
+            candidates.append(value)
+    candidates.append(tempfile.gettempdir())
+
+    seen = set()
+    ordered = []
+    for candidate in candidates:
+        resolved = os.path.abspath(candidate)
+        if resolved not in seen:
+            seen.add(resolved)
+            ordered.append(resolved)
+    return ordered
+
+
+def select_work_directory(options, size):
+    """
+    Pick a staging directory that is a real POSIX filesystem with room for the object,
+    or None.
+
+    Never silently proceed with a directory that cannot hold the file: running out of
+    space mid-publish would leave a truncated object at the destination, which is worse
+    than declining the route.
+    """
+    needed = int(size * STAGING_HEADROOM)
+    for candidate in work_directory_candidates(options):
+        staging = os.path.join(candidate, STAGING_SUBDIR)
+        try:
+            os.makedirs(staging, exist_ok=True)
+        except OSError as e:
+            log("staging candidate {} is unusable: {}".format(candidate, e))
+            continue
+
+        # the staging area has to be a real block device, not another FUSE mount
+        decision = select_route(os.path.join(staging, "probe"))
+        if decision.route != ROUTE_POSIX:
+            log("staging candidate {} is not a POSIX filesystem ({})".format(
+                candidate, decision.reason))
+            continue
+
+        available = free_bytes(staging)
+        if available < needed:
+            log("staging candidate {} has {} bytes free, needs {}".format(
+                candidate, available, needed))
+            continue
+
+        return staging, decision
+    return None, None
+
+
+def publish_staged_file(staged, dest, size):
+    """
+    Copy the staged file to the destination with one sequential streaming write.
+
+    Two deliberate choices for a FUSE object store:
+
+      * No temp name and rename. rename is not atomic on a flat-namespace bucket, so a
+        publish-then-rename would have a window where the destination is neither the old
+        nor the new object.
+      * The object is finalized by close(), not by fsync -- with gcsfuse nothing is
+        durable until the handle closes, so the copy must run to completion inside one
+        open handle and the size can only be re-checked afterwards.
+
+    A single sequential write is also the only pattern that reaches gcsfuse's
+    streaming-write path; anything else stages the whole file locally again and
+    re-uploads it.
+    """
+    directory = os.path.dirname(os.path.abspath(dest))
+    if directory and not os.path.isdir(directory):
+        os.makedirs(directory, exist_ok=True)
+
+    copied = 0
+    with open(staged, "rb") as source_file:
+        with open(dest, "wb") as destination_file:
+            while True:
+                block = source_file.read(READ_BUFFER)
+                if not block:
+                    break
+                destination_file.write(block)
+                copied += len(block)
+        # the `with` above closed the destination, which is what finalizes the object
+
+    if copied != size:
+        raise TransientError(
+            "published {} bytes, expected {}".format(copied, size)
+        )
+    return copied
+
+
+def run_staged_route(options, decision, source, size, chunks, chunk_size, plan_id,
+                     marker_path):
+    """
+    Route C: chunk-download onto a real block device, verify there, then publish with a
+    single sequential copy.
+
+    The generic fallback for a non-POSIX destination that is not a resolvable bucket.
+    Strictly worse than Route B -- it pays a full sequential publish and puts up to a
+    whole file of staged work at risk -- which is why Route B is preferred whenever the
+    destination can be addressed directly.
+    """
+    dest = options.dest
+    staging, _ = select_work_directory(options, size)
+    if staging is None:
+        # Declining is correct rather than defeatist: a single sequential curl is the
+        # only safe pattern left, and for a FUSE object store it is also the only one
+        # that avoids read-modify-write and a full-object re-upload.
+        return single_stream_fallback(
+            options, "no staging directory has room for {} bytes".format(size)
+        )
+
+    staged = os.path.join(staging, os.path.basename(dest))
+    staged_manifest, staged_marker = sidecar_paths(staged)
+    log("staging via {}".format(staged))
+
+    # A staged file that has already been verified can be published again without
+    # re-downloading anything -- which is what makes a preemption during the publish
+    # cost only the publish.
+    verified = read_done_marker(staged_marker)
+    digest = None
+    if (verified and verified.get("plan_id") == plan_id
+            and verified.get("size") == size and os.path.exists(staged)
+            and os.path.getsize(staged) == size):
+        log("staged copy is already verified; re-publishing without re-downloading")
+        digest = verified.get("hash")
+    else:
+        status, manifest = download_to_local_file(
+            options, source, size, chunks, chunk_size, plan_id, staged,
+            staged_manifest, probe_seek_hole(staging),
+        )
+        if status != EXIT_OK:
+            return status
+
+        # Verify BEFORE publishing, so a corrupt download never costs an upload.
+        try:
+            digest = verify(staged, options)
+        except PermanentError as e:
+            log("verification failed on the staged copy: {}".format(e))
+            discard(staged, manifest)
+            return EXIT_FAIL
+
+        write_done_marker(staged_marker, size, plan_id, digest)
+        if manifest is not None:
+            manifest.unlink()
+
+    try:
+        publish_staged_file(staged, dest, size)
+    except (TransientError, IOError, OSError) as e:
+        log("publish failed: {}; the staged copy is kept for the next attempt".format(e))
+        return EXIT_REQUEUE
+
+    # Re-check after close(), because that is the point at which the object exists.
+    try:
+        published = os.path.getsize(dest)
+    except OSError as e:
+        log("could not stat the published object: {}".format(e))
+        return EXIT_REQUEUE
+    if published != size:
+        log("published object is {} bytes, expected {}".format(published, size))
+        return EXIT_REQUEUE
+
+    write_done_marker(marker_path, size, plan_id, digest)
+
+    for path in (staged, staged_marker):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    log("complete: {} bytes published from {}{}".format(
+        size, staged, " (verified)" if digest else ""))
+    return EXIT_OK
+
+
 class _FakeStat:
     """
     Stands in for os.stat on a route with no local file, so the manifest's identity
@@ -2084,77 +2290,26 @@ def run(options):
         return run_bucket_route(options, decision, source, size, chunks, plan_id,
                                 manifest_path, marker_path)
 
+    if decision.route == ROUTE_STAGED:
+        return run_staged_route(options, decision, source, size, chunks, chunk_size,
+                                plan_id, marker_path)
+
     if decision.route != ROUTE_POSIX:
-        # Route C (stage-then-publish) is not implemented yet. Until it is, such a
-        # destination takes the single sequential stream -- which is not merely a
-        # placeholder: it is the documented degradation for Route C when no staging
-        # directory qualifies, and for a FUSE object store it is also the only access
-        # pattern that reaches the streaming-write path. Anything else forces
-        # read-modify-write and a full-object re-upload.
         return single_stream_fallback(
             options,
-            "route {} not yet implemented ({})".format(decision.route, decision.reason),
+            "unhandled route {} ({})".format(decision.route, decision.reason),
         )
 
     seek_hole = decision.seek_hole
     if not seek_hole:
         log("SEEK_HOLE unsupported here; checkpointing instead of frontier recovery")
 
-    fd = open_destination(dest, size)
-    manifest = None
-    try:
-        dest_stat = os.fstat(fd)
-
-        manifest = None if options.no_resume else Manifest.load(manifest_path)
-        if manifest is not None and not manifest.matches(plan_id, dest_stat, size):
-            log("manifest describes a different object or layout; restarting")
-            manifest.unlink()
-            manifest = None
-            os.ftruncate(fd, 0)
-            os.ftruncate(fd, size)
-            dest_stat = os.fstat(fd)
-
-        if manifest is None:
-            manifest = Manifest.create(
-                manifest_path, plan_id, size, chunk_size, chunks, dest_stat,
-                seek_hole, 0 if seek_hole else checkpoint_interval_for(chunk_size),
-            )
-        else:
-            log("resuming: {}/{} chunks already complete".format(
-                sum(1 for i in range(len(chunks)) if manifest.is_complete(i)),
-                len(chunks)))
-
-        try_lock(fd)
-
-        sink = PosixChunkSink(fd, manifest, chunks, dest)
-        downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
-        try:
-            downloader.run()
-        except PermanentError as e:
-            log("permanent failure: {}".format(e))
-            return EXIT_FAIL
-        except RangeNotSupported as e:
-            os.close(fd)
-            fd = None
-            return single_stream_fallback(options, str(e))
-        except TransientError as e:
-            # forward progress decides requeue-vs-fail: returning 5 unconditionally
-            # would let a download that can never progress requeue forever, and exit-5
-            # requeues are deliberately excluded from the preemption limit
-            if downloader.made_progress:
-                log("transient failure after progress; requesting requeue: {}".format(e))
-                return EXIT_REQUEUE
-            log("no forward progress this attempt: {}".format(e))
-            return EXIT_FAIL
-
-        os.fsync(fd)
-        actual_size = os.fstat(fd).st_size
-        if actual_size != size:
-            log("size mismatch after download: {} != {}".format(actual_size, size))
-            return EXIT_FAIL
-    finally:
-        if fd is not None:
-            os.close(fd)
+    status, manifest = download_to_local_file(
+        options, source, size, chunks, chunk_size, plan_id, dest, manifest_path,
+        seek_hole,
+    )
+    if status != EXIT_OK:
+        return status
 
     try:
         digest = verify(dest, options)
@@ -2168,6 +2323,75 @@ def run(options):
         manifest.unlink()
     log("complete: {} bytes{}".format(size, " (verified)" if digest else ""))
     return EXIT_OK
+
+
+def download_to_local_file(options, source, size, chunks, chunk_size, plan_id, target,
+                           manifest_path, seek_hole):
+    """
+    Download into a local POSIX file, in place and resumably.
+
+    Shared by Route A (where the target is the destination) and Route C (where it is a
+    staging file on a real block device). Returns `(exit_code, manifest)`; verification,
+    publishing and the done marker are the caller's business, because they differ
+    between the two.
+    """
+    fd = open_destination(target, size)
+    manifest = None
+    try:
+        target_stat = os.fstat(fd)
+
+        manifest = None if options.no_resume else Manifest.load(manifest_path)
+        if manifest is not None and not manifest.matches(plan_id, target_stat, size):
+            log("manifest describes a different object or layout; restarting")
+            manifest.unlink()
+            manifest = None
+            os.ftruncate(fd, 0)
+            os.ftruncate(fd, size)
+            target_stat = os.fstat(fd)
+
+        if manifest is None:
+            manifest = Manifest.create(
+                manifest_path, plan_id, size, chunk_size, chunks, target_stat,
+                seek_hole, 0 if seek_hole else checkpoint_interval_for(chunk_size),
+            )
+        else:
+            log("resuming: {}/{} chunks already complete".format(
+                sum(1 for i in range(len(chunks)) if manifest.is_complete(i)),
+                len(chunks)))
+
+        try_lock(fd)
+
+        sink = PosixChunkSink(fd, manifest, chunks, target)
+        downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
+        try:
+            downloader.run()
+        except PermanentError as e:
+            log("permanent failure: {}".format(e))
+            return EXIT_FAIL, manifest
+        except RangeNotSupported as e:
+            os.close(fd)
+            fd = None
+            return single_stream_fallback(options, str(e)), manifest
+        except TransientError as e:
+            # forward progress decides requeue-vs-fail: returning 5 unconditionally
+            # would let a download that can never progress requeue forever, and exit-5
+            # requeues are deliberately excluded from the preemption limit
+            if downloader.made_progress:
+                log("transient failure after progress; requesting requeue: {}".format(e))
+                return EXIT_REQUEUE, manifest
+            log("no forward progress this attempt: {}".format(e))
+            return EXIT_FAIL, manifest
+
+        os.fsync(fd)
+        actual_size = os.fstat(fd).st_size
+        if actual_size != size:
+            log("size mismatch after download: {} != {}".format(actual_size, size))
+            return EXIT_FAIL, manifest
+    finally:
+        if fd is not None:
+            os.close(fd)
+
+    return EXIT_OK, manifest
 
 
 def discard(dest, manifest):
@@ -2222,6 +2446,9 @@ def build_parser():
                         help="S3 multipart part length, for ETag verification")
     parser.add_argument("--url-refresh-cmd", dest="url_refresh_cmd",
                         help="shell command printing a fresh signed URL")
+    parser.add_argument("--work-dir", action="append", default=[], dest="work_dir",
+                        help="preferred staging directory for a non-POSIX destination "
+                             "(repeatable, tried in order)")
     parser.add_argument("--legacy-cmd", dest="legacy_cmd",
                         help="command to run for the single-stream fallback")
     parser.add_argument("--no-resume", action="store_true", dest="no_resume",
