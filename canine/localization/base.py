@@ -20,7 +20,7 @@ from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
-from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging
+from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging, gcloud_storage_client, touch_object
 from hound.client import _getblob_bucket
 import pandas as pd
 import google.cloud.compute_v1, google.api_core.exceptions
@@ -958,6 +958,104 @@ class AbstractLocalizer(abc.ABC):
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
+    def create_bucket_mount(self,
+      file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
+      dry_run = False
+    ):
+        """
+        Replaces create_persistent_disk() for the localize_to_persistent_disk
+        case only (use_scratch_disk is unaffected and continues to use
+        create_persistent_disk()). Instead of a GCE persistent disk, inputs
+        are uploaded to the workflow's shared GCS bucket
+        (self.backend.config["storage_bucket"]) under a content-addressed
+        object prefix, and consumed via a read-only gcsfuse mount rather
+        than a read-only disk attach.
+
+        Unlike create_persistent_disk, there is no local disk to create/
+        attach/mount for the producer side -- uploads go directly to GCS
+        via `gcloud storage cp`, so this method emits no localization/
+        teardown script commands of its own. It returns
+        (bucket_prefix, skip_upload, bucketmount_paths):
+          * bucket_prefix: "gs://<bucket>/<hash>", used by the caller to
+            build per-file upload destinations. None if skip_upload.
+          * skip_upload: True if this content already exists in the bucket
+            (checked via a `_SUCCESS` marker object -- see
+            BUCKET_FUSE_MIGRATION.md's "Producer-side dedup"/"Cross-run
+            reuse" sections) or if this is a dry run -- in either case the
+            caller should treat these inputs as already-mounted rather than
+            emitting upload commands, mirroring create_persistent_disk's
+            `disk_exists and "finished" in labels` short-circuit.
+          * bucketmount_paths: dict of input name -> [bucketmount:// URLs],
+            for the caller to save in self.rodisk_paths (same attribute
+            used for disk-backed RODISKs, since wolf.localization.LocalizeToDisk
+            reads it generically regardless of backing mechanism).
+        """
+        # flatten file_paths dict (same scheme as create_persistent_disk)
+        file_paths = []
+        for k, v in file_paths_arrays.items():
+            n_suff = 0
+            for x in v:
+                file_paths.append([
+                  k, n_suff, x.path, x.hash, x.size,
+                  not (
+                    isinstance(x, file_handlers.StringLiteral)
+                    or isinstance(x, (file_handlers.HandleRODISKURL, file_handlers.HandleBucketMountURL))
+                    or x.localization_mode == "stream"
+                  ),
+                  isinstance(x, (file_handlers.HandleRODISKURL, file_handlers.HandleBucketMountURL))
+                ])
+                n_suff += 1
+
+        F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "path", "hash", "size", "localize", "rdpassthru"])
+        F["file_basename"] = F["path"].apply(os.path.basename)
+
+        if len(F) > 0 and (~(F["localize"] | F["rdpassthru"])).all():
+            raise ValueError("You requested to localize files to a bucket, but no localizable inputs were given:\n{}\nInputs must be valid local paths or supported remote URLs.".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F[["path", "input"]].itertuples()])))
+
+        if (~(F["localize"] | F["rdpassthru"])).any():
+            canine_logging.warning("You requested to localize files to a bucket, but some inputs cannot be localized. Inputs must be valid local paths or supported remote URLs. The following inputs will be skipped:\n{}".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F.loc[~(F["localize"] | F["rdpassthru"]), ["path", "input"]].itertuples()])))
+
+        # handle special case if we are only passing through bucketmount/RODISK URLs; this is like a dry run
+        if F["rdpassthru"].any() and not F["localize"].any():
+            return None, True, F.loc[F["rdpassthru"], :].groupby("input")["path"].agg(list).to_dict()
+
+        # object prefix is determined by input names, files' basenames, and
+        # hashes -- same scheme as create_persistent_disk's disk_name, so
+        # identical input sets converge on the same bucket location
+        object_hash = "canine-" + file_handlers.hash_set(set(
+          F.loc[F["localize"], "input"] + "_" + \
+          F.loc[F["localize"], "file_basename"] + "_" + \
+          F.loc[F["localize"], "hash"]
+        ))
+
+        canine_logging.info1("Bucket object prefix is {}".format(object_hash))
+
+        bucket = self.backend.config["storage_bucket"]
+
+        # create bucketmount:// URLs for files being localized to the bucket.
+        # bucket name is embedded in the URL (not just the hash) since,
+        # unlike disk names, buckets are scoped per-workflow rather than
+        # globally, so a downstream consumer can't assume its own backend's
+        # bucket is the one that produced this content.
+        F["bucket_path"] = F["path"]
+        F.loc[F["localize"], "bucket_path"] = "bucketmount://" + bucket + "/" + object_hash + "/" + \
+          F.loc[F["localize"], ["input", "file_basename"]].apply(lambda x: "/".join(x), axis = 1)
+
+        bucketmount_paths = F.loc[F["localize"], :].groupby("input")["bucket_path"].agg(list).to_dict()
+
+        if F["rdpassthru"].any():
+            bucketmount_paths = {**bucketmount_paths, **F.loc[F["rdpassthru"], :].groupby("input")["path"].agg(list).to_dict()}
+
+        if dry_run:
+            return None, True, bucketmount_paths
+
+        marker_path = "{}/_SUCCESS".format(object_hash)
+        already_exists = gcloud_storage_client().bucket(bucket).blob(marker_path).exists()
+        if already_exists:
+            touch_object(bucket, marker_path)
+
+        return "gs://{}/{}".format(bucket, object_hash), already_exists, bucketmount_paths
+
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str], transport = None) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
         """
         Returns a tuple of (setup script, localization script, teardown script) for the given job id.
@@ -974,6 +1072,7 @@ class AbstractLocalizer(abc.ABC):
         ]
         array_exports = {}
         canine_rodisks = []
+        canine_bucketmounts = []
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
@@ -987,46 +1086,36 @@ class AbstractLocalizer(abc.ABC):
         if self.localize_to_persistent_disk:
             # FIXME: we don't have an easy way of parsing which inputs are common
             #        to all shards at this point. if every localizable input is
-            #        common to each shard, then we'll create the same disk
+            #        common to each shard, then we'll upload the same content
             #        multiple times, once per shard. thus, for now we suboptimally
             #        just localize the same file multiple times.
-            # NOTE:  we are still able to create scratch disks for scatter jobs,
-            #        one per shard. we do this by appending the shard number to the
-            #        scratch disk name
 
-            disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId], dry_run = self.persistent_disk_dry_run)
+            bucket_prefix, bucketmount_already_exists, bucketmount_paths = self.create_bucket_mount(self.inputs[jobId], dry_run = self.persistent_disk_dry_run)
 
-            # add commands to create/mount the disk
-            localization_tasks += disk_creation_script
+            # save bucketmount:// URLs for files saved to the bucket for later use
+            self.rodisk_paths[jobId] = bucketmount_paths
 
-            # save rodisk:// URLs for files saved to the disk for later use
-            self.rodisk_paths[jobId] = rodisk_paths
-
-            # if disk already exists and is finalized (as indicated by blank disk creation script),
-            # treat each localizable input as a RODISK that already exists (to be mounted),
-            # rather than as a RODISK (to be created and localized to)
-            # note that this does not apply to scratch disks that already exist;
-            # these have a special disk creation script that cause the localizer to
-            # exit early.
-            localization_disk_already_exists = False
-            if len(disk_creation_script) == 0:
-                localization_disk_already_exists = True
+            # if this content already exists in the bucket (or this is a dry
+            # run), treat each localizable input as a bucket mount that
+            # already exists (to be mounted), rather than as one to be
+            # uploaded and localized to
+            if bucketmount_already_exists:
                 for k, v_array in self.rodisk_paths[jobId].items():
                     # if this input had previously been localized in prepare_job_inputs,
                     # delete it
                     for v in self.inputs[jobId][k]:
-                        if v.localization_mode == "local": 
+                        if v.localization_mode == "local":
                             localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path)]
 
-                    # transform this input into a RODISK FileType, to be mounted
+                    # transform this input into a bucket-mount FileType, to be mounted
                     if not self.persistent_disk_dry_run:
-                        self.inputs[jobId][k] = [file_handlers.HandleRODISKURL(v) for v in v_array]
+                        self.inputs[jobId][k] = [file_handlers.HandleBucketMountURL(v) for v in v_array]
 
-                    # if this is a dry run, we are only interested in the RODISK URL string literals;
+                    # if this is a dry run, we are only interested in the bucketmount URL string literals;
                     # we will not actually be attempting to mount it. this is mainly
-                    # for wolf.LocalizeToDisk, which returns RODISK path inputs
+                    # for wolf.LocalizeToDisk, which returns bucketmount path inputs
                     # as its outputs. this would likely not be useful for most others
-                    # tasks, since they would have no idea what to do with a RODISK string
+                    # tasks, since they would have no idea what to do with a bucketmount string
                     # literal
                     else:
                         self.inputs[jobId][k] = [file_handlers.StringLiteral(v) for v in v_array]
@@ -1162,19 +1251,23 @@ class AbstractLocalizer(abc.ABC):
 
                     exportpath = self.reserve_path('jobs', jobId, 'inputs', basename)
 
-                    # localize this file to a persistent disk, if specified
+                    # set dest to path on NFS (same for both bucket-mounted
+                    # and plain localization -- reaching this branch with
+                    # self.localize_to_persistent_disk set means this is
+                    # fresh content that needs uploading, not a bucket mount
+                    # that already exists; that case is handled earlier by
+                    # transforming the input into a bucket_mount FileType)
+                    localization_tasks += [file_handler.localization_command(exportpath.remotepath)]
+                    file_handler.localized_path = exportpath
+
+                    # additionally push a copy up to the shared bucket, if
+                    # localizing to a shared bucket, so downstream jobs can
+                    # bucket-mount it instead of re-downloading
                     if self.localize_to_persistent_disk:
-                        # localize to persistent disk mountpoint; symlink into inputs folder
-                        disk_path = os.path.join(disk_prefix, key, basename)
-                        file_handler.localized_path = disk_path
+                        bucket_dest = "{}/{}/{}".format(bucket_prefix, key, basename)
                         localization_tasks += [
-                          file_handler.localization_command(disk_path),
-                          "if [[ -e {path} && ! -L {path} ]]; then echo 'Warning: task overwrote symlink to {disk_path} on RODISK' >&2; elif [[ ! -L {path} ]]; then ln -s {disk_path} {path}; fi".format(disk_path=disk_path, path=exportpath.remotepath),
+                          'gcloud storage cp -r -n "{}" "{}"'.format(exportpath.remotepath, bucket_dest)
                         ]
-                    else:
-                        # set dest to path on NFS
-                        localization_tasks += [file_handler.localization_command(exportpath.remotepath)]
-                        file_handler.localized_path = exportpath
 
                     export_writer(key, exportpath.remotepath, is_array)
 
@@ -1209,6 +1302,40 @@ class AbstractLocalizer(abc.ABC):
 
                     export_writer(key, dest.remotepath, is_array)
 
+                # this is a bucket-mounted (RODISK-replacement) URL; export
+                # variables for subsequent gcsfuse mounting and a command to
+                # symlink the future mount path into the inputs directory
+                elif file_handler.localization_mode == 'bucket_mount':
+                    assert file_handler.path.startswith("bucketmount://")
+
+                    job_vars.add(shlex.quote(key))
+
+                    dgrp = re.search(r"bucketmount://([^/]+)/([^/]+)/(.*)", file_handler.path)
+                    bkt = dgrp[1]
+                    bkt_hash = dgrp[2]
+                    file = dgrp[3]
+
+                    bucketmount_key = "{}/{}".format(bkt, bkt_hash)
+                    mount_dir = "/mnt/bucketmounts/{}".format(bucketmount_key)
+
+                    if bucketmount_key not in canine_bucketmounts:
+                        canine_bucketmounts.append(bucketmount_key)
+                        exports += ["export CANINE_BUCKETMOUNT_{}={}".format(len(canine_bucketmounts), bucketmount_key)]
+                        exports += ["export CANINE_BUCKETMOUNT_DIR_{}={}".format(len(canine_bucketmounts), mount_dir)]
+
+                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
+
+                    localization_tasks += [
+                      # symlink the future bucket-mount path into the Canine inputs directory
+                      # NOTE: it will be broken upon creation, since the bucket will
+                      #   be mounted subsequently.
+                      # NOTE: it might already exist if we are retrying this task
+                      # NOTE: the task also might have overwritten the symlink with its own file
+                      "if [[ -e {path} && ! -L {path} ]]; then echo 'Warning: task overwrote symlink to {file} on bucket mount' >&2; elif [[ ! -L {path} ]]; then ln -s {mount_dir}/{file} {path}; fi".format(mount_dir=mount_dir, file=file, path=dest.remotepath),
+                    ]
+
+                    export_writer(key, dest.remotepath, is_array)
+
                 # this is a local file; copy or symlink it to the inputs directory.
                 # if we are localizing to a persistent disk, create commands
                 # to copy it there.
@@ -1227,16 +1354,16 @@ class AbstractLocalizer(abc.ABC):
                     # update localized_path
                     file_handler.localized_path = dest.remotepath
 
-                    # add commands to copy file from NFS to persistent disk, if specified
+                    exportpath = dest.remotepath
+
+                    # additionally push a copy up to the shared bucket, if
+                    # localizing to a shared bucket, so downstream jobs can
+                    # bucket-mount it instead of re-localizing
                     if self.localize_to_persistent_disk:
-                        exportpath = os.path.join(disk_prefix, key, basename)
+                        bucket_dest = "{}/{}/{}".format(bucket_prefix, key, basename)
                         localization_tasks += [
-                          "[ ! -d {0} ] && mkdir -p {0} || :".format(os.path.join(disk_prefix, key)),
-                          "cp -r {} {}".format(dest.remotepath, exportpath)
+                          'gcloud storage cp -r -n "{}" "{}"'.format(dest.remotepath, bucket_dest)
                         ]
-                        file_handler.localized_path = exportpath
-                    else:
-                        exportpath = dest.remotepath
 
                     export_writer(
                       key,
@@ -1340,6 +1467,50 @@ class AbstractLocalizer(abc.ABC):
               "done",
             ]
 
+        #
+        # Mount bucket-mounted (RODISK-replacement) inputs, if any
+        exports += ["export CANINE_N_BUCKETMOUNTS={}".format(len(canine_bucketmounts))]
+        if len(canine_bucketmounts):
+            localization_tasks += [
+              "[ -f .bucketmount_lock_pids ] && rm .bucketmount_lock_pids || :",
+              "for i in `seq ${CANINE_N_BUCKETMOUNTS}`; do",
+              "CANINE_BUCKETMOUNT=CANINE_BUCKETMOUNT_${i}",
+              "CANINE_BUCKETMOUNT=${!CANINE_BUCKETMOUNT}",
+              "CANINE_BUCKETMOUNT_DIR=CANINE_BUCKETMOUNT_DIR_${i}",
+              "CANINE_BUCKETMOUNT_DIR=${!CANINE_BUCKETMOUNT_DIR}",
+
+              'echo "INFO: Mounting bucket ${CANINE_BUCKETMOUNT} ..." >&2',
+
+              "if [[ ! -d ${CANINE_BUCKETMOUNT_DIR} ]]; then",
+              "sudo mkdir -p ${CANINE_BUCKETMOUNT_DIR}",
+              "fi",
+
+              # unlike RODISK, mounting has no cross-node attach race to
+              # protect against: gcsfuse supports many concurrent read-only
+              # mounts of the same bucket/prefix, so we can just mount if
+              # not already mounted, with no backoff/retry dance
+              "if ! mountpoint -q ${CANINE_BUCKETMOUNT_DIR}; then",
+              # CANINE_BUCKETMOUNT is "<bucket>/<hash>"; split into gcsfuse's
+              # positional <bucket> <mountpoint> args plus --only-dir <hash>
+              "CANINE_BUCKETMOUNT_BUCKET=${CANINE_BUCKETMOUNT%%/*}",
+              "CANINE_BUCKETMOUNT_HASH=${CANINE_BUCKETMOUNT#*/}",
+              "timeout -k 60 60 gcsfuse -o ro --implicit-dirs --only-dir ${CANINE_BUCKETMOUNT_HASH} ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
+              "fi",
+
+              'mountpoint -q ${CANINE_BUCKETMOUNT_DIR} || { echo "ERROR: Bucket mount did not appear!" >&2; exit 1; }',
+
+              # lock the mountpoint; will be unlocked during teardown script
+              # (or if script crashes). unlike RODISK, this isn't to
+              # coordinate a cross-node attach race -- it's so a concurrent
+              # job sharing this same node/mountpoint doesn't get it
+              # unmounted out from under it by another job's teardown
+              "flock -os ${CANINE_BUCKETMOUNT_DIR} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids",
+
+              'echo "INFO: Successfully mounted bucket ${CANINE_BUCKETMOUNT}." >&2',
+
+              "done",
+            ]
+
         ## Symlink common inputs to job inputs
         localization_tasks += [
             'find "$CANINE_COMMON"/ -mindepth 1 -maxdepth 1 -exec sh -c "ln -s {} "$CANINE_JOB_INPUTS"/ || echo \'Could not symlink common input {}\' >&2" \;'
@@ -1375,11 +1546,14 @@ class AbstractLocalizer(abc.ABC):
             "set -e",
             "shopt -s expand_aliases #DEBUG_OMIT",
             "alias gcloud=gcloud_exp_backoff #DEBUG_OMIT"
-          ] + localization_tasks + 
+          ] + localization_tasks +
           (
-            ['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}'.format(
-              protect_string = (",protect=yes" if self.protect_disk else "")
-            )] if self.localize_to_persistent_disk and not localization_disk_already_exists else []
+            # mark this bucket object prefix as fully uploaded, so future
+            # producers (this workflow rerun, or a concurrent sibling task
+            # requesting the identical hash) can skip re-uploading -- see
+            # BUCKET_FUSE_MIGRATION.md's "Producer-side dedup"
+            ['gcloud storage cp /dev/null "{}/_SUCCESS"'.format(bucket_prefix)]
+            if self.localize_to_persistent_disk and not bucketmount_already_exists else []
           ) +
           ( # skip running task script if finished scratch disk already exists via special localizer exit code
             ["exit 15 #DEBUG_OMIT"] if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else []
@@ -1439,9 +1613,30 @@ class AbstractLocalizer(abc.ABC):
                 '  else',
                 '    echo "Read-only disk ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
                 '  fi',
+                'done)',
+
+                # unmount all bucket mounts, if they're not in use
+                # first, release all locks obtained by this job
+                'if [ -f ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids ]; then',
+                '  while read -r pid; do',
+                '    kill $pid',
+                '  done < ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids',
+                '  rm -f ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids',
+                'fi',
+                '(cd /',
+                'for i in $(seq ${CANINE_N_BUCKETMOUNTS}); do',
+                '  CANINE_BUCKETMOUNT=CANINE_BUCKETMOUNT_${i}',
+                '  CANINE_BUCKETMOUNT=${!CANINE_BUCKETMOUNT}',
+                '  CANINE_BUCKETMOUNT_DIR=CANINE_BUCKETMOUNT_DIR_${i}',
+                '  CANINE_BUCKETMOUNT_DIR=${!CANINE_BUCKETMOUNT_DIR}',
+                '  echo "Unmounting bucket ${CANINE_BUCKETMOUNT}" >&2',
+                '  if flock -n ${CANINE_BUCKETMOUNT_DIR} true && mountpoint -q ${CANINE_BUCKETMOUNT_DIR}; then',
+                '    fusermount -u ${CANINE_BUCKETMOUNT_DIR} && echo "Unmounted ${CANINE_BUCKETMOUNT}" >&2 || echo "Error unmounting ${CANINE_BUCKETMOUNT}" >&2',
+                '  else',
+                '    echo "Bucket mount ${CANINE_BUCKETMOUNT} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
+                '  fi',
                 'done)'
-            ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
-              + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
+            ] + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
         return setup_script, localization_script, teardown_script, array_exports
 

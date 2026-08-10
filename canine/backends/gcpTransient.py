@@ -8,7 +8,10 @@ import os
 import sys
 import warnings
 from .remote import RemoteSlurmBackend
-from ..utils import get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost, canine_logging
+from ..utils import (
+    get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost, canine_logging,
+    get_or_create_workflow_bucket, get_or_create_rapid_cache
+)
 # import paramiko
 import yaml
 import pandas as pd
@@ -52,7 +55,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         worker_type: str = 'n1-highcpu-2', login_count: int = 0, compute_disk_size: int = 20,
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
-        external_compute_ips: bool = False, **kwargs : typing.Any
+        external_compute_ips: bool = False, workflow_name: typing.Optional[str] = None,
+        rapid_cache_ttl: str = "7d", **kwargs : typing.Any
     ):
         self.project = project if project is not None else get_default_gcp_project()
         if self.project is None:
@@ -94,6 +98,8 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           'external_compute_ips': external_compute_ips,
           **kwargs
         }
+        self.workflow_name = workflow_name
+        self.rapid_cache_ttl = rapid_cache_ttl
 
         if gpu_type is not None and gpu_count > 0:
             if gpu_type not in GPU_TYPES:
@@ -226,6 +232,28 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 rc, sout, serr = self.invoke("which sinfo")
             time.sleep(60)
             canine_logging.info1("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
+
+            # get-or-create the bucket backing bucket-mounted localization
+            # (RODISK replacement); a genuine creation failure aborts
+            # startup here, before any node/job work begins
+            self.config["storage_bucket"] = get_or_create_workflow_bucket(
+                self.config["zone"], self.project, self.workflow_name
+            )
+
+            # Rapid Cache acceleration is best-effort: it only affects read
+            # speed, not correctness, so a failure here is logged and
+            # startup continues rather than aborting
+            try:
+                get_or_create_rapid_cache(
+                    self.config["storage_bucket"], self.config["zone"], ttl = self.rapid_cache_ttl
+                )
+            except Exception as e:
+                canine_logging.warning(
+                    "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
+                        self.config["storage_bucket"], e
+                    )
+                )
+
             return self
         except:
             self.stop()

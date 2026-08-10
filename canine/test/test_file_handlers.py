@@ -8,6 +8,7 @@ from canine.localization.file_handlers import (
     HandleGSURL,
     HandleAWSURL,
     HandleRODISKURL,
+    HandleBucketMountURL,
     HandleDRSURI,
     HandleGCSSignedURL,
     HandleGDCHTTPURL,
@@ -93,6 +94,31 @@ class TestHandleRODISKURLHash:
 
 
 # ---------------------------------------------------------------------------
+# HandleBucketMountURL._get_hash
+# ---------------------------------------------------------------------------
+
+class TestHandleBucketMountURLHash:
+
+    def test_returns_full_url(self):
+        url = "bucketmount://my-bucket/canine-abc123def456/input/myfile.txt"
+        f = HandleBucketMountURL(url)
+        assert f._get_hash() == url
+
+    def test_non_canine_hash_returns_full_url(self):
+        url = "bucketmount://my-bucket/user-custom-prefix/data.bam"
+        f = HandleBucketMountURL(url)
+        assert f._get_hash() == url
+
+    def test_invalid_url_no_path_raises(self):
+        with pytest.raises(ValueError):
+            HandleBucketMountURL("bucketmount://my-bucket/canine-abc").  _get_hash()
+
+    def test_invalid_url_completely_malformed_raises(self):
+        with pytest.raises(ValueError):
+            HandleBucketMountURL("not-a-bucketmount-url")._get_hash()
+
+
+# ---------------------------------------------------------------------------
 # get_file_handler — URL routing dispatch
 # ---------------------------------------------------------------------------
 
@@ -149,6 +175,10 @@ class TestGetFileHandler:
     def test_rodisk_url(self):
         h = get_file_handler("rodisk://canine-crc32c-abc/file.txt")
         assert isinstance(h, HandleRODISKURL)
+
+    def test_bucketmount_url(self):
+        h = get_file_handler("bucketmount://my-bucket/canine-abc123/file.txt")
+        assert isinstance(h, HandleBucketMountURL)
 
     def test_generic_https_url(self):
         # HandleOtherURL runs `curl -sIL` in __init__; mock to avoid network

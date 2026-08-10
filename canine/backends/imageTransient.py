@@ -7,7 +7,10 @@ import os
 import sys
 
 from .local import LocalSlurmBackend
-from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, canine_logging
+from ..utils import (
+    get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, canine_logging,
+    get_or_create_workflow_bucket, get_or_create_rapid_cache
+)
 
 import googleapiclient.discovery as gd
 import googleapiclient.errors
@@ -83,6 +86,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         project: typing.Optional[str] = None,
         user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None,
         action_on_stop: str = "stop",
+        workflow_name: typing.Optional[str] = None,
+        rapid_cache_ttl: str = "7d",
         **kwargs
     ):
         #
@@ -142,7 +147,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else "root",
             "slurm_conf_path" : slurm_conf_path,
-            "action_on_stop" : action_on_stop
+            "action_on_stop" : action_on_stop,
+            "workflow_name" : workflow_name,
+            "rapid_cache_ttl" : rapid_cache_ttl
         }
 
         if self.config['project'] is None:
@@ -162,6 +169,28 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         try:
             # start Slurm controller (and associated programs)
             self.init_slurm()
+
+            # get-or-create the bucket backing bucket-mounted localization
+            # (RODISK replacement); a genuine creation failure aborts
+            # startup here, before any node/job work begins
+            self.config["storage_bucket"] = get_or_create_workflow_bucket(
+                self.config["compute_zone"], self.config["project"], self.config["workflow_name"]
+            )
+
+            # Rapid Cache acceleration is best-effort: it only affects read
+            # speed, not correctness, so a failure here is logged and
+            # startup continues rather than aborting
+            try:
+                get_or_create_rapid_cache(
+                    self.config["storage_bucket"], self.config["compute_zone"],
+                    ttl = self.config["rapid_cache_ttl"]
+                )
+            except Exception as e:
+                canine_logging.warning(
+                    "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
+                        self.config["storage_bucket"], e
+                    )
+                )
 
             # start nodes
             self.init_nodes()

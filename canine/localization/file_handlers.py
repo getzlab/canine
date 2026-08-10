@@ -6,7 +6,7 @@ import pandas as pd
 import urllib.parse
 
 from google.auth.transport.requests import AuthorizedSession
-from ..utils import sha1_base32, canine_logging
+from ..utils import sha1_base32, canine_logging, gcloud_storage_client
 
 class FileType(abc.ABC):
     """
@@ -102,17 +102,6 @@ def hash_set(x):
 # define file type handlers
 
 ## Google Cloud Storage {{{
-
-STORAGE_CLIENT = None
-storage_client_creation_lock = threading.Lock()
-
-def gcloud_storage_client():
-    global STORAGE_CLIENT
-    with storage_client_creation_lock:
-        if STORAGE_CLIENT is None:
-            # this is the expensive operation
-            STORAGE_CLIENT = google.cloud.storage.Client()
-    return STORAGE_CLIENT
 
 class GSFileNotExists(Exception):
     pass
@@ -909,6 +898,32 @@ class HandleRODISKURL(FileType):
 
 # }}}
 
+## Bucket-mounted (RODISK replacement) reads {{{
+
+class HandleBucketMountURL(FileType):
+    localization_mode = "bucket_mount"
+
+    # file size is unknowable without mounting
+
+    # hash is based on the bucketmount URL itself (bucket + content hash),
+    # since actually hashing the contents would entail mounting them --
+    # same reasoning as HandleRODISKURL
+    def _get_hash(self):
+        bmURL = re.match(r"bucketmount://([^/]+)/([^/]+)/(.*)", self.path)
+        if bmURL is None or bmURL[3] == "":
+            raise ValueError("Invalid bucketmount URL specified ({})!".format(self.path))
+
+        if not bmURL[2].startswith("canine-"):
+            canine_logging.debug("Bucket-mount input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
+
+        # the whole URL (bucket + content hash + file path) serves as the hash
+        return self.path
+
+    # handler will be command to gcsfuse-mount the bucket prefix
+    # (currently implemented in base.py)
+
+# }}}
+
 def get_file_handler(path, url_map = None, **kwargs):
     url_map = {
       r"^gs://" : HandleGSURL,
@@ -918,6 +933,7 @@ def get_file_handler(path, url_map = None, **kwargs):
       r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^https://storage\.(?:googleapis|cloud\.google)\.com/" : HandleGCSSignedURL,
       r"^rodisk://" : HandleRODISKURL,
+      r"^bucketmount://" : HandleBucketMountURL,
       r"^(?:ftp|https|http)://" : HandleOtherURL
     } if url_map is None else url_map
 

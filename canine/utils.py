@@ -3,13 +3,18 @@ import os
 import sys
 import select
 import io
+import re
 import warnings
 import logging
+import datetime
+import threading
 from collections import namedtuple
 import functools
 import shlex
 import subprocess
 import google.auth
+import google.api_core.exceptions
+import google.cloud.storage
 import paramiko
 import shutil
 import time
@@ -199,6 +204,108 @@ def get_default_gcp_project():
             stacklevel=1
         )
     return __DEFAULT_GCP_PROJECT__
+
+STORAGE_CLIENT = None
+storage_client_creation_lock = threading.Lock()
+
+def gcloud_storage_client():
+    global STORAGE_CLIENT
+    with storage_client_creation_lock:
+        if STORAGE_CLIENT is None:
+            # this is the expensive operation
+            STORAGE_CLIENT = google.cloud.storage.Client()
+    return STORAGE_CLIENT
+
+def _sanitize_bucket_name_component(s: str) -> str:
+    """
+    Lowercases and replaces any run of characters not valid in a GCS bucket
+    name with a single hyphen, trimming leading/trailing hyphens.
+    """
+    s = re.sub(r'[^a-z0-9-]+', '-', s.lower()).strip('-')
+    return s if s else "default"
+
+def _zone_to_region(zone: str) -> str:
+    """
+    Derives a GCP region from a zone (e.g. "us-central1-a" -> "us-central1").
+    Standard (non-zonal) bucket locations must be a region, not a zone.
+    """
+    return zone.rsplit('-', 1)[0]
+
+def get_or_create_workflow_bucket(zone: str, project: str, workflow_name: typing.Optional[str] = None) -> str:
+    """
+    Get or create the standard regional bucket backing bucket-mounted
+    (RODISK-replacement) localization for one workflow. The name is
+    deterministic -- canine-<project>-<sanitized workflow_name> -- so
+    repeated or concurrent runs of the same workflow reuse the same
+    bucket rather than creating a new one each time. Also idempotently
+    ensures a "delete 5 days after last touched" lifecycle rule is present
+    (keyed on customTime, not object age -- see BUCKET_FUSE_MIGRATION.md).
+    Raises on a genuine creation failure (permissions, quota, bad zone).
+    """
+    client = gcloud_storage_client()
+    prefix = "canine-{}-".format(project)
+    name_budget = 63 - len(prefix)
+    sanitized = _sanitize_bucket_name_component(workflow_name or "default")[:name_budget]
+    bucket_name = prefix + sanitized
+
+    bucket = client.bucket(bucket_name)
+    if not bucket.exists():
+        try:
+            bucket = client.create_bucket(bucket_name, project=project, location=_zone_to_region(zone))
+        except google.api_core.exceptions.Conflict:
+            # bucket was created concurrently by another run of the same
+            # workflow; this is the expected reuse case, not an error
+            bucket = client.bucket(bucket_name)
+            bucket.reload()
+
+    has_lifecycle_rule = any(
+        rule.get("action", {}).get("type") == "Delete" and "daysSinceCustomTime" in rule.get("condition", {})
+        for rule in bucket.lifecycle_rules
+    )
+    if not has_lifecycle_rule:
+        bucket.add_lifecycle_delete_rule(days_since_custom_time=5)
+        bucket.patch()
+
+    return bucket_name
+
+def get_or_create_rapid_cache(bucket: str, zone: str, ttl: str = "7d", ingest_on_write: bool = True):
+    """
+    Get or create a Rapid Cache (formerly Anywhere Cache) instance for
+    `bucket` in `zone`. Callers should treat failure here as best-effort/
+    non-fatal: Rapid Cache degrades gracefully to normal bucket latency on
+    a miss or absent cache, so a failure to provision it should not fail
+    the workflow the way a bucket-creation failure does.
+    """
+    list_proc = subprocess.run(
+        ["gcloud", "storage", "buckets", "anywhere-caches", "list", "gs://{}".format(bucket), "--format=value(zone)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    check_call(
+        "gcloud storage buckets anywhere-caches list gs://{}".format(bucket),
+        list_proc.returncode, io.BytesIO(list_proc.stdout), io.BytesIO(list_proc.stderr)
+    )
+    if zone in list_proc.stdout.decode().split():
+        return
+
+    create_cmd = [
+        "gcloud", "storage", "buckets", "anywhere-caches", "create",
+        "gs://{}".format(bucket), zone, "--ttl={}".format(ttl)
+    ]
+    if ingest_on_write:
+        create_cmd.append("--enable-ingest-on-write")
+    create_proc = subprocess.run(create_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    check_call(' '.join(create_cmd), create_proc.returncode, io.BytesIO(create_proc.stdout), io.BytesIO(create_proc.stderr))
+
+def touch_object(bucket: str, path: str):
+    """
+    Bumps an object's customTime metadata to now, so a GCS Object Lifecycle
+    Management rule keyed on daysSinceCustomTime treats this object as
+    freshly touched (its 5-day clock restarts) rather than expiring it
+    based on when it was first uploaded.
+    """
+    blob = gcloud_storage_client().bucket(bucket).blob(path)
+    blob.custom_time = datetime.datetime.now(datetime.timezone.utc)
+    blob.patch()
 
 def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None, stderr: typing.Optional[typing.BinaryIO] = None):
     """
