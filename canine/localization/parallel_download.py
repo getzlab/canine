@@ -129,6 +129,13 @@ ENOSPC_MAX_WAIT = 600
 
 PROGRESS_INTERVAL = 5
 
+# Every command this script shells out to -- the legacy fallback, the URL refresh, the
+# per-chunk aws call -- comes from a bash script and is written in bash. subprocess's
+# shell=True uses /bin/sh, which on the Ubuntu worker image is dash: process substitution
+# `>(...)`, `[[ ... ]]` and other constructs those commands rely on are syntax errors
+# there. So bash is named explicitly rather than inherited.
+SHELL = "/bin/bash"
+
 # Exit codes are interpreted by canine's entrypoint: 5 means requeue-and-resume, 15
 # means skip the job, and ANY other nonzero value is treated as do-not-retry. So a
 # transient failure must never escape as an arbitrary nonzero code.
@@ -894,7 +901,8 @@ class HttpSource:
         with self._lock:
             try:
                 out = subprocess.run(
-                    self.url_refresh_cmd, shell=True, capture_output=True, timeout=120
+                    self.url_refresh_cmd, shell=True, executable=SHELL,
+                    capture_output=True, timeout=120,
                 )
             except subprocess.SubprocessError as e:
                 log("URL refresh command failed: {}".format(e))
@@ -1029,7 +1037,7 @@ class S3ApiSource:
         )
         try:
             process = subprocess.Popen(
-                command, shell=True, stdout=subprocess.PIPE,
+                command, shell=True, executable=SHELL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, env=self.env,
             )
         except OSError as e:
@@ -2219,7 +2227,7 @@ def single_stream_fallback(options, reason):
             dest=shlex.quote(options.dest),
             url=shlex.quote(options.url),
         )
-    result = subprocess.run(command, shell=True)
+    result = subprocess.run(command, shell=True, executable=SHELL)
     return result.returncode
 
 

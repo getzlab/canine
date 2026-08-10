@@ -1058,19 +1058,34 @@ class HandleAWSURL(FileType):
         bucket = self.path.split("/")[2]
         key = "/".join(self.path.split("/")[3:])
 
-        # The stat-based append-resume this handler used to emit is deliberately gone.
-        # It inferred "how much is already downloaded" from the destination's size, which
-        # is exactly the assumption that breaks once a file is created at its full
-        # apparent size upfront -- it would have seen a complete file and skipped the
-        # download entirely. `aws s3 cp` overwrites rather than appends, so it is safe
-        # against a preallocated destination; the primary path's frontier recovery gives
-        # strictly better resumability than the append trick ever did.
-        legacy = "{env} aws s3 {extra_args} cp {url} {dest}".format(
+        # The fallback keeps its append-resume, unchanged from the original command.
+        #
+        # It infers how much is already downloaded from the destination's size, which is
+        # only sound because the downloader now discards a preallocated working file
+        # before handing over (see clear_preallocated_working_file). Without that guard
+        # this would see a full-size sparse file and skip the download entirely; with it,
+        # a size-based resume is exactly as safe here as `curl -C -` is for the other
+        # handlers -- and dropping it would mean the fallback path stopped being
+        # resumable, which the resumability requirement does not allow.
+        #
+        # The `if [ $SZ != size ]` guard also makes the whole block idempotent, which
+        # matters because localization.sh is re-run in full after a preemption.
+        # Kept to a single line: this string is also embedded as a --legacy-cmd argument
+        # and inside an if/else branch, and a multi-line value there is needlessly
+        # fragile.
+        legacy = (
+            "[ -f {path} ] && SZ=$(stat --printf '%s' {path}) || SZ=0; "
+            "if [ $SZ != {size} ]; then "
+            '{env} aws s3api {extra_args} get-object --bucket {bucket} --key {key} '
+            '--range "bytes=$SZ-" >(cat >> {path}) > /dev/null; fi'
+        ).format(
+            path = self.localized_path,
+            size = self.size,
             env = self.command_env_str,
             extra_args = self.s3_extra_args_str,
-            url = self.path,
-            dest = self.localized_path,
-        ).lstrip()
+            bucket = bucket,
+            key = key,
+        )
 
         cmd = [f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :"]
 

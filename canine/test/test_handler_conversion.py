@@ -694,17 +694,22 @@ PRIVATE = dict(aws_access_key_id="AKIA", aws_secret_access_key="sk")
 
 class TestAWSUnsafePatternsRemoved:
 
-    def test_stat_based_append_resume_is_gone(self):
+    def test_the_primary_path_does_not_resume_from_the_destination_size(self):
         """
-        The old command inferred how much was already downloaded from the destination's
-        size. That is exactly the assumption that breaks once a file is created at its
-        full apparent size upfront: it would see a complete file and skip the download.
+        Size-based resume is unsound for the chunked path, where the file is created at its
+        full apparent size upfront -- it would see a complete file and skip the download.
+        The primary path recovers progress from the file's durable extents instead.
+
+        It survives in the *fallback* only, where the file really is one a single stream
+        appended to, and only because the downloader discards a preallocated working file
+        before handing over. See TestAWSFallbackIsResumable.
         """
         script = aws_handler(MULTIPART_HEADERS, check_md5=True,
                             **PRIVATE).localization_command(DEST)
-        assert "stat --printf" not in script
-        assert 'bytes=$SZ-' not in script
-        assert "SZ=" not in script
+        invocation = [l for l in script.split("\n") if "$K9_PDL_RUN" in l][0]
+        primary = invocation.split("--legacy-cmd")[0]
+        assert "stat --printf" not in primary
+        assert 'bytes=$SZ-' not in primary
 
     def test_post_hoc_multiprocessing_md5_pass_is_gone(self):
         """
@@ -717,14 +722,17 @@ class TestAWSUnsafePatternsRemoved:
         assert "md5hash=" not in script
         assert "<<" not in script, "the heredoc should be gone entirely"
 
-    def test_legacy_command_overwrites_rather_than_appends(self):
+    def test_the_fallback_is_safe_against_a_preallocated_destination(self):
         """
-        The fallback must be safe against a preallocated destination. `aws s3 cp`
-        overwrites; the old append-with-range did not.
+        The append-resume is only sound because the downloader discards a preallocated
+        working file first. This asserts the two halves stay together: if the guard were
+        removed, the fallback would silently accept a full-size sparse file.
         """
+        from canine.localization import parallel_download as pdl
+        assert hasattr(pdl, "clear_preallocated_working_file"), \
+            "the fallback's append-resume depends on this guard existing"
         script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
-        assert "aws s3 " in script and " cp " in script
-        assert ">> " not in script
+        assert 'bytes=$SZ-' in script
 
 
 class TestAWSPresign:
@@ -989,3 +997,50 @@ class TestGSURLTuning:
         """Confirms the handler was left on its own path rather than converted."""
         script = gs_handler().localization_command(DEST)
         assert "K9_PDL" not in script
+
+
+class TestAWSFallbackIsResumable:
+    """
+    The resumability requirement covers the fallback too: anything the chunked path
+    declines still has to resume rather than restart. This handler's append-resume is
+    only sound because the downloader discards a preallocated working file before
+    handing over -- but given that guard, dropping it would have been a regression for
+    no benefit.
+    """
+
+    def test_fallback_resumes_from_the_existing_size(self):
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        assert "stat --printf '%s'" in script
+        assert 'bytes=$SZ-' in script
+
+    def test_fallback_skips_an_already_complete_file(self):
+        """
+        localization.sh is re-run in full after a preemption, so the block has to be
+        idempotent.
+        """
+        script = aws_handler(SINGLE_PART_HEADERS, check_md5=False,
+                            **PRIVATE).localization_command(DEST)
+        assert "if [ $SZ != {} ]".format(SINGLE_PART_HEADERS["ContentLength"]) in script
+
+    def test_fallback_is_a_single_line(self):
+        """It is embedded as a --legacy-cmd argument and inside an if/else branch."""
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        legacy_lines = [l for l in script.split("\n") if "bytes=$SZ-" in l]
+        assert len(legacy_lines) == 1
+
+    def test_fallback_is_valid_bash(self):
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        result = bash_ok(script)
+        assert result.returncode == 0, result.stderr + "\n---\n" + script
+
+    def test_fallback_uses_bash_only_constructs_deliberately(self):
+        """
+        Process substitution is a bashism, which is why the downloader names bash
+        explicitly instead of letting subprocess pick /bin/sh (dash on the worker image).
+        """
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        assert ">(cat >>" in script
+        import subprocess as sp
+        assert sp.run(["sh", "-n"], input=script, text=True,
+                      capture_output=True).returncode != 0, \
+            "expected this to be bash-only; if sh accepts it the comment is wrong"

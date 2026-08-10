@@ -1180,3 +1180,44 @@ class TestTranscodedObject:
         """
         with open(PDL_PATH) as fh:
             assert "--compressed" not in fh.read()
+
+
+class TestShelledOutCommandsRunUnderBash:
+    """
+    Every command the downloader shells out to comes from a bash script and is written in
+    bash. subprocess's shell=True uses /bin/sh, which is dash on the Ubuntu worker image,
+    where process substitution and [[ ]] are syntax errors.
+    """
+
+    def test_shell_is_named_explicitly(self):
+        assert pdl.SHELL.endswith("bash")
+
+    def test_no_shell_true_without_an_explicit_executable(self):
+        """
+        A future shell-out that forgets this would fail only on the specific commands that
+        use bash syntax, which is the kind of bug that reaches production.
+        """
+        import re as _re
+        with open(PDL_PATH) as fh:
+            source = fh.read()
+        for match in _re.finditer(r"subprocess\.(run|Popen)\((.{0,400}?)\)\n", source,
+                                  _re.S):
+            call = match.group(2)
+            if "shell=True" in call:
+                assert "executable=" in call, \
+                    "shell=True without an explicit executable:\n" + call
+
+    def test_a_bash_only_fallback_command_actually_runs(self, tmp_path, payload):
+        """
+        End to end: a legacy command using process substitution has to work, because that
+        is the shape of the S3 fallback.
+        """
+        dest = str(tmp_path / "obj.bin")
+        legacy = "cat >(cat > {}) < /dev/null; printf works > {}".format(
+            str(tmp_path / "sink"), dest)
+        with Server(payload) as server:
+            server.state.support_range = False
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--min-chunk", MIB, "--legacy-cmd", legacy)
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert open(dest).read() == "works"
