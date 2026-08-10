@@ -144,3 +144,77 @@ class TestStagedCopyIsRunnable:
         AbstractLocalizer.copy_staged_scripts(str(tmp_path))
         with open(str(tmp_path / "parallel_download.py")) as fh:
             assert fh.read().rstrip().endswith("# k9pdl-eof")
+
+
+class TestEmittedCommandsAreRunAsBash:
+    """
+    Emitted localization commands are authored as bash and use constructs -- [[ ]],
+    process substitution -- that shell=True's default /bin/sh rejects outright. On the
+    controller image /bin/sh is dash, so every place that executes one has to name bash.
+    """
+
+    def test_bash_is_defined_once(self):
+        from canine.localization import base
+        assert base.BASH.endswith("bash")
+
+    @pytest.mark.parametrize("module_name", ["nfs", "local"])
+    def test_localizers_can_resolve_the_name_they_use(self, module_name):
+        """
+        The reference sits inside a function body, so a missing import is a NameError that
+        only surfaces when a URL input is localized -- importing the module proves nothing.
+        This checks the name actually resolves in the module's namespace.
+        """
+        import importlib
+        module = importlib.import_module("canine.localization." + module_name)
+        assert hasattr(module, "BASH"), \
+            "{} uses BASH but does not define or import it".format(module_name)
+        assert module.BASH.endswith("bash")
+
+    @pytest.mark.parametrize("module_name", ["nfs", "local"])
+    def test_every_shell_call_names_an_executable(self, module_name):
+        """
+        Catches a future shell-out that forgets, which would fail only on the specific
+        commands that use bash syntax.
+        """
+        import re
+        from canine.localization import base
+        path = os.path.join(os.path.dirname(base.__file__), module_name + ".py")
+        with open(path) as fh:
+            source = fh.read()
+        for match in re.finditer(r"subprocess\.\w+\((.{0,300}?)\)\n", source, re.S):
+            call = match.group(1)
+            if "shell = True" in call or "shell=True" in call:
+                assert "executable" in call, \
+                    "shell=True without an executable in {}:\n{}".format(module_name, call)
+
+    def test_an_emitted_command_does_not_even_parse_under_sh(self):
+        """
+        Pins the reason this matters, so the executable= arguments cannot later be removed
+        as redundant. The AWS command uses process substitution, which /bin/sh rejects at
+        parse time.
+        """
+        import subprocess as sp
+        from canine.localization import file_handlers as fh
+
+        handler = fh.HandleAWSURL.__new__(fh.HandleAWSURL)
+        handler.extra_args = {}
+        handler.check_hash = True
+        handler.parallel_download = True
+        handler.download_connections = 8
+        handler.download_min_chunk = 64 * 1024 * 1024
+        handler.path = "s3://b/k/o.bam"
+        handler.aws_endpoint_url = None
+        handler.command_env = {"AWS_ACCESS_KEY_ID": "AK", "AWS_SECRET_ACCESS_KEY": "sk"}
+        handler.command_env_str = "AWS_ACCESS_KEY_ID=AK AWS_SECRET_ACCESS_KEY=sk"
+        handler.s3_extra_args = []
+        handler.s3_extra_args_str = ""
+        handler.headers = {"ContentLength": 1048576, "ETag": '"' + "d" * 32 + '"'}
+        handler._size = 1048576
+        handler._hash = "d" * 32
+        command = handler.localization_command("/d/o.bam")
+
+        assert sp.run(["bash", "-n"], input=command, text=True,
+                      capture_output=True).returncode == 0
+        assert sp.run(["sh", "-n"], input=command, text=True,
+                      capture_output=True).returncode != 0, \
+            "expected this command to require bash; if sh accepts it the fix is moot"

@@ -7,7 +7,7 @@ import re
 import shlex
 import glob
 import subprocess
-from .base import PathType, Localization, STAGED_SCRIPTS
+from .base import PathType, Localization, STAGED_SCRIPTS, BASH
 from .local import BatchedLocalizer
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
@@ -61,7 +61,10 @@ class NFSLocalizer(BatchedLocalizer):
         # it's a remote URL; get localization command and execute
         if src.localization_mode == "url":
             cmd = src.localization_command(dest.localpath)
-            subprocess.check_call(cmd, shell = True)
+            # bash explicitly: the emitted command is authored as bash and uses
+            # constructs like [[ ]] and process substitution, which shell=True's
+            # default /bin/sh rejects (dash on the controller image)
+            subprocess.check_call(cmd, shell = True, executable = BASH)
 
         # it's a local file
         elif os.path.exists(src.path):

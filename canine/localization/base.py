@@ -50,6 +50,11 @@ Localization = namedtuple("Localization", ['type', 'path'])
 # are invoked directly; delocalization.py is 0644 with no shebang and is only ever run as
 # `python3 <path>`.
 STAGED_SCRIPTS = ("delocalization.py", "debug.sh", "parallel_download.py")
+
+# Emitted localization commands are authored as bash and use constructs -- [[ ]], process
+# substitution -- that shell=True's default /bin/sh rejects outright. On the controller
+# image /bin/sh is dash, so anything running an emitted command must name bash explicitly.
+BASH = "/bin/bash"
 # types: stream, download, ro_disk, None
 # indicates what kind of action needs to be taken during job startup
 
