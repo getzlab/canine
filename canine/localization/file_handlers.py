@@ -134,6 +134,152 @@ def extract_content_checksum(headers):
     return None, None
 
 
+# Default simultaneous ranged GETs. A single TCP stream to S3/GDC realistically gets
+# 50-200 MB/s against an n1-standard-8's ~2 GB/s egress cap, and LocalizeToDisk owns the
+# whole node exclusively (cpus-per-task=8, --exclusive), so the budget can be claimed
+# unconditionally: no runtime negotiation, no per-node semaphore.
+DEFAULT_DOWNLOAD_CONNECTIONS = 8
+DEFAULT_DOWNLOAD_MIN_CHUNK = 64 * 1024 * 1024
+
+PDL_SCRIPT_NAME = "parallel_download.py"
+PDL_EOF_SENTINEL = "# k9pdl-eof"
+
+
+def _pdl_installed_path():
+    """
+    Absolute path of the copy that ships inside the installed package.
+
+    Interpolated host-side, which is what makes this work in the controller context
+    where CANINE_ROOT may be unset or point at a staging directory that has not been
+    populated yet.
+    """
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), PDL_SCRIPT_NAME)
+
+
+def _pdl_path(legacy_cmd=None):
+    """
+    Emit shell that resolves a *usable* parallel_download.py into $K9_PDL, and the way
+    to invoke it into $K9_PDL_RUN.
+
+    Three things this has to get right.
+
+    Resolution is by first usable path, not by defaulting on CANINE_ROOT. The same
+    command string also runs on the controller for deduplicated common inputs, where
+    CANINE_ROOT may be unset or may point at a staging directory that has not been
+    populated yet -- `pick_common_inputs` runs before the staging copy.
+
+    The installed package copy is tried FIRST, so the compute node normally does not
+    depend on the shared mount at all. That matters if CANINE_ROOT ever becomes a
+    gcsfuse mount: its stat cache can serve a stale negative or stale-size entry for the
+    length of the TTL, so a freshly staged script may briefly look missing or truncated.
+
+    "Usable" means present *and* complete, checked via the trailing sentinel. A
+    partially-visible or truncated copy is skipped rather than executed, which is the
+    whole reason the sentinel exists.
+
+    Invocation prefers direct execution and falls back to `python3 <path>`, because the
+    exec bit cannot be relied on: gcsfuse cannot represent one, a mount may be noexec,
+    and chmod can fail under NFS root_squash. Correctness never depends on the bit.
+    """
+    candidates = '{} "${{CANINE_ROOT:-}}/{}"'.format(
+        shlex.quote(_pdl_installed_path()), PDL_SCRIPT_NAME
+    )
+    lines = [
+        'K9_PDL=; for p in ' + candidates + '; do [ -f "$p" ] && tail -n1 "$p" | '
+        "grep -q '^" + PDL_EOF_SENTINEL + "$' && { K9_PDL=\"$p\"; break; } || :; done",
+        '[ -n "$K9_PDL" ] && { [ -x "$K9_PDL" ] && K9_PDL_RUN="$K9_PDL" || '
+        'K9_PDL_RUN="python3 $K9_PDL"; } || :',
+    ]
+    return lines
+
+
+def _pdl_command(
+    url,
+    dest,
+    size,
+    headers=(),
+    md5=None,
+    etag=None,
+    part_length=None,
+    s3=None,
+    url_refresh_cmd=None,
+    legacy_cmd=None,
+    connections=DEFAULT_DOWNLOAD_CONNECTIONS,
+    min_chunk=DEFAULT_DOWNLOAD_MIN_CHUNK,
+    work_dirs=(),
+):
+    """
+    Emit the lines that download one object with the parallel downloader, falling back
+    to `legacy_cmd` when the downloader cannot be found or declines the object.
+
+    `legacy_cmd` is load-bearing rather than defensive: it is the existing, unmodified
+    single-stream command, so every degraded path is byte-for-byte today's behavior.
+    It is used when no usable script resolves, and passed through with --legacy-cmd so
+    the downloader can also use it in-script when the server turns out not to honor
+    ranges.
+
+    Deliberately no bash-level `.k9pdl.done` short-circuit. The design note calls for
+    one, but the marker is JSON carrying the size it attests to, so checking it properly
+    in shell means invoking python3 -- exactly the startup cost the check was meant to
+    avoid. The downloader performs the check itself as its first action, so the marker
+    remains the single source of truth for completion rather than being reimplemented in
+    a second language where the two could drift.
+
+    No heredocs, and no line may contain the literal #DEBUG_OMIT: debug.sh regenerates a
+    runnable script by filtering that marker out, so an emitted line carrying it would
+    be silently dropped.
+
+    `dest` is interpolated VERBATIM and must already be shell-safe. Every handler passes
+    `self.localized_path`, which is built by quoting the directory and the basename
+    separately and then joining them -- so it already carries quote characters, and every
+    other emitted line (the mkdir guard, the curl target, the md5 gate) interpolates it
+    raw too. Quoting it again here yields a doubly-quoted path that resolves to the wrong
+    file.
+    """
+    arguments = ["--dest", str(dest), "--size", str(int(size))]
+    if url:
+        arguments += ["--url", shlex.quote(str(url))]
+    arguments += ["--connections", str(int(connections))]
+    arguments += ["--min-chunk", str(int(min_chunk))]
+
+    for header in headers or ():
+        arguments += ["--header", shlex.quote(str(header))]
+
+    if s3:
+        arguments += ["--s3-bucket", shlex.quote(str(s3["bucket"]))]
+        arguments += ["--s3-key", shlex.quote(str(s3["key"]))]
+        if s3.get("extra_args"):
+            arguments += ["--s3-extra-args", shlex.quote(str(s3["extra_args"]))]
+
+    # An ETag is only verifiable as an md5-of-md5s when the part length is known; without
+    # it there is nothing to compare against, so it is not passed at all.
+    if etag and part_length:
+        arguments += ["--check-etag", shlex.quote(str(etag))]
+        arguments += ["--part-length", str(int(part_length))]
+    elif md5:
+        arguments += ["--check-md5", shlex.quote(str(md5))]
+
+    if url_refresh_cmd:
+        arguments += ["--url-refresh-cmd", shlex.quote(str(url_refresh_cmd))]
+    for work_dir in work_dirs or ():
+        arguments += ["--work-dir", shlex.quote(str(work_dir))]
+    if legacy_cmd:
+        arguments += ["--legacy-cmd", shlex.quote(str(legacy_cmd))]
+
+    invocation = "$K9_PDL_RUN " + " ".join(arguments)
+
+    lines = _pdl_path(legacy_cmd)
+    if legacy_cmd:
+        lines.append(
+            'if [ -n "$K9_PDL" ]; then ' + invocation + "; else "
+            "echo 'parallel_download.py not found; using the single-stream path' >&2; "
+            + legacy_cmd + "; fi"
+        )
+    else:
+        lines.append(invocation)
+    return lines
+
+
 class FileType(abc.ABC):
     """
     Stores properties of and instructions for handling a given file type:
