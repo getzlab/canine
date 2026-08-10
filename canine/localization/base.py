@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import shutil
+import stat
 import warnings
 import crayons
 import re
@@ -40,6 +41,15 @@ ZONE = get_default_gcp_zone()
 PROJECT = get_default_gcp_project()
 
 Localization = namedtuple("Localization", ['type', 'path'])
+
+# Scripts staged into CANINE_ROOT so the compute node can run them. They ride the shared
+# staging directory rather than the worker image: baking them in would need a fleet-wide
+# rebuild and would version-skew against the installed canine.
+#
+# Mode matters for two of them. debug.sh and parallel_download.py are committed 0755 and
+# are invoked directly; delocalization.py is 0644 with no shebang and is only ever run as
+# `python3 <path>`.
+STAGED_SCRIPTS = ("delocalization.py", "debug.sh", "parallel_download.py")
 # types: stream, download, ro_disk, None
 # indicates what kind of action needs to be taken during job startup
 
@@ -667,6 +677,39 @@ class AbstractLocalizer(abc.ABC):
 
             for i, v in enumerate(value):
                 self.inputs[jobId][arg][i] = handle_input(v, mode)
+
+    @staticmethod
+    def staged_script_source(name):
+        return os.path.join(os.path.dirname(__file__), name)
+
+    @staticmethod
+    def copy_staged_scripts(staging_root):
+        """
+        Copy the staged scripts into `staging_root`, preserving the executable bit.
+
+        copyfile copies contents only, so debug.sh and parallel_download.py would land
+        non-executable even though both are committed 0755, and the staged copy is
+        invoked directly. The mode is therefore restored explicitly.
+
+        Note it is copyfile plus an explicit chmod rather than shutil.copy: copy calls
+        copymode internally, i.e. it chmods outside our control. On a mount that cannot
+        represent an exec bit (gcsfuse cannot at all; NFS root_squash may refuse the
+        call) that raises and fails localization -- which is the opposite of what is
+        wanted here. Doing the chmod ourselves lets a refusal degrade to the
+        `python3 <path>` invocation, which is always available.
+        """
+        for script in STAGED_SCRIPTS:
+            source = AbstractLocalizer.staged_script_source(script)
+            destination = os.path.join(staging_root, script)
+            shutil.copyfile(source, destination)
+            if os.stat(source).st_mode & stat.S_IXUSR:
+                try:
+                    os.chmod(destination, 0o755)
+                except OSError as e:
+                    canine_logging.warning(
+                        "Could not make {} executable ({}); it will be invoked via "
+                        "python3 instead.".format(destination, e)
+                    )
 
     @staticmethod
     def _disk_resize_daemon_lines(

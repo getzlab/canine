@@ -114,22 +114,14 @@ class RemoteLocalizer(AbstractLocalizer):
                     with transport.open(export_path.remotepath, 'w') as w:
                         w.write("\n".join(v) + "\n")
 
-            # send delocalization script
-            transport.send(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    'delocalization.py'
-                ),
-                os.path.join(self.environment('remote')['CANINE_ROOT'], 'delocalization.py')
-            )
-
-            # send debug script
-            transport.send(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    'debug.sh'
-                ),
-                os.path.join(self.environment('remote')['CANINE_ROOT'], 'debug.sh')
-            )
+            # Send the scripts the compute node runs. transport.send already chmods
+            # the remote copy to the source's mode, so the exec bit on debug.sh and
+            # parallel_download.py carries across without extra handling.
+            staging_root = self.environment('remote')['CANINE_ROOT']
+            for script in STAGED_SCRIPTS:
+                transport.send(
+                    self.staged_script_source(script),
+                    os.path.join(staging_root, script)
+                )
 
             return self.finalize_staging_dir(inputs.keys(), transport=transport)
