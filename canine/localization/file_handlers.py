@@ -208,6 +208,7 @@ def _pdl_command(
     min_chunk=DEFAULT_DOWNLOAD_MIN_CHUNK,
     work_dirs=(),
     url_expr=None,
+    env_prefix="",
 ):
     """
     Emit the lines that download one object with the parallel downloader, falling back
@@ -271,7 +272,11 @@ def _pdl_command(
     if legacy_cmd:
         arguments += ["--legacy-cmd", shlex.quote(str(legacy_cmd))]
 
-    invocation = "$K9_PDL_RUN " + " ".join(arguments)
+    # The credential env prefix goes on the invocation so the downloader process, and any
+    # `aws` subprocess it spawns for the per-chunk fallback, inherit the keys. Same idiom
+    # the handler already uses for its own aws calls.
+    invocation = (env_prefix + " " if env_prefix else "") + \
+        "$K9_PDL_RUN " + " ".join(arguments)
 
     lines = _pdl_path(legacy_cmd)
     if legacy_cmd:
@@ -460,7 +465,7 @@ class FileType(abc.ABC):
 
     def _download_and_verify_lines(self, legacy_cmd, prefix="", url=None, url_expr=None,
                                    s3=None, url_refresh_cmd=None, etag=None,
-                                   part_length=None, checksum=None):
+                                   part_length=None, checksum=None, env_prefix=""):
         """
         Emit the download for this input, plus whatever verification it still needs.
 
@@ -515,6 +520,7 @@ class FileType(abc.ABC):
             connections=self.download_connections,
             min_chunk=self.download_min_chunk,
             url_expr=url_expr,
+            env_prefix=env_prefix,
         )
         lines = with_prefix(lines)
         if not downloader_verifies:
@@ -929,46 +935,80 @@ class HandleAWSURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
 
-        cmd = [
-          f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :",
-          f"[ -f {self.localized_path} ] && SZ=$(stat --printf '%s' {self.localized_path}) || SZ=0",
-          f"if [ $SZ != {self.size} ]; then",
-          '{env} aws s3api {extra_args} get-object --bucket {bucket} --key {file} --range "bytes=$SZ-" >(cat >> {dest}) > /dev/null'.format(
+        bucket = self.path.split("/")[2]
+        key = "/".join(self.path.split("/")[3:])
+
+        # The stat-based append-resume this handler used to emit is deliberately gone.
+        # It inferred "how much is already downloaded" from the destination's size, which
+        # is exactly the assumption that breaks once a file is created at its full
+        # apparent size upfront -- it would have seen a complete file and skipped the
+        # download entirely. `aws s3 cp` overwrites rather than appends, so it is safe
+        # against a preallocated destination; the primary path's frontier recovery gives
+        # strictly better resumability than the append trick ever did.
+        legacy = "{env} aws s3 {extra_args} cp {url} {dest}".format(
             env = self.command_env_str,
             extra_args = self.s3_extra_args_str,
-            bucket = self.path.split("/")[2],
-            file = "/".join(self.path.split("/")[3:]),
-            dest = self.localized_path
-          ),
-          "fi"
-        ]
-        if self.check_hash:
-            if "PartLength" in self.headers:
-                chunk_size = self.headers["PartLength"]
-                chunks = self.headers["PartsCount"]
-                cmd += [
-                  "md5hash=$(python3 << CODE",
-                  "import hashlib, multiprocessing",
-                   "def hash_chunk(args):",
-                  "    i, cs, f = args",
-                  "    fh = open(f, 'rb')",
-                  "    fh.seek(i * cs)",
-                  "    return hashlib.md5(fh.read(cs)).digest()",
-                  f"chunk_size = {chunk_size}",
-                  f"chunks = {chunks}",
-                  f"fp = '{self.localized_path}'",
-                  "pool = multiprocessing.Pool()",
-                  "results = pool.map(hash_chunk, [(i, chunk_size, fp) for i in range(chunks)])",
-                  "pool.close()",
-                  "print(hashlib.md5(b''.join(results)).hexdigest() + '-' + str(chunks))",
-                  "CODE",
-                  ")"
-                ]
-            else:
-                cmd += [f"md5hash=$(md5sum {self.localized_path} | cut -d ' ' -f 1)"]
-            cmd += [f'[[ "$md5hash" == "{self.hash}" ]] || {{ echo "deleting corrupted file" 1>&2 ; rm -f {self.localized_path} ; exit 1 ; }}']
+            url = self.path,
+            dest = self.localized_path,
+        ).lstrip()
 
+        cmd = [f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :"]
+
+        if "--no-sign-request" in self.s3_extra_args:
+            # A public bucket needs no presigning, so the object URL is built host-side
+            # and there is nothing to mint on the node.
+            url, url_expr = self._public_object_url(bucket, key), None
+        else:
+            # Presigning has to happen on the node: the credentials live there, not here.
+            # Feeding a presigned URL into the generic ranged-HTTP path means one code
+            # path for every source and no `aws` process per chunk.
+            #
+            # `|| :` keeps a presign failure from aborting the script under set -e, and an
+            # empty result makes the downloader fall through to its per-chunk
+            # `aws s3api get-object --range` source instead -- which is what covers
+            # session-token-only credentials and exotic endpoints.
+            cmd += ["export K9_S3_URL=$({env} aws s3 {extra_args} presign {url} "
+                    "2>/dev/null || :)".format(
+                        env = self.command_env_str,
+                        extra_args = self.s3_extra_args_str,
+                        url = self.path,
+                    ).lstrip()]
+            url, url_expr = None, '"$K9_S3_URL"'
+
+        checksum = etag = part_length = None
+        if self.check_hash:
+            if self.headers.get("PartsCount", 1) > 1 and "PartLength" in self.headers:
+                # A multipart ETag is an md5-of-md5s, so chunk boundaries are snapped to
+                # whole parts and the downloader computes it during the transfer. This
+                # replaces the post-hoc multiprocessing md5 pass, saving a full extra read
+                # of the object.
+                etag = self.hash
+                part_length = self.headers["PartLength"]
+            else:
+                # For a single-part object the ETag *is* the whole-file md5.
+                checksum = ("md5", self.hash)
+
+        cmd += self._download_and_verify_lines(
+            legacy,
+            url = url,
+            url_expr = url_expr,
+            s3 = {"bucket": bucket, "key": key,
+                  "extra_args": self.s3_extra_args_str},
+            etag = etag,
+            part_length = part_length,
+            checksum = checksum,
+            env_prefix = self.command_env_str,
+        )
         return "\n".join(cmd)
+
+    def _public_object_url(self, bucket, key):
+        """
+        Object URL for a bucket that needs no signing. Path-style against a custom
+        endpoint, virtual-hosted style otherwise.
+        """
+        if self.aws_endpoint_url:
+            return "{}/{}/{}".format(self.aws_endpoint_url.rstrip("/"), bucket, key)
+        return "https://{}.s3.amazonaws.com/{}".format(bucket, key)
 
 class HandleAWSURLStream(HandleAWSURL):
     localization_mode = "stream"

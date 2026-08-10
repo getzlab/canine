@@ -2176,12 +2176,39 @@ class _FakeStat:
 # single-stream fallback
 # --------------------------------------------------------------------------------
 
+def clear_preallocated_working_file(dest):
+    """
+    Remove a sparse working file before handing over to a single-stream command.
+
+    This is not tidiness, it prevents silent corruption. The legacy commands resume from
+    the destination's own size -- `curl -C -`, and `aws s3api --range "bytes=$SZ-"` before
+    it was removed -- which is only meaningful for a file a single stream appended to. Our
+    working file is created at its full apparent size upfront, so leaving it in place makes
+    curl report "already fully downloaded", exit 0, and accept a file of zeros. Verified:
+    curl really does exit 0 there, so nothing downstream notices unless check_hash is set.
+
+    The manifest is what identifies the file as ours. A genuine partial left by a previous
+    single-stream attempt has no manifest, and its progress must be preserved -- that is
+    the case `curl -C -` exists to handle.
+    """
+    manifest_path, _ = sidecar_paths(dest)
+    if not os.path.exists(manifest_path):
+        return
+    log("discarding the preallocated working file so the single stream starts clean")
+    for path in (dest, manifest_path):
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def single_stream_fallback(options, reason):
     """
-    Everything the chunked path declines to handle falls back to `curl -C -`, which is
-    exactly today's behavior and today's resume semantics.
+    Everything the chunked path declines to handle falls back to the legacy command, which
+    is exactly today's behavior and today's resume semantics.
     """
     log("falling back to a single stream: {}".format(reason))
+    clear_preallocated_working_file(options.dest)
     if options.legacy_cmd:
         command = options.legacy_cmd
     else:
@@ -2236,7 +2263,7 @@ def run(options):
     if size is None or size < 0:
         return single_stream_fallback(options, "size unknown")
 
-    if urllib.parse.urlsplit(options.url or "").scheme == "ftp":
+    if urllib.parse.urlsplit((options.url or "").strip()).scheme == "ftp":
         return single_stream_fallback(options, "ftp is not rangeable")
 
     if options.connections <= 1:
@@ -2404,7 +2431,16 @@ def discard(dest, manifest):
 
 
 def build_source(options):
-    if options.s3_bucket and options.s3_key:
+    """
+    Pick where bytes come from.
+
+    A URL wins when one is present, because the presigned-URL path is one code path for
+    every http source and costs no `aws` process per chunk. The S3 API source is the
+    fallback for when presigning is not possible (session-token-only credentials, an
+    exotic endpoint): the emitted command passes an empty --url in that case, so an empty
+    string here means "presign produced nothing", not "no source given".
+    """
+    if not (options.url or "").strip() and options.s3_bucket and options.s3_key:
         return S3ApiSource(
             options.s3_bucket, options.s3_key, options.s3_extra_args or "",
             timeout=options.timeout,
@@ -2472,7 +2508,7 @@ def main(argv=None):
         except ValueError:
             log("ignoring unparseable CANINE_DOWNLOAD_CONNECTIONS={!r}".format(override))
 
-    if not options.url and not (options.s3_bucket and options.s3_key):
+    if not (options.url or "").strip() and not (options.s3_bucket and options.s3_key):
         parser.error("one of --url or --s3-bucket/--s3-key is required")
 
     try:

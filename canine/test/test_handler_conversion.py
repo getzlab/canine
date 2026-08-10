@@ -633,3 +633,221 @@ class TestDRSEndToEnd:
                                     text=True, timeout=300)
         assert result.returncode == 0, result.stdout + result.stderr
         assert open(dest, "rb").read() == payload
+
+
+# ---------------------------------------------------------------------------
+# HandleAWSURL
+# ---------------------------------------------------------------------------
+
+S3_PATH = "s3://mybucket/data/sample.bam"
+SINGLE_PART_ETAG = "d41d8cd98f00b204e9800998ecf8427e"
+MULTIPART_ETAG = "abc123def456abc123def456abc12345-800"
+
+MULTIPART_HEADERS = {
+    "ContentLength": 50 * 1024 * MIB,
+    "ETag": '"{}"'.format(MULTIPART_ETAG),
+    "PartsCount": 800,
+    "PartLength": 64 * MIB,
+}
+SINGLE_PART_HEADERS = {
+    "ContentLength": MIB,
+    "ETag": '"{}"'.format(SINGLE_PART_ETAG),
+}
+
+
+def aws_handler(headers=None, **kwargs):
+    """
+    Build the handler without its __init__, which shells out to `aws s3api head-object`.
+    Every field the emitted command depends on is set the way __init__ would.
+    """
+    handler = fh.HandleAWSURL.__new__(fh.HandleAWSURL)
+    handler.extra_args = dict(kwargs)
+    handler.check_hash = fh.FileType._resolve_check_hash(kwargs)
+    handler.parallel_download = bool(kwargs.get("parallel_download", True))
+    handler.download_connections = int(kwargs.get(
+        "download_connections", fh.DEFAULT_DOWNLOAD_CONNECTIONS))
+    handler.download_min_chunk = int(kwargs.get(
+        "download_min_chunk", fh.DEFAULT_DOWNLOAD_MIN_CHUNK))
+    handler.path = S3_PATH
+    handler.aws_endpoint_url = kwargs.get("aws_endpoint_url")
+    handler.command_env = {
+        "AWS_ACCESS_KEY_ID": kwargs.get("aws_access_key_id"),
+        "AWS_SECRET_ACCESS_KEY": kwargs.get("aws_secret_access_key"),
+    }
+    handler.command_env_str = " ".join(
+        "{}={}".format(k, v) for k, v in handler.command_env.items() if v is not None)
+    handler.s3_extra_args = []
+    if (handler.command_env["AWS_ACCESS_KEY_ID"] is None
+            and handler.command_env["AWS_SECRET_ACCESS_KEY"] is None):
+        handler.s3_extra_args += ["--no-sign-request"]
+    if handler.aws_endpoint_url is not None:
+        handler.s3_extra_args += ["--endpoint-url {}".format(handler.aws_endpoint_url)]
+    handler.s3_extra_args_str = " ".join(handler.s3_extra_args)
+    handler.headers = dict(headers or SINGLE_PART_HEADERS)
+    handler._size = handler.headers["ContentLength"]
+    handler._hash = handler.headers["ETag"].replace('"', '')
+    return handler
+
+
+PRIVATE = dict(aws_access_key_id="AKIA", aws_secret_access_key="sk")
+
+
+class TestAWSUnsafePatternsRemoved:
+
+    def test_stat_based_append_resume_is_gone(self):
+        """
+        The old command inferred how much was already downloaded from the destination's
+        size. That is exactly the assumption that breaks once a file is created at its
+        full apparent size upfront: it would see a complete file and skip the download.
+        """
+        script = aws_handler(MULTIPART_HEADERS, check_md5=True,
+                            **PRIVATE).localization_command(DEST)
+        assert "stat --printf" not in script
+        assert 'bytes=$SZ-' not in script
+        assert "SZ=" not in script
+
+    def test_post_hoc_multiprocessing_md5_pass_is_gone(self):
+        """
+        A multipart ETag is now computed during the transfer, so the separate hashing pass
+        that re-read the whole object afterwards is unnecessary.
+        """
+        script = aws_handler(MULTIPART_HEADERS, check_md5=True,
+                            **PRIVATE).localization_command(DEST)
+        assert "multiprocessing" not in script
+        assert "md5hash=" not in script
+        assert "<<" not in script, "the heredoc should be gone entirely"
+
+    def test_legacy_command_overwrites_rather_than_appends(self):
+        """
+        The fallback must be safe against a preallocated destination. `aws s3 cp`
+        overwrites; the old append-with-range did not.
+        """
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        assert "aws s3 " in script and " cp " in script
+        assert ">> " not in script
+
+
+class TestAWSPresign:
+
+    def test_private_bucket_presigns_on_the_node(self):
+        """
+        Credentials live on the VM, not here, so the URL cannot be minted host-side.
+        Feeding a presigned URL into the generic ranged-HTTP path gives one code path for
+        every source and costs no `aws` process per chunk.
+        """
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        assert "aws s3" in script and "presign" in script
+        assert '--url "$K9_S3_URL"' in script
+
+    def test_presign_failure_does_not_abort_the_script(self):
+        """
+        Under set -e an unguarded failure would kill the whole localization; the intended
+        outcome is falling through to the per-chunk aws s3api source.
+        """
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        presign_line = [l for l in script.split("\n") if "presign" in l][0]
+        assert presign_line.rstrip().endswith("|| :)")
+        assert bash_ok(script).returncode == 0
+
+    def test_s3_api_fallback_args_are_always_passed(self):
+        """
+        An empty presign result makes the downloader use its per-chunk aws s3api source,
+        which is what covers session-token-only credentials and exotic endpoints.
+        """
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        assert "--s3-bucket mybucket" in script
+        assert "--s3-key data/sample.bam" in script
+
+    def test_public_bucket_uses_a_plain_url_and_does_not_presign(self):
+        """Nothing to sign, so there is nothing to mint on the node."""
+        script = aws_handler(check_md5=False).localization_command(DEST)
+        assert "presign" not in script
+        assert "--url https://mybucket.s3.amazonaws.com/data/sample.bam" in script
+
+    def test_custom_endpoint_uses_path_style(self):
+        script = aws_handler(check_md5=False,
+                            aws_endpoint_url="https://minio.local").localization_command(DEST)
+        assert "--url https://minio.local/mybucket/data/sample.bam" in script
+
+    def test_credentials_are_exported_to_the_downloader(self):
+        """
+        The downloader spawns `aws` for the per-chunk fallback, so it has to inherit the
+        keys. Same env-prefix idiom the handler already uses for its own aws calls.
+        """
+        script = aws_handler(check_md5=False, **PRIVATE).localization_command(DEST)
+        invocation = [l for l in script.split("\n") if "$K9_PDL_RUN" in l][0]
+        assert "AWS_ACCESS_KEY_ID=AKIA" in invocation
+        assert "AWS_SECRET_ACCESS_KEY=sk" in invocation
+
+
+class TestAWSVerification:
+
+    def test_multipart_uses_the_etag_and_part_length(self):
+        """
+        Chunk boundaries snap to whole parts so the md5-of-md5s can be computed during the
+        transfer rather than by a second full read.
+        """
+        script = aws_handler(MULTIPART_HEADERS, check_md5=True,
+                            **PRIVATE).localization_command(DEST)
+        assert "--check-etag " + MULTIPART_ETAG in script
+        assert "--part-length {}".format(64 * MIB) in script
+        assert "--check-md5" not in script
+        assert "md5sum" not in script
+
+    def test_single_part_etag_is_the_whole_file_md5(self):
+        script = aws_handler(SINGLE_PART_HEADERS, check_md5=True,
+                            **PRIVATE).localization_command(DEST)
+        assert "--check-md5 " + SINGLE_PART_ETAG in script
+        assert "--check-etag" not in script
+
+    def test_multipart_without_a_part_length_falls_back_to_md5(self):
+        """
+        Without the part length there is nothing to compare an md5-of-md5s against, so
+        asking for an ETag check would request something impossible.
+        """
+        headers = dict(MULTIPART_HEADERS)
+        del headers["PartLength"]
+        script = aws_handler(headers, check_md5=True, **PRIVATE).localization_command(DEST)
+        assert "--check-etag" not in script
+
+    def test_no_verification_requested_means_none(self):
+        script = aws_handler(MULTIPART_HEADERS, check_md5=False,
+                            **PRIVATE).localization_command(DEST)
+        assert "--check-etag" not in script and "--check-md5" not in script
+        assert "md5sum" not in script
+
+
+class TestAWSEmittedScriptContract:
+
+    VARIANTS = [
+        dict(check_md5=True), dict(check_md5=False),
+        dict(check_md5=True, parallel_download=False),
+        dict(check_md5=True, download_connections=1),
+        dict(check_md5=True, aws_endpoint_url="https://minio.local"),
+    ]
+
+    @pytest.mark.parametrize("headers", [SINGLE_PART_HEADERS, MULTIPART_HEADERS])
+    @pytest.mark.parametrize("kwargs", VARIANTS)
+    @pytest.mark.parametrize("private", [True, False])
+    def test_is_valid_bash(self, headers, kwargs, private):
+        options = dict(kwargs)
+        if private:
+            options.update(PRIVATE)
+        script = aws_handler(headers, **options).localization_command(DEST)
+        result = bash_ok(script)
+        assert result.returncode == 0, result.stderr + "\n---\n" + script
+        assert "#DEBUG_OMIT" not in script
+        assert bash_ok(debug_sh_transform(script)).returncode == 0
+
+    def test_directory_guard_is_preserved(self):
+        script = aws_handler(check_md5=True, **PRIVATE).localization_command(DEST)
+        assert script.split("\n")[0] == (
+            "[ ! -d /mnt/rwdisks/canine-abc/inputs ] && "
+            "mkdir -p /mnt/rwdisks/canine-abc/inputs || :"
+        )
+
+    def test_multiword_extra_args_stay_one_argument(self):
+        script = aws_handler(check_md5=False,
+                            aws_endpoint_url="https://minio.local").localization_command(DEST)
+        assert "--s3-extra-args '--no-sign-request --endpoint-url https://minio.local'" \
+            in script

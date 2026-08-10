@@ -1015,3 +1015,94 @@ class _StubSource:
 
     def refresh_url(self):
         return False
+
+
+# ---------------------------------------------------------------------------
+# handing over to the single-stream command
+# ---------------------------------------------------------------------------
+
+class TestPreallocatedFileIsClearedBeforeFallback:
+    """
+    The legacy commands resume from the destination's own size -- `curl -C -`, and the
+    `aws s3api --range "bytes=$SZ-"` form before it was removed. That is only meaningful
+    for a file a single stream appended to.
+
+    Our working file is created at its full apparent size upfront, so handing that to
+    `curl -C -` makes it report "already fully downloaded", exit 0, and accept a file of
+    zeros. Verified directly: curl really does exit 0 there, so nothing downstream notices
+    unless check_hash happens to be set. That is silent corruption, and the reason the
+    working file has to be discarded before the handover.
+    """
+
+    def test_curl_resume_really_does_accept_a_preallocated_file(self, tmp_path, payload):
+        """
+        Pins the underlying hazard, so the guard below cannot be removed as 'defensive'.
+        """
+        dest = str(tmp_path / "obj.bin")
+        with open(dest, "wb") as fh:
+            fh.truncate(len(payload))
+        with Server(payload) as server:
+            proc = subprocess.run(
+                ["curl", "-sS", "-C", "-", "-o", dest, server.url()],
+                capture_output=True, text=True, timeout=120,
+            )
+        assert proc.returncode == 0, "expected curl to think it was already done"
+        assert open(dest, "rb").read() == b"\0" * len(payload), \
+            "curl downloaded something; the hazard may no longer exist"
+
+    def test_working_file_is_discarded_before_the_fallback_runs(self, tmp_path, payload):
+        dest = str(tmp_path / "obj.bin")
+        manifest_path, _ = pdl.sidecar_paths(dest)
+        with open(dest, "wb") as fh:
+            fh.truncate(len(payload))
+        with open(manifest_path, "w") as fh:
+            json.dump({"schema_version": pdl.SCHEMA_VERSION, "plan_id": "x"}, fh)
+
+        pdl.clear_preallocated_working_file(dest)
+        assert not os.path.exists(dest)
+        assert not os.path.exists(manifest_path)
+
+    def test_a_genuine_partial_without_a_manifest_is_preserved(self, tmp_path):
+        """
+        A partial left by a previous single-stream attempt has no manifest, and its
+        progress must survive -- that is the case `curl -C -` exists to handle. The
+        manifest is what identifies a file as ours.
+        """
+        dest = str(tmp_path / "obj.bin")
+        with open(dest, "wb") as fh:
+            fh.write(b"partial data")
+        pdl.clear_preallocated_working_file(dest)
+        assert open(dest, "rb").read() == b"partial data"
+
+    def test_end_to_end_fallback_after_the_file_was_preallocated(self, tmp_path, payload,
+                                                                payload_md5):
+        """
+        The reachable path: the downloader creates the sparse file, then discovers the
+        server does not honour Range, and hands over. The result must be the real object,
+        not a file of zeros.
+        """
+        dest = str(tmp_path / "obj.bin")
+        legacy = "curl -sS -C - -o {} {}"
+        with Server(payload) as server:
+            # let the probe pass, then refuse ranges once the download starts
+            proc = run_downloader(
+                server.url(), dest, len(payload), "--min-chunk", MIB,
+                "--connections", 4,
+                "--legacy-cmd", legacy.format(dest, server.url()),
+            )
+            assert proc.returncode == 0, proc.stderr
+
+            # now force the fallback with a preallocated file already in place
+            server.state.support_range = False
+            os.unlink(dest)
+            _, marker = pdl.sidecar_paths(dest)
+            os.unlink(marker)
+            proc = run_downloader(
+                server.url(), dest, len(payload), "--min-chunk", MIB,
+                "--connections", 4, "--check-md5", payload_md5,
+                "--legacy-cmd", legacy.format(dest, server.url()),
+            )
+
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert hashlib.md5(open(dest, "rb").read()).hexdigest() == payload_md5, \
+            "fallback produced the wrong bytes"
