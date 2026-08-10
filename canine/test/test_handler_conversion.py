@@ -381,3 +381,255 @@ class TestEmittedCommandActuallyDownloads:
             after = server.state.snapshot()["sent"]
 
         assert after == before, "re-run moved {} bytes".format(after - before)
+
+
+# ---------------------------------------------------------------------------
+# HandleGDCHTTPURL and HandleDRSURI
+# ---------------------------------------------------------------------------
+
+DRS_URI = "drs://dg.4dfc:abc-123"
+DRS_MD5 = "d41d8cd98f00b204e9800998ecf8427e"
+GDC_UUID = "550e8400-e29b-41d4-a716-446655440000"
+GDC_URL = "https://api.gdc.cancer.gov/data/" + GDC_UUID
+
+
+def drs_handler(access_url="https://storage.googleapis.com/b/o?sig=x", **kwargs):
+    class FakeResponse:
+        status_code = 200
+        ok = True
+
+        def json(self):
+            return {"size": SIZE, "fileName": "sample.bam",
+                    "hashes": {"md5": DRS_MD5},
+                    "accessUrl": {"url": access_url}}
+
+    class FakeSession:
+        def post(self, url, headers=None, json=None):
+            return FakeResponse()
+
+    with patch("canine.localization.file_handlers.gcp_auth_session",
+               return_value=FakeSession()):
+        return fh.HandleDRSURI(DRS_URI, **kwargs)
+
+
+def gdc_handler(**kwargs):
+    """
+    A GDC handler on its API fallback path, i.e. with no DRS object -- otherwise it just
+    delegates to HandleDRSURI.
+    """
+    handler = fh.HandleGDCHTTPURL.__new__(fh.HandleGDCHTTPURL)
+    handler.extra_args = dict(kwargs)
+    handler.check_hash = fh.FileType._resolve_check_hash(kwargs)
+    handler.parallel_download = bool(kwargs.get("parallel_download", True))
+    handler.download_connections = int(kwargs.get(
+        "download_connections", fh.DEFAULT_DOWNLOAD_CONNECTIONS))
+    handler.download_min_chunk = int(kwargs.get(
+        "download_min_chunk", fh.DEFAULT_DOWNLOAD_MIN_CHUNK))
+    handler.drs_obj = None
+    handler.token = kwargs.get("token")
+    handler.token_flag = (
+        '--header  "X-Auth-Token: {}"'.format(handler.token)
+        if handler.token is not None else ''
+    )
+    handler.url = GDC_URL
+    handler.path = "sample.bam"
+    handler.localized_path = "sample.bam"
+    handler._size = SIZE
+    handler._hash = DRS_MD5
+    return handler
+
+
+class TestGDCConversion:
+
+    def test_token_travels_as_a_request_header(self):
+        script = gdc_handler(token="s3cr3t", check_md5=True).localization_command(DEST)
+        assert "--header 'X-Auth-Token: s3cr3t'" in script
+
+    def test_no_token_emits_no_header(self):
+        script = gdc_handler(check_md5=True).localization_command(DEST)
+        assert "--header" not in script
+
+    def test_token_exposure_is_not_widened(self):
+        """
+        The token is already interpolated into the emitted command today, so appearing
+        once in the header argument is not new exposure -- but it must not also be
+        duplicated into extra places.
+        """
+        script = gdc_handler(token="s3cr3t", check_md5=True).localization_command(DEST)
+        # once as the --header value, once inside the --legacy-cmd argument, and once in
+        # the else branch that runs the legacy command directly
+        assert script.count("s3cr3t") == 3
+
+    def test_content_md5_is_handed_to_the_downloader(self):
+        """
+        For this handler self.hash IS the content md5, unlike a plain URL handler where it
+        is a URL-derived identity.
+        """
+        script = gdc_handler(check_md5=True).localization_command(DEST)
+        assert "--check-md5 " + DRS_MD5 in script
+        assert "md5sum" not in script
+
+    def test_legacy_path_keeps_the_original_gate(self):
+        script = gdc_handler(token="t", check_md5=True,
+                            parallel_download=False).localization_command(DEST)
+        assert "md5sum" in script and DRS_MD5 in script
+        assert '--header  "X-Auth-Token: t"' in script, "legacy curl flag must be intact"
+
+    def test_opt_out_is_the_original_command(self):
+        script = gdc_handler(token="t", check_md5=False,
+                            parallel_download=False).localization_command(DEST)
+        assert script == (
+            "[ ! -d /mnt/rwdisks/canine-abc/inputs ] && "
+            "mkdir -p /mnt/rwdisks/canine-abc/inputs || :; "
+            'curl -C - -o /mnt/rwdisks/canine-abc/inputs/sample.bam '
+            '--header  "X-Auth-Token: t" \'{}\''.format(GDC_URL)
+        )
+
+    @pytest.mark.parametrize("kwargs", [
+        dict(check_md5=True), dict(check_md5=False), dict(token="t", check_md5=True),
+        dict(token="t", check_md5=True, parallel_download=False),
+    ])
+    def test_is_valid_bash(self, kwargs):
+        script = gdc_handler(**kwargs).localization_command(DEST)
+        result = bash_ok(script)
+        assert result.returncode == 0, result.stderr + "\n---\n" + script
+        assert "#DEBUG_OMIT" not in script
+        assert bash_ok(debug_sh_transform(script)).returncode == 0
+
+    def test_delegates_to_drs_when_a_drs_object_resolved(self):
+        handler = gdc_handler(check_md5=True)
+        handler.drs_obj = drs_handler(check_md5=True)
+        script = handler.localization_command(DEST)
+        assert "signed_url" in script, "should have delegated to the DRS handler"
+
+
+class TestDRSConversion:
+
+    def test_resolver_snippet_is_unchanged(self):
+        """
+        The resolution step is reused verbatim; only its surroundings changed. Pinning the
+        exact string keeps a future edit from quietly altering a known-good command.
+        """
+        import json as _json
+        data_str = _json.dumps({"url": DRS_URI, "fields": ["accessUrl"]})
+        expected = (
+            'curl -S -X POST --url "{}" '
+            '-H "authorization: Bearer $(gcloud auth print-access-token)" '
+            "-H \"content-type: application/json\" --data '{}' | "
+            "python3 -c 'import json,sys; print(json.load(sys.stdin)[\"accessUrl\"][\"url\"])'"
+        ).format(fh.HandleDRSURI.drs_resolver, data_str)
+
+        script = drs_handler(check_md5=True).localization_command(DEST)
+        first = script.split("\n")[0]
+        assert first == "export signed_url=$({})".format(expected)
+
+    def test_the_same_snippet_is_reused_as_the_refresh_command(self):
+        """
+        A signed URL can expire mid-transfer. Re-minting it lets the download resume in
+        place instead of starting over, and the command to do that is the one already
+        being used to mint it.
+        """
+        script = drs_handler(check_md5=True).localization_command(DEST)
+        assert "--url-refresh-cmd" in script
+        assert script.count("drshub.dsde-prod.broadinstitute.org") == 2
+
+    def test_signed_url_is_exported(self):
+        """
+        The --legacy-cmd fallback references "$signed_url" and the downloader runs it in
+        its own subshell, which would not inherit a plain shell variable -- the fallback
+        would curl an empty URL.
+        """
+        script = drs_handler(check_md5=True).localization_command(DEST)
+        assert script.startswith("export signed_url=")
+
+    def test_url_is_passed_as_a_shell_expression(self):
+        """
+        The URL is not known host-side. Quoting it would pass the literal text
+        `$signed_url` as the URL instead of its value.
+        """
+        script = drs_handler(check_md5=True).localization_command(DEST)
+        assert '--url "$signed_url"' in script
+        assert "--url '$signed_url'" not in script
+
+    def test_content_md5_is_handed_to_the_downloader(self):
+        script = drs_handler(check_md5=True).localization_command(DEST)
+        assert "--check-md5 " + DRS_MD5 in script
+        assert "md5sum" not in script
+
+    def test_no_verification_requested_means_neither(self):
+        script = drs_handler(check_md5=False).localization_command(DEST)
+        assert "--check-md5" not in script and "md5sum" not in script
+
+    def test_legacy_path_is_the_original_command(self):
+        script = drs_handler(check_md5=False,
+                            parallel_download=False).localization_command(DEST)
+        lines = script.split("\n")
+        assert len(lines) == 2
+        assert lines[1] == (
+            "[ ! -d /mnt/rwdisks/canine-abc/inputs ] && "
+            "mkdir -p /mnt/rwdisks/canine-abc/inputs || :; "
+            'curl -C - -o /mnt/rwdisks/canine-abc/inputs/sample.bam "$signed_url"'
+        )
+
+    @pytest.mark.parametrize("kwargs", [
+        dict(check_md5=True), dict(check_md5=False),
+        dict(check_md5=True, parallel_download=False),
+        dict(check_md5=True, download_connections=16),
+    ])
+    def test_is_valid_bash(self, kwargs):
+        script = drs_handler(**kwargs).localization_command(DEST)
+        result = bash_ok(script)
+        assert result.returncode == 0, result.stderr + "\n---\n" + script
+        assert "#DEBUG_OMIT" not in script
+        assert bash_ok(debug_sh_transform(script)).returncode == 0
+
+    def test_no_heredoc(self):
+        assert "<<" not in drs_handler(check_md5=True).localization_command(DEST)
+
+
+class TestDRSEndToEnd:
+    """
+    Runs the emitted DRS command for real: a local server stands in for both the resolver
+    (printing an access URL) and the object store.
+    """
+
+    def _script_for(self, tmp_path, server, payload, resolver_script, **kwargs):
+        handler = drs_handler(access_url=server.url("sample.bam"), **kwargs)
+        handler._size = len(payload)
+        dest = str(tmp_path / "sample.bam")
+        command = handler.localization_command(dest)
+        # swap the real drshub call for a local stand-in, keeping the shell shape intact
+        first, rest = command.split("\n", 1)
+        assert first.startswith("export signed_url=$(")
+        command = "export signed_url=$({})\n{}".format(resolver_script, rest)
+        return dest, "#!/bin/bash\nset -e\n" + command + "\n"
+
+    def test_downloads_via_the_resolved_url(self, tmp_path):
+        payload = os.urandom(3 * MIB + 5)
+        with Server(payload) as server:
+            resolver = "printf '%s' {}".format(server.url("sample.bam"))
+            dest, script = self._script_for(tmp_path, server, payload, resolver,
+                                            check_md5=False)
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == payload
+
+    def test_legacy_fallback_can_see_the_exported_url(self, tmp_path):
+        """
+        The concrete consequence of exporting: with no usable downloader the fallback has
+        to still know the URL.
+        """
+        payload = os.urandom(MIB)
+        with Server(payload) as server:
+            resolver = "printf '%s' {}".format(server.url("sample.bam"))
+            dest, script = self._script_for(tmp_path, server, payload, resolver,
+                                            check_md5=False)
+            # make every candidate unresolvable so the legacy branch is taken
+            script = script.replace(fh._pdl_installed_path(), "/nonexistent/pdl.py")
+            script = script.replace('"${CANINE_ROOT:-}/parallel_download.py"',
+                                    '"/nonexistent/staged.py"')
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == payload

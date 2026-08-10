@@ -207,6 +207,7 @@ def _pdl_command(
     connections=DEFAULT_DOWNLOAD_CONNECTIONS,
     min_chunk=DEFAULT_DOWNLOAD_MIN_CHUNK,
     work_dirs=(),
+    url_expr=None,
 ):
     """
     Emit the lines that download one object with the parallel downloader, falling back
@@ -237,7 +238,11 @@ def _pdl_command(
     file.
     """
     arguments = ["--dest", str(dest), "--size", str(int(size))]
-    if url:
+    if url_expr:
+        # a shell expression evaluated on the node, so interpolated verbatim -- quoting
+        # it would stop the expansion and pass the literal text as the URL
+        arguments += ["--url", str(url_expr)]
+    elif url:
         arguments += ["--url", shlex.quote(str(url))]
     arguments += ["--connections", str(int(connections))]
     arguments += ["--min-chunk", str(int(min_chunk))]
@@ -453,8 +458,9 @@ class FileType(abc.ABC):
             return False
         return True
 
-    def _download_and_verify_lines(self, legacy_cmd, prefix="", url=None, s3=None,
-                                   url_refresh_cmd=None, etag=None, part_length=None):
+    def _download_and_verify_lines(self, legacy_cmd, prefix="", url=None, url_expr=None,
+                                   s3=None, url_refresh_cmd=None, etag=None,
+                                   part_length=None, checksum=None):
         """
         Emit the download for this input, plus whatever verification it still needs.
 
@@ -469,16 +475,25 @@ class FileType(abc.ABC):
         pass over a 50 GB input. The gate is still emitted for algorithms the downloader
         does not implement (sha1, sha256, crc32c) and for the legacy path, where nothing
         else checks.
+
+        `checksum` overrides the header-derived one. Some handlers learn the content md5
+        from their own metadata service rather than from response headers -- for those
+        `self.hash` IS the content digest, whereas for a plain URL handler it is only a
+        URL-derived identity, so the two cannot be conflated.
+
+        `url_expr` is for a URL that is not known host-side: a shell expression that
+        evaluates to it at run time, interpolated verbatim. DRS needs this because its
+        signed URL is minted by a command in the emitted script.
         """
         def with_prefix(lines):
             if prefix and lines:
                 return [prefix + lines[0]] + list(lines[1:])
             return list(lines)
 
-        if not self._use_parallel_download(url):
-            return with_prefix([legacy_cmd]) + self._hash_check_command()
+        if not self._use_parallel_download(url if url_expr is None else None):
+            return with_prefix([legacy_cmd]) + self._hash_check_command(checksum)
 
-        algorithm, digest = getattr(self, "content_checksum", (None, None))
+        algorithm, digest = checksum or getattr(self, "content_checksum", (None, None))
         md5 = digest if (self.check_hash and algorithm == "md5") else None
         if etag and part_length and self.check_hash:
             downloader_verifies = True
@@ -499,10 +514,11 @@ class FileType(abc.ABC):
             legacy_cmd=legacy_cmd,
             connections=self.download_connections,
             min_chunk=self.download_min_chunk,
+            url_expr=url_expr,
         )
         lines = with_prefix(lines)
         if not downloader_verifies:
-            lines += self._hash_check_command()
+            lines += self._hash_check_command(checksum)
         return lines
 
     def _download_headers(self):
@@ -512,10 +528,13 @@ class FileType(abc.ABC):
         """
         return ()
 
-    def _hash_check_command(self):
+    def _hash_check_command(self, checksum=None):
         """
-        Emit the shell gate that verifies a localized file against the checksum the
-        server advertised. Returns [] when there is nothing to verify.
+        Emit the shell gate that verifies a localized file against a known checksum.
+        Returns [] when there is nothing to verify.
+
+        `checksum` overrides the header-derived one, for handlers that learn the content
+        digest from their own metadata service.
 
         Same shape as the md5 gates the GDC/DRS handlers already emit: compare, and on
         mismatch delete the corrupt file and exit 1.
@@ -523,8 +542,8 @@ class FileType(abc.ABC):
         if not self.check_hash:
             return []
 
-        algorithm, digest = getattr(self, "content_checksum", (None, None))
-        if algorithm is None:
+        algorithm, digest = checksum or getattr(self, "content_checksum", (None, None))
+        if algorithm is None or digest is None:
             return []
 
         fail = "{{ echo 'deleting corrupted file' ; rm -f {path} ; exit 1 ; }}".format(
@@ -1044,15 +1063,35 @@ class HandleGDCHTTPURL(FileType):
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
         if self.token is not None:
-            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} {token} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, token = self.token_flag, url = self.url)]
+            legacy = "curl -C - -o {path} {token} '{url}'".format(
+                path = self.localized_path, token = self.token_flag, url = self.url
+            )
         else:
-            cmd += ["[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {path} '{url}'".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+            legacy = "curl -C - -o {path} '{url}'".format(
+                path = self.localized_path, url = self.url
+            )
 
-        # ensure that file downloaded properly
-        if self.check_hash:
-            cmd += [f"[[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]] || {{ echo 'deleting corrupted file' ; rm -f {self.localized_path} ; exit 1 ; }}"]
-
+        # self.hash is the content md5 for this handler (from the DRS record, or from the
+        # Content-MD5 header when falling back to the GDC API) -- unlike a plain URL
+        # handler, where hash is only a URL-derived identity.
+        cmd += self._download_and_verify_lines(
+            legacy,
+            prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
+                dest_dir = dest_dir
+            ),
+            checksum = ("md5", self.hash) if self.hash else None,
+        )
         return "\n".join(cmd)
+
+    def _download_headers(self):
+        """
+        The GDC token travels as a request header. It is already interpolated into the
+        emitted command today, so this does not widen its exposure -- and the downloader
+        redacts headers and query strings from its own logging.
+        """
+        if self.token is None:
+            return ()
+        return ("X-Auth-Token: {}".format(self.token),)
 
 class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
     localization_mode="stream"
@@ -1183,17 +1222,30 @@ class HandleDRSURI(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         data_str = json.dumps({"url": self.uri, "fields": ["accessUrl"]})
-        signed_url = f'$(curl -S -X POST --url "{type(self).drs_resolver}" ' + \
-                     '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
-                     f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
-                     'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
-        cmd = [f'signed_url={signed_url}',
-               f'[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; curl -C - -o {self.localized_path} "$signed_url"']
+        # The resolver is now a value in its own right rather than being inlined into the
+        # assignment, because it serves twice: once to mint the URL up front, and again as
+        # --url-refresh-cmd so the downloader can re-mint it on a 403 and resume in place.
+        # A signed URL can expire mid-transfer, and re-minting beats starting over.
+        resolver = f'curl -S -X POST --url "{type(self).drs_resolver}" ' + \
+                   '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
+                   f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
+                   'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\''
+        # Exported, not just assigned: the fallback command passed via --legacy-cmd
+        # references "$signed_url", and the downloader runs it in its own subshell.
+        # A plain shell variable would not be inherited there, so the fallback would
+        # curl an empty URL. The resolver snippet itself is unchanged.
+        cmd = [f'export signed_url=$({resolver})']
 
-        # ensure that file downloaded properly
-        if self.check_hash:
-            cmd += [f"[[ $(md5sum {self.localized_path} | sed -r 's/  .*$//') == {self.hash} ]] || {{ echo 'deleting corrupted file' ; rm -f {self.localized_path} ; exit 1 ; }}"]
-
+        legacy = f'curl -C - -o {self.localized_path} "$signed_url"'
+        # The URL is not known host-side, so it is passed as a shell expression that the
+        # node evaluates. self.hash is the content md5 from the DRS record.
+        cmd += self._download_and_verify_lines(
+            legacy,
+            prefix = f'[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ',
+            url_expr = '"$signed_url"',
+            url_refresh_cmd = resolver,
+            checksum = ("md5", self.hash) if self.hash else None,
+        )
         return "\n".join(cmd)
 
 class HandleDRSURIStream(HandleDRSURI):
