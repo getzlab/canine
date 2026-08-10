@@ -433,6 +433,46 @@ are some considerations:
 **NOTE:** The old `localizeGS` option has been removed. From now on,
 if you do not wish to automatically localize `gs://` paths, use an appropriate override
 
+### Parallel downloads
+
+Remote URLs (`s3://`, GDC, DRS, signed GCS URLs, and plain `http(s)://`) are downloaded
+with several simultaneous ranged GETs rather than a single stream. A single TCP stream to
+S3 or GDC realistically reaches 50–200 MB/s against an n1-standard-8's ~2 GB/s egress cap,
+so fanning out is most of the available speedup. Downloads remain resumable across VM
+preemption: progress is recovered from the destination file's own durable extents, so a
+re-run refetches only what the filesystem had not yet committed.
+
+These can be set for the whole localizer, or per input via an override. A per-input value
+wins.
+
+* `parallel_download`: If False, use the previous single-stream commands (default: True).
+Those commands are also the automatic fallback for anything the chunked path declines —
+a server that ignores `Range`, an unknown size, or `ftp://` — so turning this off is a
+supported configuration rather than a degraded one.
+* `download_connections`: Simultaneous ranged GETs per input (default: 8, one per vCPU on
+the n1-standard-8 that `LocalizeToDisk` reserves exclusively). `0` or `1` means the legacy
+single stream. This controls concurrency only: the chunk layout deliberately does **not**
+depend on it, so a requeued task landing on a differently-configured node resumes rather
+than discarding its predecessor's progress.
+* `download_min_chunk`: Chunk size in bytes (default: 64 MiB). Below this, per-request
+setup and TLS overhead dominate, so smaller objects are fetched in one piece — meaning
+behavior for small inputs is unchanged.
+* `check_hash`: Verify the download against the source's declared hash before treating it
+as complete. This is the preferred spelling of `check_md5`, which continues to work
+indefinitely as an alias — the check is not always an md5 (a multipart S3 object is
+verified against its md5-of-md5s ETag, and a composite GCS object has no md5 at all).
+Passing both with conflicting values raises, rather than silently picking one.
+
+`gs://` inputs are **not** affected by `parallel_download`: `gcloud storage cp` already
+performs sliced downloads and already resumes through its own tracker directory. It is
+instead tuned to the same budget, reusing `download_connections` and `download_min_chunk`
+so one set of knobs governs both paths.
+
+An emergency kill switch is available on the VM without redeploying: setting
+`CANINE_DISABLE_PARALLEL_DOWNLOAD=1` in the environment makes every emitted command take
+the single-stream path. `CANINE_DOWNLOAD_CONNECTIONS` overrides the connection count the
+same way.
+
 ### overrides
 
 The localization section also allows for individual overrides of input handling.

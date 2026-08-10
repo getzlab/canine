@@ -788,7 +788,29 @@ class HandleGSURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
-        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'CLOUDSDK_STORAGE_TRACKER_DIR="{dest_dir}/.gcloud_tracker_dir" gcloud storage cp {self.rp_string} -r -n -L "{dest_dir}/.gcloud_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
+        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'CLOUDSDK_STORAGE_TRACKER_DIR="{dest_dir}/.gcloud_tracker_dir" {self._sliced_download_env()}gcloud storage cp {self.rp_string} -r -n -L "{dest_dir}/.gcloud_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
+
+    def _sliced_download_env(self):
+        """
+        Tune `gcloud storage cp`'s own sliced download to the same node budget the
+        parallel downloader uses.
+
+        This handler is deliberately NOT converted: gcloud already does sliced downloads
+        and already resumes via the tracker directory and manifest it is passed, so there
+        is nothing to replace -- only to size correctly. Reusing download_min_chunk and
+        download_connections means one set of knobs tunes both paths rather than two that
+        can drift.
+
+        process_count is left alone on purpose: gcloud defaults it to the core count,
+        which on the exclusively-reserved n1-standard-8 already *is* the node budget, so
+        overriding it would only risk contradicting that.
+        """
+        components = max(1, self.download_connections) if self.parallel_download else 1
+        return (
+            'CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_THRESHOLD={threshold} '
+            'CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_MAX_COMPONENTS={components} '
+            'CLOUDSDK_STORAGE_THREAD_COUNT={components} '
+        ).format(threshold = self.download_min_chunk, components = components)
 
 class HandleGSURLStream(HandleGSURL):
     localization_mode = "stream"

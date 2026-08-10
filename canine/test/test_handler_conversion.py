@@ -851,3 +851,141 @@ class TestAWSEmittedScriptContract:
                             aws_endpoint_url="https://minio.local").localization_command(DEST)
         assert "--s3-extra-args '--no-sign-request --endpoint-url https://minio.local'" \
             in script
+
+
+# ---------------------------------------------------------------------------
+# localizer-level defaults and HandleGSURL tuning
+# ---------------------------------------------------------------------------
+
+class TestLocalizerDefaults:
+    """
+    Options set once on the localizer have to reach every handler it constructs. Both
+    internal get_file_handler call sites previously passed only project and token, with a
+    TODO noting the gap.
+    """
+
+    def _defaults(self, **kwargs):
+        """Calls the real implementation, so the test cannot drift from the code."""
+        from canine.localization.base import AbstractLocalizer
+        return AbstractLocalizer.build_file_handler_defaults(
+            kwargs.get("parallel_download", True),
+            kwargs.get("download_connections", fh.DEFAULT_DOWNLOAD_CONNECTIONS),
+            kwargs.get("download_min_chunk", fh.DEFAULT_DOWNLOAD_MIN_CHUNK),
+            kwargs.get("check_hash"),
+        )
+
+    def test_check_hash_is_omitted_when_not_set(self):
+        """
+        Including check_hash=False by default would look like a contradictory flag next to
+        an input's own check_md5=True and raise, so an unset value must not be forwarded.
+        """
+        assert "check_hash" not in self._defaults()
+
+    def test_check_hash_is_forwarded_when_set(self):
+        assert self._defaults(check_hash=True)["check_hash"] is True
+        assert self._defaults(check_hash=False)["check_hash"] is False
+
+    def test_download_options_are_forwarded(self):
+        defaults = self._defaults(parallel_download=False, download_connections=12,
+                                  download_min_chunk=4 * MIB)
+        assert defaults["parallel_download"] is False
+        assert defaults["download_connections"] == 12
+        assert defaults["download_min_chunk"] == 4 * MIB
+
+    def test_handler_honors_forwarded_defaults(self):
+        """The end-to-end point: the defaults actually change the emitted command."""
+        defaults = self._defaults(download_connections=12, download_min_chunk=4 * MIB)
+        script = emit(URLS["other"], check_md5=True, **defaults)
+        assert "--connections 12" in script
+        assert "--min-chunk {}".format(4 * MIB) in script
+
+    def test_a_per_input_value_can_override_a_localizer_default(self):
+        defaults = self._defaults(download_connections=12)
+        merged = dict(defaults)
+        merged["download_connections"] = 2
+        script = emit(URLS["other"], check_md5=True, **merged)
+        assert "--connections 2" in script
+
+    def test_localizer_signature_accepts_the_options(self):
+        """Guards against the kwargs being silently swallowed by **kwargs."""
+        import inspect
+        from canine.localization.base import AbstractLocalizer
+        parameters = inspect.signature(AbstractLocalizer.__init__).parameters
+        for name in ("parallel_download", "download_connections",
+                     "download_min_chunk", "check_hash"):
+            assert name in parameters, name
+
+
+def gs_handler(is_dir=False, **kwargs):
+    handler = fh.HandleGSURL.__new__(fh.HandleGSURL)
+    handler.extra_args = dict(kwargs)
+    handler.check_hash = fh.FileType._resolve_check_hash(kwargs)
+    handler.parallel_download = bool(kwargs.get("parallel_download", True))
+    handler.download_connections = int(kwargs.get(
+        "download_connections", fh.DEFAULT_DOWNLOAD_CONNECTIONS))
+    handler.download_min_chunk = int(kwargs.get(
+        "download_min_chunk", fh.DEFAULT_DOWNLOAD_MIN_CHUNK))
+    handler.path = "gs://bkt/data/sample.bam"
+    handler.rp_string = ""
+    handler.is_dir = is_dir
+    return handler
+
+
+class TestGSURLTuning:
+    """
+    This handler is deliberately not converted: gcloud storage cp already does sliced
+    downloads and already resumes through the tracker directory and manifest it is passed,
+    so there is nothing to replace -- only to size correctly.
+    """
+
+    def test_still_uses_gcloud_storage_cp(self):
+        script = gs_handler().localization_command(DEST)
+        assert "gcloud storage cp" in script
+
+    def test_tracker_dir_and_manifest_are_preserved(self):
+        """These are what make gcloud's own transfer resumable; they must not be lost."""
+        script = gs_handler().localization_command(DEST)
+        assert "CLOUDSDK_STORAGE_TRACKER_DIR=" in script
+        assert ".gcloud_manifest" in script
+
+    def test_sliced_download_is_tuned_from_the_same_knobs(self):
+        """One set of options governs both paths rather than two that can drift."""
+        script = gs_handler(download_connections=12,
+                           download_min_chunk=8 * MIB).localization_command(DEST)
+        assert "CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_THRESHOLD={}".format(8 * MIB) \
+            in script
+        assert "CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_MAX_COMPONENTS=12" in script
+        assert "CLOUDSDK_STORAGE_THREAD_COUNT=12" in script
+
+    def test_opt_out_disables_slicing(self):
+        script = gs_handler(parallel_download=False).localization_command(DEST)
+        assert "CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_MAX_COMPONENTS=1" in script
+        assert "CLOUDSDK_STORAGE_THREAD_COUNT=1" in script
+
+    def test_a_single_connection_disables_slicing(self):
+        script = gs_handler(download_connections=1).localization_command(DEST)
+        assert "CLOUDSDK_STORAGE_SLICED_OBJECT_DOWNLOAD_MAX_COMPONENTS=1" in script
+
+    def test_process_count_is_left_to_gcloud(self):
+        """
+        gcloud defaults it to the core count, which on the exclusively-reserved
+        n1-standard-8 already is the node budget; overriding would only risk contradicting
+        that.
+        """
+        assert "CLOUDSDK_STORAGE_PROCESS_COUNT" not in \
+            gs_handler().localization_command(DEST)
+
+    @pytest.mark.parametrize("is_dir", [False, True])
+    @pytest.mark.parametrize("kwargs", [
+        dict(), dict(parallel_download=False), dict(download_connections=16),
+    ])
+    def test_is_valid_bash(self, is_dir, kwargs):
+        script = gs_handler(is_dir=is_dir, **kwargs).localization_command(DEST)
+        result = bash_ok(script)
+        assert result.returncode == 0, result.stderr + "\n---\n" + script
+        assert bash_ok(debug_sh_transform(script)).returncode == 0
+
+    def test_no_downloader_is_invoked(self):
+        """Confirms the handler was left on its own path rather than converted."""
+        script = gs_handler().localization_command(DEST)
+        assert "K9_PDL" not in script

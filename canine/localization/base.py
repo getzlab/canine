@@ -79,6 +79,10 @@ class AbstractLocalizer(abc.ABC):
         files_to_copy_to_outputs = {},
         persistent_disk_dry_run = False,
         cleanup_job_workdir = False,
+        parallel_download = True,
+        download_connections = file_handlers.DEFAULT_DOWNLOAD_CONNECTIONS,
+        download_min_chunk = file_handlers.DEFAULT_DOWNLOAD_MIN_CHUNK,
+        check_hash = None,
         **kwargs
     ):
         """
@@ -106,7 +110,24 @@ class AbstractLocalizer(abc.ABC):
           return the paths to the files on the disk that would be created
         cleanup_job_workdir: remove files in the job working directory that aren't
           denoted as outputs
+        parallel_download: download remote URLs with N simultaneous ranged GETs rather
+          than a single stream. Default True; set False for the legacy single-stream
+          commands, which remain the fallback for anything the chunked path declines.
+        download_connections: how many ranged GETs are in flight per input. Default 8,
+          one per vCPU on the n1-standard-8 that LocalizeToDisk reserves exclusively;
+          0 or 1 means the legacy single stream. Note this controls concurrency only --
+          the chunk layout deliberately does not depend on it, so a requeued task on a
+          differently-configured node still resumes rather than starting over.
+        download_min_chunk: chunk size in bytes, default 64 MiB. Below this, per-request
+          setup and TLS overhead dominate, so a smaller object is fetched in one piece.
+        check_hash: verify downloaded files against the source's declared hash. A
+          per-input `check_hash`/`check_md5` takes precedence; left as None here so that
+          not setting it does not conflict with an input that does.
         """
+        self.file_handler_defaults = self.build_file_handler_defaults(
+            parallel_download, download_connections, download_min_chunk, check_hash
+        )
+
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
             self.transfer_bucket = self.transfer_bucket[5:]
@@ -544,8 +565,10 @@ class AbstractLocalizer(abc.ABC):
                     paths = [paths] if not isinstance(paths, list) else paths
                     if arg not in overrides:
                         for p in paths:
-                            # TODO: pass through other file handler arguments here
-                            fh = file_handlers.get_file_handler(p, project = self.project, token = self.token)
+                            fh = file_handlers.get_file_handler(
+                                p, project = self.project, token = self.token,
+                                **self.file_handler_defaults
+                            )
 
                             # only pick common inputs that are URLs; it does not
                             # save time for any other input types, and only leads
@@ -625,8 +648,10 @@ class AbstractLocalizer(abc.ABC):
             
             ## if input is a string, convert it to the appropriate FileType object
             if isinstance(value, str):
-                # TODO: pass through other file handler arguments here
-                value = file_handlers.get_file_handler(value, project = self.project, token = self.token)
+                value = file_handlers.get_file_handler(
+                    value, project = self.project, token = self.token,
+                    **self.file_handler_defaults
+                )
             else:
                 assert isinstance(value, file_handlers.FileType)
 
@@ -677,6 +702,26 @@ class AbstractLocalizer(abc.ABC):
 
             for i, v in enumerate(value):
                 self.inputs[jobId][arg][i] = handle_input(v, mode)
+
+    @staticmethod
+    def build_file_handler_defaults(parallel_download, download_connections,
+                                    download_min_chunk, check_hash):
+        """
+        Options handed to every file handler this localizer constructs.
+
+        A per-input value in extra_args wins over these. check_hash is only included when
+        it was actually set: forwarding False by default would sit alongside an input's own
+        check_md5=True and look like contradictory flags, which is treated as a caller bug
+        and raises.
+        """
+        defaults = {
+            "parallel_download": parallel_download,
+            "download_connections": download_connections,
+            "download_min_chunk": download_min_chunk,
+        }
+        if check_hash is not None:
+            defaults["check_hash"] = check_hash
+        return defaults
 
     @staticmethod
     def staged_script_source(name):
