@@ -30,11 +30,31 @@ def isatty(*streams: typing.IO) -> bool:
             return False
     return True
 
-class ArgumentHelper(dict):
-    """
-    Helper class for setting arguments to slurm commands
-    Used only to handle keyword arguments to console commands
-    Should not be responsible for positionals
+class ArgumentHelper:
+    """Helper class for converting Python arguments into command line arguments.
+
+    This class is used to convert Python arguments into command line format,
+    particularly for constructing Slurm sbatch commands. It handles both
+    flag-style arguments (--flag) and parameter-style arguments (--param=value).
+
+    Parameters
+    ----------
+    *args : str
+        Flag-style arguments that will be prefixed with '--'
+    **kwargs : Any
+        Parameter-style arguments that will be formatted as '--key=value'
+
+    Attributes
+    ----------
+    commandline : str
+        The formatted command line arguments string
+
+    Examples
+    --------
+    Basic usage:
+    >>> helper = ArgumentHelper('requeue', cpus_per_task=4, mem='16G')
+    >>> print(helper.commandline)
+    --requeue --cpus-per-task=4 --mem=16G
     """
 
     def __init__(self, *flags: str, **params: typing.Any):

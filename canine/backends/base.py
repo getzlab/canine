@@ -389,11 +389,116 @@ class AbstractSlurmBackend(abc.ABC):
         return status, stdout, stderr
 
     def sbatch(self, command: str, *slurmopts: str, **slurmparams: typing.Any) -> str:
-        """
-        Runs the given command in the background
-        The first argument MUST contain the entire command and options to run
-        Additional arguments and keyword arguments provided are passed as slurm arguments to sbatch
-        Returns the jobID of the batch request
+        """Submits a command to Slurm's batch scheduler with specified options and parameters.
+
+        This method constructs and executes an sbatch command with the given options and parameters.
+        It handles both flag-style options (--flag) and parameter-style options (--param=value).
+
+        Parameters
+        ----------
+        command : str
+            The command (script) to execute. Must be the complete command with all its options.
+        *slurmopts : str
+            Flag-style Slurm options that will be prefixed with '--'
+            Common flags include:
+            - Task.extra_slurm_args where value is None:
+                - {'exclusive': None} -> --exclusive
+            - Orchestrator's submit_batch_job flags:
+                - 'requeue' for automatic job requeuing
+                - 'parsable' for machine-readable output
+            - Backend-specific flags:
+                - 'wait' for synchronous job submission
+                - 'hold' to submit job in held state
+                - 'test-only' for validation without submission
+        **slurmparams : Any
+            Parameter-style Slurm options that will be formatted as '--key=value'
+            Common parameters include:
+            - Task.resources --> Orchestrator.resources:
+                - cpus-per-task: Number of CPUs per task
+                - mem: Memory per node (e.g. "16G")
+                - time: Time limit (e.g. "24:00:00")
+            - Task.extra_slurm_args where value is not None:
+                - {'partition': 'gpu'} -> --partition=gpu
+            - Orchestrator-added parameters:
+                - requeue=True: Always added for job recovery
+                - job_name: From Task.name
+                - array: Job array specification
+                - output/error: Stdout/stderr file paths
+
+        Returns
+        -------
+        str
+            The Slurm job ID of the submitted batch job
+
+        Raises
+        ------
+        ResourceWarning
+            If requested resources exceed cluster capacity
+        ValueError
+            If sbatch output doesn't match expected pattern
+        
+        Notes
+        -----
+        The parameter flow through the system is:
+        1. User configures Task:
+           ```python
+           task = Task(
+               resources={'mem': '16G'},
+               extra_slurm_args={'exclusive': None, 'partition': 'gpu'}
+               ...
+           )
+           ```
+
+        2. Task.run() calls Orchestrator.submit_batch_job():
+           ```python
+           # Splits extra_slurm_args into flags and params
+           flags = ['exclusive']  # None values become flags
+           params = {'partition': 'gpu'}  # Non-None values become params
+           
+           # Adds required parameters
+           params.update({
+               'requeue': True,
+               'job_name': self.name,
+               'array': array_str,
+               'output': f"{compute_env['CANINE_JOBS']}/%a/stdout",
+               'error': f"{compute_env['CANINE_JOBS']}/%a/stderr",
+               **self.resources  # Add resource requirements
+           })
+           ```
+
+        3. Finally calls Backend.sbatch():
+           ```python
+           backend.sbatch(
+               entrypoint_path,
+               *flags,  # Flag-style options
+               **params  # Parameter-style options
+           )
+           ```
+
+        Examples
+        --------
+        Task configuration (start of chain):
+        >>> task = Task(
+        ...     name='example',
+        ...     resources={'mem': '16G'},
+        ...     extra_slurm_args={
+        ...         'exclusive': None,  # Becomes flag: --exclusive
+        ...         'partition': 'gpu'  # Becomes param: --partition=gpu
+        ...     }
+        ... )
+
+        What actually gets passed to sbatch (end of chain):
+        >>> backend.sbatch(
+        ...     "script.sh",
+        ...     "exclusive",  # From extra_slurm_args None value
+        ...     requeue=True,  # Added by Orchestrator
+        ...     job_name="example",  # Added by Orchestrator
+        ...     partition="gpu",  # From extra_slurm_args non-None value
+        ...     mem="16G",  # From resources
+        ...     array="0-1",  # Added by Orchestrator
+        ...     output="/path/to/jobs/%a/stdout",  # Added by Orchestrator
+        ...     error="/path/to/jobs/%a/stderr"  # Added by Orchestrator
+        ... )
         """
         command = 'sbatch {} -- {}'.format(
             ArgumentHelper(*slurmopts, **slurmparams).commandline,
