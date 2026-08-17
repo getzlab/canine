@@ -43,10 +43,34 @@ GPU_TYPES = {
     'nvidia-tesla-t4'
 }
 
+#
+# DEPRECATED -- see __init__ below.
+#
+# This backend provisions a cluster from the Deployment Manager templates in
+# canine/backends/slurm-gcp/. Those templates' node startup scripts
+# (slurm-gcp/scripts/startup-script.py) are Python 2 -- e.g. line 238's
+# `print "apt failed to install packages. Trying again in 5 seconds"` -- so any
+# cluster they provision cannot run this repo's Python 3.14 target.
+#
+# This class itself is valid Python 3 and constructs fine, which is why the
+# breakage is not visible until a cluster is actually deployed. It is disabled
+# here rather than deleted so that (a) the import path and BACKENDS registry
+# entry keep working, and (b) any remaining user surfaces immediately with an
+# actionable error instead of a silently broken cluster.
+#
+# To re-enable: port slurm-gcp/scripts/ to Python 3, then delete the raise in
+# __init__. To retire permanently: delete this module, the slurm-gcp/ tree,
+# the 'TransientGCP' entry in orchestrator.BACKENDS, and the export in
+# backends/__init__.py.
+#
 class TransientGCPSlurmBackend(RemoteSlurmBackend):
     """
-    Backend for transient slurm clusters which need to be deployed and configured
-    on GCP before they're ready for use
+    DEPRECATED. Backend for transient slurm clusters which need to be deployed
+    and configured on GCP before they're ready for use.
+
+    Disabled: the Deployment Manager node startup scripts this backend relies
+    on are Python 2 and cannot run under this repo's Python 3.14 target.
+    Constructing this backend raises NotImplementedError.
     """
 
     def __init__(
@@ -58,6 +82,18 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         external_compute_ips: bool = False, workflow_name: typing.Optional[str] = None,
         rapid_cache_ttl: str = "7d", **kwargs : typing.Any
     ):
+        raise NotImplementedError(
+            "TransientGCPSlurmBackend ('TransientGCP') is disabled. The Deployment "
+            "Manager startup scripts it provisions (canine/backends/slurm-gcp/scripts/) "
+            "are Python 2 and cannot run under this repo's Python 3.14 target.\n"
+            "\n"
+            "Use 'DockerTransientImage' (DockerTransientImageSlurmBackend), which is "
+            "what wolF uses by default, or 'TransientImage' (TransientImageSlurmBackend).\n"
+            "\n"
+            "If you depend on this backend, please open an issue -- re-enabling it "
+            "requires porting canine/backends/slurm-gcp/scripts/ to Python 3."
+        )
+
         self.project = project if project is not None else get_default_gcp_project()
         if self.project is None:
             raise ValueError("No GCP project was provided and a project could not be auto-detected")
