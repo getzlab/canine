@@ -9,7 +9,7 @@ import sys
 from .local import LocalSlurmBackend
 from ..utils import (
     get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, canine_logging,
-    get_or_create_workflow_bucket, get_or_create_rapid_cache
+    get_or_create_workflow_bucket, get_or_create_rapid_cache, upload_cluster_config
 )
 
 import googleapiclient.discovery as gd
@@ -192,6 +192,29 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                     )
                 )
 
+            # Re-persist the backend config now that storage_bucket exists.
+            # Backends that write it do so during init_slurm(), which completes
+            # before the bucket is provisioned above -- so that first copy has
+            # no storage_bucket in it, and anything reading it (e.g.
+            # slurm_resume.py, and eventually the workers' config fetch) would
+            # not know which bucket to use. No-op on backends that don't
+            # persist their config.
+            self.save_backend_conf()
+
+            # Mirror the cluster config into the bucket. Additive only -- the
+            # NFS copy remains authoritative and is still what every consumer
+            # reads; nothing depends on the uploaded copy yet. This is the
+            # upload half of getting cluster config off the shared mount
+            # (NFS-FUSE-IMPLEMENTATION-PLAN.md phase 2), staged ahead of the
+            # reader-side switch so the round trip can be exercised without
+            # putting cluster boot at risk. Must run here rather than inside
+            # provision_server.py: that runs in the controller container during
+            # init_slurm(), before storage_bucket exists.
+            #
+            # Ordering matters: this must follow save_backend_conf() so the
+            # mirrored copy includes the bucket-aware pickle.
+            upload_cluster_config(self.config["storage_bucket"])
+
             # start nodes
             self.init_nodes()
 
@@ -208,6 +231,18 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
     def __exit__(self, *args):
         self.stop()
+
+    def save_backend_conf(self):
+        """
+        Persist self.config somewhere the cluster's own scripts can read it.
+
+        No-op by default: only backends whose cluster scripts need to read the
+        backend config back (currently DockerTransientImageSlurmBackend, whose
+        slurm_resume.py loads it to configure the nodes it creates) override
+        this. Declared here so __enter__ can call it unconditionally after
+        storage_bucket has been provisioned.
+        """
+        pass
 
     def init_slurm(self):
         #

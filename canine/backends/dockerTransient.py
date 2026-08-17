@@ -177,8 +177,68 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         else:
             self.preexisting_container = True
             self.container = self._get_container(self.config["cluster_name"])
+
+            # Only one user may own a cluster. The controller container is
+            # named after cluster_name, which wolF hardcodes to "wolf"
+            # (wolf/workflow.py), so without this check a second user on the
+            # same VM would silently adopt the first user's controller and run
+            # their jobs under the first user's credentials: both
+            # /mnt/nfs/credentials/gcloud and the Secret Manager secret that
+            # replaces it are single-owner. Teardown is ambiguous too --
+            # stop() gates on `not preexisting_container`, so the second user
+            # never tears down what they are using.
+            #
+            # Multiple users on one controller VM is not a supported
+            # configuration; fail loudly rather than cross-contaminate.
+            self._assert_container_owned_by_current_user()
+
             if self.container().status == "exited":
                 self.container().start()
+
+    def _assert_container_owned_by_current_user(self):
+        """
+        Raise if the pre-existing controller container was started by a
+        different user. HOST_USER is set on the container at creation time
+        (see init_slurm), so it records the owner.
+
+        Fails open on an unreadable/absent HOST_USER -- containers predating
+        this check, or started by other tooling, should not become
+        unusable just because ownership cannot be determined.
+        """
+        try:
+            env = self.container().attrs["Config"]["Env"] or []
+        except Exception as e:
+            canine_logging.warning(
+                "Could not determine the owner of existing container '{}'; "
+                "proceeding. If this cluster belongs to another user, jobs may "
+                "run under their credentials. ({})".format(
+                    self.config["cluster_name"], e
+                )
+            )
+            return
+
+        owner = next(
+            (v.split("=", 1)[1] for v in env if v.startswith("HOST_USER=")), None
+        )
+        if owner is None or owner == self.config["user"]:
+            return
+
+        raise RuntimeError(
+            "Controller container '{name}' is already running and is owned by user "
+            "'{owner}', but you are '{me}'.\n"
+            "\n"
+            "Multiple users cannot share a controller VM: the container, the shared "
+            "mount, and the cloud credentials it distributes to workers all have a "
+            "single owner, so your jobs would run as '{owner}'.\n"
+            "\n"
+            "Either use a separate controller VM, or have '{owner}' stop their "
+            "cluster first:\n"
+            "    docker kill {name}\n".format(
+                name = self.config["cluster_name"],
+                owner = owner,
+                me = self.config["user"],
+            )
+        )
 
         # TODO: should we restart slurmctld in the container here?
 
@@ -194,11 +254,25 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # save the configuration to disk so that Slurm knows how to configure
         # the nodes it creates
-        subprocess.check_call("""
-          [ ! -d /mnt/nfs/clust_conf/canine ] && mkdir -p /mnt/nfs/clust_conf/canine ||
-            echo -n
-          """, shell = True, executable = '/bin/bash')
-        with open("/mnt/nfs/clust_conf/canine/backend_conf.pickle", "wb") as f:
+        self.save_backend_conf()
+
+    BACKEND_CONF_PATH = "/mnt/nfs/clust_conf/canine/backend_conf.pickle"
+
+    def save_backend_conf(self):
+        """
+        Persist self.config where the cluster's own scripts can read it
+        (slurm_resume.py loads this to configure the nodes it creates).
+
+        Called twice per startup, deliberately: once from init_slurm(), so the
+        file exists as early as possible, and again from
+        TransientImageSlurmBackend.__enter__ once storage_bucket has been
+        provisioned. The first write cannot contain storage_bucket -- the
+        bucket is not created until after init_slurm() returns -- so without
+        the second write, anything reading this file would see a config with
+        no bucket in it.
+        """
+        os.makedirs(os.path.dirname(self.BACKEND_CONF_PATH), exist_ok = True)
+        with open(self.BACKEND_CONF_PATH, "wb") as f:
             pickle.dump(self.config, f)
 
     def init_nodes(self):

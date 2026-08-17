@@ -307,6 +307,50 @@ def touch_object(bucket: str, path: str):
     blob.custom_time = datetime.datetime.now(datetime.timezone.utc)
     blob.patch()
 
+CLUSTER_CONFIG_PREFIX = "_cluster_conf"
+
+def upload_cluster_config(bucket: str, local_dir: str = "/mnt/nfs/clust_conf") -> bool:
+    """
+    Mirror the cluster's generated Slurm/canine configuration
+    (slurm.conf, slurmdbd.conf, cgroup.conf, nodetypes.json, host_LuT.pickle,
+    backend_conf.pickle) into gs://<bucket>/_cluster_conf/.
+
+    This is the upload half of moving cluster config off the shared NFS mount
+    (NFS-FUSE-IMPLEMENTATION-PLAN.md phase 2). It is deliberately *additive*:
+    the config is still written to, and still read from, `local_dir` exactly as
+    before. Nothing consumes the uploaded copy yet -- the reader side is
+    retargeted only once it can be validated against a live cluster. That means
+    a failure here can never prevent the cluster from booting, so this returns
+    False and logs rather than raising.
+
+    Note on ordering: this must run *after* the backend has provisioned
+    storage_bucket, which happens after init_slurm() populates `local_dir`.
+
+    Returns True if the upload succeeded.
+    """
+    if not os.path.isdir(local_dir):
+        canine_logging.info1(
+            "Cluster config directory {} does not exist; skipping config upload".format(local_dir)
+        )
+        return False
+
+    dest = "gs://{}/{}".format(bucket, CLUSTER_CONFIG_PREFIX)
+    # rsync, not `cp -r`: `gcloud storage cp -r <dir>/. <dest>/` nests the
+    # source directory's own basename under <dest> (verified -- it produced
+    # <dest>/<tmpdirname>/slurm/slurm.conf), whereas rsync mirrors the
+    # directory's *contents*, which is what the fetch side expects. rsync is
+    # also idempotent across the repeated cluster startups this sees.
+    cmd = 'gcloud storage rsync -r {} {}'.format(shlex.quote(local_dir), shlex.quote(dest))
+    proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        canine_logging.warning(
+            "Could not upload cluster config to {} (continuing; the NFS copy is still "
+            "authoritative): {}".format(dest, proc.stderr.decode().strip())
+        )
+        return False
+    canine_logging.info1("Mirrored cluster config to {}".format(dest))
+    return True
+
 def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None, stderr: typing.Optional[typing.BinaryIO] = None):
     """
     Checks that the rc is 0
