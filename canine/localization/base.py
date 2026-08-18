@@ -1494,6 +1494,14 @@ class AbstractLocalizer(abc.ABC):
               # positional <bucket> <mountpoint> args plus --only-dir <hash>
               "CANINE_BUCKETMOUNT_BUCKET=${CANINE_BUCKETMOUNT%%/*}",
               "CANINE_BUCKETMOUNT_HASH=${CANINE_BUCKETMOUNT#*/}",
+              # gcsfuse resolves credentials via ADC and does NOT read
+              # CLOUDSDK_CONFIG, so point it explicitly at the credentials the
+              # image stages there. Without this the authenticating identity
+              # depends on whatever ADC happens to resolve to (metadata-server
+              # SA vs. the copied user credentials), which silently works in
+              # one project and fails in another. Mirrors the rclone path in
+              # backends/dockerTransient.py.
+              'if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${CLOUDSDK_CONFIG}/application_default_credentials.json" ]; then export GOOGLE_APPLICATION_CREDENTIALS=${CLOUDSDK_CONFIG}/application_default_credentials.json; fi',
               "timeout -k 60 60 gcsfuse -o ro --implicit-dirs --only-dir ${CANINE_BUCKETMOUNT_HASH} ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
               "fi",
 
