@@ -340,7 +340,20 @@ def upload_cluster_config(bucket: str, local_dir: str = "/mnt/nfs/clust_conf") -
     # <dest>/<tmpdirname>/slurm/slurm.conf), whereas rsync mirrors the
     # directory's *contents*, which is what the fetch side expects. rsync is
     # also idempotent across the repeated cluster startups this sees.
-    cmd = 'gcloud storage rsync -r {} {}'.format(shlex.quote(local_dir), shlex.quote(dest))
+    #
+    # slurmdbd.conf is excluded deliberately. It is written 0600 owned by the
+    # `slurm` user (provision_server.py:171) while canine runs as the invoking
+    # user, so reading it here fails with EACCES -- observed on a live cluster,
+    # where it was the one file of six that failed to mirror.
+    #
+    # Excluding it is correct rather than a workaround: slurmdbd runs only on
+    # the controller (started at provision_server.py:200; the worker entrypoint
+    # starts slurmd only), the file is regenerated locally on every cluster
+    # start, and no worker ever reads it. Its restrictive permissions are
+    # precisely the signal that it is not worker-distributable.
+    cmd = 'gcloud storage rsync -r --exclude {} {} {}'.format(
+        shlex.quote(r'slurm/slurmdbd\.conf$'), shlex.quote(local_dir), shlex.quote(dest)
+    )
     proc = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if proc.returncode != 0:
         canine_logging.warning(
