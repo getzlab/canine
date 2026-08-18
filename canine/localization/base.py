@@ -1481,9 +1481,25 @@ class AbstractLocalizer(abc.ABC):
 
               'echo "INFO: Mounting bucket ${CANINE_BUCKETMOUNT} ..." >&2',
 
+              # The mountpoint must be WRITABLE BY THE USER THAT RUNS gcsfuse.
+              # fusermount3 refuses otherwise ("the user doesn't have
+              # write-access on the mount point: permission denied"), and
+              # gcsfuse below runs unprivileged.
+              #
+              # This differs from the RODISK path above, which `sudo mount`s and
+              # so can leave the mountpoint owned by root. The bucketmount path
+              # inherited the `sudo mkdir` from it but not the `sudo` on the
+              # mount itself, which made every bucket mount fail.
+              #
+              # Deliberately NOT fixed by running `sudo gcsfuse`: mounting as
+              # the invoking user keeps the mount readable by that user without
+              # needing `-o allow_other`, and podman maps the task container's
+              # root to this same UID (--uidmap in wolf/task.py), so the task
+              # container can read it too.
               "if [[ ! -d ${CANINE_BUCKETMOUNT_DIR} ]]; then",
               "sudo mkdir -p ${CANINE_BUCKETMOUNT_DIR}",
               "fi",
+              "sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_DIR}",
 
               # unlike RODISK, mounting has no cross-node attach race to
               # protect against: gcsfuse supports many concurrent read-only
