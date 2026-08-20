@@ -1,4 +1,5 @@
 import copy
+import json
 import typing
 import os
 import time
@@ -224,54 +225,75 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
-        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": pd.NaT, "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1}
+        # fields added for cost estimation (Start/End/Elapsed/AllocTRES/Account/
+        # attempts) default to placeholders when reading .sacct files written before
+        # this schema existed, or when no accounting info is available at all --
+        # canine.cost degrades visibly (missing_capacity_data/is_provisional) rather
+        # than guessing when it sees these.
+        new_field_placeholders = { "Start" : pd.NaT, "End" : pd.NaT, "Elapsed" : "-", "AllocTRES" : "-", "Account" : "-", "attempts" : [] }
+        # scalar-only fields, suitable for pd.DataFrame(dict, index=[0]) construction --
+        # "attempts" is list-valued and would break that constructor's row-broadcasting
+        # (a length-0 list doesn't broadcast to a length-1 index), so it's assigned
+        # separately wherever placeholder_fields is used to build a placeholder row.
+        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": pd.NaT, "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1,
+          **{k: v for k, v in new_field_placeholders.items() if k != "attempts"}}
+
+        def placeholder_row():
+            row = pd.DataFrame(placeholder_fields, index = [0])
+            row["attempts"] = [[]]
+            return row
+
+        FULL_COLUMNS = ["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem",
+                        "Start", "End", "Elapsed", "AllocTRES", "Account", "n_preempted", "attempts"]
+        # keyed by how many tab-separated fields are actually present on disk --
+        # NOT a try/except cascade: pd.read_csv silently pads/misaligns columns
+        # rather than raising when `names=` is longer than the data, so detecting
+        # the format from a downstream .astype() failure (the previous approach)
+        # would silently accept misaligned garbage instead of falling through to
+        # the right column set.
+        FORMAT_COLUMNS_BY_WIDTH = {
+          16 : FULL_COLUMNS,
+          10 : ["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"],
+          5  : ["State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"],
+        }
 
         with localizer.transport_context() as tr:
             for j, v in job_spec.items():
                 sacct_path = os.path.join(jobs_dir, j, ".sacct")
                 jid = str(batch_id) + "_" + j
                 if tr.exists(sacct_path):
-                    with tr.open(sacct_path, "r") as f:
-                        try:
-                            acct[jid] = pd.read_csv(
-                              f,
-                              header = None,
-                              sep = "\t",
-                              names = [
-                                "State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"
-                              ]
-                            ).astype({
-                              'CPUTimeRAW': int,
-                              "Submit" : "datetime64[ns]",
-                              "ReqCPUS" : int,
-                              "NCPUS" : int,
-                            })
-                        except:
-                            a = pd.read_csv(
-                              f,
-                              header = None,
-                              sep = "\t",
-                              names = [
-                                "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"
-                              ]
-                            ).astype({
-                              'CPUTimeRAW': int,
-                              "Submit" : "datetime64[ns]",
-                            })
-                            a["NodeList"] = "-"
-                            a["Partition"] = "-"
-                            a["ReqCPUS"] = -1
-                            a["NCPUS"] = -1
-                            a["ReqMem"] = "-"
-                            acct[jid] = a[["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"]]
+                    try:
+                        with tr.open(sacct_path, "r") as f:
+                            raw = pd.read_csv(f, header = None, sep = "\t")
+                        columns = FORMAT_COLUMNS_BY_WIDTH[raw.shape[1]]
+                        raw.columns = columns
+                        raw = raw.astype({
+                          'CPUTimeRAW': int,
+                          "Submit" : "datetime64[ns]",
+                          **({"ReqCPUS": int, "NCPUS": int} if "ReqCPUS" in columns else {}),
+                        })
+                        if "attempts" in columns:
+                            raw["attempts"] = raw["attempts"].apply(json.loads)
+                        for field, default in { "NodeList": "-", "Partition": "-", "ReqCPUS": -1, "NCPUS": -1, "ReqMem": "-" }.items():
+                            if field not in columns:
+                                raw[field] = default
+                        for field, placeholder in new_field_placeholders.items():
+                            if field not in columns:
+                                raw[field] = [placeholder] * len(raw) if field == "attempts" else placeholder
+                        acct[jid] = raw[FULL_COLUMNS]
+                    # unrecognized column count, or genuinely malformed/corrupt file --
+                    # treat the same as "sacct never got written" below rather than
+                    # guessing at a format.
+                    except Exception:
+                        acct[jid] = placeholder_row()
 
                     # sacct info is blank (write error?)
                     if acct[jid].empty:
-                        acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
+                        acct[jid] = placeholder_row()
 
                 # sacct never got written
                 else:
-                    acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
+                    acct[jid] = placeholder_row()
 
                 # if job_spec[j] is None, this indicates a noop (job was avoided)
                 # override state to completed, regardless of what got loaded from disk
@@ -279,6 +301,51 @@ class Orchestrator(object):
                     acct[jid]["State"] = "COMPLETED"
 
         return pd.concat(acct).droplevel(1).rename_axis("JobID")
+
+    @staticmethod
+    def query_sacct_for_nodes(backend, node_names, start, end):
+        """
+        Query sacct for every job -- any account, any user -- that ran on any of
+        the given nodes during [start, end]. Unlike wait_for_jobs_to_finish(),
+        which is scoped to one canine batch's own jobs (and thus blind to other
+        jobs/tenants sharing the same node), this is used to reconstruct how much
+        of a node's capacity was actually occupied during a window, for cost/
+        undersubscription estimation.
+
+        node_names: iterable of node hostnames. Returns an empty DataFrame,
+          without querying, if empty.
+        start, end: datetime-like (anything pd.Timestamp() accepts).
+        """
+        node_names = list(node_names)
+        if not node_names:
+            return pd.DataFrame()
+
+        def _fmt(t):
+            return pd.Timestamp(t).strftime("%Y-%m-%dT%H:%M:%S")
+
+        acct = backend.sacct(
+          "D",
+          allusers = True,
+          nodelist = ",".join(node_names),
+          starttime = _fmt(start),
+          endtime = _fmt(end),
+          format = "JobId%50,State,ExitCode,CPUTimeRAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem,Start,End,Elapsed,AllocTRES,Account"
+        )
+
+        if len(acct) == 0:
+            return acct
+
+        # drop SLURM's own per-job ".batch" substep accounting rows (they
+        # duplicate the parent job's resource usage under a distinct JobID
+        # suffix). Deliberately NOT also requiring "_" in the JobID the way
+        # wait_for_jobs_to_finish() does -- that filter assumes every job is one
+        # of wolF/canine's own array-job shards, which doesn't hold here since
+        # this query can see other tools'/accounts' jobs sharing the same node.
+        # Start/End are left as raw sacct strings (may be "Unknown" for jobs
+        # still running/pending), same reasoning as wait_for_jobs_to_finish().
+        return acct.loc[~acct.index.str.endswith("batch")].astype({
+          'CPUTimeRAW': int, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int
+        }).copy()
 
     def __init__(self, config: typing.Union[
       str,
@@ -542,6 +609,12 @@ class Orchestrator(object):
             final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
             final.at["Submit"] = g.loc[:, "Submit"].iloc[0]
             final["n_preempted"] = len(g) - 1
+            # per-attempt breakdown: the fields above collapse every preemption/
+            # requeue attempt into a single row (last attempt's NodeList, summed
+            # CPUTimeRAW), which loses which specific node(s)/time window(s) this
+            # job actually occupied -- needed to prorate cost per node, not just
+            # know total CPU-seconds consumed.
+            final["attempts"] = g[["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW"]].to_dict("records")
 
             return final
 
@@ -567,8 +640,13 @@ class Orchestrator(object):
                 acct = self.backend.sacct(
                   "D",
                   job = batch_id,
-                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem"
+                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem,Start,End,Elapsed,AllocTRES,Account"
                   ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int})
+                # Start/End/Elapsed are deliberately NOT cast to datetime here: sacct
+                # reports "Unknown" for jobs that haven't started/finished yet, and this
+                # query includes still-in-progress jobs from the same batch on every
+                # poll. Left as raw sacct strings; parsed downstream (in canine.cost)
+                # once a job has actually reached a terminal state.
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
@@ -598,7 +676,13 @@ class Orchestrator(object):
                     if save_acct and self.job_spec[job] is not None:
                         with localizer.transport_context() as transport:
                             with transport.open(os.path.join(jobs_dir, job, ".sacct"), 'w') as w:
-                                acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
+                                # "attempts" holds a list of per-attempt dicts, which
+                                # to_csv would otherwise stringify via repr(); JSON-encode
+                                # it explicitly so load_acct_from_disk() can parse it back
+                                # unambiguously.
+                                row = acct.loc[[jid]].copy()
+                                row["attempts"] = row["attempts"].apply(json.dumps)
+                                row.to_csv(w, sep = "\t", header = False, index = False)
 
             # track node uptime
             # this is an expensive operation, so only track if requested
