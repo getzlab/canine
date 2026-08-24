@@ -17,7 +17,11 @@ import shutil
 import uuid
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
-from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
+from ..utils import (
+    get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging,
+    user_credentials_secret_name, put_user_credentials_secret,
+    delete_user_credentials_secret,
+)
 
 from requests.exceptions import ConnectionError as RConnectionError, ReadTimeout
 from urllib3.exceptions import ProtocolError
@@ -34,7 +38,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
     def __init__(
         self, cluster_name, *,
         action_on_stop = "delete",
-        image_family = "gsfuse-local",
+        image_family = "fuse-nfs",
         image_project = "broad-getzlab-workflows",
         image = None,
         storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
@@ -120,7 +124,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         #
         # check if image exists; pull it if not
-        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.3'
+        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.4'
         try:
             image = self.dkr.images.get(image_ref)
         except docker.errors.ImageNotFound:
@@ -195,6 +199,22 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             if self.container().status == "exited":
                 self.container().start()
 
+        # TODO: should we restart slurmctld in the container here?
+
+        #
+        # wait until the container is fully started, or error out if it failed
+        # to start
+        self.wait_for_container_to_be_ready(timeout = 60)
+
+        #
+        # initialize storage
+        self.init_storage()
+
+        #
+        # save the configuration to disk so that Slurm knows how to configure
+        # the nodes it creates
+        self.save_backend_conf()
+
     def _assert_container_owned_by_current_user(self):
         """
         Raise if the pre-existing controller container was started by a
@@ -240,22 +260,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             )
         )
 
-        # TODO: should we restart slurmctld in the container here?
-
-        #
-        # wait until the container is fully started, or error out if it failed
-        # to start
-        self.wait_for_container_to_be_ready(timeout = 60)
-
-        #
-        # initialize storage
-        self.init_storage()
-
-        #
-        # save the configuration to disk so that Slurm knows how to configure
-        # the nodes it creates
-        self.save_backend_conf()
-
     BACKEND_CONF_PATH = "/mnt/nfs/clust_conf/canine/backend_conf.pickle"
 
     def save_backend_conf(self):
@@ -289,6 +293,22 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # if the Docker was not spun up by this context manager, do not tear
         # anything down -- we don't want to clobber an already running cluster
         if self.shutdown_on_exit and not self.preexisting_container:
+            # Delete the user's credential secret along with the cluster it
+            # belonged to. Gated on the same condition as the rest of teardown:
+            # if this context manager did not start the cluster, another user of
+            # it may still need the credentials.
+            #
+            # NOTE this is NOT the primary cleanup path. wolF sets
+            # shutdown_on_exit=False, so in the common case this never runs and
+            # the secret's rolling TTL is what removes it -- within one TTL of
+            # the controller container dying. This just makes it prompt when
+            # teardown does happen.
+            _secret = self.config.get("credentials_secret")
+            if _secret:
+                _project = self.config.get("project") or get_default_gcp_project()
+                if _project and delete_user_credentials_secret(_project, _secret):
+                    canine_logging.info1("Deleted credential secret {}".format(_secret))
+
             # delete node configuration file
             try:
                 subprocess.check_call(
@@ -498,6 +518,64 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             if not os.path.isdir("/mnt/nfs/credentials/gcloud"):
                 os.makedirs("/mnt/nfs/credentials/gcloud")
             subprocess.run(f'cp -rf $(find {gcloud_conf_dir} -mindepth 1 -maxdepth 1 ! -name "logs") /mnt/nfs/credentials/gcloud', shell = True)
+
+        self.publish_credentials_secret(gcloud_conf_dir)
+
+    def publish_credentials_secret(self, gcloud_conf_dir = None):
+        """
+        Additionally publish the user's credentials to Secret Manager, so
+        workers can fetch them once the NFS copy above goes away
+        (NFS-FUSE-IMPLEMENTATION-PLAN.md section 2.6).
+
+        Additive for now: the NFS copy is still written and is still what
+        docker_copy_gcloud_credentials.sh falls back to, so a failure here
+        cannot stop a cluster from starting.
+
+        The secret name is recorded on self.config so slurm_resume.py can hand
+        it to workers via instance metadata.
+        """
+        secret_name = user_credentials_secret_name(
+            self.config["worker_prefix"],   # = socket.gethostname(), the controller VM
+            self.config["user"],
+            self.config["storage_namespace"],
+        )
+        project = self.config.get("project") or get_default_gcp_project()
+        if project is None:
+            canine_logging.warning(
+                "No GCP project resolved; skipping credential secret (workers will use "
+                "the NFS credential copy)"
+            )
+            return
+
+        ok = put_user_credentials_secret(
+            project, secret_name, gcloud_conf_dir,
+            accessor_service_account = self._worker_service_account(project),
+        )
+        # Only advertise the secret to workers if it actually published --
+        # otherwise they should not waste a boot-time fetch on it.
+        self.config["credentials_secret"] = secret_name if ok else None
+
+    def _worker_service_account(self, project):
+        """
+        The identity workers authenticate as when fetching the credential
+        secret. Workers are created without --service-account
+        (slurm_resume.py), so they run as the project default compute SA.
+
+        Derived from the project number, which is what that SA's address uses;
+        falls back to None (no IAM grant, so the fetch will fail and workers
+        fall back to NFS) rather than guessing wrong.
+        """
+        try:
+            proc = subprocess.run(
+                ["gcloud", "projects", "describe", project, "--format", "value(projectNumber)"],
+                stdout = subprocess.PIPE, stderr = subprocess.PIPE
+            )
+            if proc.returncode != 0:
+                return None
+            num = proc.stdout.decode().strip()
+            return "{}-compute@developer.gserviceaccount.com".format(num) if num else None
+        except Exception:
+            return None
 
     def get_latest_image(self, image_family = None, project = None):
         image_family = self.config["image_family"] if image_family is None else image_family

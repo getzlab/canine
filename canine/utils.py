@@ -309,7 +309,29 @@ def touch_object(bucket: str, path: str):
 
 CLUSTER_CONFIG_PREFIX = "_cluster_conf"
 
-def upload_cluster_config(bucket: str, local_dir: str = "/mnt/nfs/clust_conf") -> bool:
+def cluster_config_prefix(namespace: typing.Optional[str] = None) -> str:
+    """
+    Object prefix holding one cluster's mirrored config.
+
+    Namespaced per controller VM, and that is load-bearing rather than tidy.
+    The bucket is canine-<project>-<workflow_name>, and wolF never passes
+    workflow_name, so *every* cluster in a project shares
+    canine-<project>-default. Workers now prefer the mirrored copy over the NFS
+    one (cluster_conf_paths.sh), so an unnamespaced prefix would let one
+    controller's slurm.conf -- with its own ControlMachine and NodeName list --
+    be picked up by another controller's workers, which then register nowhere.
+
+    The controller hostname is the same discriminator used for the credential
+    secret name; see user_credentials_secret_name.
+    """
+    if not namespace:
+        return CLUSTER_CONFIG_PREFIX
+    return "{}/{}".format(CLUSTER_CONFIG_PREFIX, _sanitize_secret_component(namespace))
+
+def upload_cluster_config(
+    bucket: str, local_dir: str = "/mnt/nfs/clust_conf",
+    namespace: typing.Optional[str] = None
+) -> bool:
     """
     Mirror the cluster's generated Slurm/canine configuration
     (slurm.conf, slurmdbd.conf, cgroup.conf, nodetypes.json, host_LuT.pickle,
@@ -334,7 +356,7 @@ def upload_cluster_config(bucket: str, local_dir: str = "/mnt/nfs/clust_conf") -
         )
         return False
 
-    dest = "gs://{}/{}".format(bucket, CLUSTER_CONFIG_PREFIX)
+    dest = "gs://{}/{}".format(bucket, cluster_config_prefix(namespace))
     # rsync, not `cp -r`: `gcloud storage cp -r <dir>/. <dest>/` nests the
     # source directory's own basename under <dest> (verified -- it produced
     # <dest>/<tmpdirname>/slurm/slurm.conf), whereas rsync mirrors the
@@ -363,6 +385,225 @@ def upload_cluster_config(bucket: str, local_dir: str = "/mnt/nfs/clust_conf") -
         return False
     canine_logging.info1("Mirrored cluster config to {}".format(dest))
     return True
+
+#
+# User credential distribution via Secret Manager
+# (NFS-FUSE-IMPLEMENTATION-PLAN.md section 2.6)
+#
+# Workers must act as the *user*, not a service account -- pipelines pull from
+# external sources whose data cannot be shared with an SA -- so credentials have
+# to be distributed somehow. Today that is a copy on the NFS share; these
+# helpers replace it with a Secret Manager secret so it survives the mount going
+# away.
+#
+# gcloud CLI rather than google-cloud-secret-manager, to avoid adding a
+# dependency; the CLI is already a hard requirement.
+
+# Rolling dead-man's switch, NOT a lifetime cap: the controller pushes
+# expire_time forward on a timer, so a workflow of any length keeps its
+# credentials. If renewal stops (cluster died), the secret self-deletes within
+# one TTL. Renewal is an admin operation and therefore free, so this is short.
+CREDENTIAL_SECRET_TTL_SECONDS = 3600
+
+# The whole gcloud config dir except logs/, mirroring what
+# fetch_credentials_from_nfs (docker_copy_gcloud_credentials.sh) copies, which
+# excludes exactly the same one entry.
+#
+# An earlier version allowlisted four files instead. That looked tidier but
+# dropped active_config, access_tokens.db and legacy_credentials/, and a worker
+# booted from it did NOT authenticate as the user: gcloud fell back to the VM's
+# default compute service account, which has no access to the workflow bucket,
+# and the job then died in localization trying to create the missing
+# access_tokens.db inside the nested task container.
+#
+# logs/ is the only entry worth excluding -- ~20MB, and useless on a worker.
+# What remains compresses to ~5KB, well inside Secret Manager's 64KiB payload
+# cap.
+CREDENTIAL_EXCLUDE = {"logs"}
+
+# At least one of these must be present for the config dir to be worth
+# publishing at all.
+CREDENTIAL_REQUIRED_ANY = ("credentials.db", "application_default_credentials.json")
+
+def _sanitize_secret_component(s: str) -> str:
+    """
+    Secret IDs must match [a-zA-Z0-9_-]{1,255}. Note this differs from bucket
+    names -- uppercase and underscore are legal here -- so do NOT reuse
+    _sanitize_bucket_name_component, which would needlessly lowercase.
+    """
+    s = re.sub(r'[^a-zA-Z0-9_-]+', '-', s).strip('-')
+    return s if s else "default"
+
+def user_credentials_secret_name(vm_name: str, unix_user: str, workspace_name: str) -> str:
+    """
+    canine-adc-<vm>-<user>-<workspace>.
+
+    workspace rather than cluster_name: wolF hardcodes cluster_name to "wolf"
+    (wolf/workflow.py), so it never varies and cannot discriminate. The <vm>
+    component is what separates users on different controller VMs -- multiple
+    users on ONE VM is not a supported configuration and is refused by
+    dockerTransient (see _assert_container_owned_by_current_user).
+    """
+    return "canine-adc-{}-{}-{}".format(
+        _sanitize_secret_component(vm_name),
+        _sanitize_secret_component(unix_user),
+        _sanitize_secret_component(workspace_name),
+    )[:255]
+
+def _gcloud(args: typing.List[str]) -> subprocess.CompletedProcess:
+    return subprocess.run(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+def put_user_credentials_secret(
+    project: str,
+    secret_name: str,
+    gcloud_config_dir: typing.Optional[str] = None,
+    ttl_seconds: int = CREDENTIAL_SECRET_TTL_SECONDS,
+    accessor_service_account: typing.Optional[str] = None,
+) -> bool:
+    """
+    Publish the user's gcloud credentials as a new version of `secret_name`,
+    create the secret with a TTL if absent, destroy the previous version, and
+    optionally grant a service account read access.
+
+    Best-effort: returns False and logs rather than raising, so a failure here
+    degrades to the NFS credential copy rather than blocking cluster startup.
+    """
+    if gcloud_config_dir is None:
+        gcloud_config_dir = os.path.expanduser("~/.config/gcloud")
+    if not os.path.isdir(gcloud_config_dir):
+        canine_logging.warning(
+            "No gcloud config at {}; skipping credential secret".format(gcloud_config_dir)
+        )
+        return False
+
+    present = sorted(f for f in os.listdir(gcloud_config_dir) if f not in CREDENTIAL_EXCLUDE)
+    if not any(f in present for f in CREDENTIAL_REQUIRED_ANY):
+        canine_logging.warning(
+            "No credential files found in {}; skipping credential secret".format(gcloud_config_dir)
+        )
+        return False
+
+    import tempfile, tarfile
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".tgz") as tf:
+            with tarfile.open(tf.name, "w:gz") as tar:
+                for f in present:
+                    tar.add(os.path.join(gcloud_config_dir, f), arcname=f)
+            size = os.path.getsize(tf.name)
+            if size > 60 * 1024:
+                canine_logging.warning(
+                    "Credential payload is {} bytes, close to Secret Manager's 64KiB "
+                    "cap; skipping".format(size)
+                )
+                return False
+
+            exists = _gcloud(["gcloud", "secrets", "describe", secret_name,
+                              "--project", project]).returncode == 0
+            if not exists:
+                # --quiet is required, not cosmetic: `secrets create --ttl`
+                # prompts "This secret and all of its versions will be
+                # automatically deleted ... continue (Y/n)?" and hard-fails in a
+                # non-interactive session.
+                p = _gcloud(["gcloud", "secrets", "create", secret_name,
+                             "--project", project, "--replication-policy", "automatic",
+                             "--ttl", "{}s".format(ttl_seconds), "--quiet"])
+                if p.returncode != 0:
+                    err = p.stderr.decode()
+                    # "already exists" here means the describe above raced with
+                    # eventual consistency -- observed immediately after a
+                    # create, where describe briefly 404s on a secret that does
+                    # exist. Treat it as success and carry on to add a version,
+                    # rather than aborting a publish that can actually proceed.
+                    if "already exists" in err:
+                        refresh_credentials_secret_expiry(project, secret_name, ttl_seconds)
+                    else:
+                        canine_logging.warning(
+                            "Could not create credential secret {}; workers will fall back "
+                            "to the NFS copy: {}".format(secret_name, err.strip())
+                        )
+                        return False
+            else:
+                refresh_credentials_secret_expiry(project, secret_name, ttl_seconds)
+
+            # Note the version numbers before adding, so we can destroy the old
+            # one: Secret Manager bills per *enabled* version per month, so a
+            # cluster refreshing per submission would otherwise accumulate them.
+            before = _gcloud(["gcloud", "secrets", "versions", "list", secret_name,
+                              "--project", project, "--filter", "state=enabled",
+                              "--format", "value(name)"])
+            prior = [v for v in before.stdout.decode().split() if v.strip()] \
+                    if before.returncode == 0 else []
+
+            p = _gcloud(["gcloud", "secrets", "versions", "add", secret_name,
+                         "--project", project, "--data-file", tf.name])
+            if p.returncode != 0:
+                canine_logging.warning(
+                    "Could not add credential secret version; workers will fall back to "
+                    "the NFS copy: {}".format(p.stderr.decode().strip())
+                )
+                return False
+
+            for v in prior:
+                _gcloud(["gcloud", "secrets", "versions", "destroy", v,
+                         "--secret", secret_name, "--project", project, "--quiet"])
+    except Exception as e:
+        canine_logging.warning("Could not publish credential secret: {}".format(e))
+        return False
+
+    if accessor_service_account:
+        grant_secret_accessor(project, secret_name, accessor_service_account)
+
+    canine_logging.info1("Published user credentials to secret {}".format(secret_name))
+    return True
+
+def grant_secret_accessor(project: str, secret_name: str, service_account: str) -> bool:
+    """
+    Let the worker service account read the secret. Idempotent.
+
+    NOTE: this grants the *project default compute SA* in the normal case, which
+    every worker shares -- so per-user secret names prevent accidental mixing but
+    not deliberate access. Real isolation would need per-user service accounts.
+    """
+    p = _gcloud(["gcloud", "secrets", "add-iam-policy-binding", secret_name,
+                 "--project", project,
+                 "--member", "serviceAccount:{}".format(service_account),
+                 "--role", "roles/secretmanager.secretAccessor",
+                 "--quiet"])
+    if p.returncode != 0:
+        canine_logging.warning(
+            "Could not grant {} access to secret {}; workers will fall back to the NFS "
+            "copy: {}".format(service_account, secret_name, p.stderr.decode().strip())
+        )
+        return False
+    return True
+
+def refresh_credentials_secret_expiry(
+    project: str, secret_name: str, ttl_seconds: int = CREDENTIAL_SECRET_TTL_SECONDS
+) -> bool:
+    """
+    Push the secret's expiry forward -- the keepalive half of the rolling TTL.
+
+    Must be driven by something that lives as long as the CLUSTER, not as long
+    as the wolF driver: wolF sets shutdown_on_exit=False, so the controller
+    container deliberately outlives the driver and Slurm keeps creating workers
+    after it exits. A driver-hosted keepalive would let the secret expire under
+    a live cluster.
+    """
+    # --quiet for the same reason as create: setting a TTL prompts for
+    # confirmation and would otherwise hang/fail non-interactively.
+    p = _gcloud(["gcloud", "secrets", "update", secret_name, "--project", project,
+                 "--ttl", "{}s".format(ttl_seconds), "--quiet"])
+    return p.returncode == 0
+
+def delete_user_credentials_secret(project: str, secret_name: str) -> bool:
+    """
+    Remove the secret at cluster teardown. The TTL is the backstop for the case
+    where teardown never runs (SIGKILL, dead VM), which is the common case since
+    wolF sets shutdown_on_exit=False.
+    """
+    p = _gcloud(["gcloud", "secrets", "delete", secret_name,
+                 "--project", project, "--quiet"])
+    return p.returncode == 0
 
 def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None, stderr: typing.Optional[typing.BinaryIO] = None):
     """

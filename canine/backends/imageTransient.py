@@ -201,19 +201,26 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             # persist their config.
             self.save_backend_conf()
 
-            # Mirror the cluster config into the bucket. Additive only -- the
-            # NFS copy remains authoritative and is still what every consumer
-            # reads; nothing depends on the uploaded copy yet. This is the
-            # upload half of getting cluster config off the shared mount
-            # (NFS-FUSE-IMPLEMENTATION-PLAN.md phase 2), staged ahead of the
-            # reader-side switch so the round trip can be exercised without
-            # putting cluster boot at risk. Must run here rather than inside
+            # Mirror the cluster config into the bucket. This is the upload
+            # half of getting cluster config off the shared mount
+            # (NFS-FUSE-IMPLEMENTATION-PLAN.md phase 2); workers prefer this
+            # copy and fall back to NFS. Must run here rather than inside
             # provision_server.py: that runs in the controller container during
             # init_slurm(), before storage_bucket exists.
             #
-            # Ordering matters: this must follow save_backend_conf() so the
-            # mirrored copy includes the bucket-aware pickle.
-            upload_cluster_config(self.config["storage_bucket"])
+            # Ordering matters twice over: this must follow save_backend_conf()
+            # so the mirrored copy includes the bucket-aware pickle, and
+            # init_slurm() must have blocked on the container being ready, or
+            # provision_server.py is still regenerating the very directory
+            # being mirrored.
+            #
+            # Namespaced by controller hostname: the bucket is shared by every
+            # cluster in the project, so an unnamespaced prefix would hand this
+            # controller's slurm.conf to another controller's workers. See
+            # utils.cluster_config_prefix.
+            upload_cluster_config(
+                self.config["storage_bucket"], namespace = self.config["worker_prefix"]
+            )
 
             # start nodes
             self.init_nodes()
