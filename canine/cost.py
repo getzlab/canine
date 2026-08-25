@@ -348,6 +348,21 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
     if machine_type not in node_types.index:
         return None
 
+    # host_LuT.pickle stores accelerator_type/accelerator_count as NaN (not
+    # None/0) for every non-GPU node -- provision_server.py builds it via a
+    # regex .str.extract(), which leaves non-matching rows as NaN across all
+    # captured columns. NaN is truthy in Python (`float("nan") or 0` evaluates
+    # to the NaN, not 0), so a plain `or` fallback never actually catches it --
+    # confirmed live: this crashed int(accelerator_count) with "cannot convert
+    # float NaN to integer" for every non-accelerator node, i.e. nearly every
+    # real job, well before this function's own try/except ever started.
+    if accelerator_type is None or (isinstance(accelerator_type, float) and pd.isna(accelerator_type)):
+        accelerator_type = None
+    accelerator_count = (
+      0 if accelerator_count is None or (isinstance(accelerator_count, float) and pd.isna(accelerator_count))
+      else int(accelerator_count)
+    )
+
     cache = load_price_cache()
     key = _price_cache_key(machine_type, zone, preemptible, accelerator_type, accelerator_count)
     if key in cache:

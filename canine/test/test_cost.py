@@ -279,6 +279,84 @@ class TestGetPrice:
             result = cost.get_price("n1-highcpu-8", "us-central1-a", False, node_types=self.node_types)
         assert result is None
 
+    def test_nan_accelerator_fields_do_not_crash(self, tmp_path):
+        # host_LuT.pickle stores NaN (not None/0) for accelerator_type/
+        # accelerator_count on every non-GPU node -- confirmed live: this
+        # crashed int(accelerator_count) with "cannot convert float NaN to
+        # integer" for nearly every real job, since NaN is truthy in Python and
+        # a plain `x or default` fallback never actually catches it.
+        cache_path = tmp_path / "price_cache.json"
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": [
+          make_sku("N1 Predefined Instance Core running in Americas", "us-central1", tiered_rate_usd=0.03),
+          make_sku("N1 Predefined Instance Ram running in Americas", "us-central1", tiered_rate_usd=0.004),
+        ]}
+        services.skus.return_value.list_next.return_value = None
+
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_price(
+              "n1-highcpu-8", "us-central1-a", False,
+              accelerator_type=float("nan"), accelerator_count=float("nan"),
+              node_types=self.node_types,
+            )
+
+        assert result is not None
+        assert result > 0
+
+
+class TestMakeLivePriceSource:
+    def test_real_host_lut_row_shape_with_nan_accelerator_fields(self, tmp_path):
+        # mirrors what host_LuT.pickle actually contains for a non-GPU node
+        # (accelerator_type/accelerator_count as NaN, via provision_server.py's
+        # regex .str.extract()) -- this is the exact shape that crashed in
+        # production. Only the network boundary (get_billing_client) is mocked,
+        # so this exercises the real get_price()/_price_cache_key() logic the
+        # bug was actually in, through the full _source() chain.
+        host_lut = pd.DataFrame(
+          {"machine_type": ["n1-standard-8"], "preemptible": [False],
+           "accelerator_type": [float("nan")], "accelerator_count": [float("nan")]},
+          index=pd.Index(["wolf-test-worker1"]),
+        )
+        node_types = pd.DataFrame({"cpus": [8], "realmemory": [28200.0]}, index=pd.Index(["n1-standard-8"]))
+
+        cache_path = tmp_path / "price_cache.json"
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": [
+          make_sku("N1 Predefined Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),
+          make_sku("N1 Predefined Instance Ram running in Americas", "us-east1", tiered_rate_usd=0.004),
+        ]}
+        services.skus.return_value.list_next.return_value = None
+
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            price_source = cost.make_live_price_source("us-east1-b", host_lut=host_lut, node_types=node_types)
+            result = price_source("wolf-test-worker1")  # must not raise
+
+        assert result is not None
+        assert result > 0
+
+    def test_unknown_node_returns_none(self):
+        host_lut = pd.DataFrame({"machine_type": []}, index=pd.Index([]))
+        price_source = cost.make_live_price_source("us-east1-b", host_lut=host_lut, node_types=pd.DataFrame())
+        assert price_source("unknown-node") is None
+
 
 # ---------------------------------------------------------------------------
 # estimate_task_cost
