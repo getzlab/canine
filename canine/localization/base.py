@@ -1078,6 +1078,40 @@ class AbstractLocalizer(abc.ABC):
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
         ]
 
+        # Node-local directory holding this job's streaming-input FIFOs.
+        #
+        # These cannot live under CANINE_ROOT once that is a gcsfuse mount:
+        # gcsfuse implements no mknod, so mkfifo fails outright with
+        # "Operation not supported", and localization.sh runs under `set -e`
+        # (see below), so every localization: stream task would hard-fail.
+        # This is blocker B4, the only one of the eight that probing confirmed
+        # cannot be worked around (NFS-FUSE-IMPLEMENTATION-PLAN.md phase 4).
+        #
+        # Node-local is not a compromise for a FIFO, it is the honest scope. A
+        # FIFO holds no data -- bytes pass through a kernel pipe buffer and
+        # never touch a disk block -- so nothing is being moved off shared
+        # storage except a rendezvous point, and both ends of that rendezvous
+        # are on this node already: the writer is the `... > fifo &` background
+        # process in localization.sh, and the reader is the task command, which
+        # runs on the same node in a container nested inside this one. Nothing
+        # crosses hosts, and the sizing question in 7.4 does not arise.
+        #
+        # CANINE_STREAM_DIR is not a new variable. The teardown script already
+        # removes it (see below) and test_localizer_batched.py still asserts
+        # FIFOs are built under it -- it is the original design, which lost its
+        # definition at some point while the cleanup and the test survived.
+        # Restoring it is what makes both correct again.
+        #
+        # Keyed by the staging directory (a uuid4 per pipeline run, unless the
+        # caller named it) and then by jobId, so concurrent array shards landing
+        # on one node cannot collide on a shared input basename.
+        stream_dir = os.path.join(
+          '/tmp/canine-streams',
+          os.path.basename(self.environment('remote')['CANINE_ROOT'].rstrip('/')),
+          jobId
+        )
+        has_stream_inputs = False
+
         #
         # create creation script for persistent disk, if specified
         if self.localize_to_persistent_disk or self.use_scratch_disk:
@@ -1241,9 +1275,16 @@ class AbstractLocalizer(abc.ABC):
                 # some kind of FIFO
                 if file_handler.localization_mode == 'stream':
                     job_vars.add(shlex.quote(key))
-                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
-                    localization_tasks += [file_handler.localization_command(dest.remotepath)]
-                    export_writer(key, dest.remotepath, is_array)
+                    # node-local, not reserve_path's shared-mount location:
+                    # mkfifo has no gcsfuse implementation (B4, see stream_dir
+                    # above). A plain string rather than a PathType because
+                    # this path exists only on the compute node -- there is no
+                    # controller-side view of it to reserve, and only
+                    # .remotepath was ever read here.
+                    dest = os.path.join(stream_dir, basename)
+                    has_stream_inputs = True
+                    localization_tasks += [file_handler.localization_command(dest)]
+                    export_writer(key, dest, is_array)
 
                 # this is a URL; create command to download it
                 elif file_handler.localization_mode == 'url':
@@ -1540,6 +1581,14 @@ class AbstractLocalizer(abc.ABC):
             'find "$CANINE_COMMON"/ -mindepth 1 -maxdepth 1 -exec sh -c "ln -s {} "$CANINE_JOB_INPUTS"/ || echo \'Could not symlink common input {}\' >&2" \;'
         ]
 
+        # The FIFOs are written from this container and read from the task
+        # container nested inside it, so the task container needs the stream
+        # directory bind-mounted in -- CANINE_ROOT no longer covers it. Only
+        # when the job actually streams something; otherwise this would mount an
+        # empty directory into every task container for no reason.
+        if has_stream_inputs:
+            docker_args.append('-v $CANINE_STREAM_DIR:$CANINE_STREAM_DIR')
+
         # generate setup script
         setup_script = '\n'.join(
             line.rstrip()
@@ -1554,9 +1603,16 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
                 'export CANINE_JOB_LOCALIZATION="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'localization.sh')),
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
+                # must precede CANINE_DOCKER_ARGS: that assignment is
+                # double-quoted, so $CANINE_STREAM_DIR in the bind mount below
+                # is expanded here, at export time, not when podman runs
+                'export CANINE_STREAM_DIR="{}"'.format(stream_dir) if has_stream_inputs else '',
                 'export CANINE_DOCKER_ARGS="{docker} $CANINE_DOCKER_ARGS"'.format(docker=' '.join(set(docker_args))),
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_WORKSPACE',
+                # HandleGSURLStream is the one stream handler that does not
+                # mkdir its own destination directory; the others do
+                'mkdir -p $CANINE_STREAM_DIR' if has_stream_inputs else '',
                 'chmod 755 $CANINE_JOB_LOCALIZATION'
             ]
             # all exported job variables
