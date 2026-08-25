@@ -457,6 +457,30 @@ class AbstractLocalizer(abc.ABC):
             os.path.join(self.environment('remote')['CANINE_ROOT'], *(str(component) for component in args)),
         )
 
+    def node_local_job_dir(self, jobId: str) -> str:
+        """
+        Per-job scratch directory on the compute node's own disk.
+
+        The counterpart to reserve_path() for things that must *not* live on the
+        shared mount. Returns a plain string, not a PathType: these paths exist
+        only on the compute node, so there is no controller-side view of them to
+        reserve.
+
+        Keyed by staging directory (a uuid4 per run unless the caller named one)
+        and then by jobId, so concurrent array shards landing on the same node
+        cannot collide.
+
+        Callers own their own subdirectory under this -- `streams/` for
+        localization FIFOs, `download/` for gcloud's transfer bookkeeping. One
+        root rather than a scattering of /tmp/canine-* siblings, so teardown and
+        future additions have an obvious place to hang.
+        """
+        return os.path.join(
+          '/tmp/canine',
+          os.path.basename(self.environment('remote')['CANINE_ROOT'].rstrip('/')),
+          str(jobId)
+        )
+
     def build_manifest(self, transport: typing.Optional[AbstractTransport] = None) -> pd.DataFrame:
         """
         Returns the job output manifest from this pipeline.
@@ -1105,12 +1129,31 @@ class AbstractLocalizer(abc.ABC):
         # Keyed by the staging directory (a uuid4 per pipeline run, unless the
         # caller named it) and then by jobId, so concurrent array shards landing
         # on one node cannot collide on a shared input basename.
-        stream_dir = os.path.join(
-          '/tmp/canine-streams',
-          os.path.basename(self.environment('remote')['CANINE_ROOT'].rstrip('/')),
-          jobId
-        )
+        node_local_dir = self.node_local_job_dir(jobId)
+        stream_dir = os.path.join(node_local_dir, 'streams')
         has_stream_inputs = False
+
+        # Node-local directory for gcloud's download bookkeeping -- the
+        # resumable-download tracker directory and the `-L` manifest that
+        # HandleGSURL writes beside every download (blocker B7b,
+        # NFS-FUSE-IMPLEMENTATION-PLAN.md phase 4).
+        #
+        # Unlike the FIFOs above, this is not about an operation gcsfuse
+        # refuses. It is about cost and churn: the tracker is a burst of small
+        # create/read/delete operations and the manifest is a read-modify-write
+        # of a whole object, and on gcsfuse each of those is an HTTP round trip
+        # against storage nobody ever reads back. The job never touches either
+        # file, so keeping them on the shared mount buys nothing.
+        #
+        # This is the *only* half of B7 that can move. The other half -- AWS's
+        # `--range "bytes=$SZ-" >(cat >> dest)` and GDC/DRS's `curl -C - -o
+        # dest` -- resumes into the destination file the job itself consumes,
+        # which has to stay on the shared mount. See 7.6.
+        #
+        # No bind mount: written by localization.sh in the worker container,
+        # never read from inside the task container.
+        download_tracker_dir = os.path.join(node_local_dir, 'download')
+        has_download_inputs = False
 
         #
         # create creation script for persistent disk, if specified
@@ -1289,6 +1332,13 @@ class AbstractLocalizer(abc.ABC):
                 # this is a URL; create command to download it
                 elif file_handler.localization_mode == 'url':
                     job_vars.add(shlex.quote(key))
+
+                    # keep gcloud's tracker dir and -L manifest off the shared
+                    # mount (B7b); the handler falls back to the destination
+                    # directory when this is unset, which is what keeps
+                    # localization_command usable on its own
+                    file_handler.download_tracker_dir = download_tracker_dir
+                    has_download_inputs = True
 
                     exportpath = self.reserve_path('jobs', jobId, 'inputs', basename)
 
@@ -1607,12 +1657,19 @@ class AbstractLocalizer(abc.ABC):
                 # double-quoted, so $CANINE_STREAM_DIR in the bind mount below
                 # is expanded here, at export time, not when podman runs
                 'export CANINE_STREAM_DIR="{}"'.format(stream_dir) if has_stream_inputs else '',
+                # exported for teardown and for debugging; unlike the stream
+                # dir this needs no bind mount, since only localization.sh
+                # touches it
+                'export CANINE_DOWNLOAD_TRACKER_DIR="{}"'.format(download_tracker_dir) if has_download_inputs else '',
                 'export CANINE_DOCKER_ARGS="{docker} $CANINE_DOCKER_ARGS"'.format(docker=' '.join(set(docker_args))),
                 'mkdir -p $CANINE_JOB_INPUTS',
                 'mkdir -p $CANINE_JOB_WORKSPACE',
                 # HandleGSURLStream is the one stream handler that does not
                 # mkdir its own destination directory; the others do
                 'mkdir -p $CANINE_STREAM_DIR' if has_stream_inputs else '',
+                # gcloud creates the tracker dir itself, but the -L manifest's
+                # parent must already exist
+                'mkdir -p $CANINE_DOWNLOAD_TRACKER_DIR' if has_download_inputs else '',
                 'chmod 755 $CANINE_JOB_LOCALIZATION'
             ]
             # all exported job variables
@@ -1669,6 +1726,11 @@ class AbstractLocalizer(abc.ABC):
 
                 # remove stream dir
                 'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi',
+
+                # same treatment for gcloud's download bookkeeping (B7b). Both
+                # live under the same node-local job directory; removed
+                # separately so each stays gated on its own variable.
+                'if [[ -n "$CANINE_DOWNLOAD_TRACKER_DIR" ]]; then rm -rf $CANINE_DOWNLOAD_TRACKER_DIR; fi',
 
                 # remove all files in workspace directory not captured by outputs
                 f'comm -23 <(find $CANINE_JOB_WORKSPACE ! -type d | sort) <(find {compute_env["CANINE_OUTPUT"]}/{jobId} -mindepth 2 -type l -exec readlink -f {{}} \; | sort) | xargs rm -f' if self.cleanup_job_workdir and not self.use_scratch_disk else '',

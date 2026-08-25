@@ -5,15 +5,22 @@ test_localizer_requester_pays_pure.py, since test_localizer_batched.py's
 module-level DummySlurmBackend needs a Docker image that is not reachable
 everywhere).
 
-Covers NFS-FUSE-IMPLEMENTATION-PLAN.md phase 4 / blocker B4: gcsfuse implements
-no mknod, so `mkfifo` on the shared mount fails with "Operation not supported".
-localization.sh runs under `set -e`, which turns that into a hard failure of
-every `localization: stream` task. FIFOs therefore have to be created on
-node-local disk, under CANINE_STREAM_DIR.
+Covers the two things NFS-FUSE-IMPLEMENTATION-PLAN.md phase 4 moves onto
+node-local disk, both under the per-job root from
+AbstractLocalizer.node_local_job_dir():
 
-A FIFO transports no data through the filesystem -- bytes move through a kernel
-pipe buffer -- and both ends live on the same node, so this is a placement
-change only, with no bearing on where job data lands.
+  B4 (streams/) -- gcsfuse implements no mknod, so `mkfifo` on the shared mount
+  fails with "Operation not supported". localization.sh runs under `set -e`,
+  which turns that into a hard failure of every `localization: stream` task.
+
+  B7b (download/) -- gcloud's resumable-download tracker directory and its -L
+  manifest. Not something gcsfuse refuses; just bookkeeping no job reads back,
+  paid for in HTTP round trips if it stays on the shared mount.
+
+Neither moves job data. A FIFO transports no bytes through the filesystem at
+all, and B7b is metadata about a transfer whose payload still lands under
+CANINE_ROOT -- an invariant asserted below, since it is what separates B7b from
+B7a, which cannot move.
 """
 import os
 from unittest.mock import MagicMock, patch
@@ -24,7 +31,8 @@ from canine.localization.local import BatchedLocalizer
 from canine.localization import file_handlers
 
 
-STREAM_ROOT = "/tmp/canine-streams"
+NODE_LOCAL_ROOT = "/tmp/canine"
+STREAM_ROOT = NODE_LOCAL_ROOT
 STAGING_DIR = "/mnt/nfs/canine-staging-0123abcd"
 
 
@@ -48,6 +56,12 @@ def make_literal_handler(value="just-a-string"):
     return file_handlers.StringLiteral(value)
 
 
+def make_download_handler(path="gs://bucket/reads.bam"):
+    """localization_mode == "url" -- an ordinary download, not a stream."""
+    with patch.object(file_handlers.HandleGSURL, "get_requester_pays", return_value=False):
+        return file_handlers.HandleGSURL(path)
+
+
 def setup_job(loc, jobId, inputs):
     """
     inputs: {input_name: [handler, ...]}
@@ -63,9 +77,10 @@ def scripts_for(loc, jobId="0"):
 
 def expected_stream_dir(loc, jobId="0"):
     return os.path.join(
-      STREAM_ROOT,
+      NODE_LOCAL_ROOT,
       os.path.basename(loc.environment("remote")["CANINE_ROOT"].rstrip("/")),
       jobId,
+      "streams",
     )
 
 
@@ -195,6 +210,13 @@ class TestNonStreamingJobsUnaffected:
         assert "CANINE_STREAM_DIR" not in docker_line
         assert "-v $CANINE_ROOT:$CANINE_ROOT" in docker_line
 
+    def test_no_download_tracker_export_without_download_inputs(self):
+        loc = make_localizer()
+        setup_job(loc, "0", {"label": [make_literal_handler()]})
+        setup, _, _ = scripts_for(loc)
+
+        assert "CANINE_DOWNLOAD_TRACKER_DIR" not in setup
+
     def test_teardown_cleanup_is_inert_without_stream_inputs(self):
         """
         The teardown line is unconditional in the generated script, so it must
@@ -207,3 +229,96 @@ class TestNonStreamingJobsUnaffected:
 
         assert 'if [[ -n "$CANINE_STREAM_DIR" ]]' in teardown
         assert "CANINE_STREAM_DIR" not in setup
+
+
+def expected_download_dir(loc, jobId="0"):
+    return os.path.join(
+      NODE_LOCAL_ROOT,
+      os.path.basename(loc.environment("remote")["CANINE_ROOT"].rstrip("/")),
+      jobId,
+      "download",
+    )
+
+
+class TestDownloadBookkeepingIsNodeLocal:
+    """
+    Blocker B7b. gcloud's resumable-download tracker directory and its -L
+    manifest are written beside every download. Nothing reads them back, but on
+    gcsfuse the tracker is a burst of small create/read/delete operations and
+    the manifest is a read-modify-write of a whole object -- each one an HTTP
+    round trip against shared storage, for bookkeeping.
+
+    Only these move. The download itself has to land where the job expects it,
+    which is the invariant the last test here pins.
+    """
+
+    def test_tracker_dir_is_node_local(self):
+        loc = make_localizer()
+        setup_job(loc, "0", {"reads": [make_download_handler()]})
+        _, localization, _ = scripts_for(loc)
+
+        assert 'CLOUDSDK_STORAGE_TRACKER_DIR="{}/.gcloud_tracker_dir"'.format(
+          expected_download_dir(loc)) in localization
+
+    def test_manifest_is_node_local(self):
+        loc = make_localizer()
+        setup_job(loc, "0", {"reads": [make_download_handler()]})
+        _, localization, _ = scripts_for(loc)
+
+        assert '-L "{}/.gcloud_manifest"'.format(expected_download_dir(loc)) in localization
+
+    def test_the_download_itself_still_lands_on_the_shared_mount(self):
+        """
+        The non-regression that matters. B7's other half -- the payload being
+        resumed in place -- cannot move, because the job reads it from
+        CANINE_ROOT. If this ever fails, the bookkeeping change has dragged the
+        data with it.
+        """
+        loc = make_localizer()
+        setup_job(loc, "0", {"reads": [make_download_handler()]})
+        setup, localization, _ = scripts_for(loc)
+
+        canine_root = loc.environment("remote")["CANINE_ROOT"]
+        expected_dest = os.path.join(canine_root, "jobs", "0", "inputs")
+        assert expected_dest in localization
+        assert "export reads={}/reads.bam".format(expected_dest) in setup
+
+    def test_tracker_dir_is_exported_and_created(self):
+        loc = make_localizer()
+        setup_job(loc, "0", {"reads": [make_download_handler()]})
+        setup, _, _ = scripts_for(loc)
+
+        assert 'export CANINE_DOWNLOAD_TRACKER_DIR="{}"'.format(expected_download_dir(loc)) in setup
+        assert "mkdir -p $CANINE_DOWNLOAD_TRACKER_DIR" in setup
+
+    def test_not_bind_mounted_into_the_task_container(self):
+        """
+        Unlike the stream dir, only localization.sh touches this -- the task
+        container never sees it, so mounting it in would be noise.
+        """
+        loc = make_localizer()
+        setup_job(loc, "0", {"reads": [make_download_handler()]})
+        setup, _, _ = scripts_for(loc)
+
+        docker_line = next(l for l in setup.splitlines() if l.startswith("export CANINE_DOCKER_ARGS="))
+        assert "CANINE_DOWNLOAD_TRACKER_DIR" not in docker_line
+
+    def test_teardown_removes_it(self):
+        loc = make_localizer()
+        setup_job(loc, "0", {"reads": [make_download_handler()]})
+        _, _, teardown = scripts_for(loc)
+
+        assert 'if [[ -n "$CANINE_DOWNLOAD_TRACKER_DIR" ]]; then rm -rf $CANINE_DOWNLOAD_TRACKER_DIR; fi' in teardown
+
+    def test_handler_falls_back_to_dest_dir_without_a_localizer(self):
+        """
+        localization_command() is called directly in places that have no
+        localizer to supply a node-local directory; those must keep the old
+        behavior rather than emitting a path under /tmp that nobody created.
+        """
+        handler = make_download_handler()
+        assert handler.download_tracker_dir is None
+        cmd = handler.localization_command("/mnt/nfs/staging/jobs/0/inputs/reads.bam")
+
+        assert 'CLOUDSDK_STORAGE_TRACKER_DIR="/mnt/nfs/staging/jobs/0/inputs/.gcloud_tracker_dir"' in cmd
+        assert NODE_LOCAL_ROOT not in cmd

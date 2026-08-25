@@ -37,6 +37,12 @@ class FileType(abc.ABC):
         self.transport = transport # currently not used
         self.extra_args = kwargs
 
+        # Where to put transfer bookkeeping that is not the downloaded file
+        # itself. Set by the localizer to a node-local directory (blocker B7b);
+        # None means "beside the destination", which is the old behavior and
+        # keeps localization_command() usable without a localizer.
+        self.download_tracker_dir = None
+
         self._size = None
         self._hash = None
 
@@ -249,7 +255,12 @@ class HandleGSURL(FileType):
         dest_dir = shlex.quote(os.path.dirname(dest))
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
-        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'CLOUDSDK_STORAGE_TRACKER_DIR="{dest_dir}/.gcloud_tracker_dir" gcloud storage cp {self.rp_string} -r -n -L "{dest_dir}/.gcloud_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
+        # The tracker directory and the -L manifest are gcloud's own
+        # bookkeeping, never read by the job, so they go on node-local disk when
+        # the localizer offers somewhere to put them (B7b). Only these move --
+        # the download itself must land in dest_dir, where the job expects it.
+        tracker_base = shlex.quote(self.download_tracker_dir) if self.download_tracker_dir else dest_dir
+        return ("[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(dest_dir = self.localized_path if self.is_dir else dest_dir)) + f'CLOUDSDK_STORAGE_TRACKER_DIR="{tracker_base}/.gcloud_tracker_dir" gcloud storage cp {self.rp_string} -r -n -L "{tracker_base}/.gcloud_manifest" {self.path} {dest_dir}/{dest_file if not self.is_dir else ""}'
 
 class HandleGSURLStream(HandleGSURL):
     localization_mode = "stream"
