@@ -756,9 +756,30 @@ class Orchestrator(object):
             #       localizer exit early.
             if transport.exists(localizer.staging_dir):
                 try:
-                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id") 
+                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
                     js_df["failed"] = False
                     js_df["output_ok"] = False
+                    # "failed" conflates two very different things: a shard we
+                    # positively know failed (we read an exit code and it was
+                    # nonzero) and a shard we simply cannot form an opinion
+                    # about (workspace or exit code file not found). Both must
+                    # re-run, so one flag is enough to schedule them -- but only
+                    # the first may have its data destroyed, so the purge below
+                    # keys off confirmed_failed instead.
+                    #
+                    # This matters on any backend: a shard whose exit codes are
+                    # unreadable for a transient reason currently has its whole
+                    # job directory deleted, and outputs/ is a symlink farm
+                    # pointing into that directory, so a successful shard's
+                    # results are destroyed and the surviving symlinks dangle.
+                    # gcsfuse makes it far more likely -- NegativeTtlSecs means a
+                    # miss is cached too -- which is why this is a prerequisite
+                    # for the mount swap (NFS-FUSE-IMPLEMENTATION-PLAN.md 8.4).
+                    js_df["confirmed_failed"] = False
+                    # a shard that left a directory behind but no readable
+                    # verdict; worth telling the user about, unlike one that
+                    # simply never ran
+                    js_df["indeterminate"] = False
                     jobs_dir = localizer.environment("local")["CANINE_JOBS"]
                     output_dir = localizer.environment("local")["CANINE_OUTPUT"]
 
@@ -772,6 +793,10 @@ class Orchestrator(object):
                         # directories, which do not generate a workspace directory.
                         if not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
                             js_df.at[i, "failed"] = True
+                            # no directory at all means the shard simply never
+                            # ran -- nothing to purge and nothing surprising.
+                            # A directory without a workspace is the odd case.
+                            js_df.at[i, "indeterminate"] = transport.isdir(os.path.join(jobs_dir, i))
 
                         # otherwise, make sure all three exit code are OK
                         else:
@@ -779,9 +804,17 @@ class Orchestrator(object):
                                 exit_code = os.path.join(jobs_dir, i, e)
                                 if transport.isfile(exit_code):
                                     with transport.open(exit_code, "r") as ec:
-                                        js_df.at[i, "failed"] = (ec.read() != "0") | js_df.at[i, "failed"]
+                                        if ec.read() != "0":
+                                            # read a verdict, and it was failure
+                                            js_df.at[i, "failed"] = True
+                                            js_df.at[i, "confirmed_failed"] = True
                                 else:
+                                    # the file is missing. The shard may have
+                                    # been killed before writing it, or the
+                                    # filesystem may just not be showing it to
+                                    # us yet. Cannot tell the two apart here.
                                     js_df.at[i, "failed"] = True
+                                    js_df.at[i, "indeterminate"] = True
                                     break
 
                     # check for matching outputs
@@ -811,9 +844,32 @@ class Orchestrator(object):
                         self.job_spec[i] = None
 
                     # shards that failed must have their output directories purged
-                    for k in js_df.index[js_df["failed"]]:
+                    #
+                    # Only shards we positively know failed. An unreadable
+                    # verdict is not evidence of failure, and this call is
+                    # destructive and irreversible: outputs/ symlinks into the
+                    # directory being removed. Re-running without purging is a
+                    # state canine already handles -- an in-run retry does
+                    # exactly that, deleting the exit codes and re-entering the
+                    # same dirty workspace (see the generated script's
+                    # `rm -f $CANINE_JOB_ROOT/.*exit_code` + `scontrol requeue`),
+                    # and teardown's cleanup_job_workdir drops workspace files
+                    # that are not captured outputs.
+                    for k in js_df.index[js_df["confirmed_failed"]]:
                         transport.rmtree(
                             localizer.reserve_path('jobs', k).remotepath
+                        )
+
+                    unreadable = js_df.index[js_df["indeterminate"] & ~js_df["confirmed_failed"]]
+                    if len(unreadable):
+                        canine_logging.warning(
+                          "Could not determine the outcome of {n} previously run shard(s) ({shards}); "
+                          "they will be re-run, but their existing job directories are being left in "
+                          "place rather than deleted, since an unreadable exit code is not proof of "
+                          "failure.".format(
+                            n = len(unreadable),
+                            shards = ", ".join(str(k) for k in unreadable[:10]) + ("..." if len(unreadable) > 10 else "")
+                          )
                         )
 
                     # if we are re-running any jobs, we also have to remove the common

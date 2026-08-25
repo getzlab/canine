@@ -15,15 +15,33 @@ This is not actually part of the canine package
 This is helper code which is run in the backend
 """
 
-def same_volume(a, b):
+def same_volume(*args):
     """
     From NFSLocalizer
-    Check if file a and b exist on same device
+    Check if all args exist on the same volume
+
+    Kept byte-for-byte identical to NFSLocalizer.same_volume (nfs.py), because
+    the two decide the same question -- symlink or copy -- on opposite sides of
+    the same pipeline, and a disagreement silently produces either a dangling
+    symlink or a needless full copy. It previously differed in three ways, all
+    of which made this the wrong one:
+
+      * no `-P`. Without it df pads to the terminal and wraps any device name
+        longer than the column, so the fields shift onto a continuation line
+        and $1 parses as a size. NFS devices are `host:/export`, which is
+        exactly the length that triggers it.
+      * `$1` (device) rather than `$6` (mount point). A bind mount reports the
+        same device as the filesystem it shadows, so this form cannot see the
+        `mount --bind /mnt/nfs /mnt/nfs` that dockerTransient.init_storage
+        performs specifically to make /mnt/nfs a volume boundary -- it would
+        call a controller-local path and a workspace path the same volume and
+        symlink something the worker cannot resolve.
+      * unquoted interpolation, so any path containing a space became two
+        arguments to df.
     """
     vols = subprocess.check_output(
-      "df {} {} | awk 'NR > 1 {{ print $1 }}'".format(
-        a,
-        b
+      "df -P {} | awk 'NR > 1 {{ print $6 }}'".format(
+        " ".join([shlex.quote(x) for x in args])
       ),
       shell = True
     )

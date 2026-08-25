@@ -402,6 +402,15 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # this is so that Canine's system for detecting whether files to be
         # localized won't symlink things that reside outside /mnt/nfs but on the same
         # actual filesystem as /mnt/nfs
+        #
+        # Do not remove this before the mount actually becomes gcsfuse. A
+        # gcsfuse mount is a volume boundary on its own and makes this
+        # redundant, but on the controller today /mnt/nfs is an ordinary
+        # directory on the root filesystem -- without the bind mount,
+        # same_volume() would report a controller-local path and a workspace
+        # path as the same volume and symlink something no worker can resolve.
+        # Scheduled for deletion in phase 6, alongside the mount swap
+        # (NFS-FUSE-IMPLEMENTATION-PLAN.md 8.3/9.1).
         subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
           sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
 

@@ -84,6 +84,30 @@ class NFSLocalizer(BatchedLocalizer):
             else:
                 shutil.copyfile(src, dest.localpath)
 
+    def _make_executable(self, path: str):
+        """
+        Make a generated script executable, and verify it took.
+
+        Single seam for the three generated scripts, replacing three bare
+        os.chmod calls.
+
+        The verification is the point. Probing showed os.chmod on gcsfuse
+        returns 0 and silently leaves the mode at the mount-wide --file-mode
+        (NFS-FUSE.md, P1) -- it does not raise, so nothing here can fail loudly
+        on its own. That downgrades B3 from "localization aborts" to "the
+        scripts are quietly non-executable", which surfaces much later as an
+        opaque permission error at job submission, on every shard at once.
+        Mounting with --file-mode=0755 (phase 6, 9.1) is what actually makes
+        these executable; this check is what notices if that is ever missing.
+        """
+        os.chmod(path, 0o775)
+        if not os.stat(path).st_mode & 0o111:
+            warnings.warn(
+              "Generated script {} is not executable and chmod did not change that. "
+              "On a FUSE mount, file modes come from the mount rather than from chmod -- "
+              "check that it was mounted with --file-mode=0755.".format(path)
+            )
+
     def localize(self, inputs: typing.Dict[str, typing.Dict[str, str]], patterns: typing.Dict[str, str], overrides: typing.Optional[typing.Dict[str, typing.Optional[str]]] = None) -> str:
         """
         3 phase task:
@@ -143,19 +167,19 @@ class NFSLocalizer(BatchedLocalizer):
                 script_path = self.reserve_path('jobs', jobId, 'setup.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(setup_script)
-                os.chmod(script_path.localpath, 0o775)
+                self._make_executable(script_path.localpath)
 
                 # Localization:
                 script_path = self.reserve_path('jobs', jobId, 'localization.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(localization_script)
-                os.chmod(script_path.localpath, 0o775)
+                self._make_executable(script_path.localpath)
 
                 # Teardown:
                 script_path = self.reserve_path('jobs', jobId, 'teardown.sh')
                 with open(script_path.localpath, 'w') as w:
                     w.write(teardown_script)
-                os.chmod(script_path.localpath, 0o775)
+                self._make_executable(script_path.localpath)
 
                 # Array exports
                 for k, v in array_exports.items():
@@ -234,6 +258,10 @@ class NFSLocalizer(BatchedLocalizer):
     def same_volume(self, *args):
         """
         Check if args are stored on the same NFS mount as the output directory.
+
+        Deliberately identical in form to delocalization.same_volume, which
+        makes the same symlink-or-copy decision on the worker at teardown.
+        Change both together or they will disagree.
         """
         vols = subprocess.check_output(
           "df -P {} | awk 'NR > 1 {{ print $6 }}'".format(
