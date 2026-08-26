@@ -13,9 +13,11 @@ are written by slurm_gcp_docker's provision_server.py at controller boot, on the
 same NFS mount wolF/canine already use. Nothing in this module writes to either.
 """
 
+import http.client
 import json
 import os
 import threading
+import time
 
 import googleapiclient.discovery as gd
 import pandas as pd
@@ -240,6 +242,27 @@ def get_billing_client():
     return _BILLING_CLIENT
 
 
+def _invalidate_billing_client():
+    """
+    Forces the next get_billing_client() call to build a brand new client
+    (fresh httplib2 connections), rather than reusing one whose underlying
+    connection may now be dead. Called by get_price() when a fetch fails with
+    a transient network/SSL error.
+
+    Confirmed live: a long-lived cluster can see its cached client's
+    keep-alive connection go stale (server- or load-balancer-side idle
+    timeout) between infrequent price lookups, surfacing as e.g.
+    "[SSL: RECORD_LAYER_FAILURE] record layer failure". Since a failed fetch
+    is never cached, simply retrying against the same broken connection would
+    otherwise keep failing for the rest of the cluster's life -- silently
+    degrading every future not-yet-cached recipe to is_provisional instead of
+    just this one transient hiccup.
+    """
+    global _BILLING_CLIENT
+    with _BILLING_CLIENT_LOCK:
+        _BILLING_CLIENT = None
+
+
 def _price_cache_key(machine_type, zone, preemptible, accelerator_type, accelerator_count):
     return "|".join([
       machine_type, zone, str(bool(preemptible)),
@@ -269,6 +292,16 @@ def _save_price_cache(cache, path = None):
             json.dump(cache, f)
     except OSError as e:
         canine_logging.warning("Could not persist price cache to {}: {}".format(path, e))
+
+
+_MAX_FETCH_ATTEMPTS = 3
+
+# ssl.SSLError and ConnectionError are both OSError subclasses in Python 3;
+# http.client.HTTPException (e.g. RemoteDisconnected) is a separate hierarchy
+# httplib2 can also surface. Both are transient-connection symptoms worth a
+# fresh-client retry, unlike e.g. a RuntimeError from a genuinely missing
+# Catalog API service, which retrying can't fix.
+_TRANSIENT_FETCH_ERRORS = (OSError, http.client.HTTPException)
 
 
 def _zone_to_region(zone):
@@ -431,25 +464,41 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
         if key in cache:
             return cache[key]
 
-        try:
-            client = get_billing_client()
-            service_name = _fetch_compute_engine_service_name(client)
-            skus = _fetch_all_skus(client, service_name)
-            region = _zone_to_region(zone)
-            matched = match_compute_engine_price(skus, machine_type, region, preemptible)
-            if matched is None:
-                return None
-            cpu_price, ram_price = matched
-            vcpus = int(node_types.loc[machine_type, "cpus"])
-            mem_gb = float(node_types.loc[machine_type, "realmemory"]) / 1024
-            price_per_hour = cpu_price * vcpus + ram_price * mem_gb
+        last_exc = None
+        for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            try:
+                client = get_billing_client()
+                service_name = _fetch_compute_engine_service_name(client)
+                skus = _fetch_all_skus(client, service_name)
+                region = _zone_to_region(zone)
+                matched = match_compute_engine_price(skus, machine_type, region, preemptible)
+                if matched is None:
+                    return None
+                cpu_price, ram_price = matched
+                vcpus = int(node_types.loc[machine_type, "cpus"])
+                mem_gb = float(node_types.loc[machine_type, "realmemory"]) / 1024
+                price_per_hour = cpu_price * vcpus + ram_price * mem_gb
 
-            if accelerator_type and accelerator_count:
-                gpu_price = match_accelerator_price(skus, accelerator_type, region, preemptible)
-                if gpu_price is not None:
-                    price_per_hour += gpu_price * accelerator_count
-        except Exception as e:
-            canine_logging.warning("Could not fetch live price for {}/{}/preemptible={}: {}".format(machine_type, zone, preemptible, e))
+                if accelerator_type and accelerator_count:
+                    gpu_price = match_accelerator_price(skus, accelerator_type, region, preemptible)
+                    if gpu_price is not None:
+                        price_per_hour += gpu_price * accelerator_count
+                break
+            except _TRANSIENT_FETCH_ERRORS as e:
+                last_exc = e
+                canine_logging.warning(
+                  "Transient error fetching live price for {}/{}/preemptible={} (attempt {}/{}): {} -- retrying with a fresh client".format(
+                    machine_type, zone, preemptible, attempt, _MAX_FETCH_ATTEMPTS, e))
+                _invalidate_billing_client()
+                if attempt < _MAX_FETCH_ATTEMPTS:
+                    time.sleep(attempt)
+            except Exception as e:
+                canine_logging.warning("Could not fetch live price for {}/{}/preemptible={}: {}".format(machine_type, zone, preemptible, e))
+                return None
+        else:
+            canine_logging.warning(
+              "Could not fetch live price for {}/{}/preemptible={} after {} attempts: {}".format(
+                machine_type, zone, preemptible, _MAX_FETCH_ATTEMPTS, last_exc))
             return None
 
         cache[key] = price_per_hour

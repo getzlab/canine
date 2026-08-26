@@ -272,6 +272,13 @@ class TestMatchAcceleratorPrice:
 # get_price (cache + API-call mocking)
 # ---------------------------------------------------------------------------
 
+class TestInvalidateBillingClient:
+    def test_resets_singleton_forcing_rebuild(self):
+        with patch("canine.cost._BILLING_CLIENT", "sentinel-client"):
+            cost._invalidate_billing_client()
+            assert cost._BILLING_CLIENT is None
+
+
 class TestGetPrice:
     def setup_method(self):
         self.node_types = pd.DataFrame({"cpus": [8], "realmemory": [7168.0]}, index=pd.Index(["n1-highcpu-8"], name="type"))
@@ -386,6 +393,84 @@ class TestGetPrice:
              patch("canine.cost.get_billing_client", side_effect=RuntimeError("no credentials")):
             result = cost.get_price("n1-highcpu-8", "us-central1-a", False, node_types=self.node_types)
         assert result is None
+
+    def test_non_transient_error_does_not_retry(self, tmp_path):
+        # a RuntimeError (e.g. "Could not find Compute Engine in Cloud Billing
+        # Catalog services") is a logic/config problem retrying can't fix --
+        # confirm it's still a single attempt, not caught by the new transient
+        # retry loop.
+        cache_path = tmp_path / "price_cache.json"
+        mock_get_client = MagicMock(side_effect=RuntimeError("no credentials"))
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", mock_get_client):
+            result = cost.get_price("n1-highcpu-8", "us-central1-a", False, node_types=self.node_types)
+        assert result is None
+        assert mock_get_client.call_count == 1
+
+    def test_retries_on_transient_ssl_error_then_succeeds(self, tmp_path):
+        # Confirmed live: "[SSL: RECORD_LAYER_FAILURE] record layer failure" --
+        # a stale keep-alive connection on the long-lived shared client going
+        # bad between infrequent price lookups. A failed fetch is never
+        # cached, so without a retry this would keep failing (and degrading
+        # every future not-yet-cached recipe to is_provisional) for the rest
+        # of the cluster's life.
+        import ssl
+        cache_path = tmp_path / "price_cache.json"
+
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.side_effect = [
+          ssl.SSLError("[SSL: RECORD_LAYER_FAILURE] record layer failure"),
+          {"skus": [
+            make_sku("N1 Predefined Instance Core running in Americas", "us-central1", tiered_rate_usd=0.03),
+            make_sku("N1 Predefined Instance Ram running in Americas", "us-central1", tiered_rate_usd=0.004),
+          ]},
+        ]
+        services.skus.return_value.list_next.return_value = None
+
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._invalidate_billing_client") as mock_invalidate, \
+             patch("canine.cost.time.sleep"), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_price("n1-highcpu-8", "us-central1-a", False, node_types=self.node_types)
+
+        expected = 0.03 * 8 + 0.004 * (7168.0 / 1024)
+        assert result == pytest.approx(expected)
+        mock_invalidate.assert_called_once()
+        assert skus_request.execute.call_count == 2
+        # the successful retry's price is still cached normally
+        assert json.loads(cache_path.read_text())[cost._price_cache_key("n1-highcpu-8", "us-central1-a", False, None, 0)] == pytest.approx(expected)
+
+    def test_gives_up_after_max_attempts_on_persistent_transient_error(self, tmp_path):
+        import ssl
+        cache_path = tmp_path / "price_cache.json"
+
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.side_effect = ssl.SSLError("[SSL: RECORD_LAYER_FAILURE] record layer failure")
+        services.list_next.return_value = None
+
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._invalidate_billing_client") as mock_invalidate, \
+             patch("canine.cost.time.sleep"), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_price("n1-highcpu-8", "us-central1-a", False, node_types=self.node_types)
+
+        assert result is None
+        assert mock_invalidate.call_count == cost._MAX_FETCH_ATTEMPTS
+        assert list_request.execute.call_count == cost._MAX_FETCH_ATTEMPTS
+        assert not cache_path.exists()  # a total failure is never cached
 
     def test_nan_accelerator_fields_do_not_crash(self, tmp_path):
         # host_LuT.pickle stores NaN (not None/0) for accelerator_type/
