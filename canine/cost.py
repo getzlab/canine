@@ -215,11 +215,22 @@ _COMPUTE_ENGINE_SERVICE_NAME = None
 
 def get_billing_client():
     """
-    Lazy, thread-safe, per-forked-process client singleton -- mirrors
+    Lazy, per-forked-process client singleton -- mirrors
     canine.backends.imageTransient.get_gce_client()'s existing pattern, since
     wolF forks per flow run and a client built in the parent isn't safe to reuse
     in a child. Uses googleapiclient.discovery (already a canine dependency);
     no new dependency needed.
+
+    Only *construction* of the singleton is thread-safe (guarded below).
+    googleapiclient's discovery-based clients are backed by httplib2, which is
+    documented as unsafe for concurrent .execute() calls from multiple threads
+    on the same instance -- callers must serialize actual use of the returned
+    client themselves (get_price() does this via _PRICE_FETCH_LOCK). Confirmed
+    live: without that serialization, several wolF tasks finishing around the
+    same time and racing into a price-cache miss concurrently crashed the
+    whole process with "malloc(): unsorted double linked list corrupted" --
+    silent heap corruption from concurrent use of the shared, non-thread-safe
+    client, not a Python-level exception.
     """
     global _BILLING_CLIENT, _BILLING_CLIENT_BUILD_PID
     with _BILLING_CLIENT_LOCK:
@@ -245,6 +256,9 @@ def load_price_cache(path = None):
             return json.load(f)
     except (json.JSONDecodeError, OSError):
         return {}
+
+
+_PRICE_FETCH_LOCK = threading.Lock()
 
 
 def _save_price_cache(cache, path = None):
@@ -377,6 +391,13 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
     `node_types` (from load_node_types()) is required to convert per-core/per-GB
     SKU prices into a per-instance $/hour rate using that machine type's actual
     vCPU/RAM counts; loaded automatically if not given.
+
+    Everything past the first cache check is serialized behind
+    _PRICE_FETCH_LOCK: get_billing_client()'s httplib2-backed client isn't safe
+    for concurrent .execute() calls from multiple threads (see its docstring),
+    and price_cache.json's own read-modify-write isn't safe to race either --
+    both real bugs, not theoretical, since wolF calls this from per-task worker
+    threads that can finish concurrently.
     """
     node_types = load_node_types() if node_types is None else node_types
     if machine_type not in node_types.index:
@@ -397,35 +418,43 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
       else int(accelerator_count)
     )
 
-    cache = load_price_cache()
     key = _price_cache_key(machine_type, zone, preemptible, accelerator_type, accelerator_count)
+    cache = load_price_cache()
     if key in cache:
         return cache[key]
 
-    try:
-        client = get_billing_client()
-        service_name = _fetch_compute_engine_service_name(client)
-        skus = _fetch_all_skus(client, service_name)
-        region = _zone_to_region(zone)
-        matched = match_compute_engine_price(skus, machine_type, region, preemptible)
-        if matched is None:
+    with _PRICE_FETCH_LOCK:
+        # re-check: another thread may have populated this key while we were
+        # waiting on the lock -- avoids a redundant fetch, not just a redundant
+        # race.
+        cache = load_price_cache()
+        if key in cache:
+            return cache[key]
+
+        try:
+            client = get_billing_client()
+            service_name = _fetch_compute_engine_service_name(client)
+            skus = _fetch_all_skus(client, service_name)
+            region = _zone_to_region(zone)
+            matched = match_compute_engine_price(skus, machine_type, region, preemptible)
+            if matched is None:
+                return None
+            cpu_price, ram_price = matched
+            vcpus = int(node_types.loc[machine_type, "cpus"])
+            mem_gb = float(node_types.loc[machine_type, "realmemory"]) / 1024
+            price_per_hour = cpu_price * vcpus + ram_price * mem_gb
+
+            if accelerator_type and accelerator_count:
+                gpu_price = match_accelerator_price(skus, accelerator_type, region, preemptible)
+                if gpu_price is not None:
+                    price_per_hour += gpu_price * accelerator_count
+        except Exception as e:
+            canine_logging.warning("Could not fetch live price for {}/{}/preemptible={}: {}".format(machine_type, zone, preemptible, e))
             return None
-        cpu_price, ram_price = matched
-        vcpus = int(node_types.loc[machine_type, "cpus"])
-        mem_gb = float(node_types.loc[machine_type, "realmemory"]) / 1024
-        price_per_hour = cpu_price * vcpus + ram_price * mem_gb
 
-        if accelerator_type and accelerator_count:
-            gpu_price = match_accelerator_price(skus, accelerator_type, region, preemptible)
-            if gpu_price is not None:
-                price_per_hour += gpu_price * accelerator_count
-    except Exception as e:
-        canine_logging.warning("Could not fetch live price for {}/{}/preemptible={}: {}".format(machine_type, zone, preemptible, e))
-        return None
-
-    cache[key] = price_per_hour
-    _save_price_cache(cache)
-    return price_per_hour
+        cache[key] = price_per_hour
+        _save_price_cache(cache)
+        return price_per_hour
 
 
 def make_live_price_source(zone, host_lut = None, node_types = None):

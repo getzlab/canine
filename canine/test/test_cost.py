@@ -5,6 +5,8 @@ not a real network call.
 """
 import json
 import os
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -316,6 +318,67 @@ class TestGetPrice:
         expected = 0.03 * 8 + 0.004 * (7168.0 / 1024)
         assert result == pytest.approx(expected)
         assert json.loads(cache_path.read_text())[cost._price_cache_key("n1-highcpu-8", "us-central1-a", False, None, 0)] == pytest.approx(expected)
+
+    def test_concurrent_cache_miss_is_serialized_not_raced(self, tmp_path):
+        # Confirmed live: googleapiclient's httplib2-backed client isn't safe
+        # for concurrent .execute() calls from multiple threads on the same
+        # instance -- several wolF tasks finishing around the same time and
+        # racing into a cold price-cache entry crashed the whole process with
+        # "malloc(): unsorted double linked list corrupted". This drives many
+        # threads through a real cache miss concurrently and confirms (a) the
+        # mocked API is never entered by two threads at once, and (b) it's
+        # only ever actually called once (the double-checked cache re-read
+        # after acquiring the lock is what makes the other N-1 threads no-ops).
+        cache_path = tmp_path / "price_cache.json"
+        concurrent = [0]
+        max_concurrent = [0]
+
+        def make_execute(response):
+            def _execute():
+                concurrent[0] += 1
+                max_concurrent[0] = max(max_concurrent[0], concurrent[0])
+                time.sleep(0.05)
+                concurrent[0] -= 1
+                return response
+            return _execute
+
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.side_effect = make_execute(
+          {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        )
+        services.list_next.return_value = None
+
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.side_effect = make_execute({"skus": [
+          make_sku("N1 Predefined Instance Core running in Americas", "us-central1", tiered_rate_usd=0.03),
+          make_sku("N1 Predefined Instance Ram running in Americas", "us-central1", tiered_rate_usd=0.004),
+        ]})
+        services.skus.return_value.list_next.return_value = None
+
+        results = []
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            threads = [
+              threading.Thread(target=lambda: results.append(
+                cost.get_price("n1-highcpu-8", "us-central1-a", False, node_types=self.node_types)
+              ))
+              for _ in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        expected = 0.03 * 8 + 0.004 * (7168.0 / 1024)
+        assert all(r == pytest.approx(expected) for r in results)
+        assert max_concurrent[0] == 1
+        assert list_request.execute.call_count == 1
+        assert skus_request.execute.call_count == 1
 
     def test_api_exception_returns_none(self, tmp_path):
         cache_path = tmp_path / "price_cache.json"
