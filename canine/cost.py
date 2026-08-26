@@ -123,6 +123,40 @@ def parse_alloc_tres(alloc_tres):
     return alloc_cpus, alloc_mem_mb
 
 
+def resolve_job_resources(alloc_tres, ncpus = None, req_mem = None):
+    """
+    (alloc_cpus, alloc_mem_mb) for a job attempt, preferring AllocTRES's own
+    cpu=/mem= (per-attempt granted allocation) and falling back, per-field, to
+    NCPUS/ReqMem when AllocTRES doesn't report a given resource.
+
+    Confirmed live: some SLURM/accounting configurations report AllocTRES as
+    just "billing=1+" with no cpu=/mem= keys at all, even though the same
+    sacct row's own NCPUS (allocated CPU count) and ReqMem are fully
+    populated -- not a hypothetical edge case. ReqMem is used rather than
+    ReqCPUS's memory analogue because SLURM has no separate "allocated mem"
+    field outside AllocTRES; since wolF/canine only ever submit via --mem
+    (never --mem-per-cpu), ReqMem is already a per-node total, matching
+    AllocTRES's own mem= convention -- but older SLURM versions can still
+    suffix ReqMem with a trailing "c"/"n" (per-cpu/per-node) marker, so that
+    suffix is stripped defensively before parsing.
+    """
+    alloc_cpus, alloc_mem_mb = parse_alloc_tres(alloc_tres)
+
+    if alloc_cpus is None and ncpus is not None:
+        try:
+            alloc_cpus = int(ncpus)
+        except (TypeError, ValueError):
+            pass
+
+    if alloc_mem_mb is None and req_mem is not None:
+        req_mem = str(req_mem).strip()
+        if req_mem and req_mem[-1].upper() in ("C", "N") and len(req_mem) > 1 and req_mem[-2].upper() in _MEM_UNIT_MULTIPLIERS_TO_MB:
+            req_mem = req_mem[:-1]
+        alloc_mem_mb = _parse_mem_to_mb(req_mem)
+
+    return alloc_cpus, alloc_mem_mb
+
+
 def _parse_sacct_time(value):
     """sacct reports "Unknown" for jobs that haven't started/finished yet."""
     if value in (None, "Unknown", "-", ""):
@@ -163,7 +197,7 @@ def group_sacct_by_job(raw_acct_df):
             final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
         final.at["Submit"] = g["Submit"].iloc[0]
         final["n_preempted"] = len(g) - 1
-        attempt_cols = [c for c in ["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW"] if c in g.columns]
+        attempt_cols = [c for c in ["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem"] if c in g.columns]
         final["attempts"] = g[attempt_cols].to_dict("records")
         return final
 
@@ -422,8 +456,11 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
     """
     acct_df: DataFrame shaped like Task.acct -- one row per shard, with an
       "attempts" column holding a list of per-attempt {NodeList, Start, End,
-      AllocTRES, CPUTimeRAW} dicts (see Orchestrator.wait_for_jobs_to_finish's
-      grouper()).
+      AllocTRES, CPUTimeRAW, NCPUS, ReqMem} dicts (see
+      Orchestrator.wait_for_jobs_to_finish's grouper()). NCPUS/ReqMem are used
+      as a per-field fallback (via resolve_job_resources()) when AllocTRES
+      doesn't report cpu=/mem= itself -- confirmed live as a real, not
+      hypothetical, case on some clusters.
     price_source: callable(node_name) -> $/hour, or None if unavailable. Swap
       make_live_price_source(...) (real-time) for a reconciliation-side,
       billing-grounded per-node lookup to get identical-logic, differently-
@@ -452,7 +489,9 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
                 missing_capacity_data = True
                 continue
 
-            alloc_cpus, alloc_mem_mb = parse_alloc_tres(attempt.get("AllocTRES"))
+            alloc_cpus, alloc_mem_mb = resolve_job_resources(
+              attempt.get("AllocTRES"), attempt.get("NCPUS"), attempt.get("ReqMem"),
+            )
             if alloc_cpus is None or alloc_mem_mb is None:
                 missing_capacity_data = True
                 continue
@@ -522,7 +561,9 @@ def estimate_node_undersubscription(node_sacct_snapshot, price_source, host_lut 
 
         intervals = []  # [start, end, alloc_cpus, alloc_mem_mb]
         for _, job in jobs.iterrows():
-            alloc_cpus, alloc_mem_mb = parse_alloc_tres(job.get("AllocTRES"))
+            alloc_cpus, alloc_mem_mb = resolve_job_resources(
+              job.get("AllocTRES"), job.get("NCPUS"), job.get("ReqMem"),
+            )
             if alloc_cpus is None or alloc_mem_mb is None:
                 continue
             start = _parse_sacct_time(job.get("Start"))

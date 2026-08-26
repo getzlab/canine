@@ -614,7 +614,7 @@ class Orchestrator(object):
             # CPUTimeRAW), which loses which specific node(s)/time window(s) this
             # job actually occupied -- needed to prorate cost per node, not just
             # know total CPU-seconds consumed.
-            final["attempts"] = g[["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW"]].to_dict("records")
+            final["attempts"] = g[["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem"]].to_dict("records")
 
             return final
 

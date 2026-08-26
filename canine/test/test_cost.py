@@ -71,6 +71,51 @@ class TestParseAllocTres:
         assert mem == 4096.0
 
 
+class TestResolveJobResources:
+    """
+    Confirmed live: some clusters' sacct only reports AllocTRES as e.g.
+    "billing=1+" with no cpu=/mem= keys at all, even though the same row's
+    NCPUS/ReqMem fields are fully populated -- this is the real-world case
+    that motivated the NCPUS/ReqMem fallback.
+    """
+
+    def test_alloc_tres_has_both_fields_ignores_fallback(self):
+        cpus, mem = cost.resolve_job_resources("cpu=2,mem=4G", ncpus=99, req_mem="99G")
+        assert cpus == 2
+        assert mem == 4096.0
+
+    def test_alloc_tres_missing_both_fields_falls_back_to_ncpus_and_reqmem(self):
+        cpus, mem = cost.resolve_job_resources("billing=1+", ncpus=1, req_mem="3G")
+        assert cpus == 1
+        assert mem == 3072.0
+
+    def test_alloc_tres_missing_cpu_only_falls_back_for_cpu_only(self):
+        cpus, mem = cost.resolve_job_resources("mem=4G", ncpus=2, req_mem="99G")
+        assert cpus == 2
+        assert mem == 4096.0  # from AllocTRES, not the (deliberately wrong) fallback
+
+    def test_alloc_tres_missing_mem_only_falls_back_for_mem_only(self):
+        cpus, mem = cost.resolve_job_resources("cpu=2", ncpus=99, req_mem="4G")
+        assert cpus == 2  # from AllocTRES, not the (deliberately wrong) fallback
+        assert mem == 4096.0
+
+    def test_no_fallback_values_available_returns_none(self):
+        cpus, mem = cost.resolve_job_resources("billing=1+")
+        assert cpus is None
+        assert mem is None
+
+    def test_reqmem_strips_trailing_per_cpu_or_per_node_suffix(self):
+        cpus, mem = cost.resolve_job_resources("billing=1+", ncpus=1, req_mem="3Gn")
+        assert mem == 3072.0
+        cpus, mem = cost.resolve_job_resources("billing=1+", ncpus=1, req_mem="3Gc")
+        assert mem == 3072.0
+
+    def test_unparseable_ncpus_leaves_cpus_none(self):
+        cpus, mem = cost.resolve_job_resources("billing=1+", ncpus="not-a-number", req_mem="3G")
+        assert cpus is None
+        assert mem == 3072.0
+
+
 class TestParseSacctTime:
     def test_unknown_is_nat(self):
         assert pd.isna(cost._parse_sacct_time("Unknown"))
@@ -387,6 +432,21 @@ class TestEstimateTaskCost:
         assert not result.loc["1_1", "missing_capacity_data"]
         assert not result.loc["1_1", "is_provisional"]
 
+    def test_alloc_tres_without_cpu_mem_falls_back_to_ncpus_and_reqmem(self):
+        # Confirmed live: AllocTRES can come back as just "billing=1+" on some
+        # clusters, with no cpu=/mem= keys at all -- NCPUS/ReqMem are the real
+        # fallback source, not a hypothetical.
+        acct = make_acct_df({
+          "1_1": [{
+            "NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00",
+            "AllocTRES": "billing=1+", "CPUTimeRAW": 14400, "NCPUS": 4, "ReqMem": "4096M",
+          }],
+        })
+        price_source = lambda node: 3600.0
+        result = cost.estimate_task_cost(acct, price_source, host_lut=self.host_lut, node_types=self.node_types)
+        assert result.loc["1_1", "cost_usd"] == pytest.approx(1800.0)
+        assert not result.loc["1_1", "missing_capacity_data"]
+
     def test_multi_attempt_preemption_sums_across_nodes(self):
         acct = make_acct_df({
           "1_1": [
@@ -446,6 +506,18 @@ class TestEstimateNodeUndersubscription:
         self.host_lut = pd.DataFrame({"machine_type": ["faketype"]}, index=pd.Index(["workerX"]))
         self.node_types = pd.DataFrame({"cpus": [4], "realmemory": [8192.0]}, index=pd.Index(["faketype"]))
         self.price_source = lambda node: 3600.0  # $1/sec, for round numbers
+
+    def test_alloc_tres_without_cpu_mem_falls_back_to_ncpus_and_reqmem(self):
+        snapshot = make_node_snapshot([
+          {
+            "NodeList": "workerX", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T00:01:40",
+            "AllocTRES": "billing=1+", "NCPUS": 4, "ReqMem": "8192M",
+          },
+        ])
+        result = cost.estimate_node_undersubscription(snapshot, self.price_source, host_lut=self.host_lut, node_types=self.node_types)
+        row = result.iloc[0]
+        # full-node allocation via the NCPUS/ReqMem fallback -> zero waste
+        assert row["wasted_cost_usd"] == pytest.approx(0.0)
 
     def test_empty_snapshot_returns_empty_frame(self):
         result = cost.estimate_node_undersubscription(pd.DataFrame(), self.price_source, host_lut=self.host_lut, node_types=self.node_types)

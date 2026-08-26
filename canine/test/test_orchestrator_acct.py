@@ -182,6 +182,8 @@ class TestWaitForJobsToFinishGrouper:
         assert len(row["attempts"]) == 2
         assert row["attempts"][0]["NodeList"] == "worker1"
         assert row["attempts"][0]["CPUTimeRAW"] == 100
+        assert row["attempts"][0]["NCPUS"] == 2
+        assert row["attempts"][0]["ReqMem"] == "4G"
         assert row["attempts"][1]["NodeList"] == "worker2"
         assert row["attempts"][1]["CPUTimeRAW"] == 200
 
@@ -202,7 +204,10 @@ class TestWaitForJobsToFinishGrouper:
 
         row = acct.loc["999_2"]
         assert row["n_preempted"] == 0
-        assert row["attempts"] == [{"NodeList": "worker3", "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:01:00", "AllocTRES": "cpu=1,mem=1G,node=1", "CPUTimeRAW": 50}]
+        assert row["attempts"] == [{
+          "NodeList": "worker3", "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:01:00",
+          "AllocTRES": "cpu=1,mem=1G,node=1", "CPUTimeRAW": 50, "NCPUS": 1, "ReqMem": "1G",
+        }]
 
 
 class TestQuerySacctForNodes:
