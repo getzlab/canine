@@ -169,13 +169,31 @@ def _parse_sacct_time(value):
         return pd.NaT
 
 
+_SACCT_TIME_PLACEHOLDERS = {"Unknown": "", "-": ""}
+
+
+def _attempt_sort_key(start_col):
+    """
+    Sort key for ordering a job's preemption/requeue attempts chronologically
+    by Start, not Submit (Submit is the original job submission time and
+    stays constant across every requeue of the same JobID, so sorting on it
+    doesn't reliably produce chronological order -- pandas' sort isn't
+    guaranteed stable for tied keys). Mirrors
+    Orchestrator.wait_for_jobs_to_finish's identically-named helper --
+    duplicated here for the same reason group_sacct_by_job() itself is (see
+    its docstring). Maps "Unknown"/"-" to "" so an attempt that hasn't
+    started yet sorts before any real ISO timestamp string.
+    """
+    return start_col.replace(_SACCT_TIME_PLACEHOLDERS)
+
+
 def group_sacct_by_job(raw_acct_df):
     """
     Collapses a raw, possibly-multi-row-per-JobID sacct DataFrame (e.g. from a
     query using sacct's "-D" duplicates flag, which shows every preemption/
     requeue attempt as a separate row -- as Orchestrator.query_sacct_for_nodes()
     returns) into one row per JobID, with a summed CPUTimeRAW, the last (by
-    Submit) attempt's other fields, and an "attempts" column holding a
+    Start) attempt's other fields, and an "attempts" column holding a
     per-attempt breakdown.
 
     This is the same shape/algorithm as the grouper() closure nested inside
@@ -193,7 +211,7 @@ def group_sacct_by_job(raw_acct_df):
         return raw_acct_df
 
     def _grouper(g):
-        g = g.sort_values("Submit")
+        g = g.sort_values("Start", key = _attempt_sort_key)
         final = g.iloc[-1].copy()
         if "CPUTimeRAW" in g.columns:
             final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
@@ -545,10 +563,25 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
       accurate numbers from the same function.
 
     Returns a DataFrame indexed the same as acct_df, with cost_usd (summed
-    across every attempt/node the shard touched), missing_capacity_data, and
-    is_provisional columns. Never guesses: a shard with any attempt on an
-    unrecognized node, with unparseable AllocTRES, or missing a price, is
-    flagged rather than silently under-costed.
+    across every attempt/node the shard touched), total_running_seconds,
+    missing_capacity_data, and is_provisional columns. Never guesses: a shard
+    with any attempt on an unrecognized node, with unparseable AllocTRES, or
+    missing a price, is flagged rather than silently under-costed.
+
+    total_running_seconds is the sum of every attempt's own (End - Start)
+    duration -- i.e. actual time spent running, across every preemption/
+    requeue attempt -- computed independently of whether pricing/capacity
+    lookup succeeded for a given attempt (a job's real runtime is a fact
+    about what sacct observed, not about whether canine.cost happens to know
+    that node's price). This is deliberately distinct from acct_df's own
+    "Elapsed" column, which (per grouper()) reflects only the single attempt
+    picked as the group's "final" row -- for a heavily-preempted job, that
+    can look deceptively small (e.g. the last, quick, successful attempt)
+    next to a cost/n_preempted that correctly reflects every attempt.
+    Confirmed live: a job preempted 47 times showed Elapsed=24s (the final
+    attempt alone) sitting next to a correctly-computed but easy-to-doubt
+    small cost_usd, with no way to see that ~497s across all 48 attempts is
+    what actually produced it.
     """
     host_lut = load_host_lut() if host_lut is None else host_lut
     node_types = load_node_types() if node_types is None else node_types
@@ -557,11 +590,18 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
     for jid, row in acct_df.iterrows():
         attempts = row.get("attempts") or []
         total_cost = 0.0
+        total_running_seconds = 0.0
         missing_capacity_data = len(attempts) == 0
         is_provisional = False
 
         for attempt in attempts:
             node_name = attempt.get("NodeList")
+
+            start = _parse_sacct_time(attempt.get("Start"))
+            end = _parse_sacct_time(attempt.get("End"))
+            if not pd.isna(start) and not pd.isna(end):
+                total_running_seconds += max(0.0, (end - start).total_seconds())
+
             vcpus, mem_mb = node_capacity(node_name, host_lut, node_types)
             if vcpus is None:
                 missing_capacity_data = True
@@ -574,8 +614,6 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
                 missing_capacity_data = True
                 continue
 
-            start = _parse_sacct_time(attempt.get("Start"))
-            end = _parse_sacct_time(attempt.get("End"))
             if pd.isna(start) or pd.isna(end):
                 missing_capacity_data = True
                 continue
@@ -591,7 +629,7 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
             total_cost += (price_per_hour / 3600) * elapsed_seconds * max(cpu_frac, mem_frac)
 
         rows.append({
-          "JobID": jid, "cost_usd": total_cost,
+          "JobID": jid, "cost_usd": total_cost, "total_running_seconds": total_running_seconds,
           "missing_capacity_data": missing_capacity_data, "is_provisional": is_provisional,
         })
 

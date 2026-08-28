@@ -180,6 +180,30 @@ def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
 class StringifyTypeError(TypeError):
     pass
 
+# sacct's placeholders for a job that hasn't started/finished yet -- real,
+# not hypothetical, since the whole batch's sacct data gets grouped on every
+# poll of wait_for_jobs_to_finish, not just once a job is confirmed done.
+_SACCT_TIME_PLACEHOLDERS = {"Unknown": "", "-": ""}
+
+
+def _attempt_sort_key(start_col):
+    """
+    Sort key for ordering a job's preemption/requeue attempts chronologically
+    by Start. Deliberately NOT Submit: Submit is the original job submission
+    time and stays constant across every requeue of the same JobID (a
+    requeue doesn't get a new Submit), so sorting on it doesn't reliably
+    produce chronological order -- pandas' sort isn't guaranteed stable for
+    tied keys, so picking iloc[-1] afterward wasn't actually guaranteed to
+    land on the chronologically last attempt, even though it often would by
+    chance. Start genuinely varies per attempt, so it doesn't have this
+    problem. Maps sacct's "Unknown"/"-" placeholders to "" so an attempt that
+    hasn't started yet sorts *before* every real ISO timestamp string, rather
+    than after (plain lexicographic comparison would otherwise put "Unknown"
+    last, since "U" > any digit).
+    """
+    return start_col.replace(_SACCT_TIME_PLACEHOLDERS)
+
+
 class Orchestrator(object):
     """
     Main class
@@ -604,7 +628,7 @@ class Orchestrator(object):
 
     def wait_for_jobs_to_finish(self, batch_id, localizer = None, track_uptime = False):
         def grouper(g):
-            g = g.sort_values("Submit")
+            g = g.sort_values("Start", key = _attempt_sort_key)
             final = g.iloc[-1].copy()
             final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
             final.at["Submit"] = g.loc[:, "Submit"].iloc[0]

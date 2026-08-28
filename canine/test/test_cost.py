@@ -640,6 +640,43 @@ class TestEstimateTaskCost:
         # cpu_frac=1.0, mem_frac=1.0 -> cost = 1 * 3600 * 1.0 = 3600 (full node-hour)
         assert result.loc["1_1", "cost_usd"] == pytest.approx(3600.0)
 
+    def test_total_running_seconds_sums_across_attempts(self):
+        # Distinct from the acct row's own "Elapsed" (only the single attempt
+        # picked as "final" by grouper()) -- this is the sum of every
+        # attempt's own duration, which is what should be compared against
+        # n_preempted/cost_usd to avoid the "Elapsed looks tiny next to a
+        # heavily-preempted job's cost" confusion confirmed live.
+        acct = make_acct_df({
+          "1_1": [
+            {"NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T00:00:10", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 40},
+            {"NodeList": "worker1", "Start": "2026-01-01T00:05:00", "End": "2026-01-01T00:05:24", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 96},
+          ],
+        })
+        result = cost.estimate_task_cost(acct, lambda node: 3600.0, host_lut=self.host_lut, node_types=self.node_types)
+        assert result.loc["1_1", "total_running_seconds"] == pytest.approx(34.0)  # 10 + 24
+
+    def test_total_running_seconds_counted_even_when_capacity_or_price_missing(self):
+        # A job's real runtime is a fact about what sacct observed -- it
+        # shouldn't disappear just because canine.cost doesn't happen to know
+        # that node's machine type or a live price for it (those instead flag
+        # missing_capacity_data/is_provisional, tracked separately).
+        acct = make_acct_df({
+          "1_1": [
+            {"NodeList": "worker-unknown", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T00:00:10", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 40},
+          ],
+        })
+        result = cost.estimate_task_cost(acct, lambda node: None, host_lut=self.host_lut, node_types=self.node_types)
+        assert result.loc["1_1", "total_running_seconds"] == pytest.approx(10.0)
+        assert result.loc["1_1", "cost_usd"] == 0.0
+        assert result.loc["1_1", "missing_capacity_data"]
+
+    def test_total_running_seconds_excludes_unparseable_timestamps(self):
+        acct = make_acct_df({
+          "1_1": [{"NodeList": "worker1", "Start": "Unknown", "End": "Unknown", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 0}],
+        })
+        result = cost.estimate_task_cost(acct, lambda node: 3600.0, host_lut=self.host_lut, node_types=self.node_types)
+        assert result.loc["1_1", "total_running_seconds"] == 0.0
+
 
 # ---------------------------------------------------------------------------
 # estimate_node_undersubscription
@@ -797,3 +834,24 @@ class TestGroupSacctByJob:
         assert set(result.index) == {"1_1", "1_2"}
         assert result.loc["1_1", "CPUTimeRAW"] == 50
         assert result.loc["1_2", "CPUTimeRAW"] == 75
+
+    def test_constant_submit_across_attempts_still_orders_by_start(self):
+        # Real SLURM behavior: Submit doesn't change across requeues of the
+        # same JobID, so sorting on it doesn't reliably produce chronological
+        # order (pandas' sort isn't stable for ties). The chronologically
+        # last attempt is deliberately placed FIRST in raw row order here, so
+        # a naive "whatever's physically last" assumption can't accidentally
+        # pass.
+        raw = pd.DataFrame({
+          "State": ["COMPLETED", "PREEMPTED"], "CPUTimeRAW": [50, 20],
+          "Submit": ["2026-01-01 00:00:00", "2026-01-01 00:00:00"],
+          "NodeList": ["worker-final", "worker-early"],
+          "Start": ["2026-01-01T00:10:00", "2026-01-01T00:00:05"],
+          "End": ["2026-01-01T00:10:30", "2026-01-01T00:00:15"],
+          "AllocTRES": ["cpu=1,mem=1G", "cpu=1,mem=1G"],
+        }, index=["1_1", "1_1"])
+        result = cost.group_sacct_by_job(raw)
+        row = result.loc["1_1"]
+        assert row["State"] == "COMPLETED"
+        assert row["NodeList"] == "worker-final"  # chronologically last, not whichever row happened to be last in raw order
+        assert row["n_preempted"] == 1

@@ -209,6 +209,60 @@ class TestWaitForJobsToFinishGrouper:
           "AllocTRES": "cpu=1,mem=1G,node=1", "CPUTimeRAW": 50, "NCPUS": 1, "ReqMem": "1G",
         }]
 
+    def test_constant_submit_across_attempts_still_orders_by_start(self):
+        # Real SLURM behavior for preemption/requeue: Submit is the ORIGINAL
+        # job submission time and does not change across requeues of the same
+        # JobID -- confirmed live (a real 48-attempt job's summary Submit
+        # exactly matched its *first* attempt's own Start). Sorting on an
+        # all-equal Submit column doesn't reliably preserve/produce
+        # chronological order (pandas' sort isn't stable for tied keys), so
+        # the old code could pick an arbitrary row -- not necessarily the
+        # truly last one -- as the "final" summary row. This deliberately
+        # puts the chronologically-LAST attempt FIRST in the raw (pre-
+        # grouping) row order, so a naive "whatever's physically last"
+        # assumption can't accidentally save a broken implementation.
+        raw = make_raw_sacct_df([
+          { "_index": "999_3", "State": "COMPLETED", "ExitCode": "0:0", "CPUTimeRAW": 50, "PlannedCPURAW": 0,
+            "Submit": "2026-01-01 00:00:00", "NodeList": "worker-final", "Partition": "main", "ReqCPUS": 1, "NCPUS": 1, "ReqMem": "1G",
+            "Start": "2026-01-01T00:10:00", "End": "2026-01-01T00:10:30", "Elapsed": "00:00:30", "AllocTRES": "cpu=1,mem=1G,node=1", "Account": "abcd" },
+          { "_index": "999_3", "State": "PREEMPTED", "ExitCode": "0:0", "CPUTimeRAW": 20, "PlannedCPURAW": 0,
+            "Submit": "2026-01-01 00:00:00", "NodeList": "worker-early", "Partition": "main", "ReqCPUS": 1, "NCPUS": 1, "ReqMem": "1G",
+            "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:00:15", "Elapsed": "00:00:10", "AllocTRES": "cpu=1,mem=1G,node=1", "Account": "abcd" },
+        ])
+
+        orch = object.__new__(Orchestrator)
+        orch.backend = MagicMock()
+        orch.backend.sacct.return_value = raw
+        orch.job_spec = {"3": {"some": "spec"}}
+
+        with patch("canine.orchestrator.time.sleep"):
+            _, _, acct = orch.wait_for_jobs_to_finish(999, localizer=None)
+
+        row = acct.loc["999_3"]
+        assert row["State"] == "COMPLETED"
+        assert row["NodeList"] == "worker-final"  # chronologically last, not whichever row happened to be last in raw order
+        assert row["n_preempted"] == 1
+
+class TestAttemptSortKey:
+    """
+    _attempt_sort_key(), used to order a job's preemption/requeue attempts by
+    Start rather than Submit. Tested directly (not by driving the whole
+    wait_for_jobs_to_finish polling loop) since a still-PENDING/RUNNING
+    attempt is explicitly a non-terminal state (see the "job has completed"
+    check further down in wait_for_jobs_to_finish) -- routing one through the
+    full polling loop, which only returns once every job reaches a terminal
+    state, would just hang.
+    """
+
+    def test_unknown_and_dash_placeholders_sort_before_real_timestamps(self):
+        from canine.orchestrator import _attempt_sort_key
+        col = pd.Series(["2026-01-01T00:00:05", "Unknown", "-", "2026-01-01T00:00:01"])
+        key = _attempt_sort_key(col)
+        assert list(key) == ["2026-01-01T00:00:05", "", "", "2026-01-01T00:00:01"]
+        sorted_index = list(key.sort_values().index)
+        assert set(sorted_index[:2]) == {1, 2}  # both placeholders sort first, in either relative order
+        assert sorted_index[2:] == [3, 0]  # then real timestamps, in chronological order
+
 
 class TestQuerySacctForNodes:
     """
