@@ -60,7 +60,7 @@ def _b64_to_hex(value, algorithm):
     return binascii.hexlify(raw).decode()
 
 
-def extract_content_checksum(headers):
+def extract_content_checksum(headers, body_is_compressed = False):
     """
     Find a content checksum in HTTP response headers that can be verified against the
     downloaded file. Returns `(algorithm, hex_digest)`, or `(None, None)`.
@@ -72,13 +72,22 @@ def extract_content_checksum(headers):
       * `x-amz-checksum-<algo>: <base64>`  — S3
       * `etag: "<32 hex>"`                 — only when it is a bare hex md5
 
-    A digest is deliberately *not* returned when the response is content-encoded: the
-    digest then covers the encoded bytes while the file lands decoded, so gating on it
-    would fail on every correct download. This is the gzip decompressive-transcoding
-    case, where checksums cannot validate the localized file at all.
+    A content-encoded response needs care, because the digest covers the *encoded* bytes:
+
+      * `body_is_compressed=False` (the default) means the caller intends the localized
+        file to be the decoded bytes, so the digest describes something other than what
+        lands on disk and gating on it would fail every correct download. None is
+        returned.
+      * `body_is_compressed=True` means the caller is keeping the body as received --
+        downloading the compressed bytes and verifying before any decompression, which is
+        the pattern `gcloud storage cp` uses for gzip objects. The digest then covers
+        exactly the bytes being verified, so it is returned.
+
+    Confirmed against a real gzip-stored GCS object: its `x-goog-hash` md5 equals its
+    ETag, and both cover the stored (compressed) bytes.
     """
     encoding = headers.get("content-encoding", "").strip().lower()
-    if encoding and encoding != "identity":
+    if encoding and encoding != "identity" and not body_is_compressed:
         return None, None
 
     candidates = {}
@@ -215,6 +224,7 @@ def _pdl_command(
     work_dirs=(),
     url_expr=None,
     env_prefix="",
+    gunzip=False,
 ):
     """
     Emit the lines that download one object with the parallel downloader, falling back
@@ -256,6 +266,14 @@ def _pdl_command(
 
     for header in headers or ():
         arguments += ["--header", shlex.quote(str(header))]
+
+    if gunzip:
+        # Ask for the stored bytes explicitly and keep them compressed until verified.
+        # This is the pattern gcloud storage cp uses: decompressing in flight would change
+        # the byte count mid-transfer, which makes ranged and resumable downloads
+        # impossible -- the same reason the chunked writer cannot consume a decoded stream.
+        arguments += ["--header", shlex.quote("Accept-Encoding: gzip")]
+        arguments += ["--gunzip"]
 
     if s3:
         arguments += ["--s3-bucket", shlex.quote(str(s3["bucket"]))]
@@ -418,9 +436,10 @@ class FileType(abc.ABC):
         Fetch response headers for `self.url` once and record both the size and any
         verifiable content checksum.
 
-        Sets `self._size` and `self.content_checksum` — a `(algorithm, hex_digest)`
-        tuple, `(None, None)` when the server advertises nothing usable. Raises
-        ValueError if no Content-Length is available, matching prior behaviour.
+        Sets `self._size` (the number of bytes that will cross the wire),
+        `self.body_is_compressed`, and `self.content_checksum` — a
+        `(algorithm, hex_digest)` tuple, `(None, None)` when nothing usable is
+        advertised. Raises ValueError if no size can be determined.
 
         Deliberately separate from `hash`/`_get_hash()`: those identify the *input*
         (and for URL handlers are derived from the URL, precisely because the server
@@ -433,14 +452,35 @@ class FileType(abc.ABC):
         )
         headers = parse_header_block(resp.stdout.decode(errors = "replace"))
 
-        if "content-length" not in headers:
+        # A gzip-stored GCS object sends its body compressed, and then reports no
+        # Content-Length at all -- the size lives in x-goog-stored-content-length
+        # instead. Confirmed against a real object: both a plain request and one with
+        # `Accept-Encoding: gzip` return identical headers with no content-length.
+        # Requiring content-length therefore made such objects unlocalizable through
+        # this handler, which is why the fallback is not merely a nicety. (The original
+        # pre-conversion code failed on them too: its `grep -i Content-Length` did match
+        # the x-goog- header, but the regex applied to it was anchored, so the match
+        # failed and the bare `except` turned it into this same error.)
+        self.body_is_compressed = "gzip" in (
+            headers.get("content-encoding", "").lower().split(",")
+        )
+
+        size = headers.get("content-length")
+        if size is None:
+            size = headers.get("x-goog-stored-content-length")
+        if size is None:
             raise ValueError("Could not get file header size")
         try:
-            self._size = int(headers["content-length"])
+            self._size = int(size)
         except ValueError:
             raise ValueError("Could not get file header size")
 
-        self.content_checksum = extract_content_checksum(headers)
+        # When the body arrives compressed and is stored that way, the advertised digest
+        # covers exactly the bytes that land on disk, so it is usable. Verified on a real
+        # object: its x-goog-hash md5 equals its ETag, both over the stored bytes.
+        self.content_checksum = extract_content_checksum(
+            headers, body_is_compressed = self.body_is_compressed
+        )
 
         if self.check_hash and self.content_checksum[0] is None:
             canine_logging.warning(
@@ -512,6 +552,7 @@ class FileType(abc.ABC):
             etag = part_length = None
             downloader_verifies = md5 is not None
 
+        gunzip = bool(getattr(self, "body_is_compressed", False))
         lines = _pdl_command(
             url if url is not None else getattr(self, "url", None),
             self.localized_path,
@@ -527,6 +568,7 @@ class FileType(abc.ABC):
             min_chunk=self.download_min_chunk,
             url_expr=url_expr,
             env_prefix=env_prefix,
+            gunzip=gunzip,
         )
         lines = with_prefix(lines)
         if not downloader_verifies:
@@ -537,6 +579,9 @@ class FileType(abc.ABC):
         """
         Request headers the downloader must send. Overridden where a handler needs an
         auth header; the base case sends none.
+
+        Note the Accept-Encoding header for a compressed body is added by _pdl_command
+        alongside --gunzip, so the two cannot get out of step.
         """
         return ()
 

@@ -2235,6 +2235,51 @@ def single_stream_fallback(options, reason):
 # orchestration
 # --------------------------------------------------------------------------------
 
+def gunzip_to(source, dest):
+    """
+    Decompress `source` into `dest`, resumable-by-restart.
+
+    Written to a temp name, fsynced, then atomically renamed, so a preemption mid-decompress
+    leaves either no output or complete output -- never a half-decompressed file that a
+    later run might mistake for finished. The compressed source is already verified by the
+    time this runs, so a re-run repeats only the decompression and never the download.
+
+    This is the same shape as Route C's publish step: verify the staged bytes, then
+    transform them into the destination, then write the marker.
+    """
+    import gzip
+
+    tmp = dest + ".k9pdl.gz.part"
+    written = 0
+    try:
+        with gzip.open(source, "rb") as compressed:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+            try:
+                while True:
+                    block = compressed.read(READ_BUFFER)
+                    if not block:
+                        break
+                    view = memoryview(block)
+                    while view:
+                        count = os.write(fd, view)
+                        if count <= 0:
+                            raise OSError("write returned {}".format(count))
+                        written += count
+                        view = view[count:]
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+    except (OSError, EOFError, gzip.BadGzipFile) as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise PermanentError("could not decompress {}: {}".format(source, e))
+
+    os.rename(tmp, dest)
+    return written
+
+
 def open_destination(dest, size):
     """
     Create the working file sparse at its final size.
@@ -2339,19 +2384,39 @@ def run(options):
     if not seek_hole:
         log("SEEK_HOLE unsupported here; checkpointing instead of frontier recovery")
 
+    # With --gunzip the transfer target is a compressed sidecar, not dest: the advertised
+    # checksum covers the compressed bytes, so they must be verified before anything is
+    # decompressed. Same ordering as Route C -- verify what was received, then transform.
+    target = dest + ".k9pdl.gz" if options.gunzip else dest
+    target_manifest = sidecar_paths(target)[0] if options.gunzip else manifest_path
+
     status, manifest = download_to_local_file(
-        options, source, size, chunks, chunk_size, plan_id, dest, manifest_path,
+        options, source, size, chunks, chunk_size, plan_id, target, target_manifest,
         seek_hole,
     )
     if status != EXIT_OK:
         return status
 
     try:
-        digest = verify(dest, options)
+        digest = verify(target, options)
     except PermanentError as e:
         log("verification failed: {}".format(e))
-        discard(dest, manifest)
+        discard(target, manifest)
         return EXIT_FAIL
+
+    if options.gunzip:
+        try:
+            expanded = gunzip_to(target, dest)
+        except PermanentError as e:
+            log("{}".format(e))
+            discard(target, manifest)
+            return EXIT_FAIL
+        log("decompressed {} bytes into {} bytes".format(size, expanded))
+        # peak disk is compressed + decompressed; give the space back immediately
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
 
     write_done_marker(marker_path, size, plan_id, digest)
     if manifest is not None:
@@ -2495,6 +2560,9 @@ def build_parser():
                              "(repeatable, tried in order)")
     parser.add_argument("--legacy-cmd", dest="legacy_cmd",
                         help="command to run for the single-stream fallback")
+    parser.add_argument("--gunzip", action="store_true", dest="gunzip",
+                        help="the body arrives gzip-compressed: download and verify the "
+                             "compressed bytes, then decompress into --dest")
     parser.add_argument("--no-resume", action="store_true", dest="no_resume",
                         help="discard any existing partial file")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)

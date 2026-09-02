@@ -41,6 +41,11 @@ class ServerState:
         # That last part is why transcoding cannot be detected by looking for the encoding
         # header -- it is absent precisely when transcoding is happening.
         self.transcoding = False
+        # Mimic a gzip-STORED GCS object (cache-control: no-transform), verified against a
+        # real one: the body is served compressed with `content-encoding: gzip`, there is
+        # NO content-length at all, the size lives in x-goog-stored-content-length, and
+        # the x-goog-hash digests cover the stored bytes. Ranges are honoured normally.
+        self.stored_gzip = False
         self.throttle_bytes = None     # write in blocks of this size...
         self.throttle_delay = 0.0      # ...sleeping this long between them
         self.fail_next = 0             # return 500 for the next N requests
@@ -119,13 +124,22 @@ def make_handler(state):
 
             if state.support_range:
                 self.send_header("Accept-Ranges", "bytes")
+            if state.stored_gzip:
+                self.send_header("Content-Encoding", "gzip")
+                self.send_header("Cache-Control", "no-transform")
+                self.send_header("x-goog-stored-content-length", str(total))
+                self.send_header("x-goog-stored-content-encoding", "gzip")
             if state.content_md5:
                 self.send_header("Content-MD5", state.content_md5)
 
             limit = len(body) if state.drop_after is None else min(len(body), state.drop_after)
 
-            if not state.omit_content_length:
+            if not state.omit_content_length and not state.stored_gzip:
                 self.send_header("Content-Length", str(len(body)))
+            elif state.stored_gzip:
+                # the real service sends no content-length here, so the client must not
+                # be able to rely on one
+                self.close_connection = True
             self.end_headers()
 
             written = 0

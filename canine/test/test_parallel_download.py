@@ -1221,3 +1221,74 @@ class TestShelledOutCommandsRunUnderBash:
                                   "--min-chunk", MIB, "--legacy-cmd", legacy)
         assert proc.returncode == 0, proc.stdout + proc.stderr
         assert open(dest).read() == "works"
+
+
+class TestGunzip:
+    """
+    The decompression step. Same shape as Route C's publish: the compressed bytes are
+    verified first, then transformed into the destination, then the marker is written.
+    """
+
+    def test_round_trips(self, tmp_path):
+        import gzip
+        plain = os.urandom(3 * MIB) + b"tail"
+        source = str(tmp_path / "o.gz")
+        with open(source, "wb") as fh:
+            fh.write(gzip.compress(plain))
+        dest = str(tmp_path / "o.bin")
+        assert pdl.gunzip_to(source, dest) == len(plain)
+        assert open(dest, "rb").read() == plain
+
+    def test_leaves_no_partial_file_on_failure(self, tmp_path):
+        """
+        A truncated or non-gzip source must not leave a half-decompressed destination that
+        a later run could mistake for finished.
+        """
+        source = str(tmp_path / "bad.gz")
+        with open(source, "wb") as fh:
+            fh.write(b"this is not gzip data at all")
+        dest = str(tmp_path / "o.bin")
+        with pytest.raises(pdl.PermanentError):
+            pdl.gunzip_to(source, dest)
+        assert not os.path.exists(dest)
+        assert not os.path.exists(dest + ".k9pdl.gz.part")
+
+    def test_truncated_gzip_is_rejected(self, tmp_path):
+        import gzip
+        blob = gzip.compress(os.urandom(MIB))
+        source = str(tmp_path / "trunc.gz")
+        with open(source, "wb") as fh:
+            fh.write(blob[: len(blob) // 2])
+        dest = str(tmp_path / "o.bin")
+        with pytest.raises(pdl.PermanentError):
+            pdl.gunzip_to(source, dest)
+        assert not os.path.exists(dest)
+
+    def test_writes_via_a_temp_name_then_renames(self, tmp_path, monkeypatch):
+        """
+        Atomic publication is what makes the step resumable-by-restart: a preemption leaves
+        either no output or complete output.
+        """
+        import gzip
+        renames = []
+        real_rename = pdl.os.rename
+        monkeypatch.setattr(pdl.os, "rename",
+                            lambda a, b: (renames.append((a, b)), real_rename(a, b))[1])
+        source = str(tmp_path / "o.gz")
+        with open(source, "wb") as fh:
+            fh.write(gzip.compress(b"data" * 1000))
+        dest = str(tmp_path / "o.bin")
+        pdl.gunzip_to(source, dest)
+        assert renames and renames[-1][1] == dest
+        assert renames[-1][0].endswith(".k9pdl.gz.part")
+
+    def test_overwrites_an_existing_destination(self, tmp_path):
+        """A re-run after an interrupted decompress must not append."""
+        import gzip
+        source = str(tmp_path / "o.gz")
+        with open(source, "wb") as fh:
+            fh.write(gzip.compress(b"new"))
+        dest = tmp_path / "o.bin"
+        dest.write_bytes(b"stale and longer")
+        pdl.gunzip_to(source, str(dest))
+        assert dest.read_bytes() == b"new"

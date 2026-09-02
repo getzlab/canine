@@ -1044,3 +1044,187 @@ class TestAWSFallbackIsResumable:
         assert sp.run(["sh", "-n"], input=script, text=True,
                       capture_output=True).returncode != 0, \
             "expected this to be bash-only; if sh accepts it the comment is wrong"
+
+
+# ---------------------------------------------------------------------------
+# gzip-stored objects (verified against a real GCS object)
+# ---------------------------------------------------------------------------
+
+# Headers copied from a real gzip-stored reference file in a Getz Lab bucket. The
+# significant parts: content-encoding: gzip is PRESENT, there is NO content-length at all,
+# the size lives in x-goog-stored-content-length, the x-goog-hash md5 equals the ETag (both
+# over the stored bytes), and ranges are accepted. Both a plain request and one with
+# Accept-Encoding: gzip returned byte-identical headers.
+STORED_GZIP_SIZE = 6266373
+STORED_GZIP_MD5 = "853f4cd545dcefd9a537546f82bd6d2a"
+STORED_GZIP_HEADERS = (
+    b"HTTP/2 200 \r\n"
+    b"content-type: text/plain; charset=us-ascii\r\n"
+    b"cache-control: no-transform\r\n"
+    b'etag: "' + STORED_GZIP_MD5.encode() + b'"\r\n'
+    b"x-goog-stored-content-encoding: gzip\r\n"
+    b"x-goog-stored-content-length: " + str(STORED_GZIP_SIZE).encode() + b"\r\n"
+    b"content-encoding: gzip\r\n"
+    b"x-goog-hash: crc32c=cYnNEg==\r\n"
+    b"x-goog-hash: md5=hT9M1UXc79mlN1Rvgr1tKg==\r\n"
+    b"accept-ranges: bytes\r\n"
+    b"\r\n"
+)
+
+
+class TestStoredGzipObject:
+
+    def _handler(self, **kwargs):
+        class Fake:
+            stdout = STORED_GZIP_HEADERS
+
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run",
+                   return_value=Fake()):
+            return fh.get_file_handler(URLS["gcs_signed"], **kwargs)
+
+    def test_does_not_raise_without_a_content_length(self):
+        """
+        Regression for a real, pre-existing failure: such an object has no
+        content-length, so requiring one made it unlocalizable through this handler. The
+        original code failed too -- its grep matched x-goog-stored-content-length but the
+        regex it then applied was anchored, so the match failed and the bare except turned
+        it into the same error.
+        """
+        assert self._handler(check_md5=True).size == STORED_GZIP_SIZE
+
+    def test_size_is_the_compressed_length(self):
+        """
+        That is what crosses the wire, so it is what the chunk plan and range requests must
+        be built from. The decompressed length is a separate quantity, used for disk sizing.
+        """
+        assert self._handler().size == STORED_GZIP_SIZE
+
+    def test_body_is_recognized_as_compressed(self):
+        assert self._handler().body_is_compressed is True
+
+    def test_the_advertised_digest_is_used(self):
+        """
+        It covers the stored bytes, which are exactly what gets verified before any
+        decompression -- confirmed by the md5 equalling the ETag on the real object.
+        """
+        assert self._handler(check_md5=True).content_checksum == ("md5", STORED_GZIP_MD5)
+
+    def test_raw_bytes_are_requested_explicitly(self):
+        """
+        Decompressing in flight would change the byte count mid-transfer, which makes
+        ranged and resumable downloads impossible -- the same reason gcloud storage cp
+        sets do_not_decompress for these objects.
+        """
+        script = self._handler(check_md5=True).localization_command(DEST)
+        assert "--header 'Accept-Encoding: gzip'" in script
+
+    def test_decompression_is_requested(self):
+        script = self._handler(check_md5=True).localization_command(DEST)
+        assert "--gunzip" in script
+
+    def test_verification_is_handed_to_the_downloader(self):
+        """It must verify the compressed bytes before decompressing them."""
+        script = self._handler(check_md5=True).localization_command(DEST)
+        assert "--check-md5 " + STORED_GZIP_MD5 in script
+        assert "md5sum" not in script
+
+    def test_a_plain_object_asks_for_neither(self):
+        plain = (b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n"
+                 b"Content-MD5: " + EMPTY_MD5_B64.encode() + b"\r\n\r\n")
+
+        class Fake:
+            stdout = plain
+
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run",
+                   return_value=Fake()):
+            handler = fh.get_file_handler(URLS["gcs_signed"], check_md5=True)
+        script = handler.localization_command(DEST)
+        assert "--gunzip" not in script
+        assert "Accept-Encoding" not in script
+
+    def test_is_valid_bash(self):
+        script = self._handler(check_md5=True).localization_command(DEST)
+        result = bash_ok(script)
+        assert result.returncode == 0, result.stderr
+        assert bash_ok(debug_sh_transform(script)).returncode == 0
+
+
+class TestGzipEndToEnd:
+
+    def test_downloads_verifies_and_decompresses(self, tmp_path):
+        """
+        The whole chain against a server that reproduces the real object's headers:
+        parallel download of the compressed bytes, verify against the stored md5,
+        decompress into dest.
+        """
+        import base64
+        import gzip
+        import hashlib
+
+        plain = b"@HD\tVN:1.6\n" + b"@SQ\tSN:chr1\tLN:248956422\n" * 40000
+        blob = gzip.compress(plain)
+        md5_b64 = base64.b64encode(hashlib.md5(blob).digest()).decode()
+
+        with Server(blob) as server:
+            server.state.stored_gzip = True
+            headers = (
+                "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                "x-goog-stored-content-length: {}\r\n"
+                "x-goog-hash: md5={}\r\n\r\n".format(len(blob), md5_b64)
+            ).encode()
+
+            class Fake:
+                stdout = headers
+
+            with patch("os.path.exists", return_value=False), \
+                 patch("canine.localization.file_handlers.subprocess.run",
+                       return_value=Fake()):
+                handler = fh.get_file_handler(
+                    server.url("gencode.dict"), check_md5=True,
+                    download_min_chunk=MIB, download_connections=4,
+                )
+            dest = str(tmp_path / "gencode.dict")
+            script = "#!/bin/bash\nset -e\n" + handler.localization_command(dest) + "\n"
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == plain, "destination is not the decompressed data"
+        assert not os.path.exists(dest + ".k9pdl.gz"), \
+            "compressed sidecar not cleaned up; peak disk stays doubled"
+
+    def test_a_corrupt_compressed_body_is_caught_before_decompression(self, tmp_path):
+        """
+        Verification happens on the compressed bytes, so a bad download must fail without
+        producing a destination file at all.
+        """
+        import gzip
+
+        blob = gzip.compress(b"payload" * 10000)
+        with Server(blob) as server:
+            server.state.stored_gzip = True
+            headers = (
+                "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                "x-goog-stored-content-length: {}\r\n"
+                "x-goog-hash: md5=AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n".format(len(blob))
+            ).encode()
+
+            class Fake:
+                stdout = headers
+
+            with patch("os.path.exists", return_value=False), \
+                 patch("canine.localization.file_handlers.subprocess.run",
+                       return_value=Fake()):
+                handler = fh.get_file_handler(
+                    server.url("o.dict"), check_md5=True, download_min_chunk=MIB,
+                    download_connections=2,
+                )
+            dest = str(tmp_path / "o.dict")
+            script = "#!/bin/bash\nset -e\n" + handler.localization_command(dest) + "\n"
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+
+        assert result.returncode != 0
+        assert not os.path.exists(dest), "wrote a destination despite failing verification"
