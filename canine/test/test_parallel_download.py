@@ -1239,14 +1239,33 @@ class TestGunzip:
         assert pdl.gunzip_to(source, dest) == len(plain)
         assert open(dest, "rb").read() == plain
 
-    def test_leaves_no_partial_file_on_failure(self, tmp_path):
+    def test_bytes_that_are_not_gzip_are_kept_rather_than_failing(self, tmp_path):
         """
-        A truncated or non-gzip source must not leave a half-decompressed destination that
-        a later run could mistake for finished.
+        A bad gzip HEADER means the server advertised Content-Encoding: gzip over bytes
+        that are not gzip -- its metadata is wrong, which is not a reason to fail the
+        localization. The stored bytes are the object.
+
+        Distinguished from truncation, which is a broken transfer and does still fail:
+        a bad header raises BadGzipFile, a truncated body raises EOFError.
         """
         source = str(tmp_path / "bad.gz")
         with open(source, "wb") as fh:
             fh.write(b"this is not gzip data at all")
+        dest = str(tmp_path / "o.bin")
+        pdl.gunzip_to(source, dest)
+        assert open(dest, "rb").read() == b"this is not gzip data at all"
+        assert not os.path.exists(dest + ".k9pdl.gz.part")
+
+    def test_a_truncated_transfer_still_fails(self, tmp_path):
+        """
+        The other half of that split. A valid header with an incomplete body is a broken
+        download, not mislabelled metadata, and must not be accepted.
+        """
+        import gzip
+        blob = gzip.compress(b"payload" * 2000)
+        source = str(tmp_path / "trunc.gz")
+        with open(source, "wb") as fh:
+            fh.write(blob[: len(blob) // 2])
         dest = str(tmp_path / "o.bin")
         with pytest.raises(pdl.PermanentError):
             pdl.gunzip_to(source, dest)
@@ -1292,3 +1311,247 @@ class TestGunzip:
         dest.write_bytes(b"stale and longer")
         pdl.gunzip_to(source, str(dest))
         assert dest.read_bytes() == b"new"
+
+
+class TestDoublyCompressedGzipNames:
+    """
+    A file whose name already promises gzip content, served with Content-Encoding: gzip,
+    is ambiguous -- two different situations produce it:
+
+      * gzipped TWICE: a .gz additionally encoded for transport, so removing one layer
+        yields the original uploaded .gz;
+      * gzipped ONCE with the content-encoding metadata set by mistake (a common slip when
+        uploading an already-compressed file), so the stored bytes ALREADY are that .gz and
+        decompressing would leave plain data in a file called .gz.
+
+    Distinguished by whether one layer of decoding yields gzip. The invariant either way:
+    the localized file matches what its name says.
+    """
+
+    VCF = b"##fileformat=VCFv4.2\n" + b"chr1\t1\t.\tA\tT\t.\t.\t.\n" * 500
+
+    @staticmethod
+    def _write(tmp_path, data, name="s.gz"):
+        path = str(tmp_path / name)
+        with open(path, "wb") as fh:
+            fh.write(data)
+        return path
+
+    def test_doubly_compressed_keeps_one_layer(self, tmp_path):
+        import gzip
+        source = self._write(tmp_path, gzip.compress(gzip.compress(self.VCF)))
+        dest = str(tmp_path / "d.vcf.gz")
+        pdl.gunzip_to(source, dest)
+        assert open(dest, "rb").read() == gzip.compress(self.VCF)
+        assert open(dest, "rb").read(2) == pdl.GZIP_MAGIC
+
+    def test_singly_compressed_with_a_gzip_name_keeps_the_stored_bytes(self, tmp_path):
+        """
+        Decompressing here would produce plain data in a file named .gz -- the outcome a
+        downstream `gzip -d` would choke on.
+        """
+        import gzip
+        stored = gzip.compress(self.VCF)
+        source = self._write(tmp_path, stored)
+        dest = str(tmp_path / "d.vcf.gz")
+        pdl.gunzip_to(source, dest)
+        assert open(dest, "rb").read() == stored
+
+    def test_a_non_gzip_name_is_always_decompressed(self, tmp_path):
+        import gzip
+        source = self._write(tmp_path, gzip.compress(self.VCF))
+        dest = str(tmp_path / "d.vcf")
+        pdl.gunzip_to(source, dest)
+        assert open(dest, "rb").read() == self.VCF
+
+    def test_a_doubly_compressed_non_gzip_name_still_removes_one_layer(self, tmp_path):
+        """
+        One Content-Encoding means one decode, regardless of what the result looks like.
+        The extension check only resolves the ambiguity for .gz-named files.
+        """
+        import gzip
+        source = self._write(tmp_path, gzip.compress(gzip.compress(self.VCF)))
+        dest = str(tmp_path / "d.vcf")
+        pdl.gunzip_to(source, dest)
+        assert open(dest, "rb").read() == gzip.compress(self.VCF)
+
+    @pytest.mark.parametrize("name", [
+        "a.gz", "a.BGZ", "a.tgz", "a.gzip", "a.vcf.gz",
+        # gzip is only one case: BGZF is a gzip container by design, so these are all
+        # gzip-magic. Omitting them was the bug -- a .bam served with
+        # Content-Encoding: gzip would have been decompressed into a raw BAM stream,
+        # which samtools cannot read. Verified against bcftools output.
+        "s.bam", "s.bai", "x.bcf", "i.tbi", "j.csi",
+    ])
+    def test_gzip_family_names(self, name):
+        assert pdl.expected_magic(name) == pdl.GZIP_MAGIC
+
+    @pytest.mark.parametrize("name,magic", [
+        ("a.bz2", b"BZh"), ("a.xz", b"\xfd7zXZ\x00"), ("a.zst", b"\x28\xb5\x2f\xfd"),
+        ("a.zip", b"PK"), ("a.cram", b"CRAM"),
+    ])
+    def test_other_compressed_names_expect_their_own_magic(self, name, magic):
+        """
+        The generalization: the name says what the DECODED bytes should be, and gzip is
+        just one possibility. A .bz2 wrapped in transport gzip decodes to bz2, not gzip.
+        """
+        assert pdl.expected_magic(name) == magic
+
+    @pytest.mark.parametrize("name", ["a.vcf", "a.fa", "a.dict", "a.sam", "a.gz.txt",
+                                      "gz", "a.tar", "a.bed"])
+    def test_names_implying_plain_content(self, name):
+        assert pdl.expected_magic(name) is None
+
+    def test_no_temporary_files_are_left_either_way(self, tmp_path):
+        """
+        The partially-decoded temp must never survive. The compressed source may -- its
+        lifecycle belongs to the caller, which unlinks it after a successful decode (and
+        in the singly-compressed branch it has already been moved into place).
+        """
+        import gzip
+        for label, data in [("single", gzip.compress(self.VCF)),
+                            ("double", gzip.compress(gzip.compress(self.VCF)))]:
+            directory = tmp_path / label
+            directory.mkdir()
+            source = self._write(directory, data)
+            dest = str(directory / "d.vcf.gz")
+            pdl.gunzip_to(source, dest)
+            remaining = sorted(p.name for p in directory.iterdir())
+            assert not any(n.endswith(".part") for n in remaining), remaining
+            assert "d.vcf.gz" in remaining
+
+    def test_the_magic_tables_are_in_step(self):
+        """
+        parallel_download.py must not import canine, so the table is duplicated in
+        file_handlers. If they drifted, the emitted fallback and the downloader would
+        disagree about which files are ambiguous -- reintroducing exactly the
+        route-dependent difference that decompressing on every path exists to prevent.
+        """
+        from canine.localization import file_handlers as fh
+        assert pdl.NAMED_FORMAT_MAGIC == fh.NAMED_FORMAT_MAGIC
+
+    def test_both_sides_agree_on_specific_names(self):
+        from canine.localization import file_handlers as fh
+        for name in ("s.bam", "x.bcf", "a.vcf.gz", "p.vcf", "z.bz2", "c.cram"):
+            assert pdl.expected_magic(name) == fh.expected_magic(name), name
+
+
+class TestNamedFormatsAreNotWronglyDecoded:
+    """
+    The generalization of the .gz rule: the filename says what the DECODED bytes should
+    be, and gzip is only one possibility. Several formats here are gzip containers by
+    design -- BGZF backs .bam, .bcf and the .bai/.tbi/.csi indices -- so a gzip-only list
+    would decompress a .bam into a raw BAM stream that samtools cannot read.
+    """
+
+    @staticmethod
+    def _localize(tmp_path, stored, name):
+        source = str(tmp_path / "src")
+        with open(source, "wb") as fh:
+            fh.write(stored)
+        dest = str(tmp_path / name)
+        pdl.gunzip_to(source, dest)
+        return open(dest, "rb").read()
+
+    def test_a_bam_stored_as_bgzf_is_not_decompressed(self, tmp_path):
+        """
+        The case the gzip-only list got wrong. A .bam IS BGZF, so the stored bytes already
+        are the object; decoding would leave an unreadable raw stream in a .bam.
+        """
+        import gzip
+        bgzf = gzip.compress(b"BAM\x01" + b"\x00" * 500)
+        assert self._localize(tmp_path, bgzf, "s.bam") == bgzf
+
+    def test_a_double_wrapped_bam_loses_one_layer(self, tmp_path):
+        import gzip
+        bgzf = gzip.compress(b"BAM\x01" + b"\x00" * 500)
+        assert self._localize(tmp_path, gzip.compress(bgzf), "s.bam") == bgzf
+
+    def test_a_double_wrapped_bz2_yields_the_bz2(self, tmp_path):
+        """
+        Shows why a gzip-only magic check is insufficient: the decoded bytes here are bz2,
+        not gzip, yet they are exactly what the name promises.
+        """
+        import bz2
+        import gzip
+        payload = bz2.compress(b"data" * 500)
+        assert self._localize(tmp_path, gzip.compress(payload), "s.bz2") == payload
+
+    def test_a_singly_compressed_bz2_keeps_the_stored_bytes(self, tmp_path):
+        """gzip decoding fails outright here, and the stored bytes are the object."""
+        import bz2
+        payload = bz2.compress(b"data" * 500)
+        assert self._localize(tmp_path, payload, "s.bz2") == payload
+
+    def test_bytes_that_are_not_gzip_at_all_are_kept(self, tmp_path):
+        """
+        A server can advertise Content-Encoding: gzip over bytes that are not gzip. That is
+        the server's metadata being wrong, not a reason to fail the localization.
+        """
+        assert self._localize(tmp_path, b"plain text, not gzip", "s.vcf") == \
+            b"plain text, not gzip"
+
+    def test_a_plain_name_is_still_decoded(self, tmp_path):
+        import gzip
+        payload = b"##fileformat=VCFv4.2\n" * 100
+        assert self._localize(tmp_path, gzip.compress(payload), "s.vcf") == payload
+
+
+class TestColumnarAndArrayContainers:
+    """
+    parquet and HDF5 are used in these pipelines and are NOT gzip streams. They already
+    localized correctly before being listed, but only via the "advertised as gzip yet is
+    not gzip" fallback -- listing them makes the outcome explicit and tested rather than
+    incidental.
+
+    Their internal compression is a separate concern that must never be touched: parquet
+    compresses per column chunk and HDF5 has a per-dataset gzip filter, both inside the
+    container. Only a transport Content-Encoding is unwrapped.
+    """
+
+    PARQUET = b"PAR1" + b"\x00" * 2000 + b"PAR1"
+    HDF5 = b"\x89HDF\r\n\x1a\n" + b"\x00" * 2000
+
+    def _localize(self, tmp_path, stored, name):
+        source = str(tmp_path / "src")
+        with open(source, "wb") as fh:
+            fh.write(stored)
+        dest = str(tmp_path / name)
+        pdl.gunzip_to(source, dest)
+        return open(dest, "rb").read()
+
+    @pytest.mark.parametrize("name,magic", [
+        ("t.parquet", b"PAR1"), ("t.pq", b"PAR1"),
+        ("t.h5", b"\x89HDF\r\n\x1a\n"), ("t.hdf5", b"\x89HDF\r\n\x1a\n"),
+    ])
+    def test_recognized(self, name, magic):
+        assert pdl.expected_magic(name) == magic
+
+    def test_hdf4_extension_is_deliberately_not_claimed(self):
+        """HDF4 has a different signature, so `.hdf` alone is ambiguous."""
+        assert pdl.expected_magic("t.hdf") is None
+
+    @pytest.mark.parametrize("name,body", [("t.parquet", PARQUET), ("t.h5", HDF5)])
+    def test_a_mislabelled_container_is_kept_intact(self, tmp_path, name, body):
+        """
+        The likely real case: the object is uploaded as-is and the content-encoding
+        metadata is set by mistake. The bytes are not gzip at all, so they are kept.
+        """
+        assert self._localize(tmp_path, body, name) == body
+
+    @pytest.mark.parametrize("name,body", [("t.parquet", PARQUET), ("t.h5", HDF5)])
+    def test_a_transport_gzipped_container_is_unwrapped(self, tmp_path, name, body):
+        import gzip
+        assert self._localize(tmp_path, gzip.compress(body), name) == body
+
+    def test_internal_compression_is_untouched(self, tmp_path):
+        """
+        A parquet whose column chunks are gzip-compressed internally still localizes
+        byte-for-byte: only the transport layer is unwrapped, never the container's own
+        encoding.
+        """
+        import gzip
+        inner = gzip.compress(b"column chunk payload" * 50)
+        body = b"PAR1" + inner + b"PAR1"
+        assert self._localize(tmp_path, gzip.compress(body), "t.parquet") == body
+        assert self._localize(tmp_path, body, "t.parquet") == body

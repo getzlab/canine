@@ -2235,6 +2235,61 @@ def single_stream_fallback(options, reason):
 # orchestration
 # --------------------------------------------------------------------------------
 
+GZIP_MAGIC = b"\x1f\x8b"
+
+# What a filename promises the DECODED bytes will be.
+#
+# `.gz` is only one case. A name can imply any already-compressed format, and several
+# formats this stack handles are gzip streams by design: BGZF -- used by .bam, .bcf, and
+# the .bai/.tbi/.csi indices -- is a valid gzip container so that standard readers work,
+# verified locally (bcftools output begins 1f 8b). Leaving those off a gzip-only list is
+# what makes the naive version wrong: a .bam served with Content-Encoding: gzip would be
+# decompressed into a raw BAM stream, which is not a valid .bam at all.
+#
+# Necessarily incomplete -- an unlisted extension is treated as promising plain content,
+# which is the common case. Both error directions produce a file a downstream tool
+# rejects outright rather than silently wrong data.
+NAMED_FORMAT_MAGIC = (
+    ((".gz", ".gzip", ".z", ".tgz", ".taz", ".bgz", ".bgzf", ".svgz",
+      ".bam", ".bai", ".bcf", ".csi", ".tbi"), GZIP_MAGIC),
+    ((".bz2", ".tbz", ".tbz2"), b"BZh"),
+    ((".xz", ".txz"), b"\xfd7zXZ\x00"),
+    ((".zst", ".tzst"), b"\x28\xb5\x2f\xfd"),
+    ((".zip", ".jar", ".whl"), b"PK"),
+    ((".7z",), b"7z\xbc\xaf\x27\x1c"),
+    ((".cram",), b"CRAM"),
+    # Columnar/array containers that are NOT gzip streams. They already localized
+    # correctly without being listed, but only via the "advertised as gzip yet is not
+    # gzip" fallback -- listing them makes the outcome explicit and tested rather than
+    # incidental.
+    #
+    # Their INTERNAL compression is a separate matter and must never be touched: parquet
+    # compresses per column chunk (snappy/gzip/zstd) and HDF5 has a per-dataset gzip
+    # filter, both inside the container. Only a transport Content-Encoding is unwrapped
+    # here. .hdf is deliberately absent: HDF4 has a different signature, so the extension
+    # is ambiguous.
+    ((".parquet", ".pq"), b"PAR1"),
+    ((".h5", ".hdf5"), b"\x89HDF\r\n\x1a\n"),
+)
+
+
+def expected_magic(path):
+    """
+    The magic bytes `path`'s name implies its content should start with, or None when the
+    name implies plain (unencoded) content.
+    """
+    name = os.path.basename(path).lower()
+    for extensions, magic in NAMED_FORMAT_MAGIC:
+        if name.endswith(extensions):
+            return magic
+    return None
+
+
+def name_implies_gzip(path):
+    """Kept for callers that only care about the gzip family."""
+    return expected_magic(path) == GZIP_MAGIC
+
+
 def gunzip_to(source, dest):
     """
     Decompress `source` into `dest`, resumable-by-restart.
@@ -2246,6 +2301,21 @@ def gunzip_to(source, dest):
 
     This is the same shape as Route C's publish step: verify the staged bytes, then
     transform them into the destination, then write the marker.
+
+    One refinement when `dest`'s name already promises gzip content (.gz and friends).
+    Two very different things produce `Content-Encoding: gzip` on such an object:
+
+      * it was gzipped TWICE -- a .gz file additionally encoded for transport -- in which
+        case removing one layer yields the original uploaded .gz, which is what the name
+        promises;
+      * it was gzipped ONCE and the content-encoding metadata was set by mistake (a common
+        slip when uploading an already-compressed file), in which case the stored bytes
+        ALREADY are the .gz the name promises, and decompressing would leave decompressed
+        data in a file called .gz.
+
+    The two are distinguished by looking at what one layer of decompression yields: if it
+    is itself gzip, the object was doubly compressed. Either way the invariant holds --
+    the localized file matches what its name says.
     """
     import gzip
 
@@ -2269,12 +2339,43 @@ def gunzip_to(source, dest):
                 os.fsync(fd)
             finally:
                 os.close(fd)
-    except (OSError, EOFError, gzip.BadGzipFile) as e:
+    except gzip.BadGzipFile:
+        # The server advertised Content-Encoding: gzip over bytes that are not gzip. The
+        # stored bytes are therefore the object itself, mislabelled -- keep them rather
+        # than failing the localization over the server's metadata being wrong.
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        log("{} was advertised as gzip-encoded but is not gzip; keeping the bytes as "
+            "received".format(os.path.basename(source)))
+        os.replace(source, dest)
+        return os.path.getsize(dest)
+    except (OSError, EOFError) as e:
         try:
             os.unlink(tmp)
         except OSError:
             pass
         raise PermanentError("could not decompress {}: {}".format(source, e))
+
+    magic = expected_magic(dest)
+    if magic is not None:
+        with open(tmp, "rb") as decoded:
+            matches = decoded.read(len(magic)) == magic
+        if not matches:
+            # The decoded bytes are not the format this name promises, so the stored bytes
+            # already were that format and the content-encoding metadata was set on an
+            # object that was only compressed once. Keep the stored bytes.
+            log("{} is named for {} content but decoding did not produce it; the "
+                "content-encoding metadata is set on a singly-compressed object, so the "
+                "stored bytes are kept as-is".format(
+                    os.path.basename(dest), magic[:4]))
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            os.replace(source, dest)
+            return os.path.getsize(dest)
 
     os.rename(tmp, dest)
     return written

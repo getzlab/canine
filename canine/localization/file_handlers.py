@@ -160,6 +160,48 @@ PDL_EOF_SENTINEL = "# k9pdl-eof"
 # over-estimating costs permanent storage on a disk that only ever grows.
 GZIP_FALLBACK_RATIO = 5
 
+# What a filename promises the DECODED bytes will be. Mirrors
+# parallel_download.NAMED_FORMAT_MAGIC -- the two cannot import each other, since the
+# downloader must not import canine, so a test asserts they stay in step.
+#
+# `.gz` is only one case: several formats here are gzip streams by design (BGZF, used by
+# .bam/.bcf and the .bai/.tbi/.csi indices), and a name can imply any already-compressed
+# format.
+NAMED_FORMAT_MAGIC = (
+    ((".gz", ".gzip", ".z", ".tgz", ".taz", ".bgz", ".bgzf", ".svgz",
+      ".bam", ".bai", ".bcf", ".csi", ".tbi"), b"\x1f\x8b"),
+    ((".bz2", ".tbz", ".tbz2"), b"BZh"),
+    ((".xz", ".txz"), b"\xfd7zXZ\x00"),
+    ((".zst", ".tzst"), b"\x28\xb5\x2f\xfd"),
+    ((".zip", ".jar", ".whl"), b"PK"),
+    ((".7z",), b"7z\xbc\xaf\x27\x1c"),
+    ((".cram",), b"CRAM"),
+    # Columnar/array containers that are NOT gzip streams. They already localized
+    # correctly without being listed, but only via the "advertised as gzip yet is not
+    # gzip" fallback -- listing them makes the outcome explicit and tested rather than
+    # incidental.
+    #
+    # Their INTERNAL compression is a separate matter and must never be touched: parquet
+    # compresses per column chunk (snappy/gzip/zstd) and HDF5 has a per-dataset gzip
+    # filter, both inside the container. Only a transport Content-Encoding is unwrapped
+    # here. .hdf is deliberately absent: HDF4 has a different signature, so the extension
+    # is ambiguous.
+    ((".parquet", ".pq"), b"PAR1"),
+    ((".h5", ".hdf5"), b"\x89HDF\r\n\x1a\n"),
+)
+
+
+def expected_magic(path):
+    """
+    The magic bytes `path`'s name implies its content starts with, or None when the name
+    implies plain (unencoded) content.
+    """
+    name = os.path.basename(path).lower()
+    for extensions, magic in NAMED_FORMAT_MAGIC:
+        if name.endswith(extensions):
+            return magic
+    return None
+
 
 def _pdl_installed_path():
     """
@@ -606,21 +648,35 @@ class FileType(abc.ABC):
             sidecar = self.localized_path + ".k9pdl.gz"
             stages = [build_legacy(sidecar)]
             stages += self._hash_check_command(checksum, path = sidecar)
-            stages += [
-                "gunzip -c {sidecar} > {dest}".format(
-                    sidecar = sidecar, dest = self.localized_path),
-                "rm -f {sidecar}".format(sidecar = sidecar),
-            ]
-            legacy_cmd = " && ".join(stages)
 
-            if re.search(r"\.(gz|bgz|tgz)$", os.path.basename(self.path or "")):
-                canine_logging.warning(
-                    "{} is served with Content-Encoding: gzip and will be decompressed, "
-                    "but its name already ends in .gz -- if the intent was to deliver a "
-                    "compressed file, the object's content-encoding metadata is likely "
-                    "set by mistake and the localized file will not be what the name "
-                    "suggests.".format(self.path)
-                )
+            magic = expected_magic(self.path or "")
+            if magic is not None:
+                # The name promises an already-compressed format, which two different
+                # situations produce. Doubly wrapped (that format additionally encoded for
+                # transport): removing one layer yields the original upload. Singly
+                # compressed with the encoding metadata set by mistake: the stored bytes
+                # ALREADY are that format, and decoding would leave the wrong thing in a
+                # file whose name says otherwise -- a decompressed BAM in a .bam, say,
+                # which samtools cannot read. Distinguished by whether the decoded bytes
+                # actually start with the format's magic. Either way the localized file
+                # matches what its name says.
+                partial = self.localized_path + ".k9pdl.part"
+                stages += [
+                    "gunzip -c {sidecar} > {partial}".format(
+                        sidecar = sidecar, partial = partial),
+                    ("if [ \"$(od -An -N{n} -tx1 {partial} | tr -d ' \\n')\" = {hex} ]; "
+                     "then mv {partial} {dest}; "
+                     "else mv {sidecar} {dest}; rm -f {partial}; fi").format(
+                        n = len(magic), hex = magic.hex(),
+                        partial = partial, sidecar = sidecar,
+                        dest = self.localized_path),
+                ]
+            else:
+                stages += ["gunzip -c {sidecar} > {dest}".format(
+                    sidecar = sidecar, dest = self.localized_path)]
+
+            stages += ["rm -f {sidecar}".format(sidecar = sidecar)]
+            legacy_cmd = " && ".join(stages)
 
         if not self._use_parallel_download(url if url_expr is None else None):
             # The compressed pipeline verifies the sidecar itself, so a trailing gate here

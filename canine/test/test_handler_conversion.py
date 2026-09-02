@@ -1607,3 +1607,80 @@ class TestAllPathsProduceTheSameFile:
         assert url + "'" in script or "'{}'".format(url) in script, \
             "the URL was rewritten:\n" + script
         assert "o.vcf.k9pdl.gz'" not in script.replace("-o /d/o.vcf.k9pdl.gz", "")
+
+
+class TestFallbackHandlesDoubleCompression:
+    """
+    The emitted fallback must resolve the .gz-name ambiguity the same way the downloader
+    does, or the localized file would depend on which path ran.
+    """
+
+    VCF = b"##fileformat=VCFv4.2\n" + b"chr1\t1\t.\tA\tT\t.\t.\t.\n" * 800
+
+    def _localize(self, tmp_path, stored, name):
+        import hashlib
+
+        digest = hashlib.md5(stored).hexdigest()
+        with Server(stored) as server:
+            server.state.stored_gzip = True
+            headers = (
+                "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n"
+                "etag: \"{}\"\r\n\r\n".format(len(stored), digest)
+            ).encode()
+
+            class Fake:
+                stdout = headers
+
+            with patch("os.path.exists", return_value=False), \
+                 patch("canine.localization.file_handlers.subprocess.run",
+                       return_value=Fake()):
+                handler = fh.get_file_handler(server.url(name), check_md5=True,
+                                              parallel_download=False)
+            dest = str(tmp_path / name)
+            script = "#!/bin/bash\nset -e\n" + handler.localization_command(dest) + "\n"
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+        return result, dest
+
+    def test_doubly_compressed_yields_the_original_gz(self, tmp_path):
+        import gzip
+        result, dest = self._localize(
+            tmp_path, gzip.compress(gzip.compress(self.VCF)), "d.vcf.gz")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == gzip.compress(self.VCF)
+
+    def test_singly_compressed_gz_name_keeps_the_stored_bytes(self, tmp_path):
+        import gzip
+        stored = gzip.compress(self.VCF)
+        result, dest = self._localize(tmp_path, stored, "d.vcf.gz")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == stored
+
+    def test_a_plain_name_is_decompressed(self, tmp_path):
+        import gzip
+        result, dest = self._localize(tmp_path, gzip.compress(self.VCF), "d.vcf")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == self.VCF
+
+    def test_no_intermediate_files_are_left(self, tmp_path):
+        import gzip
+        result, dest = self._localize(tmp_path, gzip.compress(self.VCF), "d.vcf.gz")
+        assert result.returncode == 0
+        leftovers = [p.name for p in tmp_path.iterdir() if p.name != "d.vcf.gz"]
+        assert leftovers == [], leftovers
+
+    def test_the_conditional_is_valid_bash(self, tmp_path):
+        import gzip
+
+        class Fake:
+            stdout = (b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                      b"content-length: 100\r\n\r\n")
+
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run",
+                   return_value=Fake()):
+            handler = fh.get_file_handler("https://h/d/a.vcf.gz",
+                                          parallel_download=False)
+        script = handler.localization_command("/mnt/x y/a.vcf.gz")
+        assert bash_ok(script).returncode == 0, bash_ok(script).stderr
+        assert bash_ok(debug_sh_transform(script)).returncode == 0
