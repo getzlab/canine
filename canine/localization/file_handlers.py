@@ -60,7 +60,7 @@ def _b64_to_hex(value, algorithm):
     return binascii.hexlify(raw).decode()
 
 
-def extract_content_checksum(headers, body_is_compressed = False):
+def extract_content_checksum(headers, transcoded = False):
     """
     Find a content checksum in HTTP response headers that can be verified against the
     downloaded file. Returns `(algorithm, hex_digest)`, or `(None, None)`.
@@ -72,22 +72,23 @@ def extract_content_checksum(headers, body_is_compressed = False):
       * `x-amz-checksum-<algo>: <base64>`  — S3
       * `etag: "<32 hex>"`                 — only when it is a bare hex md5
 
-    A content-encoded response needs care, because the digest covers the *encoded* bytes:
+    A digest is usable exactly when the bytes that land on disk are the bytes it covers.
+    Advertised digests describe the *stored* representation, and nothing in this stack
+    decompresses in flight -- urllib does not, and `curl` without `--compressed` does not
+    -- so what is received is what is stored, and the digest normally applies.
 
-      * `body_is_compressed=False` (the default) means the caller intends the localized
-        file to be the decoded bytes, so the digest describes something other than what
-        lands on disk and gating on it would fail every correct download. None is
-        returned.
-      * `body_is_compressed=True` means the caller is keeping the body as received --
-        downloading the compressed bytes and verifying before any decompression, which is
-        the pattern `gcloud storage cp` uses for gzip objects. The digest then covers
-        exactly the bytes being verified, so it is returned.
+    The one exception is `transcoded=True`: the object is stored compressed but the server
+    decompressed it for us, so the digest covers bytes we never see. Gating on it would
+    fail every correct download. Callers detect that case and pass it in.
 
-    Confirmed against a real gzip-stored GCS object: its `x-goog-hash` md5 equals its
-    ETag, and both cover the stored (compressed) bytes.
+    Note a `Content-Encoding` header is NOT itself grounds for refusal, which an earlier
+    version of this got wrong. S3 does not transcode: it serves a gzip-stored object as
+    stored, with `Content-Encoding: gzip` and an ETag over those same bytes -- so the
+    digest is perfectly usable, and refusing it left S3 gzip objects unverifiable for no
+    reason. Confirmed on a real gzip-stored GCS object too: its `x-goog-hash` md5 equals
+    its ETag, both over the stored bytes.
     """
-    encoding = headers.get("content-encoding", "").strip().lower()
-    if encoding and encoding != "identity" and not body_is_compressed:
+    if transcoded:
         return None, None
 
     candidates = {}
@@ -446,25 +447,60 @@ class FileType(abc.ABC):
         cannot be trusted to name the content), whereas this is a digest of the bytes
         used to verify a completed download.
         """
+        # Probe with the same Accept-Encoding the download will send, so what is measured
+        # is what will actually be fetched. urllib sets `Accept-Encoding: identity` on
+        # every request (verified), whereas curl sends no such header by default -- and
+        # per RFC 9110 those are not equivalent: omitting the header means any coding is
+        # acceptable, so a server may legitimately compress, while `identity` asks it not
+        # to. Left unmatched, the probe could describe a compressed representation whose
+        # size and digest we then compare against uncompressed bytes.
         resp = subprocess.run(
-          "curl -sIL {args} {url}".format(args = curl_args, url = shlex.quote(self.url)),
+          "curl -sIL -H 'Accept-Encoding: identity' {args} {url}".format(
+            args = curl_args, url = shlex.quote(self.url)
+          ),
           shell = True, capture_output = True
         )
         headers = parse_header_block(resp.stdout.decode(errors = "replace"))
 
-        # A gzip-stored GCS object sends its body compressed, and then reports no
-        # Content-Length at all -- the size lives in x-goog-stored-content-length
-        # instead. Confirmed against a real object: both a plain request and one with
-        # `Accept-Encoding: gzip` return identical headers with no content-length.
-        # Requiring content-length therefore made such objects unlocalizable through
-        # this handler, which is why the fallback is not merely a nicety. (The original
+        # Whether to decompress after downloading is decided ONLY on positive,
+        # GCS-specific evidence that the stored object is gzip and the stored bytes are
+        # what is being served: `x-goog-stored-content-encoding`. That is the case
+        # measured against a real object, and the only one whose semantics we know.
+        #
+        # Deliberately NOT keyed on `Content-Encoding: gzip` alone. A generic server can
+        # send that alongside a normal Content-Length, and the historical behavior for
+        # such a URL is that `curl -C - -o` (no `--compressed`) writes the bytes as
+        # received -- so the localized file has always been the compressed one. Treating
+        # the header alone as a decompress signal would silently change what lands on
+        # disk for those inputs, which is exactly the kind of change that breaks a
+        # pipeline mysteriously. Widening this needs its own evidence.
+        received_encoded = "gzip" in [
+            part.strip() for part in headers.get("content-encoding", "").lower().split(",")
+        ]
+        stored_encoded = "gzip" in [
+            part.strip()
+            for part in headers.get("x-goog-stored-content-encoding", "").lower().split(",")
+        ]
+
+        # Both signals present: the object is stored gzip AND the stored bytes are what is
+        # being served, so decompressing afterwards yields the logical content. This is
+        # what was measured on a real object, and the only combination whose semantics are
+        # established.
+        self.body_is_compressed = received_encoded and stored_encoded
+
+        # Stored compressed but served decompressed -- the digest covers bytes we never
+        # see, so it cannot be used. This is the only case where a digest must be refused.
+        transcoded = stored_encoded and not received_encoded
+
+        # Content-Length first: it is the standard header and most servers send it, gzip
+        # or not (and per RFC 9110 it describes the encoded body, which is what crosses
+        # the wire -- exactly what the chunk plan needs). The x-goog- fallback exists
+        # because a gzip-stored GCS object sends no Content-Length at all, on either a
+        # plain request or one with `Accept-Encoding: gzip`. Requiring Content-Length
+        # made such objects unlocalizable through this handler. (The original
         # pre-conversion code failed on them too: its `grep -i Content-Length` did match
         # the x-goog- header, but the regex applied to it was anchored, so the match
         # failed and the bare `except` turned it into this same error.)
-        self.body_is_compressed = "gzip" in (
-            headers.get("content-encoding", "").lower().split(",")
-        )
-
         size = headers.get("content-length")
         if size is None:
             size = headers.get("x-goog-stored-content-length")
@@ -475,12 +511,10 @@ class FileType(abc.ABC):
         except ValueError:
             raise ValueError("Could not get file header size")
 
-        # When the body arrives compressed and is stored that way, the advertised digest
-        # covers exactly the bytes that land on disk, so it is usable. Verified on a real
-        # object: its x-goog-hash md5 equals its ETag, both over the stored bytes.
-        self.content_checksum = extract_content_checksum(
-            headers, body_is_compressed = self.body_is_compressed
-        )
+        # When the body is kept compressed until verified, the advertised digest covers
+        # exactly the bytes being checked, so it is usable. Verified on a real object: its
+        # x-goog-hash md5 equals its ETag, both over the stored bytes.
+        self.content_checksum = extract_content_checksum(headers, transcoded = transcoded)
 
         if self.check_hash and self.content_checksum[0] is None:
             canine_logging.warning(
@@ -1553,10 +1587,23 @@ class HandleOtherURL(FileType):
         super().__init__(path, **kwargs)
         
         self.url = self.path
-        url_parse = re.match("(?:http|https|ftp)://.*\/(.*)$", self.url)
-        if url_parse is None:
+        split = urllib.parse.urlsplit(self.url)
+        if split.scheme not in ("http", "https", "ftp") or not split.netloc:
             raise ValueError(f"URL {self.url} format not recognized")
-        self.path = url_parse[1]
+
+        # The filename comes from the URL *path* only, with the query string dropped.
+        # The previous regex took everything after the last "/", which for any signed URL
+        # swept the whole query in: an S3 SigV4 URL localized to a file literally named
+        # `sample.bam?X-Amz-Algorithm=...&X-Amz-Signature=...`. Three things go wrong with
+        # that -- such a name usually exceeds the 255-byte limit, the signature changes on
+        # every attempt so the name is not stable, and an unstable basename also changes
+        # the localization disk's name hash and so defeats disk reuse. HandleGCSSignedURL
+        # already stripped the query for the same reason; this brings the generic handler
+        # into line.
+        name = os.path.basename(split.path.rstrip("/"))
+        if not name:
+            raise ValueError(f"URL {self.url} format not recognized")
+        self.path = name
         self.localized_path = self.path
 
         # get file size and any advertised content checksum from server

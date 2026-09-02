@@ -1170,7 +1170,10 @@ class TestGzipEndToEnd:
         with Server(blob) as server:
             server.state.stored_gzip = True
             headers = (
+                # the full header set the real object sends: decompression requires the
+                # stored-encoding signal as well as the body arriving encoded
                 "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                "x-goog-stored-content-encoding: gzip\r\n"
                 "x-goog-stored-content-length: {}\r\n"
                 "x-goog-hash: md5={}\r\n\r\n".format(len(blob), md5_b64)
             ).encode()
@@ -1207,6 +1210,7 @@ class TestGzipEndToEnd:
             server.state.stored_gzip = True
             headers = (
                 "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                "x-goog-stored-content-encoding: gzip\r\n"
                 "x-goog-stored-content-length: {}\r\n"
                 "x-goog-hash: md5=AAAAAAAAAAAAAAAAAAAAAA==\r\n\r\n".format(len(blob))
             ).encode()
@@ -1228,3 +1232,246 @@ class TestGzipEndToEnd:
 
         assert result.returncode != 0
         assert not os.path.exists(dest), "wrote a destination despite failing verification"
+
+
+class TestSignedUrlFilenames:
+    """
+    A signed URL's query string must not become part of the localized filename. This was
+    pre-existing in HandleOtherURL, which took everything after the last "/";
+    HandleGCSSignedURL already stripped the query.
+
+    It is not cosmetic. An S3 SigV4 query is several hundred characters, so the resulting
+    name usually exceeds the 255-byte filename limit; the signature changes on every
+    attempt, so the name is unstable; and an unstable basename also changes the
+    localization disk's name hash, defeating disk reuse.
+    """
+
+    def _handler(self, url):
+        class Fake:
+            stdout = b"HTTP/1.1 200 OK\r\ncontent-length: 500000\r\n\r\n"
+
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run",
+                   return_value=Fake()):
+            return fh.get_file_handler(url)
+
+    S3_SIGNED = ("https://mybucket.s3.amazonaws.com/data/sample.bam"
+                 "?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+                 "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20260810%2Fus-east-1%2Fs3"
+                 "%2Faws4_request&X-Amz-Date=20260810T221753Z&X-Amz-Expires=900"
+                 "&X-Amz-SignedHeaders=host&X-Amz-Signature=" + "f" * 64)
+
+    def test_query_string_is_not_part_of_the_filename(self):
+        assert self._handler(self.S3_SIGNED).path == "sample.bam"
+
+    def test_the_old_behavior_would_have_exceeded_the_filename_limit(self):
+        """Shows the bug had teeth rather than being merely untidy."""
+        import re as _re
+        legacy = _re.match(r"(?:http|https|ftp)://.*\/(.*)$", self.S3_SIGNED)[1]
+        assert len(legacy.encode()) > 255
+        assert len(self._handler(self.S3_SIGNED).path.encode()) <= 255
+
+    def test_the_filename_is_stable_across_re_signing(self):
+        """
+        A changing basename also changes the localization disk's name hash, so disk reuse
+        and job avoidance would silently stop working.
+        """
+        first = self._handler(self.S3_SIGNED).path
+        second = self._handler(self.S3_SIGNED.replace("f" * 64, "a" * 64)).path
+        assert first == second == "sample.bam"
+
+    def test_fragment_is_dropped_too(self):
+        assert self._handler("http://h/a/b/file.vcf.gz?t=1#frag").path == "file.vcf.gz"
+
+    def test_a_plain_url_is_unaffected(self):
+        assert self._handler("https://example.org/refs/hg38.fa").path == "hg38.fa"
+
+    @pytest.mark.parametrize("url", ["https://example.org", "https://example.org/"])
+    def test_a_url_with_no_path_segment_raises(self, url):
+        with pytest.raises(ValueError):
+            self._handler(url)
+
+    def test_a_trailing_slash_uses_the_last_segment(self):
+        """
+        Improves on the old behavior rather than matching it: the previous regex produced
+        an EMPTY filename for a trailing-slash URL (no error, just a broken name). Using
+        the last segment is at least a usable guess, and a URL with no segment at all now
+        fails early with a clear error instead of silently yielding "".
+        """
+        assert self._handler("https://example.org/dir/").path == "dir"
+
+
+class TestS3SignedUrlVerification:
+    """
+    S3 does not transcode: a gzip-stored object is served as stored, with
+    `Content-Encoding: gzip` and an ETag over those same bytes. Since nothing decompresses
+    in flight, the file on disk is what the ETag covers, so it is verifiable -- an earlier
+    version of the encoding rule refused it, leaving such objects unverifiable for no
+    reason.
+    """
+
+    def _handler(self, raw_headers, **kwargs):
+        class Fake:
+            stdout = raw_headers
+
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run",
+                   return_value=Fake()):
+            return fh.get_file_handler(
+                "https://b.s3.amazonaws.com/d/o.bam?X-Amz-Signature=a", **kwargs)
+
+    GZIP_STORED = (b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                   b"content-length: 500000\r\n"
+                   b'etag: "' + EMPTY_MD5_HEX.encode() + b'"\r\n'
+                   b"accept-ranges: bytes\r\n\r\n")
+
+    def test_a_gzip_stored_s3_object_is_still_verifiable(self):
+        handler = self._handler(self.GZIP_STORED, check_md5=True)
+        assert handler.content_checksum == ("md5", EMPTY_MD5_HEX)
+
+    def test_it_is_not_decompressed(self):
+        """
+        Historical behavior is that `curl -C - -o` writes the bytes as received, so the
+        localized file has always been the compressed one. Changing that silently would
+        break pipelines expecting a .gz, so decompression needs GCS-specific evidence
+        rather than the Content-Encoding header alone.
+        """
+        handler = self._handler(self.GZIP_STORED, check_md5=True)
+        assert handler.body_is_compressed is False
+        assert "--gunzip" not in handler.localization_command(DEST)
+
+    def test_size_comes_from_content_length(self):
+        """
+        The x-goog- fallback is GCS-specific; a standard Content-Length must always win,
+        and is what every non-GCS server sends.
+        """
+        assert self._handler(self.GZIP_STORED).size == 500000
+
+    def test_content_length_wins_over_the_google_fallback(self):
+        both = (b"HTTP/1.1 200 OK\r\ncontent-length: 111\r\n"
+                b"x-goog-stored-content-length: 999\r\n\r\n")
+        assert self._handler(both).size == 111
+
+    def test_a_transcoded_response_refuses_the_digest(self):
+        """
+        The only case a digest must be refused: stored compressed but served decompressed,
+        so the digest covers bytes we never see. Detected by the stored-encoding header
+        being present while Content-Encoding is absent -- not by Content-Encoding alone,
+        which is absent precisely here.
+        """
+        transcoded = (b"HTTP/1.1 200 OK\r\ncontent-length: 20000000\r\n"
+                      b"x-goog-stored-content-encoding: gzip\r\n"
+                      b"x-goog-hash: md5=hT9M1UXc79mlN1Rvgr1tKg==\r\n\r\n")
+        handler = self._handler(transcoded, check_md5=True)
+        assert handler.content_checksum == (None, None)
+        assert "--check-md5" not in handler.localization_command(DEST)
+
+    def test_multipart_etag_is_still_rejected(self):
+        multipart = (b"HTTP/1.1 200 OK\r\ncontent-length: 500000\r\n"
+                     b'etag: "' + EMPTY_MD5_HEX.encode() + b'-42"\r\n\r\n')
+        assert self._handler(multipart, check_md5=True).content_checksum == (None, None)
+
+
+class TestTransportCompressionIsNotRequested:
+    """
+    A standard server's on-the-fly compression is the case that RFC 9110 says should be
+    decoded -- the entity is the decompressed content, unlike the S3 stored-compressed
+    case. It mostly does not arise because we never opt in, and these tests pin that
+    rather than leaving it as an assumption.
+    """
+
+    def test_the_probe_asks_for_identity(self):
+        """
+        Matching what the download sends. Under RFC 9110 omitting Accept-Encoding permits
+        the server to compress, while `identity` asks it not to -- so an unmatched probe
+        could describe a representation that is never downloaded.
+        """
+        captured = {}
+
+        class Fake:
+            stdout = b"HTTP/1.1 200 OK\r\ncontent-length: 10\r\n\r\n"
+
+        def spy(cmd, **kwargs):
+            captured["cmd"] = cmd
+            return Fake()
+
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run", side_effect=spy):
+            fh.get_file_handler("https://example.org/o.bam")
+        assert "Accept-Encoding: identity" in captured["cmd"]
+
+    def test_the_downloader_asks_for_identity_by_default(self):
+        """urllib's own default, relied on here, so it is worth asserting."""
+        from canine.localization import parallel_download as pdl
+        source = pdl.HttpSource("https://example.org/o")
+        request = source._request({"Range": "bytes=0-0"})
+        # urllib adds the header at send time when absent, so absence here is the point:
+        # nothing in our code overrides it toward gzip
+        assert "gzip" not in str(request.headers).lower()
+
+    def test_a_pre_compressed_static_response_is_left_compressed(self):
+        """
+        Indistinguishable on the wire from the S3 case, and treated the same: left as
+        received, matching what `curl -C -` has always produced for such a URL.
+        """
+        headers = (b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                   b"content-length: 500000\r\n"
+                   b"content-md5: " + EMPTY_MD5_B64.encode() + b"\r\n\r\n")
+
+        class Fake:
+            stdout = headers
+
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run",
+                   return_value=Fake()):
+            handler = fh.get_file_handler("https://example.org/o.vcf", check_md5=True)
+
+        assert handler.body_is_compressed is False
+        assert "--gunzip" not in handler.localization_command(DEST)
+        # and still verifiable: the digest covers exactly the bytes that land on disk
+        assert handler.content_checksum == ("md5", EMPTY_MD5_HEX)
+
+    def test_a_compressed_response_with_no_length_raises(self):
+        """
+        On-the-fly compression that ignored the identity request: chunked, no
+        Content-Length, no precomputable digest. Raising is the right outcome -- the
+        alternative is proceeding with a size that describes different bytes. Same
+        behavior as before this work, which also required Content-Length.
+        """
+        headers = b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n\r\n"
+
+        class Fake:
+            stdout = headers
+
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run",
+                   return_value=Fake()):
+            with pytest.raises(ValueError, match="Could not get file header size"):
+                fh.get_file_handler("https://example.org/o.vcf")
+
+    def test_only_the_google_stored_encoding_triggers_decompression(self):
+        """
+        The distinguishing rule, stated once: decompression needs the object to be stored
+        gzip AND the body to arrive encoded. Neither header alone is enough.
+        """
+        variants = {
+            "neither": b"content-length: 10\r\n",
+            "received only": b"content-length: 10\r\ncontent-encoding: gzip\r\n",
+            "stored only": b"content-length: 10\r\nx-goog-stored-content-encoding: gzip\r\n",
+            "both": (b"x-goog-stored-content-length: 10\r\n"
+                     b"content-encoding: gzip\r\n"
+                     b"x-goog-stored-content-encoding: gzip\r\n"),
+        }
+        results = {}
+        for label, block in variants.items():
+            class Fake:
+                stdout = b"HTTP/1.1 200 OK\r\n" + block + b"\r\n"
+
+            with patch("os.path.exists", return_value=False), \
+                 patch("canine.localization.file_handlers.subprocess.run",
+                       return_value=Fake()):
+                handler = fh.get_file_handler("https://example.org/o.vcf")
+            results[label] = handler.body_is_compressed
+
+        assert results == {"neither": False, "received only": False,
+                           "stored only": False, "both": True}

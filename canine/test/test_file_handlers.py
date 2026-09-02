@@ -528,14 +528,27 @@ class TestExtractContentChecksum:
     def test_malformed_base64_is_rejected(self):
         assert extract_content_checksum({"content-md5": "not!valid!base64"}) == (None, None)
 
-    def test_content_encoded_response_yields_no_checksum(self):
+    def test_content_encoding_alone_does_not_refuse_the_digest(self):
         """
-        A digest on an encoded response covers the *encoded* bytes while the file
-        lands decoded, so gating on it would fail every correct download. This is the
-        gzip decompressive-transcoding case.
+        Corrects an earlier rule of mine. It assumed an encoded response means "the file
+        lands decoded, so the digest describes something else" -- but nothing in this
+        stack decompresses in flight (urllib sends Accept-Encoding: identity; curl without
+        --compressed does not decode), so what is received is what is stored and the digest
+        applies. Refusing on the header alone left gzip-stored S3 objects unverifiable for
+        no reason.
         """
         assert extract_content_checksum(
-            {"content-md5": self.EMPTY_MD5_B64, "content-encoding": "gzip"}) == (None, None)
+            {"content-md5": self.EMPTY_MD5_B64, "content-encoding": "gzip"}
+        ) == ("md5", self.EMPTY_MD5_HEX)
+
+    def test_a_transcoded_response_yields_no_checksum(self):
+        """
+        The one case that must refuse: stored compressed but served decompressed, so the
+        digest covers bytes never seen. Callers detect it and pass it in -- it cannot be
+        read off Content-Encoding, which is absent precisely when transcoding happens.
+        """
+        assert extract_content_checksum(
+            {"content-md5": self.EMPTY_MD5_B64}, transcoded = True) == (None, None)
 
     def test_identity_encoding_is_not_treated_as_encoded(self):
         assert extract_content_checksum(
