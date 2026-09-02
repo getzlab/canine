@@ -482,11 +482,17 @@ class FileType(abc.ABC):
             for part in headers.get("x-goog-stored-content-encoding", "").lower().split(",")
         ]
 
-        # Both signals present: the object is stored gzip AND the stored bytes are what is
-        # being served, so decompressing afterwards yields the logical content. This is
-        # what was measured on a real object, and the only combination whose semantics are
-        # established.
-        self.body_is_compressed = received_encoded and stored_encoded
+        # `Content-Encoding: gzip` means the body is a transport-encoded representation of
+        # the file, so the localized file must be the DECODED content: a task reading it
+        # expects the actual data, not a gzip stream. This matches RFC 9110 (a
+        # content-coding is a property of the representation and the recipient decodes it)
+        # and it matches what `gs://` inputs already get, since `gcloud storage cp`
+        # decompresses locally -- previously the same object arrived decompressed via
+        # gs:// but compressed via a signed URL.
+        #
+        # Note this changes what lands on disk for such URLs: the old
+        # `curl -C - -o` command wrote the bytes as received, i.e. still compressed.
+        self.body_is_compressed = received_encoded
 
         # Stored compressed but served decompressed -- the digest covers bytes we never
         # see, so it cannot be used. This is the only case where a digest must be refused.
@@ -543,7 +549,7 @@ class FileType(abc.ABC):
             return False
         return True
 
-    def _download_and_verify_lines(self, legacy_cmd, prefix="", url=None, url_expr=None,
+    def _download_and_verify_lines(self, build_legacy, prefix="", url=None, url_expr=None,
                                    s3=None, url_refresh_cmd=None, etag=None,
                                    part_length=None, checksum=None, env_prefix=""):
         """
@@ -575,7 +581,53 @@ class FileType(abc.ABC):
                 return [prefix + lines[0]] + list(lines[1:])
             return list(lines)
 
+        gunzip = bool(getattr(self, "body_is_compressed", False))
+
+        # `build_legacy` is a callable rather than a finished string so the compressed
+        # pipeline can retarget the download at a sidecar. Rewriting the string instead
+        # was actively wrong: replacing the destination path also hit the same substring
+        # inside the URL, producing `-o /d/o.vcf.k9pdl.gz 'https://h/d/o.vcf.k9pdl.gz'`.
+        legacy_cmd = build_legacy(self.localized_path)
+
+        if gunzip:
+            # The fallback has to produce the same file as the primary path, or which one
+            # ran would change what the task reads. So it downloads to a compressed
+            # sidecar, verifies THOSE bytes (which is what the advertised digest covers),
+            # decompresses, and only then drops the sidecar.
+            #
+            # Deliberately NOT `curl --compressed`: combined with `-C -` that is a
+            # silent-corruption hazard, because the resume offset is taken from the local
+            # *decompressed* size but interpreted by the server as an offset into the
+            # *compressed* stream. Downloading the encoded bytes and decompressing
+            # afterwards keeps `-C -` resuming against the bytes it actually counted.
+            #
+            # Chained with && so a failed transfer never decompresses a partial file, and
+            # a failed stage leaves the sidecar for the next attempt to resume from.
+            sidecar = self.localized_path + ".k9pdl.gz"
+            stages = [build_legacy(sidecar)]
+            stages += self._hash_check_command(checksum, path = sidecar)
+            stages += [
+                "gunzip -c {sidecar} > {dest}".format(
+                    sidecar = sidecar, dest = self.localized_path),
+                "rm -f {sidecar}".format(sidecar = sidecar),
+            ]
+            legacy_cmd = " && ".join(stages)
+
+            if re.search(r"\.(gz|bgz|tgz)$", os.path.basename(self.path or "")):
+                canine_logging.warning(
+                    "{} is served with Content-Encoding: gzip and will be decompressed, "
+                    "but its name already ends in .gz -- if the intent was to deliver a "
+                    "compressed file, the object's content-encoding metadata is likely "
+                    "set by mistake and the localized file will not be what the name "
+                    "suggests.".format(self.path)
+                )
+
         if not self._use_parallel_download(url if url_expr is None else None):
+            # The compressed pipeline verifies the sidecar itself, so a trailing gate here
+            # would re-check the DECOMPRESSED file against a digest covering the
+            # compressed bytes -- a guaranteed false failure.
+            if gunzip:
+                return with_prefix([legacy_cmd])
             return with_prefix([legacy_cmd]) + self._hash_check_command(checksum)
 
         algorithm, digest = checksum or getattr(self, "content_checksum", (None, None))
@@ -586,7 +638,6 @@ class FileType(abc.ABC):
             etag = part_length = None
             downloader_verifies = md5 is not None
 
-        gunzip = bool(getattr(self, "body_is_compressed", False))
         lines = _pdl_command(
             url if url is not None else getattr(self, "url", None),
             self.localized_path,
@@ -619,7 +670,7 @@ class FileType(abc.ABC):
         """
         return ()
 
-    def _hash_check_command(self, checksum=None):
+    def _hash_check_command(self, checksum=None, path=None):
         """
         Emit the shell gate that verifies a localized file against a known checksum.
         Returns [] when there is nothing to verify.
@@ -637,14 +688,15 @@ class FileType(abc.ABC):
         if algorithm is None or digest is None:
             return []
 
+        target = path if path is not None else self.localized_path
         fail = "{{ echo 'deleting corrupted file' ; rm -f {path} ; exit 1 ; }}".format(
-          path = self.localized_path
+          path = target
         )
 
         if algorithm in _CHECKSUM_COREUTILS:
             return ["[[ $({prog} {path} | sed -r 's/  .*$//') == {digest} ]] || {fail}".format(
               prog = _CHECKSUM_COREUTILS[algorithm],
-              path = self.localized_path,
+              path = target,
               digest = digest,
               fail = fail,
             )]
@@ -655,7 +707,7 @@ class FileType(abc.ABC):
                 "[h.update(c) for c in iter(lambda: f.read(1048576), b'')];"
                 'sys.exit(0 if h.hexdigest().decode() == sys.argv[2] else 1)" '
                 '{path} {digest} || {fail}'.format(
-                  path = self.localized_path, digest = digest, fail = fail
+                  path = target, digest = digest, fail = fail
                 )]
 
     @property
@@ -1152,19 +1204,20 @@ class HandleAWSURL(FileType):
         # Kept to a single line: this string is also embedded as a --legacy-cmd argument
         # and inside an if/else branch, and a multi-line value there is needlessly
         # fragile.
-        legacy = (
-            "[ -f {path} ] && SZ=$(stat --printf '%s' {path}) || SZ=0; "
-            "if [ $SZ != {size} ]; then "
-            '{env} aws s3api {extra_args} get-object --bucket {bucket} --key {key} '
-            '--range "bytes=$SZ-" >(cat >> {path}) > /dev/null; fi'
-        ).format(
-            path = self.localized_path,
-            size = self.size,
-            env = self.command_env_str,
-            extra_args = self.s3_extra_args_str,
-            bucket = bucket,
-            key = key,
-        )
+        def legacy(target):
+            return (
+                "[ -f {path} ] && SZ=$(stat --printf '%s' {path}) || SZ=0; "
+                "if [ $SZ != {size} ]; then "
+                '{env} aws s3api {extra_args} get-object --bucket {bucket} --key {key} '
+                '--range "bytes=$SZ-" >(cat >> {path}) > /dev/null; fi'
+            ).format(
+                path = target,
+                size = self.size,
+                env = self.command_env_str,
+                extra_args = self.s3_extra_args_str,
+                bucket = bucket,
+                key = key,
+            )
 
         cmd = [f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :"]
 
@@ -1316,14 +1369,12 @@ class HandleGDCHTTPURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
-        if self.token is not None:
-            legacy = "curl -C - -o {path} {token} '{url}'".format(
-                path = self.localized_path, token = self.token_flag, url = self.url
-            )
-        else:
-            legacy = "curl -C - -o {path} '{url}'".format(
-                path = self.localized_path, url = self.url
-            )
+        def legacy(target):
+            if self.token is not None:
+                return "curl -C - -o {path} {token} '{url}'".format(
+                    path = target, token = self.token_flag, url = self.url
+                )
+            return "curl -C - -o {path} '{url}'".format(path = target, url = self.url)
 
         # self.hash is the content md5 for this handler (from the DRS record, or from the
         # Content-MD5 header when falling back to the GDC API) -- unlike a plain URL
@@ -1490,7 +1541,8 @@ class HandleDRSURI(FileType):
         # curl an empty URL. The resolver snippet itself is unchanged.
         cmd = [f'export signed_url=$({resolver})']
 
-        legacy = f'curl -C - -o {self.localized_path} "$signed_url"'
+        def legacy(target):
+            return f'curl -C - -o {target} "$signed_url"'
         # The URL is not known host-side, so it is passed as a shell expression that the
         # node evaluates. self.hash is the content md5 from the DRS record.
         cmd += self._download_and_verify_lines(
@@ -1569,11 +1621,10 @@ class HandleGCSSignedURL(FileType):
         cmd = []
         # the legacy single-stream command, kept verbatim: it is both the
         # parallel_download=False opt-out and the in-script no-range fallback
-        legacy = "curl -C - -o {path} '{url}'".format(
-            path = self.localized_path, url = self.url
-        )
         cmd += self._download_and_verify_lines(
-            legacy,
+            lambda target: "curl -C - -o {path} '{url}'".format(
+                path = target, url = self.url
+            ),
             prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
                 dest_dir = dest_dir
             ),
@@ -1620,11 +1671,10 @@ class HandleOtherURL(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
-        legacy = "curl -C - -o {path} '{url}'".format(
-            path = self.localized_path, url = self.url
-        )
         cmd += self._download_and_verify_lines(
-            legacy,
+            lambda target: "curl -C - -o {path} '{url}'".format(
+                path = target, url = self.url
+            ),
             prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
                 dest_dir = dest_dir
             ),

@@ -1127,7 +1127,10 @@ class TestStoredGzipObject:
         """It must verify the compressed bytes before decompressing them."""
         script = self._handler(check_md5=True).localization_command(DEST)
         assert "--check-md5 " + STORED_GZIP_MD5 in script
-        assert "md5sum" not in script
+        # the only md5sum in the command belongs to the fallback pipeline, where it gates
+        # the compressed sidecar; the primary path does not re-check after the downloader
+        primary = script.split("--legacy-cmd")[0]
+        assert "md5sum" not in primary
 
     def test_a_plain_object_asks_for_neither(self):
         plain = (b"HTTP/1.1 200 OK\r\nContent-Length: 1024\r\n"
@@ -1329,16 +1332,18 @@ class TestS3SignedUrlVerification:
         handler = self._handler(self.GZIP_STORED, check_md5=True)
         assert handler.content_checksum == ("md5", EMPTY_MD5_HEX)
 
-    def test_it_is_not_decompressed(self):
+    def test_it_is_decompressed(self):
         """
-        Historical behavior is that `curl -C - -o` writes the bytes as received, so the
-        localized file has always been the compressed one. Changing that silently would
-        break pipelines expecting a .gz, so decompression needs GCS-specific evidence
-        rather than the Content-Encoding header alone.
+        `Content-Encoding: gzip` means the body is a transport encoding of the file, so
+        the localized file must be the decoded content -- a task reading it expects the
+        data, not a gzip stream. This also makes an S3 signed URL agree with the same
+        object fetched over gs://, which gcloud already decompresses locally.
+
+        This IS a behavior change: the old `curl -C - -o` wrote the bytes as received.
         """
         handler = self._handler(self.GZIP_STORED, check_md5=True)
-        assert handler.body_is_compressed is False
-        assert "--gunzip" not in handler.localization_command(DEST)
+        assert handler.body_is_compressed is True
+        assert "--gunzip" in handler.localization_command(DEST)
 
     def test_size_comes_from_content_length(self):
         """
@@ -1409,10 +1414,11 @@ class TestTransportCompressionIsNotRequested:
         # nothing in our code overrides it toward gzip
         assert "gzip" not in str(request.headers).lower()
 
-    def test_a_pre_compressed_static_response_is_left_compressed(self):
+    def test_a_pre_compressed_static_response_is_decompressed(self):
         """
-        Indistinguishable on the wire from the S3 case, and treated the same: left as
-        received, matching what `curl -C -` has always produced for such a URL.
+        Indistinguishable on the wire from the S3 case, and treated the same -- both are
+        decoded, because a content-coding is a transport property and the task reading the
+        file expects the decoded content.
         """
         headers = (b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
                    b"content-length: 500000\r\n"
@@ -1426,9 +1432,10 @@ class TestTransportCompressionIsNotRequested:
                    return_value=Fake()):
             handler = fh.get_file_handler("https://example.org/o.vcf", check_md5=True)
 
-        assert handler.body_is_compressed is False
-        assert "--gunzip" not in handler.localization_command(DEST)
-        # and still verifiable: the digest covers exactly the bytes that land on disk
+        assert handler.body_is_compressed is True
+        assert "--gunzip" in handler.localization_command(DEST)
+        # still verifiable: the digest covers the compressed bytes, which are what gets
+        # verified -- before decompression, not after
         assert handler.content_checksum == ("md5", EMPTY_MD5_HEX)
 
     def test_a_compressed_response_with_no_length_raises(self):
@@ -1449,10 +1456,12 @@ class TestTransportCompressionIsNotRequested:
             with pytest.raises(ValueError, match="Could not get file header size"):
                 fh.get_file_handler("https://example.org/o.vcf")
 
-    def test_only_the_google_stored_encoding_triggers_decompression(self):
+    def test_the_received_encoding_is_what_decides_decompression(self):
         """
-        The distinguishing rule, stated once: decompression needs the object to be stored
-        gzip AND the body to arrive encoded. Neither header alone is enough.
+        The rule, stated once: the body arriving gzip-encoded is what triggers
+        decompression, regardless of provider. The stored-encoding header alone means the
+        opposite -- the object is stored compressed but was served decoded (transcoded),
+        so there is nothing to decompress and its digest is unusable.
         """
         variants = {
             "neither": b"content-length: 10\r\n",
@@ -1473,5 +1482,128 @@ class TestTransportCompressionIsNotRequested:
                 handler = fh.get_file_handler("https://example.org/o.vcf")
             results[label] = handler.body_is_compressed
 
-        assert results == {"neither": False, "received only": False,
+        assert results == {"neither": False, "received only": True,
                            "stored only": False, "both": True}
+
+
+class TestAllPathsProduceTheSameFile:
+    """
+    A compressed body must decompress on every route, not just the primary one. Which path
+    runs depends on configuration and on whether the server honors Range, so if they
+    disagreed the localized file would differ for reasons invisible to the pipeline.
+    """
+
+    def _run(self, tmp_path, label, **kwargs):
+        import gzip
+        import hashlib
+
+        plain = b"@HD\tVN:1.6\n" + b"@SQ\tSN:chr1\tLN:248956422\n" * 3000
+        blob = gzip.compress(plain)
+        digest = hashlib.md5(blob).hexdigest()
+
+        with Server(blob) as server:
+            server.state.stored_gzip = True
+            headers = (
+                "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                "content-length: {}\r\netag: \"{}\"\r\n\r\n".format(len(blob), digest)
+            ).encode()
+
+            class Fake:
+                stdout = headers
+
+            with patch("os.path.exists", return_value=False), \
+                 patch("canine.localization.file_handlers.subprocess.run",
+                       return_value=Fake()):
+                handler = fh.get_file_handler(server.url("o.dict"), check_md5=True,
+                                              **kwargs)
+            dest = str(tmp_path / "o.dict")
+            script = "#!/bin/bash\nset -e\n" + handler.localization_command(dest) + "\n"
+            if label == "no script":
+                # force every resolver candidate to miss, so the else branch runs
+                script = script.replace(fh._pdl_installed_path(), "/nonexistent/pdl.py")
+                script = script.replace('"${CANINE_ROOT:-}/parallel_download.py"',
+                                        '"/nonexistent/staged.py"')
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+        return result, dest, plain
+
+    def test_parallel_path(self, tmp_path):
+        result, dest, plain = self._run(tmp_path, "parallel", download_min_chunk=MIB,
+                                        download_connections=4)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == plain
+
+    def test_opt_out_path(self, tmp_path):
+        result, dest, plain = self._run(tmp_path, "opt-out", parallel_download=False)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == plain
+
+    def test_no_downloader_available(self, tmp_path):
+        result, dest, plain = self._run(tmp_path, "no script", download_min_chunk=MIB)
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert open(dest, "rb").read() == plain
+
+    def test_the_compressed_sidecar_is_cleaned_up(self, tmp_path):
+        """Peak disk is compressed + decompressed; the sidecar must not linger."""
+        result, dest, _ = self._run(tmp_path, "opt-out", parallel_download=False)
+        assert result.returncode == 0
+        assert not os.path.exists(dest + ".k9pdl.gz")
+
+    def test_the_fallback_verifies_before_decompressing(self, tmp_path):
+        """
+        The digest covers the compressed bytes, so it has to be checked on the sidecar. A
+        gate applied after decompression would compare the decoded file against a digest
+        of the encoded one -- a guaranteed false failure on every correct download.
+        """
+        import gzip
+        import hashlib
+
+        blob = gzip.compress(b"payload" * 5000)
+        with Server(blob) as server:
+            server.state.stored_gzip = True
+            headers = (
+                "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                "content-length: {}\r\netag: \"{}\"\r\n\r\n".format(len(blob), "0" * 32)
+            ).encode()
+
+            class Fake:
+                stdout = headers
+
+            with patch("os.path.exists", return_value=False), \
+                 patch("canine.localization.file_handlers.subprocess.run",
+                       return_value=Fake()):
+                handler = fh.get_file_handler(server.url("o.dict"), check_md5=True,
+                                              parallel_download=False)
+            dest = str(tmp_path / "o.dict")
+            script = "#!/bin/bash\nset -e\n" + handler.localization_command(dest) + "\n"
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+
+        assert result.returncode != 0
+        assert not os.path.exists(dest), "decompressed despite failing verification"
+
+    def test_the_url_is_not_corrupted_when_retargeting_to_the_sidecar(self):
+        """
+        Regression. The sidecar target was first produced by string-replacing the
+        destination path in the finished command -- which also matched the same substring
+        inside the URL, emitting
+        `-o /d/o.vcf.k9pdl.gz 'https://h/d/o.vcf.k9pdl.gz'`. The command is now built
+        against a target rather than rewritten.
+        """
+        headers = (b"HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\n"
+                   b"content-length: 500000\r\n"
+                   b'etag: "' + EMPTY_MD5_HEX.encode() + b'"\r\n\r\n')
+
+        class Fake:
+            stdout = headers
+
+        # a URL whose tail is exactly the destination path is what triggered it
+        url = "https://example.org/d/o.vcf"
+        with patch("os.path.exists", return_value=False), \
+             patch("canine.localization.file_handlers.subprocess.run",
+                   return_value=Fake()):
+            handler = fh.get_file_handler(url, check_md5=True, parallel_download=False)
+        script = handler.localization_command("/d/o.vcf")
+        assert url + "'" in script or "'{}'".format(url) in script, \
+            "the URL was rewritten:\n" + script
+        assert "o.vcf.k9pdl.gz'" not in script.replace("-o /d/o.vcf.k9pdl.gz", "")
