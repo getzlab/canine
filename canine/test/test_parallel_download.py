@@ -1420,20 +1420,39 @@ class TestDoublyCompressedGzipNames:
             assert not any(n.endswith(".part") for n in remaining), remaining
             assert "d.vcf.gz" in remaining
 
-    def test_the_magic_tables_are_in_step(self):
+    def test_the_magic_table_has_a_single_definition(self):
         """
-        parallel_download.py must not import canine, so the table is duplicated in
-        file_handlers. If they drifted, the emitted fallback and the downloader would
-        disagree about which files are ambiguous -- reintroducing exactly the
-        route-dependent difference that decompressing on every path exists to prevent.
+        The emitted fallback and the downloader must agree about which files are
+        ambiguous, or the localized file would depend on which route ran. That was once a
+        duplicated table plus a test that they matched; file_handlers now imports it, so
+        the property holds by construction and this asserts identity rather than
+        equality -- equality would still pass if someone reintroduced a copy.
         """
         from canine.localization import file_handlers as fh
-        assert pdl.NAMED_FORMAT_MAGIC == fh.NAMED_FORMAT_MAGIC
+        assert fh.NAMED_FORMAT_MAGIC is pdl.NAMED_FORMAT_MAGIC
+        assert fh.expected_magic is pdl.expected_magic
 
-    def test_both_sides_agree_on_specific_names(self):
+    def test_the_download_defaults_have_a_single_definition(self):
         from canine.localization import file_handlers as fh
-        for name in ("s.bam", "x.bcf", "a.vcf.gz", "p.vcf", "z.bz2", "c.cram"):
-            assert pdl.expected_magic(name) == fh.expected_magic(name), name
+        assert fh.DEFAULT_DOWNLOAD_CONNECTIONS is pdl.DEFAULT_CONNECTIONS
+        assert fh.DEFAULT_DOWNLOAD_MIN_CHUNK is pdl.DEFAULT_MIN_CHUNK
+
+    def test_the_downloader_still_imports_no_canine(self):
+        """
+        The constraint that makes the import one-directional. If the downloader ever
+        imported canine it would stop being runnable by hand on a node where canine is
+        absent, and would also make this a circular import.
+        """
+        import ast
+        with open(PDL_PATH) as fh_:
+            tree = ast.parse(fh_.read())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom):
+                assert not node.level, "relative import in the standalone script"
+                assert not (node.module or "").startswith("canine")
+            elif isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert not alias.name.startswith("canine")
 
 
 class TestNamedFormatsAreNotWronglyDecoded:

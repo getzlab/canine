@@ -8,6 +8,26 @@ import urllib.parse
 from google.auth.transport.requests import AuthorizedSession
 from ..utils import sha1_base32, canine_logging
 
+# Imported rather than duplicated. The standalone-script constraint is one-directional:
+# parallel_download.py must not import canine, so it stays runnable by hand on a node
+# where canine is absent -- but it is a module inside this package, so importing FROM it
+# is an ordinary intra-package import, and costs ~30 ms of stdlib against a canine chain
+# that already pulls in google.cloud.storage and pandas.
+#
+# Single-sourcing matters most for NAMED_FORMAT_MAGIC: the emitted fallback and the
+# downloader have to agree about which files are ambiguous, or the localized file would
+# depend on which route ran. Duplicating the table made that a property to be tested for
+# rather than one that holds by construction.
+#
+# The two DEFAULT_* names differ only because "download_connections" is the handler-level
+# option name; the values are the same objects.
+from .parallel_download import (
+    NAMED_FORMAT_MAGIC,
+    expected_magic,
+    DEFAULT_CONNECTIONS as DEFAULT_DOWNLOAD_CONNECTIONS,
+    DEFAULT_MIN_CHUNK as DEFAULT_DOWNLOAD_MIN_CHUNK,
+)
+
 # Checksum algorithms we can verify on a compute node, mapped to how we verify them.
 # The coreutils tools are guaranteed present; google_crc32c is in the worker image
 # (and is already a canine dependency), and python3 is relied on unconditionally by
@@ -144,13 +164,6 @@ def extract_content_checksum(headers, transcoded = False):
     return None, None
 
 
-# Default simultaneous ranged GETs. A single TCP stream to S3/GDC realistically gets
-# 50-200 MB/s against an n1-standard-8's ~2 GB/s egress cap, and LocalizeToDisk owns the
-# whole node exclusively (cpus-per-task=8, --exclusive), so the budget can be claimed
-# unconditionally: no runtime negotiation, no per-node semaphore.
-DEFAULT_DOWNLOAD_CONNECTIONS = 8
-DEFAULT_DOWNLOAD_MIN_CHUNK = 64 * 1024 * 1024
-
 PDL_SCRIPT_NAME = "parallel_download.py"
 PDL_EOF_SENTINEL = "# k9pdl-eof"
 
@@ -160,47 +173,6 @@ PDL_EOF_SENTINEL = "# k9pdl-eof"
 # over-estimating costs permanent storage on a disk that only ever grows.
 GZIP_FALLBACK_RATIO = 5
 
-# What a filename promises the DECODED bytes will be. Mirrors
-# parallel_download.NAMED_FORMAT_MAGIC -- the two cannot import each other, since the
-# downloader must not import canine, so a test asserts they stay in step.
-#
-# `.gz` is only one case: several formats here are gzip streams by design (BGZF, used by
-# .bam/.bcf and the .bai/.tbi/.csi indices), and a name can imply any already-compressed
-# format.
-NAMED_FORMAT_MAGIC = (
-    ((".gz", ".gzip", ".z", ".tgz", ".taz", ".bgz", ".bgzf", ".svgz",
-      ".bam", ".bai", ".bcf", ".csi", ".tbi"), b"\x1f\x8b"),
-    ((".bz2", ".tbz", ".tbz2"), b"BZh"),
-    ((".xz", ".txz"), b"\xfd7zXZ\x00"),
-    ((".zst", ".tzst"), b"\x28\xb5\x2f\xfd"),
-    ((".zip", ".jar", ".whl"), b"PK"),
-    ((".7z",), b"7z\xbc\xaf\x27\x1c"),
-    ((".cram",), b"CRAM"),
-    # Columnar/array containers that are NOT gzip streams. They already localized
-    # correctly without being listed, but only via the "advertised as gzip yet is not
-    # gzip" fallback -- listing them makes the outcome explicit and tested rather than
-    # incidental.
-    #
-    # Their INTERNAL compression is a separate matter and must never be touched: parquet
-    # compresses per column chunk (snappy/gzip/zstd) and HDF5 has a per-dataset gzip
-    # filter, both inside the container. Only a transport Content-Encoding is unwrapped
-    # here. .hdf is deliberately absent: HDF4 has a different signature, so the extension
-    # is ambiguous.
-    ((".parquet", ".pq"), b"PAR1"),
-    ((".h5", ".hdf5"), b"\x89HDF\r\n\x1a\n"),
-)
-
-
-def expected_magic(path):
-    """
-    The magic bytes `path`'s name implies its content starts with, or None when the name
-    implies plain (unencoded) content.
-    """
-    name = os.path.basename(path).lower()
-    for extensions, magic in NAMED_FORMAT_MAGIC:
-        if name.endswith(extensions):
-            return magic
-    return None
 
 
 def _pdl_installed_path():
