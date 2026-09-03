@@ -489,20 +489,67 @@ that ratio, not the sweep's internal speedup, is the number to report.
 ### 6.4 Correctness against the real sources
 
 Once for each source type, at the chosen connection count. This is correctness, not
-throughput, so a smaller object is fine — and for S3 this is where egress gets billed, so
-keep it small deliberately.
+throughput, so a smaller object is fine — and where egress is billed, keep it small
+deliberately.
+
+**For an S3 source you supply neither `--size` nor `--md5`.** `head-object` already reports
+both: the ETag is the md5 for a single-part object and the md5-of-md5s for a multipart one,
+and the benchmark derives the size, picks `--check-md5` or `--check-etag --part-length`
+accordingly, and recomputes the digest itself to check the result independently.
 
 ```bash
-# S3 (https endpoint or a presigned URL)
-pdl sweep --url "$S3_URL" --size $S3_SIZE --md5 "$S3_MD5" \
-          --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3.json
+# S3 API path -- one `aws` process per chunk, and what runs when presigning is unavailable
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-api.json
+
+# a store that is not Amazon's: same flags plus the endpoint
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-other.json
+
+# public bucket: no credentials, path-style URL against the endpoint
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" --no-sign-request \
+          --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-public.json
+
+# presigned-URL path -- the preferred one, no `aws` per chunk. `probe` prints the URL.
+pdl sweep --url "$PRESIGNED_URL" --size $S3_SIZE \
+          --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-presigned.json
 
 # GDC
 pdl sweep --url "$GDC_URL" --size $GDC_SIZE --md5 "$GDC_MD5" \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/gdc.json
 ```
 
-`md5 = ok` is the whole result. A `BAD` here is a release blocker.
+`hash = ok` is the whole result. A `BAD` here is a release blocker. A `-` means nothing was
+verified — check the `verify:` line at the top of the output, because an unverified pass
+proves much less than it looks like it does.
+
+Worth running **both** S3 paths where presigning works: they are different code
+(`HttpSource` versus `S3ApiSource`, the latter spawning one `aws` process per chunk), and
+the throughput gap between them is a real finding — it tells you what the per-chunk process
+overhead costs, and therefore how much it matters that presigning keeps working.
+
+### S3-compatible stores that are not Amazon's
+
+canine supports these throughout: `HandleAWSURL`'s `aws_endpoint_url` becomes
+`--endpoint-url` on `head-object`, on `presign` and on the per-chunk fallback, and public
+objects get a path-style URL built against the endpoint rather than
+`bucket.s3.amazonaws.com`. What varies between implementations, and what
+`probe --s3-bucket … --s3-key … --s3-endpoint-url …` reports:
+
+| Checked | Why it matters |
+|---|---|
+| `head-object` succeeds | everything else depends on it; failure usually means credentials, the endpoint, or a missing `--no-sign-request` |
+| **ranged GET honoured** | the assumption the entire design rests on. A store or proxy that ignores `Range` and returns the whole body cannot be chunked at all |
+| **what the ETag means** | AWS semantics are md5, or md5-of-md5s with `-N`. An opaque ETag is not a reproducible digest, so `check_hash` would fail on *correct* data — localize those inputs with hashing off, or supply an md5 out of band |
+| **presign works** | decides whether the fast single-code-path source is available, or whether every chunk pays an `aws` process |
+
+Also note that the §0 cost table assumes AWS egress pricing. For an on-premises or
+institutional S3-compatible store, egress may be free or billed entirely differently — in
+which case the "sweep against GCS, not the real source" advice is unnecessary caution and
+you can sweep against the real store directly. Check before optimizing for a cost you do
+not actually pay.
 
 ### 6.5 Resume and page-cache loss
 

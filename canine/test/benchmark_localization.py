@@ -25,9 +25,17 @@ Deliberately stdlib-only and runnable without canine installed, so it can be dro
 a node as-is:
 
     ./benchmark_localization.py probe                      # seconds, no egress, no cost
-    ./benchmark_localization.py sweep --url URL --size N
+    ./benchmark_localization.py sweep  --url URL --size N
     ./benchmark_localization.py resume --url URL --size N
     ./benchmark_localization.py routeb --url URL --size N --gs-url gs://bucket/obj
+
+An S3 source needs neither --size nor --md5: head-object reports the size, and the ETag is
+the md5 for a single-part object and the md5-of-md5s for a multipart one. The store does
+not have to be Amazon's -- --s3-endpoint-url threads through every aws call, as
+HandleAWSURL's aws_endpoint_url does:
+
+    ./benchmark_localization.py probe --s3-bucket B --s3-key K --s3-endpoint-url URL
+    ./benchmark_localization.py sweep --s3-bucket B --s3-key K --s3-endpoint-url URL
 
 `probe` is free and answers several open questions immediately; run it first.
 
@@ -44,6 +52,7 @@ import os
 import platform
 import random
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -56,6 +65,11 @@ DOWNLOADER = os.path.join(HERE, os.pardir, "localization", "parallel_download.py
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
+
+# The emitted commands and the legacy fallbacks use [[ ]] and process substitution, which
+# dash rejects -- and /bin/sh in the worker image is dash. Same reason parallel_download.py
+# pins it: shell=True would otherwise pick /bin/sh.
+SHELL = "/bin/bash"
 
 
 # --------------------------------------------------------------------------------
@@ -286,7 +300,112 @@ def disk_details(device):
 PD_WRITE_MB_S_PER_GB = {"pd-standard": 0.12, "pd-balanced": 0.28, "pd-ssd": 0.48}
 
 
-def command_probe():
+def probe_s3_endpoint(args):
+    """
+    Capability check for an S3 store, which matters most when it is NOT Amazon's.
+
+    canine supports a custom endpoint throughout -- HandleAWSURL threads
+    `--endpoint-url` into head-object, presign and the per-chunk fallback, and builds
+    path-style URLs for public objects. But S3-compatible implementations differ in ways
+    that decide which code path works, and none of it is discoverable from the repo:
+
+      * whether ranged GETs are honoured (a store or proxy that ignores Range and returns
+        the whole body would break chunking);
+      * what the ETag means. AWS gives md5 for a single-part object and md5-of-md5s with a
+        `-N` suffix for multipart, and `check_hash` relies on exactly that. An opaque or
+        non-md5 ETag makes verification fail on correct data;
+      * whether presigning works. If it does, every chunk goes through the plain HTTP path;
+        if not, the fallback spawns one `aws` process per chunk, which costs throughput.
+    """
+    extra = s3_extra_args(args)
+    out = {"endpoint": getattr(args, "s3_endpoint_url", None) or "aws (default)",
+           "extra_args": extra}
+
+    heading("S3 endpoint: {}".format(out["endpoint"]))
+    if not shutil.which("aws"):
+        say("the `aws` CLI is missing, so no S3 path can work here")
+        out["aws"] = False
+        return out
+    out["aws"] = True
+
+    def aws(*words, timeout=120):
+        command = "aws {} {}".format(extra, " ".join(words))
+        try:
+            return subprocess.run(command, shell=True, executable=SHELL,
+                                  capture_output=True, text=True, timeout=timeout)
+        except subprocess.SubprocessError as e:
+            return subprocess.CompletedProcess(command, 1, "", str(e))
+
+    head = aws("s3api head-object --bucket {} --key {}".format(
+        shlex.quote(args.s3_bucket), shlex.quote(args.s3_key)))
+    if head.returncode != 0:
+        say("head-object FAILED: {}".format(head.stderr.strip().splitlines()[:2]))
+        say("without this nothing else can be measured -- check credentials, the")
+        say("endpoint URL, and whether the bucket needs --no-sign-request")
+        out["head_object"] = False
+        return out
+
+    try:
+        meta = json.loads(head.stdout)
+    except ValueError:
+        meta = {}
+    out["head_object"] = True
+    out["size"] = meta.get("ContentLength")
+    out["etag"] = (meta.get("ETag") or "").strip('"')
+    out["parts_count"] = meta.get("PartsCount")
+    say("size        : {}".format(human(out["size"]) if out["size"] else "?"))
+
+    # what the ETag means decides whether check_hash can work at all
+    etag = out["etag"]
+    if re.fullmatch(r"[0-9a-f]{32}", etag or ""):
+        out["etag_kind"] = "md5"
+        say("etag        : {}  -- plain md5, usable directly".format(etag))
+    elif re.fullmatch(r"[0-9a-f]{32}-\d+", etag or ""):
+        out["etag_kind"] = "multipart"
+        say("etag        : {}  -- multipart (md5-of-md5s)".format(etag))
+        say("              PartsCount={}, so the downloader snaps chunks to part"
+            .format(out["parts_count"]))
+        say("              boundaries and computes the ETag during the transfer.")
+        if not out["parts_count"]:
+            say("              WARNING: multipart-shaped ETag but no PartsCount, so the")
+            say("              part length is unknown and verification cannot use it.")
+    else:
+        out["etag_kind"] = "opaque"
+        say("etag        : {!r}  -- NOT an AWS-style md5".format(etag))
+        say("              This store does not follow AWS ETag semantics, so hash")
+        say("              verification against the ETag would fail on correct data.")
+        say("              Localize these inputs with check_hash off, or supply an md5")
+        say("              out of band.")
+
+    # ranged GET, the assumption the whole design rests on
+    probe_size = min(1024, out["size"] or 1024)
+    ranged = aws("s3api get-object --bucket {} --key {} --range {} /dev/stdout".format(
+        shlex.quote(args.s3_bucket), shlex.quote(args.s3_key),
+        shlex.quote("bytes=0-{}".format(probe_size - 1))))
+    out["range_supported"] = ranged.returncode == 0
+    say("ranged GET  : {}".format("yes" if out["range_supported"] else "NO -- chunked "
+                                  "download cannot work against this endpoint"))
+
+    # presign, which decides which source the downloader uses
+    if getattr(args, "no_sign_request", False):
+        out["presign"] = None
+        say("presign     : n/a -- a public bucket needs none, and HandleAWSURL builds a")
+        say("              path-style URL against the endpoint directly")
+    else:
+        presigned = aws("s3 presign s3://{}/{}".format(args.s3_bucket, args.s3_key))
+        url = presigned.stdout.strip()
+        out["presign"] = presigned.returncode == 0 and bool(url)
+        if out["presign"]:
+            out["presigned_url"] = url
+            say("presign     : yes -> the plain HTTP path, no `aws` process per chunk")
+        else:
+            say("presign     : NO -> falls back to S3ApiSource, which spawns one `aws`")
+            say("              process per chunk. Expect lower throughput, and benchmark")
+            say("              that path specifically with --s3-bucket/--s3-key.")
+    return out
+
+
+def command_probe(args=None):
     result = {"platform": platform.platform(), "python": sys.version.split()[0],
               "in_container": in_container()}
 
@@ -379,6 +498,9 @@ def command_probe():
             "" if seek["supported"] else " (hole_at={})".format(seek.get("hole_at"))))
         say("    punch-hole : {}".format("yes" if punch["supported"] else "no"))
 
+    if getattr(args, "s3_bucket", None) and getattr(args, "s3_key", None):
+        result["s3"] = probe_s3_endpoint(args)
+
     heading("what this means")
     frontier = [d for d, v in result["destinations"].items() if v["seek_hole"]["supported"]]
     if frontier:
@@ -408,20 +530,79 @@ def peak_rss(pid):
         return None
 
 
-def run_download(url, dest, size, connections, min_chunk, extra=(), expect_md5=None,
+def s3_extra_args(args):
+    """
+    The `aws` flags HandleAWSURL would assemble: an explicit endpoint for a store that is
+    not Amazon's, and unsigned requests for a public bucket.
+    """
+    parts = []
+    if getattr(args, "s3_endpoint_url", None):
+        parts.append("--endpoint-url {}".format(shlex.quote(args.s3_endpoint_url)))
+    if getattr(args, "no_sign_request", False):
+        parts.append("--no-sign-request")
+    if getattr(args, "s3_extra_args", None):
+        parts.append(args.s3_extra_args)
+    return " ".join(parts)
+
+
+def s3_legacy_command(args, dest, size):
+    """
+    HandleAWSURL's own fallback command, reproduced so the connections=1 row is the real
+    legacy baseline for an S3 source.
+
+    It cannot be the synthesized `curl -C -` the URL path gets: on the S3 API path there
+    is no URL to curl. Uses process substitution, hence bash -- which the downloader
+    already runs legacy commands under.
+    """
+    return (
+        "[ -f {path} ] && SZ=$(stat --printf '%s' {path}) || SZ=0; "
+        "if [ $SZ != {size} ]; then "
+        "aws s3api {extra} get-object --bucket {bucket} --key {key} "
+        '--range "bytes=$SZ-" >(cat >> {path}) > /dev/null; fi'
+    ).format(path=shlex.quote(dest), size=size, extra=s3_extra_args(args),
+             bucket=shlex.quote(args.s3_bucket), key=shlex.quote(args.s3_key))
+
+
+def source_args(args, dest, size):
+    """
+    Turn the parsed source options into the downloader's own arguments.
+
+    Three source shapes, matching what the handlers emit:
+
+      * `--url`             plain HTTP, or an S3 presigned URL minted host-side;
+      * `--s3-bucket/--s3-key` with an empty `--url`, which is how build_source selects
+        S3ApiSource -- one `aws` process per chunk, the path that covers
+        session-token-only credentials and endpoints that cannot presign;
+      * both, when you want to measure the presigned path against a non-Amazon store.
+    """
+    if args.s3_bucket and args.s3_key and not (args.url or "").strip():
+        return ["--url", "",                      # empty: "presign produced nothing"
+                "--s3-bucket", args.s3_bucket,
+                "--s3-key", args.s3_key,
+                # `--opt=value`, not `--opt value`: the value itself starts with dashes
+                # (e.g. "--no-sign-request"), and argparse treats such a token as an
+                # option unless it happens to contain a space.
+                "--s3-extra-args={}".format(s3_extra_args(args)),
+                "--legacy-cmd", s3_legacy_command(args, dest, size)]
+    return ["--url", args.url]
+
+
+def run_download(source, dest, size, connections, min_chunk, extra=(), verification=None,
                  kill_after_bytes=None):
     """
     One download, measured. Returns a dict of results.
 
-    With connections=1 the downloader declines and synthesizes `curl -C - -sSL`, so that
-    row is genuinely the legacy single-stream path and the right baseline for the speedup
-    claim -- it is not the new code with one connection.
+    `source` is the list of source arguments from source_args().
+
+    With connections=1 the downloader declines and falls back to the legacy single stream,
+    so that row is genuinely today's behaviour and the right baseline for the speedup
+    claim -- it is not the new code throttled to one connection.
     """
-    command = [sys.executable, os.path.abspath(DOWNLOADER),
-               "--url", url, "--dest", dest, "--size", str(size),
-               "--connections", str(connections), "--min-chunk", str(min_chunk)]
-    if expect_md5:
-        command += ["--check-md5", expect_md5]
+    command = [sys.executable, os.path.abspath(DOWNLOADER)] + list(source) + [
+        "--dest", dest, "--size", str(size),
+        "--connections", str(connections), "--min-chunk", str(min_chunk)]
+    if verification is not None:
+        command += verification.downloader_args
     command += list(extra)
 
     with Sampler() as sampler:
@@ -470,6 +651,156 @@ def file_md5(path, block=8 * MIB):
     return digest.hexdigest()
 
 
+def file_multipart_etag(path, part_length, block=8 * MIB):
+    """
+    AWS's multipart ETag: md5 of the concatenated per-part md5 digests, then `-<n parts>`.
+
+    Computed here so the benchmark's verdict is independent of the downloader's own. If we
+    simply reported what the downloader concluded, "md5 ok" would mean no more than "it did
+    not notice a problem".
+    """
+    part_digests = []
+    with open(path, "rb") as fh:
+        while True:
+            part = hashlib.md5()
+            remaining = part_length
+            while remaining:
+                chunk = fh.read(min(block, remaining))
+                if not chunk:
+                    break
+                part.update(chunk)
+                remaining -= len(chunk)
+            if remaining == part_length:
+                break                       # read nothing: end of file
+            part_digests.append(part.digest())
+    combined = hashlib.md5(b"".join(part_digests)).hexdigest()
+    return "{}-{}".format(combined, len(part_digests))
+
+
+def s3_object_metadata(args):
+    """
+    Size and ETag from head-object, exactly as HandleAWSURL derives them.
+
+    For a multipart object the part length comes from a second head with
+    `--part-number 1`, which is the only way to learn it -- head-object reports how many
+    parts there are but not how big they are.
+    """
+    extra = s3_extra_args(args)
+
+    def head(*words):
+        command = "aws {} s3api head-object --bucket {} --key {} {}".format(
+            extra, shlex.quote(args.s3_bucket), shlex.quote(args.s3_key), " ".join(words))
+        result = subprocess.run(command, shell=True, executable=SHELL,
+                                capture_output=True, text=True, timeout=300)
+        if result.returncode != 0:
+            raise RuntimeError("head-object failed: {}".format(
+                result.stderr.strip().splitlines()[-1:] or result.returncode))
+        return json.loads(result.stdout)
+
+    meta = head()
+    out = {"size": meta.get("ContentLength"),
+           "etag": (meta.get("ETag") or "").strip('"'),
+           "parts_count": meta.get("PartsCount") or 1,
+           "part_length": None}
+    if out["parts_count"] > 1:
+        out["part_length"] = head("--part-number 1").get("ContentLength")
+    return out
+
+
+class Verification:
+    """
+    How the bytes get checked, and by what.
+
+    An S3 source needs no `--md5` from the operator: head-object already carries the
+    ETag, which for a single-part object *is* the md5 and for a multipart object is the
+    md5-of-md5s the downloader can compute during the transfer. Requiring an explicit
+    digest would be asking for something the store already told us.
+
+    The exception is a store that is not Amazon's and does not follow AWS ETag semantics.
+    An opaque ETag is not a digest of anything we can reproduce, so verification is
+    skipped rather than reported as a failure on correct data.
+    """
+
+    def __init__(self, kind, value=None, part_length=None, reason=None):
+        self.kind = kind                 # "md5" | "etag" | None
+        self.value = value
+        self.part_length = part_length
+        self.reason = reason
+
+    @property
+    def downloader_args(self):
+        if self.kind == "md5":
+            return ["--check-md5", self.value]
+        if self.kind == "etag":
+            return ["--check-etag", self.value, "--part-length", str(self.part_length)]
+        return []
+
+    def check(self, path):
+        """True, False, or None when there is nothing to check against."""
+        if self.kind == "md5":
+            return file_md5(path) == self.value
+        if self.kind == "etag":
+            return file_multipart_etag(path, self.part_length) == self.value
+        return None
+
+    @property
+    def label(self):
+        if self.kind == "md5":
+            return "md5 {}".format(self.value)
+        if self.kind == "etag":
+            return "multipart etag {} ({} byte parts)".format(self.value, self.part_length)
+        return "NOT VERIFIED -- {}".format(self.reason or "no digest available")
+
+
+def describe_source(args):
+    if args.s3_bucket and args.s3_key and not (args.url or "").strip():
+        return "s3://{}/{} via {} (S3ApiSource)".format(
+            args.s3_bucket, args.s3_key,
+            args.s3_endpoint_url or "amazon")
+    return args.url
+
+
+def resolve_source(args):
+    """
+    Fill in size and verification from the object itself where possible.
+
+    Returns (size, Verification). An explicit --md5/--size always wins, so a deliberate
+    override stays possible.
+    """
+    size, verification = args.size, None
+
+    if args.md5:
+        verification = Verification("md5", args.md5)
+
+    if getattr(args, "s3_bucket", None) and getattr(args, "s3_key", None):
+        meta = s3_object_metadata(args)
+        if size is None:
+            size = meta["size"]
+        if verification is None:
+            etag = meta["etag"]
+            if re.fullmatch(r"[0-9a-f]{32}", etag or ""):
+                verification = Verification("md5", etag)
+            elif meta["parts_count"] > 1 and meta["part_length"]:
+                if re.fullmatch(r"[0-9a-f]{32}-\d+", etag or ""):
+                    verification = Verification("etag", etag,
+                                                part_length=meta["part_length"])
+                else:
+                    verification = Verification(
+                        None, reason="multipart, but the ETag {!r} is not AWS-style "
+                                     "md5-of-md5s".format(etag))
+            else:
+                verification = Verification(
+                    None, reason="the ETag {!r} is not an md5; this store does not follow "
+                                 "AWS semantics".format(etag))
+
+    if verification is None:
+        verification = Verification(
+            None, reason="no --md5 given and the source carries no usable digest")
+    if size is None:
+        raise SystemExit("--size is required for this source (only S3 can report it)")
+    return size, verification
+
+
 # --------------------------------------------------------------------------------
 # sweep
 # --------------------------------------------------------------------------------
@@ -479,22 +810,26 @@ def command_sweep(args):
     §8.5's connection sweep. 1 connection is the legacy single stream and the baseline
     the >=4x claim is measured against.
     """
+    size, verification = resolve_source(args)
+    args.size = size
     results = []
     heading("connection sweep")
-    say("object    : {}".format(args.url))
-    say("size      : {}".format(human(args.size)))
+    say("object    : {}".format(describe_source(args)))
+    say("size      : {}".format(human(size)))
     say("dest dir  : {}".format(args.dest_dir))
+    say("verify    : {}".format(verification.label))
     say("egress    : ~{} per setting, {} settings".format(
-        human(args.size), len(args.connections)))
-    if args.size < GIB:
+        human(size), len(args.connections)))
+    if size < GIB:
         say()
         say("WARNING: {} is too small for this to mean anything. Per-connection setup"
-            .format(human(args.size)))
+            .format(human(size)))
         say("dominates, and the numbers below should not be recorded as the benchmark.")
-        say("§8.5 calls for ~50 GB. Treat this run as a smoke test of the harness.")
+        say("Treat this run as a smoke test of the harness.")
     say()
     say("{:>5}  {:>9}  {:>13}  {:>13}  {:>13}  {:>10}  {:>4}".format(
-        "conns", "seconds", "throughput", "peak NIC", "peak disk", "peak RSS", "md5"))
+        "conns", "seconds", "throughput", "peak NIC", "peak disk", "peak RSS",
+        "hash"))
 
     baseline = None
     for connections in args.connections:
@@ -508,14 +843,13 @@ def command_sweep(args):
                 args.dest_dir, ".bench.{}.bin.k9pdl.*".format(connections))):
             os.unlink(sidecar)
 
-        outcome = run_download(args.url, dest, args.size, connections, args.min_chunk,
-                               expect_md5=args.md5)
+        outcome = run_download(source_args(args, dest, args.size), dest, args.size,
+                               connections, args.min_chunk,
+                               verification=verification)
         if outcome["returncode"] == 0 and os.path.exists(dest):
-            digest = file_md5(dest)
-            outcome["md5"] = digest
-            outcome["md5_ok"] = (digest == args.md5) if args.md5 else None
+            outcome["verified"] = verification.check(dest)
         else:
-            outcome["md5_ok"] = False
+            outcome["verified"] = False
         throughput = args.size / outcome["seconds"] if outcome["seconds"] else 0
         outcome["throughput_bytes_per_s"] = throughput
         if connections <= 1:
@@ -529,7 +863,8 @@ def command_sweep(args):
             rate(outcome["peak_nic_bytes_per_s"] or 0, 1),
             rate(outcome["peak_disk_bytes_per_s"] or 0, 1),
             human(outcome["peak_rss"]) if outcome["peak_rss"] else "?",
-            "ok" if outcome["md5_ok"] else ("-" if outcome["md5_ok"] is None else "BAD")))
+            "ok" if outcome["verified"] else
+            ("-" if outcome["verified"] is None else "BAD")))
         if not args.keep:
             try:
                 os.unlink(dest)
@@ -594,7 +929,11 @@ def command_resume(args):
     Resumability against the real filesystem, which is where it matters: the frontier path
     only runs where SEEK_HOLE passes, and that is not the development machine.
     """
+    size, verification = resolve_source(args)
+    args.size = size
     heading("resume behaviour")
+    say("object         : {}".format(describe_source(args)))
+    say("verify         : {}".format(verification.label))
     seek = probe_seek_hole(args.dest_dir)
     say("SEEK_HOLE here : {}".format(
         "yes -- frontier recovery" if seek["supported"] else "no -- checkpoint fallback"))
@@ -609,9 +948,9 @@ def command_resume(args):
         kill_at = None
         if attempt < args.max_attempts:
             kill_at = int(args.size * (0.25 * attempt))
-        outcome = run_download(args.url, dest, args.size, args.connections,
-                               args.min_chunk, expect_md5=args.md5,
-                               kill_after_bytes=kill_at)
+        outcome = run_download(source_args(args, dest, args.size), dest, args.size,
+                               args.connections, args.min_chunk,
+                               verification=verification, kill_after_bytes=kill_at)
         total_nic += outcome["nic_bytes"] or 0
         attempts.append(outcome)
         say("attempt {}: rc={} {} seconds, killed={}, NIC {}".format(
@@ -621,10 +960,10 @@ def command_resume(args):
             break
 
     heading("verdict")
-    digest = file_md5(dest) if os.path.exists(dest) else None
-    correct = (digest == args.md5) if args.md5 else None
-    say("final md5      : {}{}".format(
-        digest, "" if correct is None else ("  CORRECT" if correct else "  WRONG")))
+    correct = verification.check(dest) if os.path.exists(dest) else False
+    say("final hash     : {}".format(
+        "no digest to check against" if correct is None
+        else ("CORRECT" if correct else "WRONG")))
     say("total received : {} for a {} object".format(human(total_nic), human(args.size)))
     if total_nic and args.size:
         waste = total_nic - args.size
@@ -654,14 +993,15 @@ def command_resume(args):
             os.unlink(marker)
         except OSError:
             pass
-        outcome = run_download(args.url, dest, args.size, args.connections,
-                               args.min_chunk, expect_md5=args.md5)
-        after = file_md5(dest) if os.path.exists(dest) else None
-        say("re-run rc={}, refetched {}, md5 {}".format(
+        outcome = run_download(source_args(args, dest, args.size), dest, args.size,
+                               args.connections, args.min_chunk,
+                               verification=verification)
+        after = verification.check(dest) if os.path.exists(dest) else False
+        say("re-run rc={}, refetched {}, hash {}".format(
             outcome["returncode"], human(outcome["nic_bytes"] or 0),
-            "CORRECT" if after == args.md5 else "WRONG"))
+            "unchecked" if after is None else ("CORRECT" if after else "WRONG")))
 
-    return {"resume": attempts, "final_md5": digest, "md5_ok": correct,
+    return {"resume": attempts, "verified": correct, "verification": verification.label,
             "total_nic_bytes": total_nic}
 
 
@@ -674,8 +1014,11 @@ def command_routeb(args):
     Route B against real GCS. Never exercised outside a fake, and the auth path in
     particular has no local coverage at all.
     """
+    size, verification = resolve_source(args)
+    args.size = size
     heading("route B (bucket destination) against real GCS")
     say("gs url : {}".format(args.gs_url))
+    say("verify : {}".format(verification.label))
     say()
     say("Checks the things the fake cannot: that the metadata server (or gcloud) yields a")
     say("usable token, that resumable sessions behave as the 308/Range protocol says, and")
@@ -704,8 +1047,8 @@ def command_routeb(args):
     dest = os.path.join(args.mount_dir, os.path.basename(args.gs_url))
     say("dest         : {} (must be on the gcsfuse mount for the route to be chosen)"
         .format(dest))
-    outcome = run_download(args.url, dest, args.size, args.connections, args.min_chunk,
-                           expect_md5=args.md5)
+    outcome = run_download(source_args(args, dest, args.size), dest, args.size,
+                           args.connections, args.min_chunk, verification=verification)
     say("rc={} in {} seconds".format(outcome["returncode"], outcome["seconds"]))
     for line in outcome["stderr_tail"]:
         say("  {}".format(line))
@@ -778,18 +1121,50 @@ def build_parser():
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    def add_s3(p):
+        """
+        S3 source options. The store does not have to be Amazon's: canine threads a
+        custom endpoint through head-object, presign and the per-chunk fallback, and this
+        mirrors HandleAWSURL's own arguments so the benchmark exercises the same paths.
+        """
+        group = p.add_argument_group(
+            "S3 source (Amazon or any S3-compatible store)",
+            "Give --url for the presigned/HTTP path, or --s3-bucket/--s3-key to drive "
+            "S3ApiSource, which is what runs when presigning is unavailable.")
+        group.add_argument("--s3-bucket")
+        group.add_argument("--s3-key")
+        group.add_argument("--s3-endpoint-url", metavar="URL",
+                           help="for a store that is not Amazon's; becomes "
+                                "--endpoint-url on every aws call, as "
+                                "HandleAWSURL's aws_endpoint_url does")
+        group.add_argument("--no-sign-request", action="store_true",
+                           help="public bucket: no credentials, and the object URL is "
+                                "built path-style against the endpoint")
+        group.add_argument("--s3-extra-args", default="",
+                           help="any further aws flags, passed through verbatim")
+
     def add_common(p, need_url=True):
         if need_url:
-            p.add_argument("--url", required=True, help="object to download")
-            p.add_argument("--size", required=True, type=int, help="its size in bytes")
-            p.add_argument("--md5", help="expected md5, so correctness is checked")
+            p.add_argument("--url", default="",
+                           help="object to download; omit when using "
+                                "--s3-bucket/--s3-key")
+            p.add_argument("--size", type=int,
+                           help="its size in bytes; not needed for an S3 source, where "
+                                "head-object reports it")
+            p.add_argument("--md5", help="expected md5. Not needed for an S3 source: the "
+                                         "ETag is the md5 for a single-part object and "
+                                         "the md5-of-md5s for a multipart one, and both "
+                                         "are used automatically")
         p.add_argument("--dest-dir", default="/mnt/rwdisks",
                        help="where to write; use the localization disk to measure the "
                             "path that matters (default: %(default)s)")
         p.add_argument("--min-chunk", type=int, default=64 * MIB)
         p.add_argument("--json", metavar="PATH", help="also write results as JSON")
+        add_s3(p)
 
-    sub.add_parser("probe", help="free environment report; run this first")
+    probe = sub.add_parser("probe", help="free environment report; run this first")
+    add_s3(probe)
+    probe.add_argument("--json", metavar="PATH", help="also write results as JSON")
 
     sweep = sub.add_parser("sweep", help="connection sweep, speedup, NIC-vs-disk limit")
     add_common(sweep)
@@ -822,7 +1197,7 @@ def main(argv=None):
         return 1
 
     handlers = {
-        "probe": lambda a: command_probe(),
+        "probe": command_probe,
         "sweep": command_sweep,
         "resume": command_resume,
         "routeb": command_routeb,
