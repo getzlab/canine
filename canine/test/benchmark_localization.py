@@ -241,8 +241,66 @@ def probe_mount(directory):
             "device": best[0], "mountpoint": best[1], "fstype": best[2]}
 
 
+def in_container():
+    """
+    Same test canine itself uses. It matters here because the localization script runs as
+    a SLURM job step and slurmd lives inside the slurm_gcp_docker container, so that is
+    the context whose /bin/sh, tool inventory and mount table are the real ones.
+    """
+    return os.path.exists("/.dockerenv")
+
+
+def disk_details(device):
+    """
+    PD type and provisioned size for a mounted localization disk.
+
+    Worth reporting because pd-standard write throughput is provisioned PER GIGABYTE, and
+    create_persistent_disk sizes the localization disk at the object size plus 5%. A disk
+    that small can be an order of magnitude slower than the NIC, in which case no number
+    of connections helps and the sweep will show a flat line.
+    """
+    name = os.path.basename(os.path.realpath(device))
+    match = re.search(r"google-(.+)$", device) or re.search(r"^(canine-.+)$", name)
+    if not (match and shutil.which("gcloud")):
+        return None
+    disk = match.group(1)
+    try:
+        out = subprocess.run(
+            ["gcloud", "compute", "disks", "describe", disk,
+             "--format=value(type,sizeGb)"],
+            capture_output=True, text=True, timeout=60)
+        if out.returncode != 0:
+            return None
+        fields = out.stdout.split()
+        kind = fields[0].rsplit("/", 1)[-1] if fields else None
+        size = int(fields[1]) if len(fields) > 1 else None
+        return {"disk": disk, "type": kind, "size_gb": size}
+    except (subprocess.SubprocessError, ValueError, OSError):
+        return None
+
+
+# GCP's documented sustained write throughput, provisioned per GB.
+PD_WRITE_MB_S_PER_GB = {"pd-standard": 0.12, "pd-balanced": 0.28, "pd-ssd": 0.48}
+
+
 def command_probe():
-    result = {"platform": platform.platform(), "python": sys.version.split()[0]}
+    result = {"platform": platform.platform(), "python": sys.version.split()[0],
+              "in_container": in_container()}
+
+    heading("context")
+    if in_container():
+        say("Running INSIDE a container, which is the right place: the localization")
+        say("script runs as a SLURM job step and slurmd lives in the")
+        say("slurm_gcp_docker container.")
+    else:
+        say("WARNING: not running inside a container.")
+        say()
+        say("worker_startup_script.sh bind-mounts only /mnt/nfs -- NOT /mnt/rwdisks -- so")
+        say("the localization disk is mounted in the CONTAINER's mount namespace and is")
+        say("invisible here. /bin/sh and the tool inventory below are the host's, not the")
+        say("ones the emitted commands actually run against.")
+        say()
+        say("Re-run as:  docker exec slurm <path>/benchmark_localization.py probe")
 
     heading("host")
     say("platform      : {}".format(result["platform"]))
@@ -295,11 +353,24 @@ def command_probe():
             free = stats.f_bavail * stats.f_frsize
         except OSError:
             pass
+        disk = disk_details(mount.get("device", "")) if mount.get("matched") else None
         result["destinations"][directory] = {
-            "mount": mount, "seek_hole": seek, "punch_hole": punch, "free": free}
+            "mount": mount, "seek_hole": seek, "punch_hole": punch, "free": free,
+            "disk": disk}
         say("{}".format(directory))
         say("    fstype     : {}".format(mount.get("fstype", "?")))
         say("    free       : {}".format(human(free) if free else "?"))
+        if disk:
+            per_gb = PD_WRITE_MB_S_PER_GB.get(disk["type"])
+            ceiling = (per_gb * disk["size_gb"]) if (per_gb and disk["size_gb"]) else None
+            say("    pd type    : {} at {} GB".format(disk["type"], disk["size_gb"]))
+            if ceiling:
+                # Capped at the per-instance ceiling; the per-GB figure binds well below
+                # it at the sizes create_persistent_disk actually provisions.
+                say("    write cap  : ~{:.0f} MB/s (provisioned per-GB){}".format(
+                    min(ceiling, 240.0),
+                    "  <-- far below the ~2 GB/s NIC; expect a flat sweep"
+                    if ceiling < 500 else ""))
         say("    SEEK_HOLE  : {}{}".format(
             "yes" if seek["supported"] else "NO -- checkpoint fallback would be used",
             "" if seek["supported"] else " (hole_at={})".format(seek.get("hole_at"))))
