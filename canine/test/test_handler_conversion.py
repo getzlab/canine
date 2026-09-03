@@ -1684,3 +1684,89 @@ class TestFallbackHandlesDoubleCompression:
         script = handler.localization_command("/mnt/x y/a.vcf.gz")
         assert bash_ok(script).returncode == 0, bash_ok(script).stderr
         assert bash_ok(debug_sh_transform(script)).returncode == 0
+
+
+class TestNameMatchesContent:
+    """
+    The invariant that matters to consumers, stated in their terms: several pipelines
+    dispatch on the file extension, so the localized file must be what its name says.
+
+    This is the property the double-compression rule produces, and it is why the gzip
+    decision is safe for extension-dispatching callers. The single case that changed --
+    a plain-named file that used to receive gzip bytes -- was precisely a name lying about
+    its content, so the change removes an inconsistency rather than introducing one. The
+    metadata-inconsistency case (a .gz whose content-encoding was set by mistake) does not
+    change at all.
+    """
+
+    VCF = b"##fileformat=VCFv4.2\n" * 300
+
+    def _localize(self, tmp_path, stored, name, **kwargs):
+        import hashlib
+
+        digest = hashlib.md5(stored).hexdigest()
+        with Server(stored) as server:
+            server.state.stored_gzip = True
+            headers = (
+                "HTTP/1.1 200 OK\r\ncontent-encoding: gzip\r\ncontent-length: {}\r\n"
+                "etag: \"{}\"\r\n\r\n".format(len(stored), digest)
+            ).encode()
+
+            class Fake:
+                stdout = headers
+
+            with patch("os.path.exists", return_value=False), \
+                 patch("canine.localization.file_handlers.subprocess.run",
+                       return_value=Fake()):
+                handler = fh.get_file_handler(server.url(name), check_md5=True, **kwargs)
+            dest = str(tmp_path / name)
+            script = "#!/bin/bash\nset -e\n" + handler.localization_command(dest) + "\n"
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+        assert result.returncode == 0, result.stdout + result.stderr
+        return open(dest, "rb").read()
+
+    def _stored_for(self, label):
+        import bz2
+        import gzip
+        bam = gzip.compress(b"BAM\x01" + b"\x00" * 800)
+        return {
+            "plain-gzip-encoded": ("d.vcf", gzip.compress(self.VCF)),
+            "gz-single": ("d.vcf.gz", gzip.compress(self.VCF)),
+            "gz-double": ("d.vcf.gz", gzip.compress(gzip.compress(self.VCF))),
+            "bam-single": ("d.bam", bam),
+            "bam-double": ("d.bam", gzip.compress(bam)),
+            "bz2-single": ("d.vcf.bz2", bz2.compress(self.VCF)),
+            "bz2-double": ("d.vcf.bz2", gzip.compress(bz2.compress(self.VCF))),
+            "dict-gzip-encoded": ("d.dict", gzip.compress(self.VCF)),
+        }[label]
+
+    ALL = ["plain-gzip-encoded", "gz-single", "gz-double", "bam-single", "bam-double",
+           "bz2-single", "bz2-double", "dict-gzip-encoded"]
+
+    @pytest.mark.parametrize("label", ALL)
+    @pytest.mark.parametrize("route", [{}, {"parallel_download": False}])
+    def test_the_content_matches_the_extension(self, tmp_path, label, route):
+        """
+        Checked on both routes, since a pipeline cannot know which one ran.
+        """
+        name, stored = self._stored_for(label)
+        got = self._localize(tmp_path, stored, name, download_min_chunk=MIB, **route)
+        magic = fh.expected_magic(name)
+        if magic is None:
+            assert not got.startswith(b"\x1f\x8b"), \
+                "{}: a plain-named file received compressed bytes".format(name)
+        else:
+            assert got.startswith(magic), \
+                "{}: content does not match what the name promises".format(name)
+
+    def test_the_metadata_mistake_case_is_unchanged_from_before(self, tmp_path):
+        """
+        The case most likely to exist in the wild -- an already-compressed file uploaded
+        with the content-encoding metadata set by mistake -- localizes to exactly the
+        bytes the old single-stream command produced, so nothing depending on it moves.
+        """
+        import gzip
+        stored = gzip.compress(self.VCF)
+        assert self._localize(tmp_path, stored, "d.vcf.gz",
+                              parallel_download=False) == stored
