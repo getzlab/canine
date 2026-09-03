@@ -546,9 +546,274 @@ def make_live_price_source(zone, host_lut = None, node_types = None):
     return _source
 
 
+############ persistent-disk pricing (Cloud Billing Catalog API, cached on disk) ############
+
+# GCP's own standard month-length convention for converting a $/GB-month PD
+# price into a $/GB-hour rate -- introduced here, not something derived from
+# any API response.
+AVG_HOURS_PER_MONTH = 730.0
+
+_DISK_TYPE_ALIASES = {
+  "standard": "pd-standard", "pd-standard": "pd-standard",
+  "ssd": "pd-ssd", "pd-ssd": "pd-ssd",
+  "balanced": "pd-balanced", "pd-balanced": "pd-balanced",
+}
+
+
+def _normalize_disk_type(disk_type):
+    """
+    Canonicalizes the two disk-type vocabularies used across wolF/canine
+    (nfs_disk_type's "pd-standard"/"pd-ssd"/"pd-balanced", scratch_disk_type's
+    "standard"/"ssd"/"balanced") onto one "pd-<x>" form. Returns None for
+    anything unrecognized -- callers should treat that as missing pricing
+    data, not guess a fallback type.
+    """
+    if not disk_type:
+        return None
+    return _DISK_TYPE_ALIASES.get(str(disk_type).strip().lower())
+
+
+_DISK_TYPE_SKU_WORD = {
+  "pd-standard": "Storage PD Capacity",
+  "pd-ssd": "SSD backed PD Capacity",
+  "pd-balanced": "Balanced PD Capacity",
+}
+
+
+def match_disk_price(skus, disk_type, region):
+    """
+    Given Catalog API SKUs (as returned by _fetch_all_skus), find the
+    $/GB-month price for a persistent-disk type in a region. Returns None if
+    no confident match is found.
+
+    Best-effort text match, same caveat as match_compute_engine_price: this
+    needs checking against a real Catalog API response during live
+    validation, not trusted from static review alone -- in particular,
+    whether persistent-disk SKUs really report resourceFamily "Storage"
+    (rather than "Compute", used by the CPU/RAM SKUs matched above) isn't
+    asserted anywhere else in this codebase. Regional (replicated) PD
+    variants are explicitly excluded: wolF/canine never creates those.
+    """
+    sku_word = _DISK_TYPE_SKU_WORD.get(disk_type)
+    if sku_word is None:
+        return None  # unrecognized disk type -- not enough info to match confidently
+
+    def matches(sku):
+        if sku.get("category", {}).get("resourceFamily") != "Storage":
+            return False
+        if region not in sku.get("serviceRegions", []):
+            return False
+        desc = sku.get("description", "")
+        if "Regional" in desc:
+            return False
+        return sku_word in desc
+
+    matched = [s for s in skus if matches(s)]
+    if not matched:
+        return None
+    return _sku_unit_price_usd(matched[0])
+
+
+def _disk_price_cache_key(disk_type, zone):
+    # "disk|" prefix keeps this distinct from get_price()'s own cache keys in
+    # the same on-disk cache file (PRICE_CACHE_PATH) -- disk pricing has no
+    # preemptible/accelerator dimension, but a plain "<disk_type>|<zone>" key
+    # could otherwise collide in principle with a machine-type string.
+    return "disk|{}|{}".format(disk_type, zone)
+
+
+def get_disk_price_per_gb_month(disk_type, zone):
+    """
+    Live $/GB-month for a persistent-disk type in a zone, via the Cloud
+    Billing Catalog API, cached on disk (PRICE_CACHE_PATH -- same cache file
+    get_price() uses, keyed distinctly via the "disk|" prefix so the two
+    never collide). Returns None (never a guess) if pricing can't be
+    determined or disk_type is unrecognized.
+
+    Shares get_price()'s retry/locking machinery (_PRICE_FETCH_LOCK,
+    _TRANSIENT_FETCH_ERRORS, _invalidate_billing_client) for the same reason:
+    get_billing_client()'s underlying httplib2 client isn't safe for
+    concurrent .execute() calls, and price_cache.json's read-modify-write
+    isn't safe to race either.
+    """
+    disk_type = _normalize_disk_type(disk_type)
+    if disk_type is None:
+        return None
+
+    key = _disk_price_cache_key(disk_type, zone)
+    cache = load_price_cache()
+    if key in cache:
+        return cache[key]
+
+    with _PRICE_FETCH_LOCK:
+        # re-check: another thread may have populated this key while we were
+        # waiting on the lock.
+        cache = load_price_cache()
+        if key in cache:
+            return cache[key]
+
+        last_exc = None
+        for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            try:
+                client = get_billing_client()
+                service_name = _fetch_compute_engine_service_name(client)
+                skus = _fetch_all_skus(client, service_name)
+                region = _zone_to_region(zone)
+                price_per_gb_month = match_disk_price(skus, disk_type, region)
+                if price_per_gb_month is None:
+                    return None
+                break
+            except _TRANSIENT_FETCH_ERRORS as e:
+                last_exc = e
+                canine_logging.warning(
+                  "Transient error fetching live disk price for {}/{} (attempt {}/{}): {} -- retrying with a fresh client".format(
+                    disk_type, zone, attempt, _MAX_FETCH_ATTEMPTS, e))
+                _invalidate_billing_client()
+                if attempt < _MAX_FETCH_ATTEMPTS:
+                    time.sleep(attempt)
+            except Exception as e:
+                canine_logging.warning("Could not fetch live disk price for {}/{}: {}".format(disk_type, zone, e))
+                return None
+        else:
+            canine_logging.warning(
+              "Could not fetch live disk price for {}/{} after {} attempts: {}".format(
+                disk_type, zone, _MAX_FETCH_ATTEMPTS, last_exc))
+            return None
+
+        cache[key] = price_per_gb_month
+        _save_price_cache(cache)
+        return price_per_gb_month
+
+
+def get_disk_price_per_gb_hour(disk_type, zone):
+    price_per_gb_month = get_disk_price_per_gb_month(disk_type, zone)
+    if price_per_gb_month is None:
+        return None
+    return price_per_gb_month / AVG_HOURS_PER_MONTH
+
+
+############ live disk size/type (Compute Engine API, short-lived in-process cache) ############
+
+_GCE_DISK_CLIENT = None
+_GCE_DISK_CLIENT_BUILD_PID = os.getpid()
+_GCE_DISK_CLIENT_LOCK = threading.Lock()
+
+
+def get_gce_disk_client():
+    """
+    Lazy, per-forked-process client singleton for the Compute Engine disks()
+    API -- same rationale/pattern as get_billing_client() (wolF forks per
+    flow run; a client built in the parent isn't safe to reuse in a child).
+    Kept here (rather than imported from canine.backends.imageTransient's own
+    GCE client helper) for consistency with this module's existing
+    self-contained style; only construction is thread-safe, same caveat as
+    get_billing_client().
+    """
+    global _GCE_DISK_CLIENT, _GCE_DISK_CLIENT_BUILD_PID
+    with _GCE_DISK_CLIENT_LOCK:
+        if _GCE_DISK_CLIENT is None or os.getpid() != _GCE_DISK_CLIENT_BUILD_PID:
+            _GCE_DISK_CLIENT_BUILD_PID = os.getpid()
+            _GCE_DISK_CLIENT = gd.build('compute', 'v1')
+    return _GCE_DISK_CLIENT
+
+
+_DISK_INFO_CACHE = {}
+_DISK_INFO_CACHE_LOCK = threading.Lock()
+
+_GCE_DISK_TYPE_URL_ALIASES = {"pd-standard": "pd-standard", "pd-ssd": "pd-ssd", "pd-balanced": "pd-balanced"}
+
+
+def _parse_gce_disk_type(disk_type_url):
+    """'https://www.googleapis.com/compute/v1/projects/.../diskTypes/pd-ssd' -> 'pd-ssd'."""
+    if not disk_type_url:
+        return None
+    return _GCE_DISK_TYPE_URL_ALIASES.get(disk_type_url.rsplit("/", 1)[-1])
+
+
+def get_live_disk_info(disk_name, zone, project, ttl_seconds = 300):
+    """
+    Live (size_gb, disk_type) for a disk resource, via the Compute Engine
+    API -- used to get a worker node's *actual current* boot-disk size,
+    since worker_boot_disk_resize.sh auto-grows it well past its
+    provisioning-time default over a long-lived node's lifetime, and that
+    growth is recorded nowhere static (not in host_LuT.pickle/nodetypes.json).
+
+    Returns (None, None) on any failure (disk not found, API error, node
+    already torn down) -- never guesses a fallback size.
+
+    Cached in-process only (not persisted to PRICE_CACHE_PATH like
+    get_price()/get_disk_price_per_gb_month(), since a disk's size can
+    legitimately change again later in the same node's life -- persisting it
+    would risk permanently undercounting a node that grows its disk after the
+    first lookup), with a short TTL: this collapses redundant lookups when
+    several shards on the same node finish near-simultaneously (a real, not
+    hypothetical, pattern -- see get_price()'s own docstring on concurrent
+    per-task cost-estimate calls) without letting a long-lived, still-growing
+    node's cached size go stale for its whole remaining lifetime. The
+    ttl_seconds default is a judgment call, not a measured constant.
+    """
+    key = (project, zone, disk_name)
+    now = time.monotonic()
+    with _DISK_INFO_CACHE_LOCK:
+        cached = _DISK_INFO_CACHE.get(key)
+        if cached is not None and now - cached[0] < ttl_seconds:
+            return cached[1]
+
+    try:
+        client = get_gce_disk_client()
+        disk = client.disks().get(project = project, zone = zone, disk = disk_name).execute()
+        result = (float(disk["sizeGb"]), _parse_gce_disk_type(disk.get("type")))
+    except Exception as e:
+        canine_logging.warning("Could not fetch live disk info for {}/{}/{}: {}".format(project, zone, disk_name, e))
+        result = (None, None)
+
+    with _DISK_INFO_CACHE_LOCK:
+        _DISK_INFO_CACHE[key] = (now, result)
+    return result
+
+
+def make_live_boot_disk_price_source(zone, project):
+    """
+    Builds a disk_price_source callable (node_name -> $/hour or None) for a
+    worker node's boot disk, for the real-time path -- mirrors
+    make_live_price_source()'s shape exactly, so estimate_task_cost() can
+    treat compute and disk pricing identically. This is also the intended
+    seam for a future GCSfuse-based cost model: a bucket-mount mode would
+    need only a new price-source builder with this same
+    "node_name -> $/hour" signature, no changes to estimate_task_cost()
+    itself.
+
+    Assumes gcloud's default naming convention (the boot disk's resource
+    name equals its instance's name) -- true for worker nodes as provisioned
+    by slurm_gcp_docker's slurm_resume.py, which passes no explicit disk
+    name/--create-disk flag, but this is a gcloud CLI convention being relied
+    on, not something this codebase asserts anywhere else.
+    """
+    def _source(node_name):
+        size_gb, disk_type = get_live_disk_info(node_name, zone, project)
+        if size_gb is None or disk_type is None:
+            return None
+        price_per_gb_hour = get_disk_price_per_gb_hour(disk_type, zone)
+        if price_per_gb_hour is None:
+            return None
+        return price_per_gb_hour * size_gb
+    return _source
+
+
+def make_live_disk_gb_hour_price_source(zone):
+    """
+    disk_type -> $/GB-hour, for standalone per-task disk costs (scratch
+    disks) that aren't tied to a node's own capacity/lifetime the way boot
+    disks are -- see estimate_scratch_disk_cost().
+    """
+    def _source(disk_type):
+        return get_disk_price_per_gb_hour(disk_type, zone)
+    return _source
+
+
 ############ per-task / per-node cost estimation ############
 
-def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None):
+def estimate_task_cost(acct_df, price_source, disk_price_source = None, host_lut = None, node_types = None):
     """
     acct_df: DataFrame shaped like Task.acct -- one row per shard, with an
       "attempts" column holding a list of per-attempt {NodeList, Start, End,
@@ -561,12 +826,23 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
       make_live_price_source(...) (real-time) for a reconciliation-side,
       billing-grounded per-node lookup to get identical-logic, differently-
       accurate numbers from the same function.
+    disk_price_source: optional callable(node_name) -> $/hour, or None if
+      unavailable -- mirrors price_source's own shape exactly (see
+      make_live_boot_disk_price_source), so a worker's boot-disk cost can be
+      prorated using the same max(cpu_frac, mem_frac) share already computed
+      for compute cost. Default None reproduces today's exact behavior/
+      columns unchanged -- existing callers are unaffected. When given, adds
+      disk_cost_usd/disk_cost_provisional columns, kept DELIBERATELY separate
+      from cost_usd/is_provisional/missing_capacity_data so a disk-pricing
+      failure can never corrupt or mask the existing, already-relied-upon
+      compute-cost signal.
 
     Returns a DataFrame indexed the same as acct_df, with cost_usd (summed
     across every attempt/node the shard touched), total_running_seconds,
-    missing_capacity_data, and is_provisional columns. Never guesses: a shard
-    with any attempt on an unrecognized node, with unparseable AllocTRES, or
-    missing a price, is flagged rather than silently under-costed.
+    missing_capacity_data, is_provisional, disk_cost_usd, and
+    disk_cost_provisional columns. Never guesses: a shard with any attempt on
+    an unrecognized node, with unparseable AllocTRES, or missing a price, is
+    flagged rather than silently under-costed.
 
     total_running_seconds is the sum of every attempt's own (End - Start)
     duration -- i.e. actual time spent running, across every preemption/
@@ -590,9 +866,13 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
     for jid, row in acct_df.iterrows():
         attempts = row.get("attempts") or []
         total_cost = 0.0
+        total_disk_cost = 0.0
         total_running_seconds = 0.0
         missing_capacity_data = len(attempts) == 0
         is_provisional = False
+        # No attempt ever gets a chance to clear this when disk pricing
+        # wasn't requested at all -- $0 there means "not priced", not "free".
+        disk_cost_provisional = disk_price_source is None
 
         for attempt in attempts:
             node_name = attempt.get("NodeList")
@@ -618,22 +898,84 @@ def estimate_task_cost(acct_df, price_source, host_lut = None, node_types = None
                 missing_capacity_data = True
                 continue
 
-            price_per_hour = price_source(node_name)
-            if price_per_hour is None:
-                is_provisional = True
-                continue
-
+            # Computed once, up front, so disk pricing (below) can reuse the
+            # same proration share as compute pricing even on an attempt
+            # where compute pricing itself is unavailable -- the two are
+            # priced independently from this point on.
             elapsed_seconds = max(0.0, (end - start).total_seconds())
             cpu_frac = alloc_cpus / vcpus
             mem_frac = alloc_mem_mb / mem_mb
-            total_cost += (price_per_hour / 3600) * elapsed_seconds * max(cpu_frac, mem_frac)
+            resource_frac = max(cpu_frac, mem_frac)
+
+            price_per_hour = price_source(node_name)
+            if price_per_hour is None:
+                is_provisional = True
+            else:
+                total_cost += (price_per_hour / 3600) * elapsed_seconds * resource_frac
+
+            if disk_price_source is not None:
+                disk_price_per_hour = disk_price_source(node_name)
+                if disk_price_per_hour is None:
+                    disk_cost_provisional = True
+                else:
+                    total_disk_cost += (disk_price_per_hour / 3600) * elapsed_seconds * resource_frac
 
         rows.append({
           "JobID": jid, "cost_usd": total_cost, "total_running_seconds": total_running_seconds,
           "missing_capacity_data": missing_capacity_data, "is_provisional": is_provisional,
+          "disk_cost_usd": total_disk_cost, "disk_cost_provisional": disk_cost_provisional,
         })
 
     return pd.DataFrame(rows).set_index("JobID")
+
+
+############ standalone disk / infrastructure cost helpers (not derived from acct_df) ############
+
+def estimate_scratch_disk_cost(size_gb, disk_type, duration_seconds, price_source):
+    """
+    Cost of a per-task scratch/persistent disk (Task's use_scratch_disk):
+    unlike a worker's boot disk, this disk is dedicated to one shard, not
+    shared with other jobs on the same node -- so it's priced for its full
+    size over its full duration, with no cpu/mem-fraction proration.
+
+    price_source: callable(disk_type) -> $/GB-hour, or None if unavailable
+    (see make_live_disk_gb_hour_price_source) -- deliberately a
+    disk_type-only interface (not node-based, like boot-disk pricing), and
+    the intended seam for a future bucket-mount-backed scratch "disk": swap
+    in a GCS-storage-equivalent $/GB-hour price_source with the same
+    signature, no change needed here.
+
+    Returns (cost_usd, is_provisional). Never guesses: returns (0.0, True)
+    if size_gb/duration_seconds aren't known or pricing isn't available.
+    """
+    if not size_gb or duration_seconds is None or duration_seconds < 0:
+        return 0.0, True
+
+    normalized_type = _normalize_disk_type(disk_type)
+    if normalized_type is None:
+        return 0.0, True
+
+    price_per_gb_hour = price_source(normalized_type)
+    if price_per_gb_hour is None:
+        return 0.0, True
+
+    return price_per_gb_hour * size_gb * (duration_seconds / 3600), False
+
+
+def estimate_window_cost_usd(price_per_hour, window_start, window_end):
+    """
+    Generic elapsed-hours x price helper for costs that aren't derived from
+    acct_df at all -- used for controller-VM and shared-storage overhead,
+    which are priced over a run's own wall-clock window rather than any
+    job's own [Start, End]. Returns None (never a guess) if price_per_hour
+    is None or either timestamp is missing.
+    """
+    if price_per_hour is None or window_start is None or window_end is None:
+        return None
+    window_start = pd.Timestamp(window_start)
+    window_end = pd.Timestamp(window_end)
+    elapsed_hours = max(0.0, (window_end - window_start).total_seconds() / 3600)
+    return price_per_hour * elapsed_hours
 
 
 def estimate_node_undersubscription(node_sacct_snapshot, price_source, host_lut = None, node_types = None):

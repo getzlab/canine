@@ -855,3 +855,374 @@ class TestGroupSacctByJob:
         assert row["State"] == "COMPLETED"
         assert row["NodeList"] == "worker-final"  # chronologically last, not whichever row happened to be last in raw order
         assert row["n_preempted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# _normalize_disk_type / match_disk_price / get_disk_price_per_gb_month(_hour)
+# ---------------------------------------------------------------------------
+
+class TestNormalizeDiskType:
+    @pytest.mark.parametrize("raw,expected", [
+      ("standard", "pd-standard"), ("pd-standard", "pd-standard"),
+      ("ssd", "pd-ssd"), ("pd-ssd", "pd-ssd"),
+      ("balanced", "pd-balanced"), ("pd-balanced", "pd-balanced"),
+      ("PD-SSD", "pd-ssd"),  # case-insensitive
+    ])
+    def test_known_aliases(self, raw, expected):
+        assert cost._normalize_disk_type(raw) == expected
+
+    def test_unrecognized_type_returns_none(self):
+        assert cost._normalize_disk_type("hyperdisk-extreme") is None
+
+    def test_none_or_empty_returns_none(self):
+        assert cost._normalize_disk_type(None) is None
+        assert cost._normalize_disk_type("") is None
+
+
+def make_disk_sku(description, region, family="Storage", tiered_rate_usd=0.04):
+    return make_sku(description, region, family=family, tiered_rate_usd=tiered_rate_usd)
+
+
+class TestMatchDiskPrice:
+    def test_matches_standard_pd(self):
+        skus = [
+          make_disk_sku("Storage PD Capacity", "us-central1", tiered_rate_usd=0.04),
+          make_disk_sku("SSD backed PD Capacity", "us-central1", tiered_rate_usd=0.17),
+        ]
+        assert cost.match_disk_price(skus, "pd-standard", "us-central1") == pytest.approx(0.04)
+
+    def test_matches_ssd_pd(self):
+        skus = [make_disk_sku("SSD backed PD Capacity", "us-central1", tiered_rate_usd=0.17)]
+        assert cost.match_disk_price(skus, "pd-ssd", "us-central1") == pytest.approx(0.17)
+
+    def test_excludes_regional_variant(self):
+        skus = [make_disk_sku("Regional Storage PD Capacity", "us-central1", tiered_rate_usd=0.08)]
+        assert cost.match_disk_price(skus, "pd-standard", "us-central1") is None
+
+    def test_no_match_in_wrong_region(self):
+        skus = [make_disk_sku("Storage PD Capacity", "europe-west1", tiered_rate_usd=0.04)]
+        assert cost.match_disk_price(skus, "pd-standard", "us-central1") is None
+
+    def test_wrong_resource_family_excluded(self):
+        skus = [make_disk_sku("Storage PD Capacity", "us-central1", family="Compute", tiered_rate_usd=0.04)]
+        assert cost.match_disk_price(skus, "pd-standard", "us-central1") is None
+
+    def test_unrecognized_disk_type_returns_none(self):
+        assert cost.match_disk_price([], "hyperdisk-extreme", "us-central1") is None
+
+
+class TestGetDiskPricePerGbMonth:
+    def test_unrecognized_disk_type_returns_none_without_api_call(self):
+        with patch("canine.cost.get_billing_client") as mock_client:
+            result = cost.get_disk_price_per_gb_month("hyperdisk-extreme", "us-central1-a")
+        assert result is None
+        mock_client.assert_not_called()
+
+    def test_cache_hit_skips_api_call(self, tmp_path):
+        cache_path = tmp_path / "price_cache.json"
+        key = cost._disk_price_cache_key("pd-standard", "us-central1-a")
+        cache_path.write_text(json.dumps({key: 0.04}))
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client") as mock_client:
+            result = cost.get_disk_price_per_gb_month("pd-standard", "us-central1-a")
+        assert result == 0.04
+        mock_client.assert_not_called()
+
+    def test_cache_miss_calls_api_and_persists(self, tmp_path):
+        cache_path = tmp_path / "price_cache.json"
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": [make_disk_sku("Storage PD Capacity", "us-central1", tiered_rate_usd=0.04)]}
+        services.skus.return_value.list_next.return_value = None
+
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_disk_price_per_gb_month("pd-standard", "us-central1-a")
+
+        assert result == pytest.approx(0.04)
+        cached = json.loads(cache_path.read_text())
+        assert cached[cost._disk_price_cache_key("pd-standard", "us-central1-a")] == pytest.approx(0.04)
+
+    def test_disk_and_compute_cache_keys_never_collide(self, tmp_path):
+        # "disk|" prefix keeps get_disk_price_per_gb_month() distinct from
+        # get_price() in the same on-disk cache file: a real "pd-standard"
+        # compute-price cache entry must not be mistaken for a disk-price
+        # cache hit, forcing a real (here, mocked) API round trip instead.
+        cache_path = tmp_path / "price_cache.json"
+        cache_path.write_text(json.dumps({
+          cost._price_cache_key("pd-standard", "us-central1-a", False, None, 0): 99.0,
+        }))
+
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": []}  # no match -- not the point of this test
+        services.skus.return_value.list_next.return_value = None
+
+        mock_get_client = MagicMock(return_value=fake_client)
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", mock_get_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_disk_price_per_gb_month("pd-standard", "us-central1-a")
+        assert result is None
+        mock_get_client.assert_called_once()
+
+    def test_no_match_returns_none(self, tmp_path):
+        cache_path = tmp_path / "price_cache.json"
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": []}
+        services.skus.return_value.list_next.return_value = None
+
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_disk_price_per_gb_month("pd-standard", "us-central1-a")
+        assert result is None
+        assert not cache_path.exists()
+
+
+class TestGetDiskPricePerGbHour:
+    def test_divides_by_avg_hours_per_month(self, tmp_path):
+        cache_path = tmp_path / "price_cache.json"
+        key = cost._disk_price_cache_key("pd-standard", "us-central1-a")
+        cache_path.write_text(json.dumps({key: 73.0}))
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)):
+            result = cost.get_disk_price_per_gb_hour("pd-standard", "us-central1-a")
+        assert result == pytest.approx(73.0 / cost.AVG_HOURS_PER_MONTH)
+
+    def test_none_when_underlying_price_unavailable(self):
+        with patch("canine.cost.get_disk_price_per_gb_month", return_value=None):
+            assert cost.get_disk_price_per_gb_hour("pd-standard", "us-central1-a") is None
+
+
+# ---------------------------------------------------------------------------
+# get_live_disk_info / make_live_boot_disk_price_source / make_live_disk_gb_hour_price_source
+# ---------------------------------------------------------------------------
+
+class TestGetLiveDiskInfo:
+    def setup_method(self):
+        cost._DISK_INFO_CACHE.clear()
+
+    def test_successful_lookup(self):
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.return_value = {
+          "sizeGb": "50", "type": "https://www.googleapis.com/compute/v1/projects/p/zones/z/diskTypes/pd-ssd",
+        }
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            size_gb, disk_type = cost.get_live_disk_info("worker1", "us-central1-a", "my-project")
+        assert size_gb == pytest.approx(50.0)
+        assert disk_type == "pd-ssd"
+
+    def test_api_failure_returns_none_none(self):
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.side_effect = RuntimeError("disk not found")
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            result = cost.get_live_disk_info("worker-gone", "us-central1-a", "my-project")
+        assert result == (None, None)
+
+    def test_cache_hit_skips_api_call(self):
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.return_value = {
+          "sizeGb": "25", "type": ".../diskTypes/pd-standard",
+        }
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            first = cost.get_live_disk_info("worker1", "us-central1-a", "my-project", ttl_seconds=300)
+            fake_client.disks.return_value.get.reset_mock()
+            second = cost.get_live_disk_info("worker1", "us-central1-a", "my-project", ttl_seconds=300)
+        assert first == second == (25.0, "pd-standard")
+        fake_client.disks.return_value.get.assert_not_called()
+
+    def test_cache_expires_after_ttl(self):
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.return_value = {
+          "sizeGb": "25", "type": ".../diskTypes/pd-standard",
+        }
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            cost.get_live_disk_info("worker1", "us-central1-a", "my-project", ttl_seconds=0)
+            cost.get_live_disk_info("worker1", "us-central1-a", "my-project", ttl_seconds=0)
+        assert fake_client.disks.return_value.get.call_count == 2
+
+
+class TestMakeLiveBootDiskPriceSource:
+    def test_composes_size_and_gb_hour_price(self):
+        with patch("canine.cost.get_live_disk_info", return_value=(50.0, "pd-ssd")), \
+             patch("canine.cost.get_disk_price_per_gb_hour", return_value=0.0002):
+            price_source = cost.make_live_boot_disk_price_source("us-central1-a", "my-project")
+            result = price_source("worker1")
+        assert result == pytest.approx(50.0 * 0.0002)
+
+    def test_missing_disk_info_returns_none(self):
+        with patch("canine.cost.get_live_disk_info", return_value=(None, None)):
+            price_source = cost.make_live_boot_disk_price_source("us-central1-a", "my-project")
+            assert price_source("worker-gone") is None
+
+    def test_missing_disk_price_returns_none(self):
+        with patch("canine.cost.get_live_disk_info", return_value=(50.0, "pd-ssd")), \
+             patch("canine.cost.get_disk_price_per_gb_hour", return_value=None):
+            price_source = cost.make_live_boot_disk_price_source("us-central1-a", "my-project")
+            assert price_source("worker1") is None
+
+
+class TestMakeLiveDiskGbHourPriceSource:
+    def test_delegates_to_get_disk_price_per_gb_hour(self):
+        with patch("canine.cost.get_disk_price_per_gb_hour", return_value=0.0001) as mock_get:
+            price_source = cost.make_live_disk_gb_hour_price_source("us-central1-a")
+            result = price_source("pd-standard")
+        assert result == pytest.approx(0.0001)
+        mock_get.assert_called_once_with("pd-standard", "us-central1-a")
+
+
+# ---------------------------------------------------------------------------
+# estimate_task_cost -- disk_price_source
+# ---------------------------------------------------------------------------
+
+class TestEstimateTaskCostDiskPriceSource:
+    def setup_method(self):
+        self.host_lut = pd.DataFrame(
+          {"machine_type": ["n1-highcpu-8", "n1-highcpu-8"], "preemptible": [True, True]},
+          index = pd.Index(["worker1", "worker2"]),
+        )
+        self.node_types = pd.DataFrame({"cpus": [8], "realmemory": [8192.0]}, index=pd.Index(["n1-highcpu-8"]))
+
+    def test_none_disk_price_source_reproduces_prior_behavior_exactly(self):
+        # Regression safety: omitting disk_price_source must not change
+        # cost_usd/is_provisional/missing_capacity_data at all relative to
+        # before this feature existed.
+        acct = make_acct_df({
+          "1_1": [{"NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
+        })
+        result = cost.estimate_task_cost(acct, lambda node: 3600.0, host_lut=self.host_lut, node_types=self.node_types)
+        assert result.loc["1_1", "cost_usd"] == pytest.approx(1800.0)
+        assert result.loc["1_1", "disk_cost_usd"] == 0.0
+        assert result.loc["1_1", "disk_cost_provisional"]  # never priced -- flagged, not silently zero
+
+    def test_disk_cost_prorated_same_as_compute(self):
+        acct = make_acct_df({
+          "1_1": [{"NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
+        })
+        result = cost.estimate_task_cost(
+          acct, lambda node: 3600.0, disk_price_source=lambda node: 36.0,
+          host_lut=self.host_lut, node_types=self.node_types,
+        )
+        # same max(cpu_frac, mem_frac)=0.5 proration as compute: (36/3600)*3600*0.5 = 18
+        assert result.loc["1_1", "cost_usd"] == pytest.approx(1800.0)
+        assert result.loc["1_1", "disk_cost_usd"] == pytest.approx(18.0)
+        assert not result.loc["1_1", "disk_cost_provisional"]
+
+    def test_disk_pricing_failure_does_not_affect_compute_cost_or_flags(self):
+        acct = make_acct_df({
+          "1_1": [{"NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
+        })
+        result = cost.estimate_task_cost(
+          acct, lambda node: 3600.0, disk_price_source=lambda node: None,
+          host_lut=self.host_lut, node_types=self.node_types,
+        )
+        assert result.loc["1_1", "cost_usd"] == pytest.approx(1800.0)
+        assert not result.loc["1_1", "is_provisional"]
+        assert result.loc["1_1", "disk_cost_usd"] == 0.0
+        assert result.loc["1_1", "disk_cost_provisional"]
+
+    def test_compute_pricing_failure_does_not_prevent_disk_pricing(self):
+        # The inverse isolation case: compute price missing shouldn't prevent
+        # disk cost (which reuses the same resource_frac/elapsed_seconds)
+        # from still being computed.
+        acct = make_acct_df({
+          "1_1": [{"NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
+        })
+        result = cost.estimate_task_cost(
+          acct, lambda node: None, disk_price_source=lambda node: 36.0,
+          host_lut=self.host_lut, node_types=self.node_types,
+        )
+        assert result.loc["1_1", "cost_usd"] == 0.0
+        assert result.loc["1_1", "is_provisional"]
+        assert result.loc["1_1", "disk_cost_usd"] == pytest.approx(18.0)
+        assert not result.loc["1_1", "disk_cost_provisional"]
+
+    def test_missing_capacity_data_skips_disk_pricing_too(self):
+        acct = make_acct_df({
+          "1_1": [{"NodeList": "worker-unknown", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
+        })
+        result = cost.estimate_task_cost(
+          acct, lambda node: 3600.0, disk_price_source=lambda node: 36.0,
+          host_lut=self.host_lut, node_types=self.node_types,
+        )
+        assert result.loc["1_1", "missing_capacity_data"]
+        assert result.loc["1_1", "disk_cost_usd"] == 0.0
+
+
+# ---------------------------------------------------------------------------
+# estimate_scratch_disk_cost
+# ---------------------------------------------------------------------------
+
+class TestEstimateScratchDiskCost:
+    def test_prices_full_size_and_duration_no_proration(self):
+        cost_usd, is_provisional = cost.estimate_scratch_disk_cost(10, "standard", 3600.0, lambda disk_type: 0.01)
+        assert cost_usd == pytest.approx(0.10)  # 10GB * $0.01/GB-hr * 1hr
+        assert not is_provisional
+
+    def test_normalizes_disk_type_before_calling_price_source(self):
+        seen = {}
+        def price_source(disk_type):
+            seen["disk_type"] = disk_type
+            return 0.01
+        cost.estimate_scratch_disk_cost(10, "ssd", 3600.0, price_source)
+        assert seen["disk_type"] == "pd-ssd"
+
+    def test_unrecognized_disk_type_is_provisional(self):
+        cost_usd, is_provisional = cost.estimate_scratch_disk_cost(10, "hyperdisk-extreme", 3600.0, lambda disk_type: 0.01)
+        assert cost_usd == 0.0
+        assert is_provisional
+
+    def test_missing_price_is_provisional(self):
+        cost_usd, is_provisional = cost.estimate_scratch_disk_cost(10, "standard", 3600.0, lambda disk_type: None)
+        assert cost_usd == 0.0
+        assert is_provisional
+
+    def test_zero_size_is_provisional(self):
+        cost_usd, is_provisional = cost.estimate_scratch_disk_cost(0, "standard", 3600.0, lambda disk_type: 0.01)
+        assert cost_usd == 0.0
+        assert is_provisional
+
+    def test_negative_or_missing_duration_is_provisional(self):
+        assert cost.estimate_scratch_disk_cost(10, "standard", None, lambda disk_type: 0.01) == (0.0, True)
+        assert cost.estimate_scratch_disk_cost(10, "standard", -1.0, lambda disk_type: 0.01) == (0.0, True)
+
+
+# ---------------------------------------------------------------------------
+# estimate_window_cost_usd
+# ---------------------------------------------------------------------------
+
+class TestEstimateWindowCostUsd:
+    def test_prices_elapsed_hours(self):
+        result = cost.estimate_window_cost_usd(2.0, "2026-01-01T00:00:00", "2026-01-01T02:00:00")
+        assert result == pytest.approx(4.0)
+
+    def test_none_price_returns_none(self):
+        assert cost.estimate_window_cost_usd(None, "2026-01-01T00:00:00", "2026-01-01T02:00:00") is None
+
+    def test_none_window_returns_none(self):
+        assert cost.estimate_window_cost_usd(2.0, None, "2026-01-01T02:00:00") is None
+        assert cost.estimate_window_cost_usd(2.0, "2026-01-01T00:00:00", None) is None
+
+    def test_negative_window_clamped_to_zero(self):
+        result = cost.estimate_window_cost_usd(2.0, "2026-01-01T02:00:00", "2026-01-01T00:00:00")
+        assert result == pytest.approx(0.0)
