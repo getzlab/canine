@@ -115,6 +115,17 @@ def make_handler(state):
             parsed = urllib.parse.urlsplit(self.path)
             query = urllib.parse.parse_qs(parsed.query)
 
+            if query.get("uploadType") == ["media"]:
+                # one-shot media upload: the object appears whole or not at all, which is
+                # the atomicity the manifest depends on
+                name = query.get("name", [""])[0]
+                body = self._body()
+                with state.lock:
+                    state.objects[name] = body
+                    state.composite[name] = 1
+                self._json(200, self._object_metadata(name, body))
+                return
+
             if query.get("uploadType") == ["resumable"]:
                 self._body()
                 name = query.get("name", [""])[0]

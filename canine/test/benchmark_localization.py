@@ -1,0 +1,771 @@
+#!/usr/bin/env python3
+"""
+Integration benchmark for the parallel downloader, to be run on a real GCP worker.
+
+Everything in the unit suite runs against fakes. This script exists for the things a fake
+cannot establish, and the list is not short:
+
+  * the >=4x speedup claim, and the connection count that actually achieves it;
+  * whether the NIC or the persistent disk is the limit (§2 says the PD is the more
+    likely one for LocalizeToDisk, but that was reasoning, not measurement);
+  * whether SEEK_HOLE passes on the real localization disk. Locally it does NOT -- APFS
+    fails the probe -- so every local run exercises the checkpoint fallback and the
+    frontier path has never been integration-tested at all;
+  * page-cache loss via FALLOC_FL_PUNCH_HOLE, which is Linux-only and skipped locally;
+  * Route B against real GCS, including the auth path (metadata server, falling back to
+    gcloud), resumable sessions and compose -- none of which has touched real
+    infrastructure;
+  * Route C against a real gcsfuse mount, if one is being evaluated;
+  * what /bin/sh actually is on the controller image, which this repo does not reveal.
+
+Not covered here, because it cannot be driven from the VM being preempted: forcing a real
+preemption mid-localization. See `preempt` for what to do by hand.
+
+Deliberately stdlib-only and runnable without canine installed, so it can be dropped onto
+a node as-is:
+
+    ./benchmark_localization.py probe                      # seconds, no egress, no cost
+    ./benchmark_localization.py sweep --url URL --size N
+    ./benchmark_localization.py resume --url URL --size N
+    ./benchmark_localization.py routeb --url URL --size N --gs-url gs://bucket/obj
+
+`probe` is free and answers several open questions immediately; run it first.
+"""
+
+import argparse
+import errno
+import glob
+import hashlib
+import json
+import os
+import platform
+import random
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+DOWNLOADER = os.path.join(HERE, os.pardir, "localization", "parallel_download.py")
+
+MIB = 1024 * 1024
+GIB = 1024 * MIB
+
+
+# --------------------------------------------------------------------------------
+# reporting
+# --------------------------------------------------------------------------------
+
+def say(message=""):
+    sys.stdout.write(message + "\n")
+    sys.stdout.flush()
+
+
+def heading(text):
+    say()
+    say(text)
+    say("-" * len(text))
+
+
+def human(count):
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if abs(count) < 1024 or unit == "TiB":
+            return "{:.2f} {}".format(count, unit)
+        count /= 1024.0
+
+
+def rate(count, seconds):
+    if seconds <= 0:
+        return "n/a"
+    return "{}/s".format(human(count / seconds))
+
+
+# --------------------------------------------------------------------------------
+# host counters
+# --------------------------------------------------------------------------------
+
+def nic_bytes():
+    """Received bytes across real interfaces, from /proc/net/dev."""
+    total = 0
+    try:
+        with open("/proc/net/dev") as fh:
+            for line in fh.read().splitlines()[2:]:
+                name, _, rest = line.partition(":")
+                if name.strip() in ("lo", ""):
+                    continue
+                total += int(rest.split()[0])
+    except (IOError, OSError, IndexError, ValueError):
+        return None
+    return total
+
+
+def disk_written_bytes():
+    """
+    Bytes written across physical block devices, from /proc/diskstats.
+
+    Partitions and device-mapper entries are skipped so a write is not counted twice.
+    """
+    total = 0
+    try:
+        with open("/proc/diskstats") as fh:
+            for line in fh:
+                fields = line.split()
+                if len(fields) < 10:
+                    continue
+                name = fields[2]
+                if re.search(r"\d$", name) and not name.startswith("nvme"):
+                    continue  # a partition
+                if name.startswith(("dm-", "loop", "ram")):
+                    continue
+                total += int(fields[9]) * 512
+    except (IOError, OSError, ValueError):
+        return None
+    return total
+
+
+class Sampler:
+    """
+    Deltas and peaks for the NIC and disk counters over a run.
+
+    Sampled rather than taken end-to-end so a plateau is visible: if throughput stops
+    scaling with connections while NIC utilisation stays well under the cap, the disk is
+    the limit, which is the question §2 leaves open.
+    """
+
+    def __init__(self, interval=2.0):
+        self.interval = interval
+        self.samples = []
+
+    def __enter__(self):
+        self.start = time.monotonic()
+        self.nic0 = nic_bytes()
+        self.disk0 = disk_written_bytes()
+        self._last = (self.start, self.nic0, self.disk0)
+        return self
+
+    def tick(self):
+        now = time.monotonic()
+        if now - self._last[0] < self.interval:
+            return
+        nic, disk = nic_bytes(), disk_written_bytes()
+        elapsed = now - self._last[0]
+        if None not in (nic, self._last[1]):
+            self.samples.append({
+                "nic_bytes_per_s": (nic - self._last[1]) / elapsed,
+                "disk_bytes_per_s": ((disk - self._last[2]) / elapsed
+                                     if None not in (disk, self._last[2]) else None),
+            })
+        self._last = (now, nic, disk)
+
+    def __exit__(self, *exc):
+        self.seconds = time.monotonic() - self.start
+        nic, disk = nic_bytes(), disk_written_bytes()
+        self.nic_total = (nic - self.nic0) if None not in (nic, self.nic0) else None
+        self.disk_total = (disk - self.disk0) if None not in (disk, self.disk0) else None
+
+    def peak(self, key):
+        values = [s[key] for s in self.samples if s.get(key)]
+        return max(values) if values else None
+
+
+# --------------------------------------------------------------------------------
+# probe: free, and answers several open questions
+# --------------------------------------------------------------------------------
+
+def probe_seek_hole(directory):
+    path = os.path.join(directory, ".benchprobe.{}".format(os.getpid()))
+    fd = None
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_TRUNC, 0o600)
+        os.ftruncate(fd, 8 * MIB)
+        os.pwrite(fd, b"x" * 65536, 0)
+        os.fsync(fd)
+        hole = os.lseek(fd, 0, os.SEEK_HOLE)
+        return {"supported": 65536 <= hole <= 65536 + 65536, "hole_at": hole}
+    except (OSError, ValueError) as e:
+        return {"supported": False, "error": str(e)}
+    finally:
+        if fd is not None:
+            os.close(fd)
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def probe_punch_hole(directory):
+    if not (hasattr(os, "fallocate") and hasattr(os, "FALLOC_FL_PUNCH_HOLE")):
+        return {"supported": False, "reason": "no FALLOC_FL_PUNCH_HOLE on this platform"}
+    path = os.path.join(directory, ".benchpunch.{}".format(os.getpid()))
+    try:
+        with open(path, "wb") as fh:
+            fh.write(b"A" * (4 * MIB))
+        fd = os.open(path, os.O_RDWR)
+        try:
+            os.fallocate(fd, os.FALLOC_FL_PUNCH_HOLE | os.FALLOC_FL_KEEP_SIZE,
+                         MIB, MIB)
+        finally:
+            os.close(fd)
+        with open(path, "rb") as fh:
+            fh.seek(MIB)
+            punched = fh.read(16) == b"\0" * 16
+        return {"supported": punched}
+    except OSError as e:
+        return {"supported": False, "error": str(e)}
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def probe_mount(directory):
+    try:
+        with open("/proc/mounts") as fh:
+            entries = [l.split() for l in fh if len(l.split()) >= 3]
+    except (IOError, OSError):
+        return {"available": False}
+    target = os.path.realpath(os.path.abspath(directory))
+    best = None
+    for device, mountpoint, fstype in ((e[0], e[1], e[2]) for e in entries):
+        point = mountpoint.rstrip("/") or "/"
+        if target == point or point == "/" or target.startswith(point + "/"):
+            if best is None or len(point) > len(best[1].rstrip("/") or "/"):
+                best = (device, mountpoint, fstype)
+    if best is None:
+        return {"available": True, "matched": False}
+    return {"available": True, "matched": True,
+            "device": best[0], "mountpoint": best[1], "fstype": best[2]}
+
+
+def command_probe():
+    result = {"platform": platform.platform(), "python": sys.version.split()[0]}
+
+    heading("host")
+    say("platform      : {}".format(result["platform"]))
+    say("python        : {}".format(result["python"]))
+    try:
+        cpus = os.cpu_count()
+        with open("/proc/meminfo") as fh:
+            total_kb = int(re.search(r"MemTotal:\s+(\d+)", fh.read()).group(1))
+        result["cpus"], result["memory"] = cpus, total_kb * 1024
+        say("cpus / memory : {} / {}".format(cpus, human(total_kb * 1024)))
+    except Exception:
+        pass
+
+    heading("/bin/sh identity")
+    say("This is an open question the repo cannot answer: emitted commands are bash and")
+    say("use [[ ]] and process substitution, which dash rejects.")
+    try:
+        link = os.path.realpath("/bin/sh")
+        version = subprocess.run(["/bin/sh", "-c", "echo ${BASH_VERSION:-<not bash>}"],
+                                 capture_output=True, text=True, timeout=10).stdout.strip()
+        result["bin_sh"] = {"realpath": link, "bash_version": version}
+        say("/bin/sh -> {}   BASH_VERSION={}".format(link, version))
+    except Exception as e:
+        say("could not determine: {}".format(e))
+
+    heading("tools the emitted commands rely on")
+    result["tools"] = {}
+    for tool in ("bash", "curl", "python3", "gzip", "gunzip", "od", "aws", "gcloud",
+                 "gsutil", "stat", "md5sum"):
+        path = shutil.which(tool)
+        result["tools"][tool] = path
+        say("  {:<9} {}".format(tool, path or "MISSING"))
+
+    heading("candidate destinations")
+    result["destinations"] = {}
+    candidates = [d for d in [
+        os.environ.get("CANINE_LOCAL_DISK_DIR"),
+        "/mnt/nfs",
+        tempfile.gettempdir(),
+    ] if d] + sorted(glob.glob("/mnt/rwdisks/*"))
+    for directory in candidates:
+        if not os.path.isdir(directory):
+            continue
+        mount = probe_mount(directory)
+        seek = probe_seek_hole(directory)
+        punch = probe_punch_hole(directory)
+        free = None
+        try:
+            stats = os.statvfs(directory)
+            free = stats.f_bavail * stats.f_frsize
+        except OSError:
+            pass
+        result["destinations"][directory] = {
+            "mount": mount, "seek_hole": seek, "punch_hole": punch, "free": free}
+        say("{}".format(directory))
+        say("    fstype     : {}".format(mount.get("fstype", "?")))
+        say("    free       : {}".format(human(free) if free else "?"))
+        say("    SEEK_HOLE  : {}{}".format(
+            "yes" if seek["supported"] else "NO -- checkpoint fallback would be used",
+            "" if seek["supported"] else " (hole_at={})".format(seek.get("hole_at"))))
+        say("    punch-hole : {}".format("yes" if punch["supported"] else "no"))
+
+    heading("what this means")
+    frontier = [d for d, v in result["destinations"].items() if v["seek_hole"]["supported"]]
+    if frontier:
+        say("SEEK_HOLE passes on: {}".format(", ".join(frontier)))
+        say("-> the frontier path is live here. It has NEVER been integration-tested,")
+        say("   because it fails the probe on the development machine (APFS).")
+    else:
+        say("SEEK_HOLE passes nowhere -- every download would use the 8 MiB checkpoint")
+        say("fallback. Worth understanding before trusting the resume numbers.")
+    return result
+
+
+# --------------------------------------------------------------------------------
+# running the downloader
+# --------------------------------------------------------------------------------
+
+def peak_rss(pid):
+    """
+    VmHWM for a live process: the high-water mark, so polling it cannot miss a spike
+    between samples the way sampling VmRSS would.
+    """
+    try:
+        with open("/proc/{}/status".format(pid)) as fh:
+            match = re.search(r"VmHWM:\s+(\d+) kB", fh.read())
+        return int(match.group(1)) * 1024 if match else None
+    except (IOError, OSError, ValueError):
+        return None
+
+
+def run_download(url, dest, size, connections, min_chunk, extra=(), expect_md5=None,
+                 kill_after_bytes=None):
+    """
+    One download, measured. Returns a dict of results.
+
+    With connections=1 the downloader declines and synthesizes `curl -C - -sSL`, so that
+    row is genuinely the legacy single-stream path and the right baseline for the speedup
+    claim -- it is not the new code with one connection.
+    """
+    command = [sys.executable, os.path.abspath(DOWNLOADER),
+               "--url", url, "--dest", dest, "--size", str(size),
+               "--connections", str(connections), "--min-chunk", str(min_chunk)]
+    if expect_md5:
+        command += ["--check-md5", expect_md5]
+    command += list(extra)
+
+    with Sampler() as sampler:
+        process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                                   stderr=subprocess.PIPE)
+        killed = False
+        rss = 0
+        while True:
+            # RSS is read before poll(), so the last sample is taken while the process is
+            # still alive; /proc/<pid> is gone by the time poll() reports an exit.
+            current = peak_rss(process.pid)
+            if current:
+                rss = max(rss, current)
+            if process.poll() is not None:
+                break
+            sampler.tick()
+            if kill_after_bytes is not None and not killed:
+                try:
+                    if os.path.getsize(dest) >= kill_after_bytes:
+                        process.send_signal(signal.SIGKILL)
+                        killed = True
+                except OSError:
+                    pass
+            time.sleep(0.25)
+        stderr = process.stderr.read().decode("utf-8", "replace")
+
+    return {
+        "connections": connections,
+        "returncode": process.returncode,
+        "seconds": round(sampler.seconds, 2),
+        "killed": killed,
+        "peak_rss": rss or None,
+        "nic_bytes": sampler.nic_total,
+        "disk_bytes": sampler.disk_total,
+        "peak_nic_bytes_per_s": sampler.peak("nic_bytes_per_s"),
+        "peak_disk_bytes_per_s": sampler.peak("disk_bytes_per_s"),
+        "stderr_tail": stderr.strip().splitlines()[-3:],
+    }
+
+
+def file_md5(path, block=8 * MIB):
+    digest = hashlib.md5()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(block), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+# --------------------------------------------------------------------------------
+# sweep
+# --------------------------------------------------------------------------------
+
+def command_sweep(args):
+    """
+    §8.5's connection sweep. 1 connection is the legacy single stream and the baseline
+    the >=4x claim is measured against.
+    """
+    results = []
+    heading("connection sweep")
+    say("object    : {}".format(args.url))
+    say("size      : {}".format(human(args.size)))
+    say("dest dir  : {}".format(args.dest_dir))
+    say("egress    : ~{} per setting, {} settings".format(
+        human(args.size), len(args.connections)))
+    if args.size < GIB:
+        say()
+        say("WARNING: {} is too small for this to mean anything. Per-connection setup"
+            .format(human(args.size)))
+        say("dominates, and the numbers below should not be recorded as the benchmark.")
+        say("§8.5 calls for ~50 GB. Treat this run as a smoke test of the harness.")
+    say()
+    say("{:>5}  {:>9}  {:>13}  {:>13}  {:>13}  {:>10}  {:>4}".format(
+        "conns", "seconds", "throughput", "peak NIC", "peak disk", "peak RSS", "md5"))
+
+    baseline = None
+    for connections in args.connections:
+        dest = os.path.join(args.dest_dir, "bench.{}.bin".format(connections))
+        for stale in (dest, dest + ".k9pdl.gz"):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+        for sidecar in glob.glob(os.path.join(
+                args.dest_dir, ".bench.{}.bin.k9pdl.*".format(connections))):
+            os.unlink(sidecar)
+
+        outcome = run_download(args.url, dest, args.size, connections, args.min_chunk,
+                               expect_md5=args.md5)
+        if outcome["returncode"] == 0 and os.path.exists(dest):
+            digest = file_md5(dest)
+            outcome["md5"] = digest
+            outcome["md5_ok"] = (digest == args.md5) if args.md5 else None
+        else:
+            outcome["md5_ok"] = False
+        throughput = args.size / outcome["seconds"] if outcome["seconds"] else 0
+        outcome["throughput_bytes_per_s"] = throughput
+        if connections <= 1:
+            baseline = throughput
+        outcome["speedup_vs_single_stream"] = (
+            round(throughput / baseline, 2) if baseline else None)
+        results.append(outcome)
+
+        say("{:>5}  {:>9}  {:>13}  {:>13}  {:>13}  {:>10}  {:>4}".format(
+            connections, outcome["seconds"], rate(args.size, outcome["seconds"]),
+            rate(outcome["peak_nic_bytes_per_s"] or 0, 1),
+            rate(outcome["peak_disk_bytes_per_s"] or 0, 1),
+            human(outcome["peak_rss"]) if outcome["peak_rss"] else "?",
+            "ok" if outcome["md5_ok"] else ("-" if outcome["md5_ok"] is None else "BAD")))
+        if not args.keep:
+            try:
+                os.unlink(dest)
+            except OSError:
+                pass
+
+    heading("verdict")
+    best = max(results, key=lambda r: r["throughput_bytes_per_s"])
+    say("fastest        : {} connections at {}".format(
+        best["connections"], rate(args.size, best["seconds"])))
+    if baseline:
+        say("speedup        : {}x vs a single stream (§8.5 wants >=4x)".format(
+            best["speedup_vs_single_stream"]))
+        say("               : {}".format(
+            "MEETS the target" if (best["speedup_vs_single_stream"] or 0) >= 4
+            else "DOES NOT meet the target"))
+
+    # §8.5 wants memory bounded regardless of object size: the design's claim is that
+    # only READ_BLOCK per connection is ever buffered, so RSS should be roughly flat
+    # across the sweep and utterly unrelated to the 50 GB being moved.
+    memory = [r["peak_rss"] for r in results if r["peak_rss"]]
+    if memory:
+        say()
+        say("peak RSS       : {} across the sweep".format(human(max(memory))))
+        budget = args.min_chunk  # a generous ceiling: one chunk, not one READ_BLOCK
+        say("               : {} -- the claim is ~1 MiB per connection buffered".format(
+            "bounded as designed" if max(memory) < max(256 * MIB, budget)
+            else "HIGHER than expected; check for accumulation"))
+
+    # the NIC-vs-disk question §2 leaves open
+    peak_nic = max((r["peak_nic_bytes_per_s"] or 0) for r in results)
+    peak_disk = max((r["peak_disk_bytes_per_s"] or 0) for r in results)
+    say()
+    say("peak NIC       : {}   (n1-standard-8 cap is ~2 GB/s)".format(rate(peak_nic, 1)))
+    say("peak disk write: {}".format(rate(peak_disk, 1)))
+    if peak_nic and peak_disk:
+        if peak_disk < peak_nic * 0.8:
+            say("-> the DISK looks like the limit, as §2 predicted for LocalizeToDisk.")
+            say("   Raising connections further will not help; a larger PD would.")
+        elif peak_nic > 1.4 * GIB:
+            say("-> the NIC is close to its cap, so the network is the limit.")
+        else:
+            say("-> neither is saturated; the source may be the limit.")
+
+    plateau = [r for r in results if r["connections"] > 1]
+    if len(plateau) >= 2:
+        top = max(r["throughput_bytes_per_s"] for r in plateau)
+        knee = min((r["connections"] for r in plateau
+                    if r["throughput_bytes_per_s"] >= 0.95 * top), default=None)
+        say()
+        say("throughput is within 5% of its best from {} connections upward,".format(knee))
+        say("which is the value to set as the default (currently 8).")
+    return {"sweep": results}
+
+
+# --------------------------------------------------------------------------------
+# resume
+# --------------------------------------------------------------------------------
+
+def command_resume(args):
+    """
+    Resumability against the real filesystem, which is where it matters: the frontier path
+    only runs where SEEK_HOLE passes, and that is not the development machine.
+    """
+    heading("resume behaviour")
+    seek = probe_seek_hole(args.dest_dir)
+    say("SEEK_HOLE here : {}".format(
+        "yes -- frontier recovery" if seek["supported"] else "no -- checkpoint fallback"))
+
+    dest = os.path.join(args.dest_dir, "bench.resume.bin")
+    for stale in glob.glob(os.path.join(args.dest_dir, "*bench.resume.bin*")):
+        os.unlink(stale)
+
+    attempts = []
+    total_nic = 0
+    for attempt in range(1, args.max_attempts + 1):
+        kill_at = None
+        if attempt < args.max_attempts:
+            kill_at = int(args.size * (0.25 * attempt))
+        outcome = run_download(args.url, dest, args.size, args.connections,
+                               args.min_chunk, expect_md5=args.md5,
+                               kill_after_bytes=kill_at)
+        total_nic += outcome["nic_bytes"] or 0
+        attempts.append(outcome)
+        say("attempt {}: rc={} {} seconds, killed={}, NIC {}".format(
+            attempt, outcome["returncode"], outcome["seconds"], outcome["killed"],
+            human(outcome["nic_bytes"] or 0)))
+        if outcome["returncode"] == 0 and not outcome["killed"]:
+            break
+
+    heading("verdict")
+    digest = file_md5(dest) if os.path.exists(dest) else None
+    correct = (digest == args.md5) if args.md5 else None
+    say("final md5      : {}{}".format(
+        digest, "" if correct is None else ("  CORRECT" if correct else "  WRONG")))
+    say("total received : {} for a {} object".format(human(total_nic), human(args.size)))
+    if total_nic and args.size:
+        waste = total_nic - args.size
+        say("refetched      : {} ({:.1f}% overhead)".format(
+            human(max(0, waste)), 100.0 * max(0, waste) / args.size))
+        say()
+        say("The claim is that only the uncommitted tail is refetched. With {} kills,".format(
+            len(attempts) - 1))
+        say("a per-attempt loss of a whole chunk would show up as roughly")
+        say("{} of overhead; a frontier/checkpoint working correctly shows far less."
+            .format(human((len(attempts) - 1) * args.min_chunk * args.connections)))
+
+    if seek["supported"] and probe_punch_hole(args.dest_dir)["supported"]:
+        heading("page-cache loss (punch-hole)")
+        say("This is the case SIGKILL cannot produce -- bytes the process wrote are gone")
+        say("because the VM vanished before they were committed. Skipped on the dev")
+        say("machine for lack of FALLOC_FL_PUNCH_HOLE, so it runs here for the first time.")
+        fd = os.open(dest, os.O_RDWR)
+        try:
+            os.fallocate(fd, os.FALLOC_FL_PUNCH_HOLE | os.FALLOC_FL_KEEP_SIZE,
+                         args.size // 3, min(64 * MIB, args.size // 4))
+        finally:
+            os.close(fd)
+        marker = os.path.join(os.path.dirname(dest),
+                              "." + os.path.basename(dest) + ".k9pdl.done")
+        try:
+            os.unlink(marker)
+        except OSError:
+            pass
+        outcome = run_download(args.url, dest, args.size, args.connections,
+                               args.min_chunk, expect_md5=args.md5)
+        after = file_md5(dest) if os.path.exists(dest) else None
+        say("re-run rc={}, refetched {}, md5 {}".format(
+            outcome["returncode"], human(outcome["nic_bytes"] or 0),
+            "CORRECT" if after == args.md5 else "WRONG"))
+
+    return {"resume": attempts, "final_md5": digest, "md5_ok": correct,
+            "total_nic_bytes": total_nic}
+
+
+# --------------------------------------------------------------------------------
+# route B
+# --------------------------------------------------------------------------------
+
+def command_routeb(args):
+    """
+    Route B against real GCS. Never exercised outside a fake, and the auth path in
+    particular has no local coverage at all.
+    """
+    heading("route B (bucket destination) against real GCS")
+    say("gs url : {}".format(args.gs_url))
+    say()
+    say("Checks the things the fake cannot: that the metadata server (or gcloud) yields a")
+    say("usable token, that resumable sessions behave as the 308/Range protocol says, and")
+    say("that compose produces the right object.")
+
+    token_source = None
+    try:
+        request = subprocess.run(
+            ["curl", "-s", "-H", "Metadata-Flavor: Google",
+             "http://metadata.google.internal/computeMetadata/v1/"
+             "instance/service-accounts/default/token"],
+            capture_output=True, text=True, timeout=10)
+        if request.returncode == 0 and "access_token" in request.stdout:
+            token_source = "metadata server"
+    except Exception:
+        pass
+    if token_source is None and shutil.which("gcloud"):
+        out = subprocess.run(["gcloud", "auth", "print-access-token"],
+                             capture_output=True, text=True, timeout=60)
+        if out.returncode == 0 and out.stdout.strip():
+            token_source = "gcloud fallback"
+    say("token source : {}".format(token_source or "NONE -- route B cannot run"))
+    if token_source is None:
+        return {"routeb": {"token": None}}
+
+    dest = os.path.join(args.mount_dir, os.path.basename(args.gs_url))
+    say("dest         : {} (must be on the gcsfuse mount for the route to be chosen)"
+        .format(dest))
+    outcome = run_download(args.url, dest, args.size, args.connections, args.min_chunk,
+                           expect_md5=args.md5)
+    say("rc={} in {} seconds".format(outcome["returncode"], outcome["seconds"]))
+    for line in outcome["stderr_tail"]:
+        say("  {}".format(line))
+    return {"routeb": {"token_source": token_source, "outcome": outcome}}
+
+
+# --------------------------------------------------------------------------------
+# preemption: cannot be automated from the VM being preempted
+# --------------------------------------------------------------------------------
+
+PREEMPT_STEPS = """\
+Forcing a real preemption cannot be driven from the VM being preempted -- it stops
+executing. It also needs the SLURM requeue path to observe the resume, so it belongs in a
+real wolF run rather than in this script. The steps:
+
+ 1. Submit a wolF task whose only work is a large LocalizeToDisk, so localization IS the
+    job:
+        wolf.LocalizeToDisk(files = {"big": "<the 50 GB URL>"})
+
+ 2. Watch for the localization disk to be created and partially written:
+        gcloud compute disks list --filter="name~canine-"
+        gcloud compute ssh <worker> --command 'ls -la /mnt/rwdisks/*/'
+    Confirm the .k9pdl.json manifest exists and the .k9pdl.done marker does NOT.
+
+ 3. From ANOTHER machine, kill the worker outright -- delete rather than stop, so it is a
+    preemption and not a clean shutdown:
+        gcloud compute instances delete <worker> --quiet
+
+ 4. Confirm SLURM requeues the task and a new worker re-attaches the same disk. The log
+    should show canine's "Resuming creation of persistent disk", then the downloader's
+    "resuming: N/M chunks already complete".
+
+ 5. Let it finish and check:
+      * the localized file's md5 matches the source;
+      * the disk was labelled finished=yes only AFTER completion;
+      * total bytes billed are close to one object, not two. The downloader logs
+        "N transferred" per attempt; sum them.
+
+ 6. Repeat with an NFS destination (a plain `url`-mode input, no
+    localize_to_persistent_disk) -- it takes a different path through the localizer.
+
+What to watch for specifically, since these are unverified rather than merely untested:
+
+  * If SEEK_HOLE passes on the PD (see `probe`), this is the FIRST time frontier recovery
+    runs for real. Every local test used the checkpoint fallback.
+  * §12.2's disk-resize daemon now runs for the localization disk. Confirm it fires and
+    that `gcloud compute disks resize` succeeds from the worker's service account.
+  * A preemption between "download finished" and "disk labelled finished=yes" should
+    resume without re-downloading, because the .k9pdl.done marker survives. Worth
+    engineering deliberately: kill the worker right after the marker appears.
+"""
+
+
+def command_preempt(_args):
+    heading("forced preemption: manual procedure")
+    say(PREEMPT_STEPS)
+    return {"preempt": "manual"}
+
+
+# --------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="benchmark_localization.py",
+        description="Integration benchmark for the parallel downloader, on a real worker.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Start with `probe`: it costs nothing and answers several open questions.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    def add_common(p, need_url=True):
+        if need_url:
+            p.add_argument("--url", required=True, help="object to download")
+            p.add_argument("--size", required=True, type=int, help="its size in bytes")
+            p.add_argument("--md5", help="expected md5, so correctness is checked")
+        p.add_argument("--dest-dir", default="/mnt/rwdisks",
+                       help="where to write; use the localization disk to measure the "
+                            "path that matters (default: %(default)s)")
+        p.add_argument("--min-chunk", type=int, default=64 * MIB)
+        p.add_argument("--json", metavar="PATH", help="also write results as JSON")
+
+    sub.add_parser("probe", help="free environment report; run this first")
+
+    sweep = sub.add_parser("sweep", help="connection sweep, speedup, NIC-vs-disk limit")
+    add_common(sweep)
+    sweep.add_argument("--connections", type=int, nargs="+",
+                       default=[1, 4, 8, 12, 16],
+                       help="1 is the single-stream baseline (default: %(default)s)")
+    sweep.add_argument("--keep", action="store_true", help="keep the downloaded files")
+
+    resume = sub.add_parser("resume", help="SIGKILL resume, refetch accounting, punch-hole")
+    add_common(resume)
+    resume.add_argument("--connections", type=int, default=8)
+    resume.add_argument("--max-attempts", type=int, default=4)
+
+    routeb = sub.add_parser("routeb", help="route B against real GCS")
+    add_common(routeb)
+    routeb.add_argument("--gs-url", required=True, help="gs://bucket/object destination")
+    routeb.add_argument("--mount-dir", required=True,
+                        help="the gcsfuse mount the destination lives on")
+    routeb.add_argument("--connections", type=int, default=8)
+
+    sub.add_parser("preempt", help="print the manual forced-preemption procedure")
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+
+    if not os.path.exists(DOWNLOADER):
+        say("cannot find the downloader at {}".format(DOWNLOADER))
+        return 1
+
+    handlers = {
+        "probe": lambda a: command_probe(),
+        "sweep": command_sweep,
+        "resume": command_resume,
+        "routeb": command_routeb,
+        "preempt": command_preempt,
+    }
+    result = handlers[args.command](args)
+
+    path = getattr(args, "json", None)
+    if path and result:
+        with open(path, "w") as fh:
+            json.dump(result, fh, indent=2, default=str)
+        say()
+        say("results written to {}".format(path))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+
+# k9pdl-eof

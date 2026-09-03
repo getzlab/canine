@@ -48,6 +48,19 @@ def force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, OBJECT)):
     )
 
 
+MANIFEST_OBJECT = OBJECT + ".k9pdl.json"
+
+
+def read_manifest(gcs):
+    """
+    The manifest is a GCS object on this route, not a file. It must not be on the mount:
+    a flat-namespace bucket has no atomic rename, which is what the filesystem manifest's
+    commit depends on -- and this route exists because that filesystem misbehaves.
+    """
+    body = gcs.state.objects.get(MANIFEST_OBJECT)
+    return json.loads(body.decode("utf-8")) if body else None
+
+
 def options_for(dest, url, size, **overrides):
     argv = [
         "--url", url, "--dest", dest, "--size", str(size),
@@ -197,9 +210,10 @@ class TestSessionResumability:
             self._interrupted_run(dest, source, payload, payload_md5, gcs,
                                   succeed_uploads=0)
 
-        assert os.path.exists(manifest_path), "manifest should survive the failure"
-        with open(manifest_path) as fh:
-            state = json.load(fh)
+        state = read_manifest(gcs)
+        assert state is not None, "manifest should survive the failure"
+        assert not os.path.exists(manifest_path), \
+            "the manifest must live in the bucket, not on the mount"
         sessions = [r.get("session") for r in state["chunks"].values()]
         assert sessions and all(sessions), \
             "expected a persisted session per attempted part, got {}".format(sessions)
@@ -260,9 +274,8 @@ class TestSessionResumability:
                                   succeed_uploads=6)
 
             # kill one of the recorded sessions
-            manifest_path, _ = pdl.sidecar_paths(dest)
-            with open(manifest_path) as fh:
-                state = json.load(fh)
+            state = read_manifest(gcs)
+            assert state is not None
             for record in state["chunks"].values():
                 session_uri = record.get("session")
                 if session_uri:
@@ -477,3 +490,339 @@ class TestGcsObjectMd5:
 
     def test_malformed_yields_none(self):
         assert pdl.gcs_object_md5({"md5Hash": "!!!not base64!!!"}) is None
+
+
+class TestManifestLivesInTheBucket:
+    """
+    Route B exists for a bucket destination, so its manifest must not be committed through
+    the mount. The filesystem manifest writes a temp file and renames, but on a
+    flat-namespace bucket rename is a server-side copy followed by a delete -- not atomic.
+    A single media upload gives the property directly: the object appears whole or not at
+    all.
+
+    The consequence of getting this wrong is bounded rather than corrupting -- a torn
+    manifest fails to parse, loads as None, and forces a clean restart -- but that costs
+    re-uploading every part, and this is the one route where the filesystem cannot be
+    trusted to avoid it.
+    """
+
+    def test_the_manifest_is_a_bucket_object(self, tmp_path, monkeypatch, gcs, payload,
+                                             payload_md5):
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            # interrupt so the manifest is still present at the end
+            gcs.state.uploads_seen = 0
+            gcs.state.fail_uploads_after = 2
+            pdl.run(options_for(dest, source.url(), len(payload),
+                                check_md5=payload_md5, retries=0))
+            gcs.state.fail_uploads_after = None
+
+        assert read_manifest(gcs) is not None
+        assert MANIFEST_OBJECT in gcs.state.objects
+
+    def test_nothing_is_written_to_the_mount(self, tmp_path, monkeypatch, gcs, payload,
+                                             payload_md5):
+        """The VM is a pure relay on this route; the manifest is not an exception."""
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            gcs.state.uploads_seen = 0
+            gcs.state.fail_uploads_after = 2
+            pdl.run(options_for(dest, source.url(), len(payload),
+                                check_md5=payload_md5, retries=0))
+            gcs.state.fail_uploads_after = None
+
+        assert list(tmp_path.iterdir()) == [], \
+            "wrote to the destination filesystem: {}".format(
+                [p.name for p in tmp_path.iterdir()])
+
+    def test_it_is_committed_without_a_temp_name_or_rename(self, gcs):
+        """
+        Staging then renaming is exactly what does not work here, so the GCS manifest has
+        no staging path at all -- asking for one is a programming error rather than a
+        silent fallback to the unsafe pattern.
+        """
+        manifest = pdl.GcsManifest.create(
+            pdl.GcsClient(), BUCKET, "m.json", "pid", 100, 50, [(0, 50), (50, 100)]
+        )
+        with pytest.raises(AssertionError):
+            manifest.tmp_path
+
+    def test_a_torn_manifest_is_impossible_but_unparseable_still_restarts(self, gcs):
+        """
+        A partial object cannot be observed here, unlike the filesystem case. Unparseable
+        content is nonetheless treated identically -- no usable resume state -- so the
+        behavior does not depend on that guarantee holding.
+        """
+        client = pdl.GcsClient()
+        gcs.state.objects["m.json"] = b'{"schema_version": 1, "plan'
+        assert pdl.GcsManifest.load(client, BUCKET, "m.json") is None
+
+    def test_a_wrong_schema_version_restarts(self, gcs):
+        client = pdl.GcsClient()
+        gcs.state.objects["m.json"] = b'{"schema_version": 999}'
+        assert pdl.GcsManifest.load(client, BUCKET, "m.json") is None
+
+    def test_an_absent_manifest_loads_as_none(self, gcs):
+        assert pdl.GcsManifest.load(pdl.GcsClient(), BUCKET, "absent.json") is None
+
+    def test_records_survive_a_round_trip(self, gcs):
+        """
+        Only persistence is overridden; the record-keeping is inherited, so the two
+        manifests cannot drift in what they record.
+        """
+        client = pdl.GcsClient()
+        manifest = pdl.GcsManifest.create(
+            client, BUCKET, "m.json", "pid", 100, 50, [(0, 50), (50, 100)]
+        )
+        manifest.record_session(0, "https://upload/session/7")
+        manifest.record_part_digest(0, "d41d8cd98f00b204e9800998ecf8427e")
+        manifest.record_chunk_done(0, None)
+
+        reloaded = pdl.GcsManifest.load(client, BUCKET, "m.json")
+        assert reloaded.session_uri(0) == "https://upload/session/7"
+        assert reloaded.chunk_record(0)["md5"] == "d41d8cd98f00b204e9800998ecf8427e"
+        assert reloaded.is_complete(0)
+        assert not reloaded.is_complete(1)
+
+    def test_a_failed_manifest_write_does_not_fail_the_transfer(self, gcs, monkeypatch):
+        """
+        Losing an update costs re-uploading parts, never correctness -- the same rule as
+        the filesystem manifest, but the errors here are the client's, not OSError.
+        """
+        client = pdl.GcsClient()
+        manifest = pdl.GcsManifest.create(
+            client, BUCKET, "m.json", "pid", 100, 50, [(0, 50), (50, 100)]
+        )
+
+        def boom(*args, **kwargs):
+            raise pdl.TransientError("bucket unavailable")
+
+        monkeypatch.setattr(client, "put_object", boom)
+        manifest.record_chunk_done(0, None)   # must not raise
+
+    def test_plan_id_identity_is_what_invalidates_it(self, gcs):
+        """
+        There is no local file on this route, so inode and size checks are meaningless;
+        the plan identity is the whole test.
+        """
+        client = pdl.GcsClient()
+        manifest = pdl.GcsManifest.create(
+            client, BUCKET, "m.json", "pid", 100, 50, [(0, 50), (50, 100)]
+        )
+        assert manifest.matches("pid", None, 100)
+        assert not manifest.matches("other", None, 100)
+        assert not manifest.matches("pid", None, 200)
+
+    def test_it_is_removed_on_success(self, tmp_path, monkeypatch, gcs, payload,
+                                     payload_md5):
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            assert pdl.run(options_for(dest, source.url(), len(payload),
+                                       check_md5=payload_md5)) == pdl.EXIT_OK
+        assert MANIFEST_OBJECT not in gcs.state.objects
+
+    def test_the_marker_still_lands_beside_the_destination(self, tmp_path, monkeypatch,
+                                                           gcs, payload, payload_md5):
+        """
+        The manifest moves to the bucket but the completion marker must not: the emitted
+        bash consults it on the next attempt, and that runs against the mount.
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            pdl.run(options_for(dest, source.url(), len(payload),
+                                check_md5=payload_md5))
+        _, marker_path = pdl.sidecar_paths(dest)
+        assert os.path.exists(marker_path)
+
+
+class TestPerPartDigestComparison:
+    """
+    §4.7's cheap verification for a bucket destination: each uploaded part is a plain
+    single-stream upload, so GCS reports its md5Hash, and comparing that against the md5
+    computed in flight checks every byte against the source's own digest with no read-back.
+
+    It was dead code. record_chunk_done replaced the chunk's record rather than merging
+    into it, so the md5 written by record_part_digest was destroyed immediately afterwards
+    and the comparison read None every time. These tests pin both halves: that the digest
+    survives, and that a mismatch is actually caught.
+    """
+
+    def test_the_digest_survives_being_marked_done(self, gcs):
+        """
+        The specific regression. record_part_digest then record_chunk_done is the exact
+        order BucketChunkSink.chunk_done uses.
+        """
+        client = pdl.GcsClient()
+        manifest = pdl.GcsManifest.create(
+            client, BUCKET, "m.json", "pid", 100, 50, [(0, 50), (50, 100)]
+        )
+        manifest.record_session(0, "https://upload/session/7")
+        manifest.record_part_digest(0, "d41d8cd98f00b204e9800998ecf8427e")
+        manifest.record_chunk_done(0, None)
+
+        assert manifest.chunk_record(0)["md5"] == "d41d8cd98f00b204e9800998ecf8427e"
+        assert manifest.session_uri(0) == "https://upload/session/7"
+        assert manifest.is_complete(0)
+
+    def test_the_same_holds_for_the_filesystem_manifest(self, tmp_path):
+        """The bug was in the shared base class, so both routes were affected."""
+        destination = tmp_path / "obj.bin"
+        destination.write_bytes(b"\0" * 100)
+        manifest = pdl.Manifest.create(
+            str(tmp_path / "m.json"), "pid", 100, 50, [(0, 50), (50, 100)],
+            os.stat(str(destination)), True, 0,
+        )
+        manifest.record_part_digest(0, "abc")
+        manifest.record_chunk_done(0, None)
+        assert manifest.chunk_record(0)["md5"] == "abc"
+        assert manifest.is_complete(0)
+
+    def test_a_recorded_digest_is_compared_before_compose(self, tmp_path, monkeypatch,
+                                                          gcs, payload, payload_md5):
+        """
+        End to end: the digests are recorded during the transfer and the comparison runs.
+        A successful download implies every part matched what GCS stored.
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        recorded = {}
+        real = pdl.gcs_object_md5
+
+        def spy(metadata):
+            value = real(metadata)
+            recorded[metadata.get("name")] = value
+            return value
+
+        monkeypatch.setattr(pdl, "gcs_object_md5", spy)
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+        assert rc == pdl.EXIT_OK
+        assert recorded, "the per-part comparison never ran"
+        assert all(v is not None for v in recorded.values()), \
+            "GCS reported no md5 for a part, so nothing was compared"
+
+    def test_a_part_whose_md5_disagrees_fails_before_compose(self, tmp_path, monkeypatch,
+                                                             gcs, payload, payload_md5):
+        """
+        The point of the comparison. If it were still dead, this would compose and pass.
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        monkeypatch.setattr(pdl, "gcs_object_md5", lambda metadata: "0" * 32)
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+        assert rc == pdl.EXIT_FAIL
+        assert OBJECT not in gcs.state.objects, "composed despite a part mismatch"
+
+
+# ---------------------------------------------------------------------------
+# nothing is written in place
+# ---------------------------------------------------------------------------
+
+class TestNothingIsWrittenInPlace:
+    """
+    Route B must never touch a local file at the destination.
+
+    This is the property the route exists for: a full-size ftruncate or an out-of-order
+    pwrite is exactly what makes a FUSE object store materialize gigabytes of zeros and
+    re-upload the whole object per write. Asserted here on a run that SUCCEEDS -- an
+    earlier version of this test forced the route with no GCS behind it and checked the
+    property on a failed attempt, which proves much less: a run that dies early has not
+    had the chance to write in place yet.
+    """
+
+    def test_no_ftruncate_or_pwrite_anywhere_on_a_successful_run(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+
+        calls = []
+        real_ftruncate, real_pwrite = pdl.os.ftruncate, pdl.os.pwrite
+
+        # Recorded and then genuinely performed, so an unexpected call fails on the
+        # assertion below rather than as some confusing downstream symptom.
+        def spy_ftruncate(fd, length):
+            calls.append(("ftruncate", length))
+            return real_ftruncate(fd, length)
+
+        def spy_pwrite(fd, data, offset):
+            calls.append(("pwrite", offset, len(data)))
+            return real_pwrite(fd, data, offset)
+
+        monkeypatch.setattr(pdl.os, "ftruncate", spy_ftruncate)
+        monkeypatch.setattr(pdl.os, "pwrite", spy_pwrite)
+
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+
+        assert rc == pdl.EXIT_OK
+        assert calls == [], "wrote in place on the bucket route: {}".format(calls)
+        assert gcs.state.objects.get(OBJECT) == payload
+
+    def test_the_destination_path_is_never_created_on_the_mount(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        """
+        Not even an empty file. The bytes go to the bucket, and the only thing allowed
+        beside the destination is the done marker.
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+        assert rc == pdl.EXIT_OK
+        assert not os.path.exists(dest), "created the destination file on the mount"
+        leftover = [n for n in os.listdir(str(tmp_path)) if "k9pdl" not in n]
+        assert leftover == [], "left files on the mount: {}".format(leftover)
+
+
+class TestAnUnreadableManifestIsNotFatal:
+    """
+    Failing to READ the resume state costs re-uploading parts, never correctness -- the
+    same rule flush() follows for failing to write it.
+
+    This asymmetry was a real bug: load() happens before the downloader's own error
+    handling, so a raised TransientError escaped to main()'s catch-all and exited
+    do-not-retry, turning a transient GCS blip into a permanently failed job.
+    """
+
+    def test_a_transient_read_failure_starts_fresh_and_succeeds(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+
+        def unreadable(self, bucket, name):
+            raise pdl.TransientError("GET {}: 503".format(name))
+
+        monkeypatch.setattr(pdl.GcsClient, "read_object", unreadable)
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+        assert rc == pdl.EXIT_OK, "an unreadable manifest should not fail the transfer"
+        assert gcs.state.objects.get(OBJECT) == payload
+
+    def test_it_does_not_exit_do_not_retry(self, tmp_path, monkeypatch, gcs, payload):
+        """
+        The specific regression: exit 1 is canine's do-not-retry, so this must never be
+        the way a manifest read failure surfaces.
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+
+        def unreadable(self, bucket, name):
+            raise pdl.TransientError("GET {}: 503".format(name))
+
+        monkeypatch.setattr(pdl.GcsClient, "read_object", unreadable)
+        with Server(payload) as source:
+            rc = pdl.main([
+                "--url", source.url(), "--dest", dest, "--size", str(len(payload)),
+                "--connections", "4", "--min-chunk", str(MIB), "--retries", "2",
+            ])
+        assert rc != pdl.EXIT_FAIL

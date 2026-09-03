@@ -708,11 +708,21 @@ class Manifest:
         return int(self.chunk_record(index).get("offset") or 0)
 
     def record_chunk_done(self, index, data_fd, digest=None):
+        """
+        Mark a chunk complete, MERGING into whatever is already recorded for it.
+
+        This used to replace the record outright, which quietly destroyed the two other
+        things kept per chunk: the resumable-upload session URI, and the per-part md5
+        written moments earlier by record_part_digest. The visible consequence was that
+        Route B's pre-compose check -- comparing each part's md5 against what GCS reports
+        for it, the cheap verification that avoids a full read-back -- read None every time
+        and so never actually compared anything.
+        """
         with self._lock:
-            record = {"done": True}
+            record = self.state.setdefault("chunks", {}).setdefault(str(index), {})
+            record["done"] = True
             if digest is not None:
                 record["md5"] = digest
-            self.state.setdefault("chunks", {})[str(index)] = record
             self.flush(data_fd)
 
     def record_checkpoint(self, index, offset, data_fd):
@@ -804,6 +814,114 @@ class Manifest:
                 os.unlink(path)
             except OSError:
                 pass
+
+
+class GcsManifest(Manifest):
+    """
+    A manifest stored as a GCS object rather than through the filesystem.
+
+    Route B exists for a destination that is a bucket, and on a flat-namespace bucket the
+    base class's commit is not atomic: it writes a temp file and renames, but rename there
+    is a server-side copy followed by a delete. A torn manifest is not a correctness
+    problem -- it fails to parse, loads as None, and forces a clean restart -- but it costs
+    every part being re-uploaded, and Route B is precisely the case where that filesystem
+    does not behave, so it should not be relying on it.
+
+    A single media upload gives the property directly: the object appears whole or not at
+    all. There is no temp name, no rename, and no fsync (durability is the service's
+    problem once it acknowledges the write).
+
+    Only the persistence is overridden; all the record-keeping -- chunk completion, session
+    URIs, per-part digests -- is inherited, so the two manifests cannot drift in what they
+    record.
+    """
+
+    def __init__(self, client, bucket, name, state):
+        # `path` is kept for the inherited logging/identity, but is never opened
+        super().__init__(name, state)
+        self.client = client
+        self.bucket = bucket
+        self.name = name
+
+    @property
+    def tmp_path(self):
+        raise AssertionError("a GCS manifest is written in one request, with no staging")
+
+    @classmethod
+    def load(cls, client, bucket, name):
+        try:
+            body = client.read_object(bucket, name)
+        except TransientError as e:
+            # Failing to READ the resume state costs re-uploading parts, never
+            # correctness -- the same rule flush() follows for failing to write it. The
+            # asymmetry matters because this call happens before the downloader's own
+            # error handling, so raising here would escape as an "unexpected failure" and
+            # exit do-not-retry, turning a GCS blip into a permanently failed job. If the
+            # service is genuinely unreachable the first upload fails a moment later, with
+            # progress correctly accounted for.
+            log("could not read the manifest ({}); starting fresh".format(e))
+            return None
+        if not body:
+            return None
+        try:
+            state = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            # A partial object should be impossible here, unlike the filesystem case, but
+            # treat unparseable exactly the same: no usable resume state.
+            return None
+        if not isinstance(state, dict) or state.get("schema_version") != SCHEMA_VERSION:
+            return None
+        return cls(client, bucket, name, state)
+
+    @classmethod
+    def create(cls, client, bucket, name, plan_id, size, chunk_size, chunks):
+        state = {
+            "schema_version": SCHEMA_VERSION,
+            "plan_id": plan_id,
+            "size": size,
+            "chunk_size": chunk_size,
+            "n_chunks": len(chunks),
+            "route": ROUTE_BUCKET,
+            # no dest inode/size: there is no local file on this route, and the object's
+            # own existence is checked before compose instead
+            "dest": {},
+            "seek_hole": False,
+            "checkpoint_interval": 0,
+            "chunks": {},
+            "writer": {
+                "hostname": _hostname(),
+                "pid": os.getpid(),
+                "boot_id": _boot_id(),
+            },
+        }
+        manifest = cls(client, bucket, name, state)
+        manifest.flush(data_fd=None)
+        return manifest
+
+    def matches(self, plan_id, dest_stat, size):
+        # Only the plan identity is meaningful without a local file.
+        return (self.state.get("plan_id") == plan_id
+                and self.state.get("size") == size)
+
+    def flush(self, data_fd):
+        # Losing a manifest update costs re-uploading parts, never correctness, so a
+        # failure here must not fail the transfer -- same rule as the filesystem manifest,
+        # but the errors are the client's rather than OSError.
+        try:
+            self._flush(data_fd)
+        except (TransientError, PermanentError, OSError) as e:
+            log("could not update the manifest ({}); parts may be re-uploaded".format(e))
+
+    def _flush(self, data_fd):
+        self.client.put_object(
+            self.bucket, self.name, json.dumps(self.state).encode("utf-8")
+        )
+
+    def unlink(self):
+        try:
+            self.client.delete_object(self.bucket, self.name)
+        except (TransientError, PermanentError):
+            pass
 
 
 def _hostname():
@@ -1251,6 +1369,35 @@ class GcsClient:
             if match:
                 committed = int(match.group(2)) + 1
         return None, committed
+
+    def put_object(self, bucket, name, body):
+        """
+        Write a small object in one request.
+
+        A single media upload is atomic: the object either appears whole or not at all,
+        with no intermediate state a reader could see. That is the property the manifest
+        needs on a bucket, where the tmp-plus-rename commit used on a POSIX filesystem
+        does not work -- rename is a server-side copy and delete on a flat-namespace
+        bucket, so it is not atomic there.
+        """
+        url = "{}/b/{}/o?uploadType=media&name={}".format(
+            GCS_UPLOAD_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(name, safe=""),
+        )
+        self.request("POST", url, body=body,
+                     headers={"Content-Type": "application/json"})
+
+    def read_object(self, bucket, name):
+        """Full contents of an object, or None when it does not exist."""
+        url = "{}/b/{}/o/{}?alt=media".format(
+            GCS_API_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(name, safe=""),
+        )
+        try:
+            _, _, body = self.request("GET", url, expect=(200,))
+        except PermanentError:
+            return None
+        return body
 
     def get_object(self, bucket, name):
         url = "{}/b/{}/o/{}".format(
@@ -1872,21 +2019,23 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     client = GcsClient(timeout=options.timeout)
     parts_prefix = "{}.k9pdl.parts".format(object_name)
 
-    # The manifest is an object write on this route rather than a tmp+rename, since
-    # rename is not atomic on a flat-namespace bucket. It still lands beside the
-    # destination so it travels with the data.
-    manifest = None if options.no_resume else Manifest.load(manifest_path)
+    # The manifest lives in the bucket, next to the destination object, so it travels with
+    # the data and is committed by a single atomic media upload. It deliberately does NOT
+    # go through the mount: on a flat-namespace bucket the filesystem manifest's
+    # tmp-plus-rename commit is not atomic, since rename there is a copy followed by a
+    # delete -- and this route exists precisely because that filesystem misbehaves.
+    manifest_object = "{}.k9pdl.json".format(object_name)
+    manifest = (None if options.no_resume
+                else GcsManifest.load(client, bucket, manifest_object))
     chunk_size = (chunks[0][1] - chunks[0][0]) if chunks else size
-    if manifest is not None and manifest.state.get("plan_id") != plan_id:
+    if manifest is not None and not manifest.matches(plan_id, None, size):
         log("manifest describes a different object or layout; restarting")
         manifest.unlink()
         manifest = None
     if manifest is None:
-        manifest = Manifest.create(
-            manifest_path, plan_id, size, chunk_size, chunks, _FakeStat(size),
-            False, 0,
+        manifest = GcsManifest.create(
+            client, bucket, manifest_object, plan_id, size, chunk_size, chunks
         )
-        manifest.state["route"] = ROUTE_BUCKET
     else:
         log("resuming: {}/{} parts already complete".format(
             sum(1 for i in range(len(chunks)) if manifest.is_complete(i)), len(chunks)))
@@ -2166,18 +2315,6 @@ def run_staged_route(options, decision, source, size, chunks, chunk_size, plan_i
     log("complete: {} bytes published from {}{}".format(
         size, staged, " (verified)" if digest else ""))
     return EXIT_OK
-
-
-class _FakeStat:
-    """
-    Stands in for os.stat on a route with no local file, so the manifest's identity
-    fields stay populated without pretending an inode exists.
-    """
-
-    def __init__(self, size):
-        self.st_dev = 0
-        self.st_ino = 0
-        self.st_size = size
 
 
 # --------------------------------------------------------------------------------

@@ -951,13 +951,16 @@ class TestSelectRoute:
 
 class TestNonPosixDestinationIsNotWrittenInPlace:
     """
-    The safety property that matters while routes B and C are unimplemented: a non-POSIX
-    destination must never see a full-size ftruncate or an out-of-order pwrite. Those
-    are precisely the operations that make a FUSE object store materialize gigabytes of
-    zeros and re-upload the whole object per write.
+    A non-POSIX destination must never see a full-size ftruncate or an out-of-order
+    pwrite: those are precisely the operations that make a FUSE object store materialize
+    gigabytes of zeros and re-upload the whole object per write.
+
+    Only the degradation path is covered here. The same property for Route B needs a GCS
+    endpoint to be meaningful, so it lives in test_parallel_download_bucket.py, asserted
+    on a run that succeeds.
     """
 
-    def _run_with_route(self, tmp_path, monkeypatch, route, gs_url=None):
+    def _run_with_route(self, tmp_path, monkeypatch, route):
         calls = []
         monkeypatch.setattr(pdl.os, "ftruncate",
                             lambda *a: calls.append(("ftruncate",) + a))
@@ -965,8 +968,7 @@ class TestNonPosixDestinationIsNotWrittenInPlace:
                             lambda *a: calls.append(("pwrite",) + a))
         monkeypatch.setattr(
             pdl, "select_route",
-            lambda dest, **kw: pdl.RouteDecision(
-                route, "test: forced route", gs_url=gs_url),
+            lambda dest, **kw: pdl.RouteDecision(route, "test: forced route"),
         )
         monkeypatch.setattr(pdl, "build_source", lambda opts: _StubSource())
 
@@ -980,23 +982,11 @@ class TestNonPosixDestinationIsNotWrittenInPlace:
         rc = pdl.run(options)
         return rc, calls, marker
 
-    def test_no_ftruncate_or_pwrite_on_the_bucket_route(self, tmp_path, monkeypatch):
-        """
-        Route B relays bytes straight from the source into resumable upload sessions, so
-        it must never touch a local file. Here it fails (nothing is listening), which is
-        fine -- what matters is that it failed without writing in place.
-        """
-        rc, calls, _ = self._run_with_route(
-            tmp_path, monkeypatch, pdl.ROUTE_BUCKET, gs_url="gs://b/o"
-        )
-        assert rc != 0
-        assert calls == [], "wrote in place to a bucket destination: {}".format(calls)
-
     def test_staged_route_degrades_to_the_legacy_command(self, tmp_path, monkeypatch):
         """
-        Route C is not implemented, so it takes the single sequential stream -- the
-        documented degradation, and for a FUSE object store the only access pattern
-        that reaches its streaming-write path.
+        Route C declines when no staging directory has room for the object, and takes the
+        single sequential stream instead -- the documented degradation, and for a FUSE
+        object store the only access pattern that reaches its streaming-write path.
         """
         rc, calls, marker = self._run_with_route(
             tmp_path, monkeypatch, pdl.ROUTE_STAGED
