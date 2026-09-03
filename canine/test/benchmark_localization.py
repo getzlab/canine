@@ -30,6 +30,9 @@ a node as-is:
     ./benchmark_localization.py routeb --url URL --size N --gs-url gs://bucket/obj
 
 `probe` is free and answers several open questions immediately; run it first.
+
+Step-by-step procedure, including standing up the node and the pd-standard localization
+disk: BENCHMARK_RUNBOOK.md, beside this file.
 """
 
 import argparse
