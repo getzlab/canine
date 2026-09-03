@@ -16,6 +16,7 @@ what you can expect to get.
 ### What you need
 
 * `gcloud` authenticated, with permission to create instances, disks and snapshots.
+  (§4.2 only; snapshots are not needed for the main measurements.)
 * Quota for one `n1-standard-8` and ~1 TB of persistent disk in your zone (§4 creates
   several 316 GB disks, though not all at once).
 * Test objects of ~12 GB and ~300 GB, and their md5s (§2 makes both).
@@ -315,9 +316,100 @@ in §10.
 Also re-run `pdl probe` now that a disk is mounted — it prints the PD type, provisioned size
 and implied per-GB cap, which should agree with `dd`. If they disagree, trust `dd`.
 
+### 4.1b Oversized pd-standard: the same speed without changing type
+
+pd-standard throughput is provisioned per gigabyte, so the fast disk does not have to be a
+different *type* — it can be a bigger pd-standard, which keeps unlimited read-only fan-out.
+Confirm the model and find the real per-instance ceiling:
+
+```bash
+for GB in 316 742 2000; do
+  D=ddsize-$GB
+  gcloud compute disks create $D --size ${GB}GB --type pd-standard --zone $ZONE --quiet
+  gcloud compute instances attach-disk $NODE --zone $ZONE --disk $D --device-name $D
+  sudo docker exec slurm bash -c "
+    while [ ! -b /dev/disk/by-id/google-$D ]; do sleep 1; done
+    echo -n '${GB}GB write: '
+    dd if=/dev/zero of=/dev/disk/by-id/google-$D bs=1M count=8000 \
+       oflag=direct conv=fdatasync 2>&1 | tail -1
+    echo -n '${GB}GB read : '
+    dd if=/dev/disk/by-id/google-$D of=/dev/null bs=1M count=8000 iflag=direct 2>&1 | tail -1"
+  gcloud compute instances detach-disk $NODE --zone $ZONE --disk $D --quiet
+  gcloud compute disks delete $D --zone $ZONE --quiet
+done
+```
+
+Predicted ~38 / ~89 / ~240 MB/s, the last being the per-instance ceiling rather than
+`0.12 × 2000`. If 2000 GB really gives ~240 MB/s, a 300 GB download takes **21 minutes**
+instead of 2.2 hours — a 6.3× win with no type change and no snapshot machinery at all.
+
+The catch is cost, and §10 works it through. The short version: oversizing is **not**
+justified by download time alone, but it may be justified several times over by consumer
+reads, and which of those is true depends on §4.1c.
+
+### 4.1c Does read-only fan-out share the disk's throughput?
+
+A localization disk is re-attached read-only to many VMs. Two possible models:
+
+* **shared** — the disk has one provisioned rate and N readers split it. A 316 GB disk with
+  20 readers would give each 1.9 MB/s;
+* **per-attachment** — each reader gets up to the disk's provisioned rate, so 38 MB/s each.
+
+Note what this does *not* decide: oversizing speeds up reads either way, because the
+per-GB provisioning is a property of the disk. (An earlier version of this section had that
+wrong.) What §4.1c decides is **how bad the status quo is** — under the shared model,
+today's 316 GB disks are a severe bottleneck for exactly the fan-out they exist to provide,
+which would be a bigger finding than anything else in this document.
+
+```bash
+# one RO disk, several readers at the same time
+gcloud compute disks create fanout-test --size 316GB --type pd-standard --zone $ZONE --quiet
+# ...write some data to it first, then detach and:
+for i in 1 2 3; do
+  gcloud compute instances create fanout-$i --zone $ZONE --machine-type n1-standard-8 \
+    --image-family slurm-gcp-docker-v3 --image-project broad-getzlab-workflows --quiet
+  gcloud compute instances attach-disk fanout-$i --zone $ZONE \
+    --disk fanout-test --device-name d --mode ro
+done
+
+# measure ONE reader alone, then all three simultaneously, and compare aggregate
+gcloud compute ssh fanout-1 --zone $ZONE --command \
+  'sudo dd if=/dev/disk/by-id/google-d of=/dev/null bs=1M count=4000 iflag=direct'
+# then launch all three at once and sum the reported rates
+```
+
+* **aggregate ≈ single-reader rate** → throughput is shared per-disk. Oversizing benefits
+  every consumer, and §10's cost case is strong.
+* **aggregate ≈ 3× single** → per-attachment. Oversizing helps localization only, and the
+  8-20 hour break-even in §10 is the whole story.
+
 ### 4.2 Does the disk-conversion idea actually win?
 
-**Start with the arithmetic, because it rules out the obvious version immediately.**
+**First, a constraint that may rule out the shrink step entirely.** GCP requires a disk
+created from a snapshot to be **at least as large as the disk the snapshot came from**. If
+that holds, you cannot download onto a large fast disk, snapshot it, and restore into a
+small 316 GB one — the restore floor is the original size. Verify it in two minutes before
+designing anything around it:
+
+```bash
+gcloud compute disks create shrink-src --size 742GB --type pd-standard --zone $ZONE --quiet
+gcloud compute snapshots create shrink-snap --source-disk shrink-src \
+  --source-disk-zone $ZONE --quiet
+# expected to FAIL:
+gcloud compute disks create shrink-dst --source-snapshot shrink-snap \
+  --size 316GB --type pd-standard --zone $ZONE
+```
+
+If it fails, then the only ways to fill a small pd-standard are a normal write — capped at
+its own 38 MB/s, which is the problem we started with — or a same-size-or-larger restore.
+**Conversion cannot shrink, so "download fast, publish small" is not available**, and the
+choice becomes: accept 2.2 h, or keep the oversized disk and pay for it (§10).
+
+That leaves conversion useful only for changing *type* while keeping size, e.g. pd-balanced
+742 GB → pd-standard 742 GB. Which is worth measuring, but note it no longer saves any disk
+cost — so it has to justify itself purely on the fan-out limit.
+
+**Then the arithmetic, because it rules out the obvious version too.**
 
 Any path that ends by *writing* 300 GB onto a pd-standard disk is bounded by that disk's
 ~38 MB/s, so:
@@ -337,15 +429,36 @@ So the whole idea reduces to two rates nobody has measured:
 | Rate | Why it might beat the guest ceiling | If it doesn't |
 |---|---|---|
 | **snapshot creation** from the fast disk | reads happen inside GCP, not through the VM | ≥0.94 h, and the budget is blown |
+| (an **image** instead would track the whole provisioned disk, not the data — strictly worse for an oversized source) | | |
 | **restore + hydration** onto pd-standard | writes happen inside GCP, not through the VM | ≥2.2 h, and conversion is pointless |
 
 The budget is tight: download-to-fast-disk already spends 0.94 h of the 2.2 h baseline, so
 **snapshot + restore must together finish in under ~1.26 h just to break even**, and in
 about 0.1 h to reach the ≥4× target. Measure it:
 
+**Snapshots and images are not the same thing, and the difference is material here.**
+
+| | Captures | Billed on | Relevance |
+|---|---|---|---|
+| **Snapshot** | the data on the disk | **used** data (~300 GB) | the right primitive for conversion |
+| **Image** | the entire disk | the **whole provisioned** disk (742 GB, or 2000 GB) | 2.5-6.7× more storage for an oversized source |
+
+This matters precisely because the fast source disk is *oversized*. A snapshot of a 2000 GB
+disk holding 300 GB bills for ~300 GB; an image of the same disk bills for 2000 GB. Anyone
+reaching for `gcloud compute images create` here would multiply the intermediate's storage
+cost by nearly seven for no benefit, and the time to create it would track the full disk
+rather than the data.
+
+Measure both if you evaluate this at all, and do not assume the snapshot figures carry over
+to images — the extrapolation below is only valid for snapshots.
+
 ```bash
-# on the node. 100 GB, extrapolate x3 -- snapshot cost tracks USED blocks, not disk size,
-# so a third of the data is a third of the work.
+# on the node. 100 GB of data, extrapolate x3 for 300 GB.
+#
+# The extrapolation assumes snapshot TIME tracks used blocks, the way snapshot BILLING
+# does. That is an inference, not a documented guarantee -- which is the point of
+# measuring it rather than reasoning about it. It does NOT hold for an image, whose work
+# tracks the whole provisioned disk.
 export SRC=conv-src DST=conv-dst SNAP=conv-snap
 
 gcloud compute disks create $SRC --size 316GB --type pd-balanced --zone $ZONE --quiet
@@ -471,20 +584,78 @@ Note the 12 GB object gets a 316 GB disk here, so the per-GB ceiling is the *300
 that is deliberate. Sizing the disk to the small object would give a ~13 GB disk at ~1.6 MB/s
 and measure a situation that never occurs.
 
-### 6.3 One confirmation run at full size
+### 6.3 Direct to pd-standard at full size — the primary result
 
-Once the knee is chosen and the disk question settled, a single run against the real object
-on the real disk type, to confirm the end-to-end number and the md5:
+**This is the number everything else is judged against, and it may well be the answer on
+its own.** Not a confirmation run: it is the shipping configuration, unchanged except for
+the downloader, and every alternative in §4.2 and §10 has to beat *this* by enough to
+justify its complexity.
 
 ```bash
 pdl sweep --url "$URL_300G" --size $SIZE_300G --md5 "$MD5_300G" \
           --dest-dir /mnt/rwdisks/$DISK \
           --connections $KNEE \
-          --json /tmp/confirm-300g.json
+          --json /tmp/direct-300g.json
 ```
 
-Expect roughly `300 GB ÷ (the §6.2 plateau)`. Compare against the 4 hours it takes today —
-that ratio, not the sweep's internal speedup, is the number to report.
+Run it against the real slow BAM too, since that is the actual subject:
+
+```bash
+pdl sweep --s3-bucket "$BAM_BUCKET" --s3-key "$BAM_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --dest-dir /mnt/rwdisks/$DISK --connections $KNEE \
+          --json /tmp/direct-300g-realbam.json
+```
+
+Expect roughly `300 GB ÷ (the §6.2 plateau)`. Report it as **"4 h → X h"** against today's
+behaviour, not as the sweep's internal speedup.
+
+Record alongside it the thing that makes this configuration valuable and the alternatives
+expensive: **time to `finished=yes`**. That label is when the data becomes available to
+every other workflow waiting on it (§6.7), and on this path it lands the moment the
+download completes.
+
+### 6.7 Contention: several workflows localizing the same inputs
+
+The case the existing design is built around, and the one an alternative is most likely to
+break. `create_persistent_disk` derives the disk name from a hash of the inputs, so
+concurrent workflows needing the same data converge on **one** disk, and the protocol is
+carried entirely by that single object:
+
+| State of the disk | What an arriving worker does |
+|---|---|
+| has label `finished=yes` | mount read-only, no localization at all |
+| exists, listed `users` (attached elsewhere) | `exit 5` — requeue and wait for the builder |
+| exists, no users, no `finished` | resume building it |
+| absent | create it |
+
+`finished=yes` is applied only after localization succeeds (`base.py:1564`, and gated on
+`CANINE_JOB_RC -eq 0` in the teardown variant), so it is a single atomic commit on the same
+object that holds the work in progress. That identity is what makes the race safe.
+
+Measure it, because the numbers matter for judging alternatives:
+
+```bash
+# from your workstation: three workers, same inputs, staggered starts
+for i in 1 2 3; do
+  wolf ... &     # or three sbatch submissions of the same LocalizeToDisk task
+  sleep 120
+done
+```
+
+Record:
+
+* **time to `finished=yes`** from the first worker's start — this is first-availability, and
+  it is what every waiting workflow actually experiences;
+* that workers 2 and 3 **exit 5 and park** rather than each starting a duplicate download;
+* that exactly **one** disk is created, and no orphans are left
+  (`gcloud compute disks list --filter="name~canine-"`);
+* what happens if the *builder* is preempted mid-download — another waiter should take over
+  and resume, not restart.
+
+The last one is the interesting interaction with this project: resume state now lives in
+`.k9pdl.json` **on the disk being built**, so a second worker taking over inherits it and
+continues rather than re-downloading. Worth confirming directly.
 
 ### 6.4 Correctness against the real sources
 
@@ -650,40 +821,122 @@ gcloud compute disks list --filter="name~canine-bench"    # confirm nothing is l
 
 ## 10. What to do about the disk
 
-`pd-standard` stays. It is the only type that attaches read-only to an unlimited number of
-VMs, and unlimited fan-out is what the rodisk exists to provide. `pd-balanced` and `pd-ssd`
-cap at 10 VMs, so they cannot back the published artifact however fast they are.
+`pd-standard` stays — it is the only type with unlimited read-only fan-out, and that is
+what the rodisk exists for. But its throughput is provisioned **per gigabyte**, so the same
+speed is available from a *bigger pd-standard* with no type change and no snapshot
+machinery. That makes this a sizing question, and sizing is a cost question.
 
-That makes the ~38 MB/s write ceiling at 316 GB a fixed constraint on the
-`LocalizeToDisk` path, and it means:
+**Cache disks are retained 24-48 hours**, which is the number that decides it.
 
-**Ship the parallel downloader anyway.** On pd-standard it takes 4 h to ~2.2 h — a 1.8x
-win, less than the 4x §8.5 targets but a real halving of the slowest step in the pipeline.
-It also *changes which resource is scarce*: today the network is the bottleneck at 21 MB/s,
-and afterwards the disk is, at 38. That reordering is what makes the disk worth attacking
-next, and it is not visible until the downloader lands.
+### Localization alone does not justify oversizing
 
-**Then pick one of the two ways past the ceiling**, neither of which is a disk-type change:
+0.12 MB/s/GB, $0.04/GB/month, n1-standard-8 at $0.379/h, 300 GB object:
 
-| Direction | Ceiling | Status |
+| Disk | Write | 300 GB takes | VM time saved | extra disk @24h | net @24h | extra @48h | net @48h |
+|---|---|---|---|---|---|---|---|
+| 316 GB (today) | ~38 MB/s | 2.20 h | — | — | — | — | — |
+| 742 GB | ~89 MB/s | 0.94 h | $0.48 | +$0.56 | **−$0.08** | +$1.12 | **−$0.64** |
+| 1000 GB | ~120 MB/s | 0.69 h | $0.57 | +$0.90 | **−$0.33** | +$1.80 | **−$1.23** |
+| 2000 GB | ~240 MB/s | 0.35 h | $0.70 | +$2.21 | **−$1.51** | +$4.43 | **−$3.73** |
+
+Every row is a net loss. The download is a one-off; the disk bill runs for two days.
+
+### The consumers justify it, and the bar is low
+
+Each task that reads the whole object saves the difference in read time — the same per-GB
+rate applies to reads:
+
+| Disk | One consumer reading 300 GB | saves vs 316 GB |
 |---|---|---|
-| Snapshot conversion: download to pd-balanced, snapshot, restore as pd-standard | unknown — §4.2 measures it | needs ~30 min of measurement before any design work |
-| GCS bucket + read caching (`fuse-localize`) | no fan-out limit at all | benchmarked separately |
+| 316 GB | 2.20 h | — |
+| 742 GB | 0.94 h | $0.48 of its own VM time |
+| 2000 GB | 0.35 h | $0.70 |
 
-§4.2 is worth running before committing to either, because it is cheap and it can *rule out*
-the conversion path outright: if snapshot creation and hydration are themselves bounded by
-guest-visible throughput, the conversion is slower than writing straight to pd-standard and
-there is nothing to build. Note also that conversion's lazily-hydrated output disk may be
-slower for consumers than a natively-written one, which would count against it even if the
-timings work.
+Consumers needed to break even:
 
-One thing worth quantifying separately, since it is cheap and could change the framing: the
-**actual observed maximum concurrent readers** per rodisk. If real fan-out were reliably
-under 10, pd-balanced would be usable directly and this whole section would be moot. The
-reason it probably is not moot: rodisks are content-addressed and reused across runs, so a
-disk created for a 4-shard job can later be consumed by a 500-shard one — the fan-out is a
-property of the disk's whole lifetime, not of the job that created it. That is also why
-choosing the type per-task from the shard count does not work.
+| Disk | @24h retention | @48h retention |
+|---|---|---|
+| 742 GB | **1.2** | **2.3** |
+| 1000 GB | 1.6 | 3.2 |
+| 2000 GB | 3.2 | 6.3 |
+
+**And retention is itself evidence of reuse.** A disk is kept for 48 hours because
+something is still reading it — otherwise it would be deleted. So the case with the highest
+storage cost is precisely the case with the most consumers paying for it. The two columns
+are correlated, not independent.
+
+### Recommendation: oversize modestly, around 2.35×
+
+**742 GB for a 300 GB object** looks like the sweet spot:
+
+* ~89 MB/s, so 300 GB in **0.94 h** — a **4.3× improvement on today's 4 hours**, which
+  clears §8.5's target that pd-standard at 316 GB cannot;
+* breaks even at 1-2 consumers, and with 24-48 h retention there are almost certainly more;
+* unlimited fan-out preserved, no type change, no snapshot, no new state machine;
+* $29.68/month — within 6% of what a 316 GB `pd-balanced` would have cost ($31.60). It
+  delivers pd-balanced speed at pd-balanced price *without* the 10-VM cap.
+
+2000 GB is harder to justify: it needs 3-6 consumers and costs $4.43 extra at 48 h for
+another 0.6 h of localization.
+
+**One subtlety if this becomes a code change.** Sizing for a throughput target rather than
+for the data — `disk_gb = target_mbps / 0.12` — over-provisions absurdly for small inputs:
+a 10 GB object wanting 89 MB/s would get a 742 GB disk, 74× oversized. So it has to be a
+*multiplier with a floor and a ceiling*, or applied only above a size threshold. Something
+like `disk_gb = natural_size if natural_size < 50 else natural_size * 2.35`. The 300 GB BAM
+case is what matters here, but the same formula runs for every input.
+
+### A gap in the model above: the intermediate artifact
+
+Everything in this section prices **disks and VM time only**. It never priced the snapshot
+or image that conversion would create, which is an omission that matters given how it
+interacts with oversizing.
+
+Approximate rates — verify these, since they move regionally and I have already been wrong
+once in this area:
+
+| Artifact | Billed on | 300 GB of data on a 742 GB disk, 24 h |
+|---|---|---|
+| `pd-standard` disk | provisioned size | 742 GB → ~$0.98 |
+| **Snapshot** | **used data** | ~300 GB → ~$0.26 |
+| **Image** | **whole provisioned disk** | 742 GB → materially more than the snapshot |
+
+Two consequences:
+
+**Conversion must use snapshots, not images.** With an oversized source the difference is
+roughly the oversizing factor — 2.5× at 742 GB, 6.7× at 2000 GB.
+
+**And a snapshot is cheaper storage than a disk for a retained artifact.** That is worth
+noticing given the 24-48 h retention: holding ~300 GB of snapshot costs less than holding a
+316 GB pd-standard disk, because one is billed on data and the other on provisioned size.
+A design that snapshots the disk and deletes it, restoring on demand, would be *cheaper to
+retain*.
+
+I am not proposing that, for two reasons that are already established above: restoring
+cannot shrink below the source disk's size (§4.2), and a restored disk hydrates lazily so
+the first consumer pays for it. But it does mean the retention cost driving §10's
+arithmetic is not fixed — it is a consequence of retaining a *disk* specifically, and worth
+keeping in view if retention ever becomes the dominant cost.
+
+### Where that leaves the alternatives
+
+* **Conversion** — now clearly the wrong tool. It cannot shrink (§4.2), so it cannot save
+  the storage cost that is the only argument against oversizing; it delays
+  first-availability under contention; and it replaces a single-object commit protocol with
+  a three-object state machine. Oversizing gets the same speed for the same money with none
+  of that.
+* **`fuse-localize`** — still the cleanest answer to the underlying problem, and unaffected
+  by any of this. Benchmarked separately.
+
+### What to measure to confirm
+
+1. **§6.3**, direct to 316 GB pd-standard: the honest baseline, and it may be enough.
+2. **§4.1b**, the size sweep: confirm 742 GB really gives ~89 MB/s before believing the table.
+3. **§4.1c**, fan-out: if throughput is shared, today's disks are throttling consumers badly
+   and oversizing is urgent rather than optional.
+4. **The one number I cannot get from here**: how many tasks typically read one cache disk.
+   That is a workflow question, and per the tables above it is what actually decides the
+   sizing. Two or more, and 742 GB pays for itself.
 
 ---
 
