@@ -385,6 +385,16 @@ def match_compute_engine_price(skus, machine_type, region, preemptible):
     SKU wording is not a stable, versioned contract; this should be checked
     against a real API response during live validation, not trusted from static
     review alone.
+
+    Confirmed live against a real Catalog API response: the "Predefined
+    Instance" wording only holds for N1 ("N1 Predefined Instance Core
+    running in Americas") -- N2/N2D/E2's real, plain on-demand SKUs read
+    "N2 Instance Core running in Americas"/"N2D AMD Instance Core running in
+    Americas" etc, with no "Predefined" at all. Requiring that literal
+    phrase made every non-N1 family silently unmatchable (get_price()
+    returning None with no error, since the API call itself succeeds --
+    see get_price()'s own "no matching SKU found" warning, added
+    specifically because this failure mode used to be invisible).
     """
     family_word = _FAMILY_SKU_WORD.get(_machine_family(machine_type))
     if family_word is None:
@@ -399,7 +409,18 @@ def match_compute_engine_price(skus, machine_type, region, preemptible):
         is_preemptible_sku = "Preemptible" in desc or "Spot" in desc
         if is_preemptible_sku != bool(preemptible):
             return False
-        return family_word in desc and "Predefined Instance" in desc and resource_word in desc
+        # Custom machine types and Sole Tenancy nodes have their own,
+        # differently-priced SKUs that also contain the plain family
+        # word/"Instance" (e.g. "N2 Custom Instance Core running in
+        # Americas", "N2 Sole Tenancy Instance Core running in Americas")
+        # -- excluded explicitly, since canine only ever creates predefined
+        # (non-custom, non-sole-tenancy) machine types.
+        if "Custom" in desc or "Sole Tenancy" in desc:
+            return False
+        # family_word must match as a whole word, not a substring: "N2" is
+        # a substring of "N2D", so a plain `"N2" in desc` check would let an
+        # N2 query silently match (and mis-price against) an N2D SKU.
+        return family_word in desc.split() and "Instance" in desc and resource_word in desc
 
     cpu_skus = [s for s in skus if matches(s, "Core")]
     ram_skus = [s for s in skus if matches(s, "Ram")]
@@ -491,6 +512,18 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
                 region = _zone_to_region(zone)
                 matched = match_compute_engine_price(skus, machine_type, region, preemptible)
                 if matched is None:
+                    # Distinct from the API-call failures below: the request
+                    # itself succeeded, but no SKU's description text matched
+                    # this machine_type/region/preemptible combination.
+                    # Confirmed live: this was previously silent (a bare
+                    # `return None`), which is indistinguishable from
+                    # "pricing succeeded and cost is legitimately $0" in the
+                    # logs -- the very failure mode match_compute_engine_price()'s
+                    # own docstring already warns is possible (SKU wording is
+                    # not a stable, versioned contract).
+                    canine_logging.warning(
+                      "Could not fetch live price for {}/{}/preemptible={}: no matching SKU found (region={})".format(
+                        machine_type, zone, preemptible, region))
                     return None
                 cpu_price, ram_price = matched
                 vcpus = int(node_types.loc[machine_type, "cpus"])
@@ -661,6 +694,13 @@ def get_disk_price_per_gb_month(disk_type, zone):
                 region = _zone_to_region(zone)
                 price_per_gb_month = match_disk_price(skus, disk_type, region)
                 if price_per_gb_month is None:
+                    # Same distinction as get_price()'s equivalent branch:
+                    # the request succeeded, but no SKU matched -- log it
+                    # rather than returning silently, so this isn't
+                    # indistinguishable from "priced at $0".
+                    canine_logging.warning(
+                      "Could not fetch live disk price for {}/{}: no matching SKU found (region={})".format(
+                        disk_type, zone, region))
                     return None
                 break
             except _TRANSIENT_FETCH_ERRORS as e:
@@ -717,6 +757,15 @@ def get_gce_disk_client():
     return _GCE_DISK_CLIENT
 
 
+def _invalidate_gce_disk_client():
+    """Same rationale as _invalidate_billing_client(): forces the next
+    get_gce_disk_client() call to build a fresh client, rather than retrying
+    against a connection that may now be dead (e.g. after a read timeout)."""
+    global _GCE_DISK_CLIENT
+    with _GCE_DISK_CLIENT_LOCK:
+        _GCE_DISK_CLIENT = None
+
+
 _DISK_INFO_CACHE = {}
 _DISK_INFO_CACHE_LOCK = threading.Lock()
 
@@ -751,6 +800,14 @@ def get_live_disk_info(disk_name, zone, project, ttl_seconds = 300):
     per-task cost-estimate calls) without letting a long-lived, still-growing
     node's cached size go stale for its whole remaining lifetime. The
     ttl_seconds default is a judgment call, not a measured constant.
+
+    Retries on the same transient-error class get_price() does
+    (_TRANSIENT_FETCH_ERRORS -- read timeouts confirmed live against real GCE
+    API calls, not hypothetical), rebuilding the client between attempts via
+    _invalidate_gce_disk_client() for the same reason get_price() does for
+    the billing client: a read timeout can leave the underlying connection in
+    a bad state that a bare retry against the same client wouldn't recover
+    from.
     """
     key = (project, zone, disk_name)
     now = time.monotonic()
@@ -759,28 +816,55 @@ def get_live_disk_info(disk_name, zone, project, ttl_seconds = 300):
         if cached is not None and now - cached[0] < ttl_seconds:
             return cached[1]
 
-    try:
-        client = get_gce_disk_client()
-        disk = client.disks().get(project = project, zone = zone, disk = disk_name).execute()
-        result = (float(disk["sizeGb"]), _parse_gce_disk_type(disk.get("type")))
-    except Exception as e:
-        canine_logging.warning("Could not fetch live disk info for {}/{}/{}: {}".format(project, zone, disk_name, e))
-        result = (None, None)
+    result = (None, None)
+    last_exc = None
+    for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+        try:
+            client = get_gce_disk_client()
+            disk = client.disks().get(project = project, zone = zone, disk = disk_name).execute()
+            result = (float(disk["sizeGb"]), _parse_gce_disk_type(disk.get("type")))
+            break
+        except _TRANSIENT_FETCH_ERRORS as e:
+            last_exc = e
+            canine_logging.warning(
+              "Transient error fetching live disk info for {}/{}/{} (attempt {}/{}): {} -- retrying with a fresh client".format(
+                project, zone, disk_name, attempt, _MAX_FETCH_ATTEMPTS, e))
+            _invalidate_gce_disk_client()
+            if attempt < _MAX_FETCH_ATTEMPTS:
+                time.sleep(attempt)
+        except Exception as e:
+            canine_logging.warning("Could not fetch live disk info for {}/{}/{}: {}".format(project, zone, disk_name, e))
+            break
+    else:
+        canine_logging.warning(
+          "Could not fetch live disk info for {}/{}/{} after {} attempts: {}".format(
+            project, zone, disk_name, _MAX_FETCH_ATTEMPTS, last_exc))
 
     with _DISK_INFO_CACHE_LOCK:
         _DISK_INFO_CACHE[key] = (now, result)
     return result
 
 
-def make_live_boot_disk_price_source(zone, project):
+
+# slurm_gcp_docker's slurm_resume.py's own hardcoded boot-disk provisioning
+# defaults (disk_size = "25GB", bumped to "50GB" for a GPU node; no
+# --boot-disk-type flag is passed, so the GCE image's own default type
+# applies -- pd-standard is assumed here, matching this codebase's existing
+# "flag text-matching/format assumptions for live verification" caveat
+# style rather than something actually confirmed against a real image).
+_STATIC_BOOT_DISK_GB_DEFAULT = 25.0
+_STATIC_BOOT_DISK_GB_GPU_DEFAULT = 50.0
+_STATIC_BOOT_DISK_TYPE_DEFAULT = "pd-standard"
+
+
+def make_live_boot_disk_price_source(zone, project, host_lut = None, node_types = None):
     """
-    Builds a disk_price_source callable (node_name -> $/hour or None) for a
-    worker node's boot disk, for the real-time path -- mirrors
-    make_live_price_source()'s shape exactly, so estimate_task_cost() can
-    treat compute and disk pricing identically. This is also the intended
-    seam for a future GCSfuse-based cost model: a bucket-mount mode would
-    need only a new price-source builder with this same
-    "node_name -> $/hour" signature, no changes to estimate_task_cost()
+    Builds a disk_price_source callable (node_name -> (price_per_hour,
+    is_approximate) or None) for a worker node's boot disk, for the
+    real-time path -- mirrors make_live_price_source()'s shape (plus the
+    is_approximate flag estimate_task_cost() folds into disk_cost_provisional),
+    so a future GCSfuse-based cost model needs only a new price-source
+    builder with this same signature, no changes to estimate_task_cost()
     itself.
 
     Assumes gcloud's default naming convention (the boot disk's resource
@@ -788,15 +872,45 @@ def make_live_boot_disk_price_source(zone, project):
     by slurm_gcp_docker's slurm_resume.py, which passes no explicit disk
     name/--create-disk flag, but this is a gcloud CLI convention being relied
     on, not something this codebase asserts anywhere else.
+
+    Falls back to the static provisioning-time default (_STATIC_BOOT_DISK_GB_
+    DEFAULT/_GPU_DEFAULT, from slurm_resume.py's own hardcoded values) when
+    the live GCE lookup fails, rather than giving up entirely. Confirmed
+    live: this is common, not rare -- a task's own cost estimate only runs
+    once, after ALL of its shards finish, so an early-finishing shard's node
+    can already be reclaimed by SLURM's elastic scaling by the time this
+    runs, well before any other, still-running shard's own completion.
+    Deliberately a reasonable approximation for exactly that case: a node
+    reclaimed quickly is also the node least likely to have ever triggered
+    worker_boot_disk_resize.sh's auto-grow (which only fires once free space
+    drops below 30%), so its provisioning-time size is usually still
+    accurate. Flagged via is_approximate=True either way, so this is never
+    mistaken for a precise live measurement -- e.g. a genuinely long-lived,
+    heavily-grown node that also happens to 404 for some *other* reason
+    would still be marked approximate rather than silently trusted.
     """
+    host_lut = load_host_lut() if host_lut is None else host_lut
+    node_types = load_node_types() if node_types is None else node_types
+
+    def _static_fallback(node_name):
+        has_gpu = False
+        if node_name in host_lut.index:
+            accel_count = host_lut.loc[node_name].get("accelerator_count")
+            has_gpu = bool(accel_count) and not (isinstance(accel_count, float) and pd.isna(accel_count))
+        size_gb = _STATIC_BOOT_DISK_GB_GPU_DEFAULT if has_gpu else _STATIC_BOOT_DISK_GB_DEFAULT
+        price_per_gb_hour = get_disk_price_per_gb_hour(_STATIC_BOOT_DISK_TYPE_DEFAULT, zone)
+        if price_per_gb_hour is None:
+            return None
+        return price_per_gb_hour * size_gb, True
+
     def _source(node_name):
         size_gb, disk_type = get_live_disk_info(node_name, zone, project)
         if size_gb is None or disk_type is None:
-            return None
+            return _static_fallback(node_name)
         price_per_gb_hour = get_disk_price_per_gb_hour(disk_type, zone)
         if price_per_gb_hour is None:
             return None
-        return price_per_gb_hour * size_gb
+        return price_per_gb_hour * size_gb, False
     return _source
 
 
@@ -826,11 +940,15 @@ def estimate_task_cost(acct_df, price_source, disk_price_source = None, host_lut
       make_live_price_source(...) (real-time) for a reconciliation-side,
       billing-grounded per-node lookup to get identical-logic, differently-
       accurate numbers from the same function.
-    disk_price_source: optional callable(node_name) -> $/hour, or None if
-      unavailable -- mirrors price_source's own shape exactly (see
-      make_live_boot_disk_price_source), so a worker's boot-disk cost can be
-      prorated using the same max(cpu_frac, mem_frac) share already computed
-      for compute cost. Default None reproduces today's exact behavior/
+    disk_price_source: optional callable(node_name) -> (price_per_hour,
+      is_approximate) or None, so a worker's boot-disk cost can be prorated
+      using the same max(cpu_frac, mem_frac) share already computed for
+      compute cost. `is_approximate` lets a source like
+      make_live_boot_disk_price_source() report a usable (non-None) price
+      that's known to be a rough stand-in -- e.g. a static provisioning-time
+      default used because the node was already torn down before its live
+      size could be read -- without that price being mistaken for a precise
+      live measurement. Default None reproduces today's exact behavior/
       columns unchanged -- existing callers are unaffected. When given, adds
       disk_cost_usd/disk_cost_provisional columns, kept DELIBERATELY separate
       from cost_usd/is_provisional/missing_capacity_data so a disk-pricing
@@ -914,11 +1032,14 @@ def estimate_task_cost(acct_df, price_source, disk_price_source = None, host_lut
                 total_cost += (price_per_hour / 3600) * elapsed_seconds * resource_frac
 
             if disk_price_source is not None:
-                disk_price_per_hour = disk_price_source(node_name)
-                if disk_price_per_hour is None:
+                disk_price = disk_price_source(node_name)
+                if disk_price is None:
                     disk_cost_provisional = True
                 else:
+                    disk_price_per_hour, disk_price_is_approximate = disk_price
                     total_disk_cost += (disk_price_per_hour / 3600) * elapsed_seconds * resource_frac
+                    if disk_price_is_approximate:
+                        disk_cost_provisional = True
 
         rows.append({
           "JobID": jid, "cost_usd": total_cost, "total_running_seconds": total_running_seconds,

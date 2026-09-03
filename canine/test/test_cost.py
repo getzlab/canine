@@ -254,6 +254,74 @@ class TestMatchComputeEnginePrice:
         skus = [make_sku("N1 Predefined Instance Core running in Americas", "us-central1")]
         assert cost.match_compute_engine_price(skus, "n1-highcpu-8", "us-central1", preemptible=False) is None
 
+    def test_matches_n2_real_sku_wording_with_no_predefined_word(self):
+        # Confirmed live against a real Catalog API response: unlike N1,
+        # N2's plain on-demand SKU is "N2 Instance Core running in
+        # Americas" -- no "Predefined" at all. This was a real, previously
+        # silent bug (get_price() returned None with no warning for every
+        # N2/N2D/E2 machine type).
+        skus = [
+          make_sku("N2 Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),
+          make_sku("N2 Instance Ram running in Americas", "us-east1", tiered_rate_usd=0.004),
+        ]
+        result = cost.match_compute_engine_price(skus, "n2-standard-16", "us-east1", preemptible=False)
+        assert result == pytest.approx((0.03, 0.004))
+
+    def test_matches_n2_spot_preemptible_wording(self):
+        skus = [
+          make_sku("Spot Preemptible N2 Instance Core running in Americas", "us-east1", tiered_rate_usd=0.01),
+          make_sku("Spot Preemptible N2 Instance Ram running in Americas", "us-east1", tiered_rate_usd=0.001),
+        ]
+        result = cost.match_compute_engine_price(skus, "n2-standard-16", "us-east1", preemptible=True)
+        assert result == pytest.approx((0.01, 0.001))
+
+    def test_n2_query_does_not_match_n2d_sku(self):
+        # "N2" is a substring of "N2D" -- a naive substring check on the
+        # family word would let an N2 query silently match (and mis-price
+        # against) an N2D SKU. Only an N2D SKU exists here, so an N2 query
+        # must find nothing.
+        skus = [
+          make_sku("N2D AMD Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),
+          make_sku("N2D AMD Instance Ram running in Americas", "us-east1", tiered_rate_usd=0.004),
+        ]
+        assert cost.match_compute_engine_price(skus, "n2-standard-16", "us-east1", preemptible=False) is None
+
+    def test_n2d_query_matches_only_n2d_not_n2(self):
+        skus = [
+          make_sku("N2 Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),
+          make_sku("N2 Instance Ram running in Americas", "us-east1", tiered_rate_usd=0.004),
+          make_sku("N2D AMD Instance Core running in Americas", "us-east1", tiered_rate_usd=0.02),
+          make_sku("N2D AMD Instance Ram running in Americas", "us-east1", tiered_rate_usd=0.003),
+        ]
+        result = cost.match_compute_engine_price(skus, "n2d-standard-16", "us-east1", preemptible=False)
+        assert result == pytest.approx((0.02, 0.003))
+
+    def test_excludes_custom_instance_skus(self):
+        # Only a Custom-machine-type SKU exists -- canine only ever creates
+        # predefined machine types, so this must not match.
+        skus = [
+          make_sku("N2 Custom Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),
+          make_sku("N2 Custom Instance Ram running in Americas", "us-east1", tiered_rate_usd=0.004),
+        ]
+        assert cost.match_compute_engine_price(skus, "n2-standard-16", "us-east1", preemptible=False) is None
+
+    def test_excludes_sole_tenancy_skus(self):
+        skus = [
+          make_sku("N2 Sole Tenancy Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),
+          make_sku("N2 Sole Tenancy Instance RAM running in Americas", "us-east1", tiered_rate_usd=0.004),
+        ]
+        assert cost.match_compute_engine_price(skus, "n2-standard-16", "us-east1", preemptible=False) is None
+
+    def test_excludes_commitment_skus_lacking_instance_word(self):
+        # "Commitment v1: N2 Ram in Americas for 1 Year" has no "Instance"
+        # in its description at all -- must not be mistaken for the
+        # on-demand rate.
+        skus = [
+          make_sku("N2 Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),
+          make_sku("Commitment v1: N2 Ram in Americas for 1 Year", "us-east1", tiered_rate_usd=0.002),
+        ]
+        assert cost.match_compute_engine_price(skus, "n2-standard-16", "us-east1", preemptible=False) is None
+
 
 class TestMatchAcceleratorPrice:
     def test_matches_gpu_model(self):
@@ -325,6 +393,40 @@ class TestGetPrice:
         expected = 0.03 * 8 + 0.004 * (7168.0 / 1024)
         assert result == pytest.approx(expected)
         assert json.loads(cache_path.read_text())[cost._price_cache_key("n1-highcpu-8", "us-central1-a", False, None, 0)] == pytest.approx(expected)
+
+    def test_no_matching_sku_logs_a_warning_not_silent(self, tmp_path, monkeypatch):
+        # Confirmed live: a real, previously-silent failure mode -- the API
+        # call itself succeeds (no exception, no retry), but no SKU's
+        # description text matches this machine_type/region/preemptible
+        # combination (e.g. because match_compute_engine_price()'s hardcoded
+        # "Predefined Instance" wording doesn't hold for every machine
+        # family). Before this fix, get_price() returned None here with no
+        # log line at all -- indistinguishable from "priced at $0" in the
+        # logs, with nothing to grep for.
+        cache_path = tmp_path / "price_cache.json"
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": [
+          make_sku("N2 Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),  # no "Predefined Instance"
+        ]}
+        services.skus.return_value.list_next.return_value = None
+
+        node_types = pd.DataFrame({"cpus": [16], "realmemory": [65536.0]}, index=pd.Index(["n2-standard-16"], name="type"))
+        warnings = []
+        monkeypatch.setattr(cost.canine_logging, "warning", lambda msg: warnings.append(msg))
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_price("n2-standard-16", "us-east1-d", False, node_types=node_types)
+
+        assert result is None
+        assert any("no matching SKU found" in w and "n2-standard-16" in w for w in warnings)
 
     def test_concurrent_cache_miss_is_serialized_not_raced(self, tmp_path):
         # Confirmed live: googleapiclient's httplib2-backed client isn't safe
@@ -999,6 +1101,29 @@ class TestGetDiskPricePerGbMonth:
         assert result is None
         assert not cache_path.exists()
 
+    def test_no_match_logs_a_warning_not_silent(self, tmp_path, monkeypatch):
+        cache_path = tmp_path / "price_cache.json"
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": []}
+        services.skus.return_value.list_next.return_value = None
+
+        warnings = []
+        monkeypatch.setattr(cost.canine_logging, "warning", lambda msg: warnings.append(msg))
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_disk_price_per_gb_month("pd-standard", "us-central1-a")
+
+        assert result is None
+        assert any("no matching SKU found" in w and "pd-standard" in w for w in warnings)
+
 
 class TestGetDiskPricePerGbHour:
     def test_divides_by_avg_hours_per_month(self, tmp_path):
@@ -1061,6 +1186,44 @@ class TestGetLiveDiskInfo:
             cost.get_live_disk_info("worker1", "us-central1-a", "my-project", ttl_seconds=0)
         assert fake_client.disks.return_value.get.call_count == 2
 
+    def test_retries_on_transient_read_timeout_then_succeeds(self):
+        # Confirmed live: "The read operation timed out" against a real GCE
+        # disks().get() call -- socket.timeout/TimeoutError is an OSError
+        # subclass, so it's already covered by _TRANSIENT_FETCH_ERRORS; this
+        # just confirms get_live_disk_info() actually retries on it rather
+        # than giving up after a single attempt like before.
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.side_effect = [
+          TimeoutError("The read operation timed out"),
+          {"sizeGb": "25", "type": ".../diskTypes/pd-standard"},
+        ]
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client), \
+             patch("canine.cost._invalidate_gce_disk_client") as mock_invalidate, \
+             patch("canine.cost.time.sleep"):
+            result = cost.get_live_disk_info("worker1", "us-central1-a", "my-project")
+        assert result == (25.0, "pd-standard")
+        mock_invalidate.assert_called_once()
+        assert fake_client.disks.return_value.get.return_value.execute.call_count == 2
+
+    def test_gives_up_after_max_attempts_on_persistent_timeout(self):
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.side_effect = TimeoutError("The read operation timed out")
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client), \
+             patch("canine.cost._invalidate_gce_disk_client") as mock_invalidate, \
+             patch("canine.cost.time.sleep"):
+            result = cost.get_live_disk_info("worker1", "us-central1-a", "my-project")
+        assert result == (None, None)
+        assert mock_invalidate.call_count == cost._MAX_FETCH_ATTEMPTS
+        assert fake_client.disks.return_value.get.return_value.execute.call_count == cost._MAX_FETCH_ATTEMPTS
+
+    def test_non_transient_error_does_not_retry(self):
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.side_effect = RuntimeError("disk not found")
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            result = cost.get_live_disk_info("worker-gone", "us-central1-a", "my-project")
+        assert result == (None, None)
+        assert fake_client.disks.return_value.get.return_value.execute.call_count == 1
+
 
 class TestMakeLiveBootDiskPriceSource:
     def test_composes_size_and_gb_hour_price(self):
@@ -1068,18 +1231,68 @@ class TestMakeLiveBootDiskPriceSource:
              patch("canine.cost.get_disk_price_per_gb_hour", return_value=0.0002):
             price_source = cost.make_live_boot_disk_price_source("us-central1-a", "my-project")
             result = price_source("worker1")
-        assert result == pytest.approx(50.0 * 0.0002)
+        assert result == (pytest.approx(50.0 * 0.0002), False)  # False -- a real live measurement
 
-    def test_missing_disk_info_returns_none(self):
-        with patch("canine.cost.get_live_disk_info", return_value=(None, None)):
-            price_source = cost.make_live_boot_disk_price_source("us-central1-a", "my-project")
-            assert price_source("worker-gone") is None
-
-    def test_missing_disk_price_returns_none(self):
+    def test_missing_disk_price_for_live_size_returns_none(self):
+        # size/type were read live fine, but no Catalog API price for that
+        # disk type -- genuinely unpriceable, not the "node already gone"
+        # case, so no fallback applies here.
         with patch("canine.cost.get_live_disk_info", return_value=(50.0, "pd-ssd")), \
              patch("canine.cost.get_disk_price_per_gb_hour", return_value=None):
             price_source = cost.make_live_boot_disk_price_source("us-central1-a", "my-project")
             assert price_source("worker1") is None
+
+    def test_missing_live_disk_info_falls_back_to_static_default(self):
+        # Confirmed live: 404 "resource not found" when a node's already
+        # been reclaimed by SLURM's elastic scaling before this task's
+        # cost estimate runs -- falls back rather than giving up entirely.
+        with patch("canine.cost.get_live_disk_info", return_value=(None, None)), \
+             patch("canine.cost.get_disk_price_per_gb_hour", return_value=0.0001):
+            price_source = cost.make_live_boot_disk_price_source(
+              "us-central1-a", "my-project", host_lut=pd.DataFrame(), node_types=pd.DataFrame(),
+            )
+            result = price_source("worker-gone")
+        assert result == (pytest.approx(cost._STATIC_BOOT_DISK_GB_DEFAULT * 0.0001), True)  # True -- approximate
+
+    def test_fallback_uses_gpu_default_size_for_gpu_node(self):
+        host_lut = pd.DataFrame(
+          {"machine_type": ["n1-standard-8"], "accelerator_type": ["nvidia-tesla-t4"], "accelerator_count": [1]},
+          index=pd.Index(["gpu-worker1"]),
+        )
+        with patch("canine.cost.get_live_disk_info", return_value=(None, None)), \
+             patch("canine.cost.get_disk_price_per_gb_hour", return_value=0.0001) as mock_get_disk_price:
+            price_source = cost.make_live_boot_disk_price_source(
+              "us-central1-a", "my-project", host_lut=host_lut, node_types=pd.DataFrame(),
+            )
+            result = price_source("gpu-worker1")
+        assert result == (pytest.approx(cost._STATIC_BOOT_DISK_GB_GPU_DEFAULT * 0.0001), True)
+        mock_get_disk_price.assert_called_once_with(cost._STATIC_BOOT_DISK_TYPE_DEFAULT, "us-central1-a")
+
+    def test_fallback_treats_nan_accelerator_count_as_no_gpu(self):
+        # host_LuT.pickle stores accelerator_count as NaN (not 0) for every
+        # non-GPU node -- same real bug shape get_price() already guards
+        # against; a plain truthiness check on NaN would misfire here too.
+        host_lut = pd.DataFrame(
+          {"machine_type": ["n1-standard-8"], "accelerator_type": [float("nan")], "accelerator_count": [float("nan")]},
+          index=pd.Index(["worker1"]),
+        )
+        with patch("canine.cost.get_live_disk_info", return_value=(None, None)), \
+             patch("canine.cost.get_disk_price_per_gb_hour", return_value=0.0001):
+            price_source = cost.make_live_boot_disk_price_source(
+              "us-central1-a", "my-project", host_lut=host_lut, node_types=pd.DataFrame(),
+            )
+            result = price_source("worker1")
+        assert result == (pytest.approx(cost._STATIC_BOOT_DISK_GB_DEFAULT * 0.0001), True)
+
+    def test_fallback_also_unpriceable_returns_none(self):
+        # Both the live lookup AND the fallback's own pricing fail -- nothing
+        # left to report.
+        with patch("canine.cost.get_live_disk_info", return_value=(None, None)), \
+             patch("canine.cost.get_disk_price_per_gb_hour", return_value=None):
+            price_source = cost.make_live_boot_disk_price_source(
+              "us-central1-a", "my-project", host_lut=pd.DataFrame(), node_types=pd.DataFrame(),
+            )
+            assert price_source("worker-gone") is None
 
 
 class TestMakeLiveDiskGbHourPriceSource:
@@ -1120,13 +1333,28 @@ class TestEstimateTaskCostDiskPriceSource:
           "1_1": [{"NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
         })
         result = cost.estimate_task_cost(
-          acct, lambda node: 3600.0, disk_price_source=lambda node: 36.0,
+          acct, lambda node: 3600.0, disk_price_source=lambda node: (36.0, False),
           host_lut=self.host_lut, node_types=self.node_types,
         )
         # same max(cpu_frac, mem_frac)=0.5 proration as compute: (36/3600)*3600*0.5 = 18
         assert result.loc["1_1", "cost_usd"] == pytest.approx(1800.0)
         assert result.loc["1_1", "disk_cost_usd"] == pytest.approx(18.0)
         assert not result.loc["1_1", "disk_cost_provisional"]
+
+    def test_approximate_disk_price_flags_provisional_but_still_counts(self):
+        # e.g. make_live_boot_disk_price_source()'s static-default fallback:
+        # a usable, non-None price that's known to be a rough stand-in --
+        # counted toward disk_cost_usd, but still flagged, unlike a precise
+        # live measurement.
+        acct = make_acct_df({
+          "1_1": [{"NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
+        })
+        result = cost.estimate_task_cost(
+          acct, lambda node: 3600.0, disk_price_source=lambda node: (36.0, True),
+          host_lut=self.host_lut, node_types=self.node_types,
+        )
+        assert result.loc["1_1", "disk_cost_usd"] == pytest.approx(18.0)
+        assert result.loc["1_1", "disk_cost_provisional"]
 
     def test_disk_pricing_failure_does_not_affect_compute_cost_or_flags(self):
         acct = make_acct_df({
@@ -1149,7 +1377,7 @@ class TestEstimateTaskCostDiskPriceSource:
           "1_1": [{"NodeList": "worker1", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
         })
         result = cost.estimate_task_cost(
-          acct, lambda node: None, disk_price_source=lambda node: 36.0,
+          acct, lambda node: None, disk_price_source=lambda node: (36.0, False),
           host_lut=self.host_lut, node_types=self.node_types,
         )
         assert result.loc["1_1", "cost_usd"] == 0.0
@@ -1162,7 +1390,7 @@ class TestEstimateTaskCostDiskPriceSource:
           "1_1": [{"NodeList": "worker-unknown", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T01:00:00", "AllocTRES": "cpu=4,mem=4096M", "CPUTimeRAW": 14400}],
         })
         result = cost.estimate_task_cost(
-          acct, lambda node: 3600.0, disk_price_source=lambda node: 36.0,
+          acct, lambda node: 3600.0, disk_price_source=lambda node: (36.0, False),
           host_lut=self.host_lut, node_types=self.node_types,
         )
         assert result.loc["1_1", "missing_capacity_data"]
