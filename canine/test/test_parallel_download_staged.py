@@ -1,12 +1,12 @@
 """
-Route C tests: stage on a real block device, verify there, then publish.
+The stage-publish route tests: stage on a real block device, verify there, then publish.
 
 The generic fallback for a non-POSIX destination that is not a resolvable bucket.
 
 Forcing this route needs care: only the *destination* may look non-POSIX, because the
 staging directory has to be a real filesystem or the route makes no sense. So
 select_route is patched per-path rather than wholesale, which also exercises the fact
-that Route C consults it a second time for its own staging candidate.
+that the stage-publish route consults it a second time for its own staging candidate.
 """
 
 import hashlib
@@ -283,7 +283,7 @@ class TestPublishResumability:
         self, tmp_path, monkeypatch, payload, payload_md5
     ):
         """
-        The headline Route C property: a preemption during the publish costs only the
+        The headline the stage-publish route property: a preemption during the publish costs only the
         publish. The staged copy is already verified, so the re-run must transfer no
         source bytes at all.
         """

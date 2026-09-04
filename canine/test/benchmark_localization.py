@@ -12,10 +12,10 @@ cannot establish, and the list is not short:
     fails the probe -- so every local run exercises the checkpoint fallback and the
     frontier path has never been integration-tested at all;
   * page-cache loss via FALLOC_FL_PUNCH_HOLE, which is Linux-only and skipped locally;
-  * Route B against real GCS, including the auth path (metadata server, falling back to
+  * the bucket-compose route against real GCS, including the auth path (metadata server, falling back to
     gcloud), resumable sessions and compose -- none of which has touched real
     infrastructure;
-  * Route C against a real gcsfuse mount, if one is being evaluated;
+  * the stage-publish route against a real gcsfuse mount, if one is being evaluated;
   * what /bin/sh actually is on the controller image, which this repo does not reveal.
 
 Not covered here, because it cannot be driven from the VM being preempted: forcing a real
@@ -1045,17 +1045,17 @@ def command_resume(args):
 
 
 # --------------------------------------------------------------------------------
-# route B
+# the bucket-compose route
 # --------------------------------------------------------------------------------
 
 def command_routeb(args):
     """
-    Route B against real GCS. Never exercised outside a fake, and the auth path in
+    the bucket-compose route against real GCS. Never exercised outside a fake, and the auth path in
     particular has no local coverage at all.
     """
     size, verification = resolve_source(args)
     args.size = size
-    heading("route B (bucket destination) against real GCS")
+    heading("the bucket-compose route (bucket destination) against real GCS")
     say("gs url : {}".format(args.gs_url))
     say("verify : {}".format(verification.label))
     say()
@@ -1079,7 +1079,7 @@ def command_routeb(args):
                              capture_output=True, text=True, timeout=60)
         if out.returncode == 0 and out.stdout.strip():
             token_source = "gcloud fallback"
-    say("token source : {}".format(token_source or "NONE -- route B cannot run"))
+    say("token source : {}".format(token_source or "NONE -- the bucket-compose route cannot run"))
     if token_source is None:
         return {"routeb": {"token": None}}
 
@@ -1217,7 +1217,7 @@ def build_parser():
     resume.add_argument("--connections", type=int, default=8)
     resume.add_argument("--max-attempts", type=int, default=4)
 
-    routeb = sub.add_parser("routeb", help="route B against real GCS")
+    routeb = sub.add_parser("routeb", help="the bucket-compose route against real GCS")
     add_common(routeb)
     routeb.add_argument("--gs-url", required=True, help="gs://bucket/object destination")
     routeb.add_argument("--mount-dir", required=True,

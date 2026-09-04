@@ -158,7 +158,7 @@ Beside each destination, while a download is in flight:
 | `<name>.k9pdl.gz` | compressed sidecar, only with `--gunzip` |
 
 The manifest is removed on success; the done marker is kept, and is what makes a re-run of
-`localization.sh` after a preemption a no-op instead of a re-download. On Route B (a
+`localization.sh` after a preemption a no-op instead of a re-download. On the bucket-compose route (a
 bucket destination) the manifest is an object in the bucket rather than a file on the
 mount, because a flat-namespace bucket has no atomic rename.
 

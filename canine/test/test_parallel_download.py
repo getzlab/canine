@@ -956,7 +956,7 @@ class TestNonPosixDestinationIsNotWrittenInPlace:
     pwrite: those are precisely the operations that make a FUSE object store materialize
     gigabytes of zeros and re-upload the whole object per write.
 
-    Only the degradation path is covered here. The same property for Route B needs a GCS
+    Only the degradation path is covered here. The same property for the bucket-compose route needs a GCS
     endpoint to be meaningful, so it lives in test_parallel_download_bucket.py, asserted
     on a run that succeeds.
     """
@@ -985,7 +985,7 @@ class TestNonPosixDestinationIsNotWrittenInPlace:
 
     def test_staged_route_degrades_to_the_legacy_command(self, tmp_path, monkeypatch):
         """
-        Route C declines when no staging directory has room for the object, and takes the
+        the stage-publish route declines when no staging directory has room for the object, and takes the
         single sequential stream instead -- the documented degradation, and for a FUSE
         object store the only access pattern that reaches its streaming-write path.
         """
@@ -1216,7 +1216,7 @@ class TestShelledOutCommandsRunUnderBash:
 
 class TestGunzip:
     """
-    The decompression step. Same shape as Route C's publish: the compressed bytes are
+    The decompression step. Same shape as the stage-publish route's publish: the compressed bytes are
     verified first, then transformed into the destination, then the marker is written.
     """
 
@@ -1747,3 +1747,36 @@ class TestPhaseTiming:
         err = capsys.readouterr().err
         assert "k9pdl-phase download" in err
         assert "k9pdl-phase verify" in err
+
+
+class TestRoutesAreNamed:
+    """
+    The route identifier reaches logs, manifests and emitted scripts, so it is read by
+    people diagnosing a localization. "B" told them nothing.
+    """
+
+    def test_each_route_says_what_it_does(self):
+        assert pdl.ROUTE_POSIX == "in-place"
+        assert pdl.ROUTE_BUCKET == "bucket-compose"
+        assert pdl.ROUTE_STAGED == "stage-publish"
+
+    def test_no_route_is_a_bare_letter(self):
+        for name in ("ROUTE_POSIX", "ROUTE_BUCKET", "ROUTE_STAGED"):
+            value = getattr(pdl, name)
+            assert len(value) > 1, "{} is {!r}, which explains nothing".format(name, value)
+            assert value.islower(), value
+
+    def test_the_chosen_route_is_named_in_the_log(self, tmp_path, monkeypatch, capsys):
+        payload = os.urandom(80000)
+        monkeypatch.setattr(
+            pdl, "select_route",
+            lambda dest, **kw: pdl.RouteDecision(pdl.ROUTE_POSIX, "test: ext4"),
+        )
+        with Server(payload) as server:
+            rc = pdl.main([
+                "--url", server.url(), "--dest", str(tmp_path / "o.bin"),
+                "--size", str(len(payload)), "--connections", "2",
+                "--min-chunk", "16384",
+            ])
+        assert rc == pdl.EXIT_OK
+        assert "route in-place: test: ext4" in capsys.readouterr().err

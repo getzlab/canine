@@ -379,9 +379,12 @@ POSIX_FSTYPE_ALLOWLIST = frozenset({
 # GCS bucket naming: 3-63 chars of lowercase alphanumerics, dashes, underscores, dots.
 _BUCKET_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{1,61}[a-z0-9]$")
 
-ROUTE_POSIX = "A"       # write chunks straight into dest (the dominant PD/NFS path)
-ROUTE_BUCKET = "B"      # upload parts, compose server-side (bucket-backed dest)
-ROUTE_STAGED = "C"      # stage on a real block device, then publish
+# Named rather than lettered: these strings appear in logs, in manifests and in the
+# emitted scripts, where a bare "route B" told an operator nothing about what was
+# happening. Each name says what the route does with the bytes.
+ROUTE_POSIX = "in-place"          # write chunks straight into dest (dominant PD/NFS path)
+ROUTE_BUCKET = "bucket-compose"   # upload parts, compose server-side (bucket-backed dest)
+ROUTE_STAGED = "stage-publish"    # stage on a real block device, then publish
 
 
 class Mount:
@@ -714,9 +717,9 @@ class Manifest:
         This used to replace the record outright, which quietly destroyed the two other
         things kept per chunk: the resumable-upload session URI, and the per-part md5
         written moments earlier by record_part_digest. The visible consequence was that
-        Route B's pre-compose check -- comparing each part's md5 against what GCS reports
-        for it, the cheap verification that avoids a full read-back -- read None every time
-        and so never actually compared anything.
+        the bucket-compose route's pre-compose check -- comparing each part's md5 against
+        what GCS reports for it, the cheap verification that avoids a full read-back -- read
+        None every time and so never actually compared anything.
         """
         with self._lock:
             record = self.state.setdefault("chunks", {}).setdefault(str(index), {})
@@ -734,7 +737,7 @@ class Manifest:
 
     def record_session(self, index, session_uri):
         """
-        Persist a resumable upload session URI (Route B).
+        Persist a resumable upload session URI (the bucket-compose route).
 
         This MUST happen before any bytes are sent to that session, because the URI is
         the only handle to the partially-uploaded data: losing it means the part has to
@@ -820,12 +823,13 @@ class GcsManifest(Manifest):
     """
     A manifest stored as a GCS object rather than through the filesystem.
 
-    Route B exists for a destination that is a bucket, and on a flat-namespace bucket the
-    base class's commit is not atomic: it writes a temp file and renames, but rename there
-    is a server-side copy followed by a delete. A torn manifest is not a correctness
-    problem -- it fails to parse, loads as None, and forces a clean restart -- but it costs
-    every part being re-uploaded, and Route B is precisely the case where that filesystem
-    does not behave, so it should not be relying on it.
+    The bucket-compose route exists for a destination that is a bucket, and on a
+    flat-namespace bucket the base class's commit is not atomic: it writes a temp file and
+    renames, but rename there is a server-side copy followed by a delete. A torn manifest is
+    not a correctness problem -- it fails to parse, loads as None, and forces a clean
+    restart -- but it costs every part being re-uploaded, and the bucket-compose route is
+    precisely the case where that filesystem does not behave, so it should not be relying on
+    it.
 
     A single media upload gives the property directly: the object appears whole or not at
     all. There is no temp name, no rename, and no fsync (durability is the service's
@@ -1182,7 +1186,7 @@ class _ProcessStream:
 
 
 # --------------------------------------------------------------------------------
-# GCS JSON API client (Route B)
+# GCS JSON API client (the bucket-compose route)
 # --------------------------------------------------------------------------------
 
 GCS_API_ROOT = "https://storage.googleapis.com/storage/v1"
@@ -1193,7 +1197,8 @@ METADATA_TOKEN_URL = (
 )
 
 # GCS persists resumable-upload bytes at this granularity, and every non-final PUT in a
-# session must be a multiple of it. This is what bounds discarded work on Route B.
+# session must be a multiple of it. This is what bounds discarded work on the bucket-compose
+# route.
 GCS_UPLOAD_GRANULARITY = 256 * 1024
 
 # A single compose call accepts at most this many sources; more are tree-composed.
@@ -1202,8 +1207,8 @@ GCS_COMPOSE_MAX_SOURCES = 32
 
 class GcsClient:
     """
-    Minimal GCS JSON API client over urllib, so Route B needs nothing beyond the
-    standard library.
+    Minimal GCS JSON API client over urllib, so the bucket-compose route needs nothing
+    beyond the standard library.
 
     Writes deliberately bypass the gcsfuse mount and go straight to the API. That
     sidesteps staged-write re-uploads, the close()-only durability rule, the metadata
@@ -1316,9 +1321,9 @@ class GcsClient:
         """
         Ask the session how far it has durably persisted.
 
-        This is Route B's frontier oracle, exactly analogous to SEEK_HOLE: the answer
-        comes from the storage rather than from a counter we kept. `None` means the
-        upload already finished; 0 means nothing is persisted yet.
+        This is the bucket-compose route's frontier oracle, exactly analogous to SEEK_HOLE:
+        the answer comes from the storage rather than from a counter we kept. `None` means
+        the upload already finished; 0 means nothing is persisted yet.
         """
         status, headers, _ = self.request(
             "PUT", session_uri,
@@ -1535,7 +1540,7 @@ class Progress:
 
 class PosixChunkSink:
     """
-    Writes chunks in place into the sparse destination file (Route A).
+    Writes chunks in place into the sparse destination file (the in-place route).
 
     Durable progress comes from the file's own extents, so there is nothing to keep in
     sync -- see the module docstring.
@@ -1605,20 +1610,20 @@ class PosixChunkSink:
 class BucketChunkSink:
     """
     Uploads each chunk as its own GCS object through a resumable upload session, then
-    composes them server-side (Route B).
+    composes them server-side (the bucket-compose route).
 
     The VM is a pure relay here: bytes arrive from the source and leave again to GCS
     with no local file at all, which is why this route needs no staging disk and no
     concatenation transfer.
 
-    Resumability is preserved by the same principle as Route A -- ask the storage where
-    its durable frontier is rather than trusting a stored counter. A resumable session
+    Resumability is preserved by the same principle as the in-place route -- ask the storage
+    where its durable frontier is rather than trusting a stored counter. A resumable session
     answers that with a 308 plus a Range header, at 256 KiB granularity, so worst-case
     discarded work is under 256 KiB per in-flight chunk. Sessions live 7 days, uploads
-    within one must be sequential (which is how chunks are streamed anyway), persisted
-    bytes can never be overwritten (so a retry re-sending a committed range is
-    harmless), and an incomplete upload is invisible in the bucket -- a preempted part
-    leaves no partial object and no ambiguity about what exists.
+    within one must be sequential (which is how chunks are streamed anyway), persisted bytes
+    can never be overwritten (so a retry re-sending a committed range is harmless), and an
+    incomplete upload is invisible in the bucket -- a preempted part leaves no partial
+    object and no ambiguity about what exists.
     """
 
     needs_local_file = False
@@ -2023,9 +2028,10 @@ def verify(path, options):
 
     Note what this costs on the in-place route: it is a full read-back of the object.
     The per-part digests computed during the transfer live on BucketChunkSink, so only
-    Route B can skip this pass -- on Route A a 300 GB object is downloaded and then read
-    again to hash it. `multipart_etag` at least parallelizes that read; a whole-file md5
-    cannot be parallelized at all, being inherently sequential over the byte stream.
+    the bucket-compose route can skip this pass -- on the in-place route a 300 GB object is
+    downloaded and then read again to hash it. `multipart_etag` at least parallelizes that
+    read; a whole-file md5 cannot be parallelized at all, being inherently sequential over
+    the byte stream.
     """
     if options.check_etag and options.part_length:
         # getattr, not attribute access: verify() takes anything options-shaped, and a
@@ -2097,8 +2103,8 @@ def verify_bucket_object(client, bucket, name, size, options, block=READ_BUFFER)
 def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_path,
                      marker_path):
     """
-    Route B: upload each chunk as its own object through a resumable session, compose
-    them server-side, verify, then delete the parts.
+    The bucket-compose route: upload each chunk as its own object through a
+    resumable session, compose them server-side, verify, then delete the parts.
 
     Preferred over stage-then-publish whenever the destination bucket can be addressed,
     because compose transfers no object data -- so there is no sequential tail and the
@@ -2204,7 +2210,7 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
 
 
 # --------------------------------------------------------------------------------
-# Route C: stage on a real block device, then publish
+# The stage-publish route: stage on a real block device, then publish
 # --------------------------------------------------------------------------------
 
 # The staged file plus the published copy coexist briefly, and the plan's own disk
@@ -2327,13 +2333,13 @@ def publish_staged_file(staged, dest, size):
 def run_staged_route(options, decision, source, size, chunks, chunk_size, plan_id,
                      marker_path):
     """
-    Route C: chunk-download onto a real block device, verify there, then publish with a
-    single sequential copy.
+    The stage-publish route: chunk-download onto a real block device, verify there,
+    then publish with a single sequential copy.
 
     The generic fallback for a non-POSIX destination that is not a resolvable bucket.
-    Strictly worse than Route B -- it pays a full sequential publish and puts up to a
-    whole file of staged work at risk -- which is why Route B is preferred whenever the
-    destination can be addressed directly.
+    Strictly worse than the bucket-compose route -- it pays a full sequential publish and
+    puts up to a whole file of staged work at risk -- which is why the bucket-compose route
+    is preferred whenever the destination can be addressed directly.
     """
     dest = options.dest
     staging, _ = select_work_directory(options, size)
@@ -2531,8 +2537,8 @@ def gunzip_to(source, dest):
     later run might mistake for finished. The compressed source is already verified by the
     time this runs, so a re-run repeats only the decompression and never the download.
 
-    This is the same shape as Route C's publish step: verify the staged bytes, then
-    transform them into the destination, then write the marker.
+    This is the same shape as the stage-publish route's publish step: verify the staged
+    bytes, then transform them into the destination, then write the marker.
 
     One refinement when `dest`'s name already promises gzip content (.gz and friends).
     Two very different things produce `Content-Encoding: gzip` on such an object:
@@ -2719,7 +2725,8 @@ def run(options):
 
     # With --gunzip the transfer target is a compressed sidecar, not dest: the advertised
     # checksum covers the compressed bytes, so they must be verified before anything is
-    # decompressed. Same ordering as Route C -- verify what was received, then transform.
+    # decompressed. Same ordering as the stage-publish route -- verify what was received,
+    # then transform.
     target = dest + ".k9pdl.gz" if options.gunzip else dest
     target_manifest = sidecar_paths(target)[0] if options.gunzip else manifest_path
 
@@ -2768,10 +2775,10 @@ def download_to_local_file(options, source, size, chunks, chunk_size, plan_id, t
     """
     Download into a local POSIX file, in place and resumably.
 
-    Shared by Route A (where the target is the destination) and Route C (where it is a
-    staging file on a real block device). Returns `(exit_code, manifest)`; verification,
-    publishing and the done marker are the caller's business, because they differ
-    between the two.
+    Shared by the in-place route (where the target is the destination) and the stage-publish
+    route (where it is a staging file on a real block device). Returns `(exit_code,
+    manifest)`; verification, publishing and the done marker are the caller's business,
+    because they differ between the two.
     """
     fd = open_destination(target, size)
     manifest = None

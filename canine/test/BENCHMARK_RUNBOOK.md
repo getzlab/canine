@@ -126,7 +126,7 @@ Two deliberate choices:
   hand in §3 instead.
 
 `--scopes cloud-platform` lets `gcloud` inside the container attach disks and mint the
-token Route B needs, straight from the metadata server.
+token the bucket-compose route needs, straight from the metadata server.
 
 ---
 
@@ -650,9 +650,9 @@ SIGKILLs the download at 25%, 50% and 75%, then lets it finish. Check:
 * the **punch-hole** section, which is Linux-only and skipped locally. It simulates bytes
   the process wrote being gone because the VM vanished — the case SIGKILL cannot produce.
 
-### 6.6 Route B against real GCS
+### 6.6 the bucket-compose route against real GCS
 
-Route B has never touched real infrastructure — not the auth path, not resumable sessions,
+The bucket-compose route has never touched real infrastructure — not the auth path, not resumable sessions,
 not compose. It needs a bucket mounted in the container so `select_route` sees a non-POSIX
 destination. In this deployment those mounts come from the `.rclone*.sh` scripts on NFS, so
 on a mock node create one by hand:
@@ -670,7 +670,7 @@ pdl routeb --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
 The token source line matters: **metadata server** is what a real worker uses; a **gcloud
 fallback** means the metadata path failed and is worth investigating on its own.
 
-If `gcsfuse` is not in the image, Route B cannot be reached this way — note it as unverified
+If `gcsfuse` is not in the image, the bucket-compose route cannot be reached this way — note it as unverified
 rather than assuming it works.
 
 ---
@@ -780,7 +780,7 @@ minutes of one core":
 
 * on the in-place route, `verify()` is a **full read-back of the object** — 300 GB
   downloaded, then 300 GB read again. The per-part digests computed during transfer live
-  on `BucketChunkSink`, so only Route B skips this;
+  on `BucketChunkSink`, so only the bucket-compose route skips this;
 * for an S3 **multipart** ETag the read-back parallelizes across parts (each part's md5 is
   independent), and now does — so it will use as many cores as `connections`;
 * a **whole-file** md5 cannot be parallelized at all, so it is one core for as long as it
@@ -820,7 +820,7 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | md5 correct from S3 and GDC | §6.4 |
 | Frontier or checkpoint on ext4? | §6.5 |
 | Punch-hole recovery correct? | §6.5 |
-| Route B on real GCS, and its token source | §6.6 |
+| the bucket-compose route on real GCS, and its token source | §6.6 |
 | `/bin/sh` in the container | §3 probe |
 | Resume across a real preemption | §7 |
 

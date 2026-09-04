@@ -1,11 +1,11 @@
 """
-A fake GCS JSON API, enough of it to exercise Route B.
+A fake GCS JSON API, enough of it to exercise the bucket-compose route.
 
 Not named test_* so pytest does not collect it.
 
 Implements the parts the downloader actually depends on: resumable upload sessions with
 the 308/Range status protocol, objects.compose, get, delete, and ranged media reads. The
-session semantics are the crux of Route B's resumability claim, so they are modelled
+session semantics are the crux of the bucket-compose route's resumability claim, so they are modelled
 faithfully rather than stubbed:
 
   * bytes persist at 256 KiB granularity, so an interrupted PUT commits only whole

@@ -1,8 +1,8 @@
 """
-Route B tests: parts uploaded through resumable sessions, composed server-side.
+The bucket-compose route tests: parts uploaded through resumable sessions, composed server-side.
 
-Route B runs in-process here rather than as a subprocess, because it has to be pointed
-at a fake GCS endpoint. That means SIGKILL is not the instrument it is for Route A;
+The bucket-compose route runs in-process here rather than as a subprocess, because it has to be pointed
+at a fake GCS endpoint. That means SIGKILL is not the instrument it is for the in-place route;
 instead interruption is simulated at the storage layer, which is arguably closer to what
 actually happens -- the resumability claim is about what GCS has durably persisted, and
 the fake service models that at the real 256 KiB granularity.
@@ -494,7 +494,7 @@ class TestGcsObjectMd5:
 
 class TestManifestLivesInTheBucket:
     """
-    Route B exists for a bucket destination, so its manifest must not be committed through
+    the bucket-compose route exists for a bucket destination, so its manifest must not be committed through
     the mount. The filesystem manifest writes a temp file and renames, but on a
     flat-namespace bucket rename is a server-side copy followed by a delete -- not atomic.
     A single media upload gives the property directly: the object appears whole or not at
@@ -727,7 +727,7 @@ class TestPerPartDigestComparison:
 
 class TestNothingIsWrittenInPlace:
     """
-    Route B must never touch a local file at the destination.
+    the bucket-compose route must never touch a local file at the destination.
 
     This is the property the route exists for: a full-size ftruncate or an out-of-order
     pwrite is exactly what makes a FUSE object store materialize gigabytes of zeros and
