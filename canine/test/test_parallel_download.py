@@ -7,6 +7,7 @@ Preemption-specific behavior lives in test_parallel_download_resume.py.
 """
 
 import hashlib
+import re
 import json
 import os
 import stat
@@ -1678,3 +1679,71 @@ class TestMultipartEtagIsParallelAndBounded:
         ])
         assert pdl.verify(str(path), options) == self.reference_etag(data, 4096)
         assert seen["workers"] == 6
+
+
+class TestPhaseTiming:
+    """
+    Localization is two costs, not one -- moving the bytes, then re-reading them to hash
+    -- and the log reported neither. The runbook asks for that split because it decides
+    whether hashing during the transfer is worth building and whether the node can be
+    sized down, so the format is a contract the benchmark parses.
+    """
+
+    def test_logs_a_parseable_line_with_name_seconds_and_rate(self, capsys):
+        with pdl.phase("download", 2 * MIB):
+            pass
+        err = capsys.readouterr().err
+        assert re.search(r"k9pdl-phase download [\d.]+s, [\d.]+ MB/s", err), err
+
+    def test_omits_the_rate_when_no_size_is_given(self, capsys):
+        with pdl.phase("compose"):
+            pass
+        err = capsys.readouterr().err
+        assert re.search(r"k9pdl-phase compose [\d.]+s", err)
+        assert "MB/s" not in err
+
+    def test_records_elapsed_on_the_object(self):
+        with pdl.phase("x") as timing:
+            pass
+        assert timing.seconds is not None and timing.seconds >= 0
+
+    def test_an_exception_is_marked_and_propagates(self, capsys):
+        with pytest.raises(ValueError):
+            with pdl.phase("verify", MIB):
+                raise ValueError("boom")
+        err = capsys.readouterr().err
+        assert "k9pdl-phase verify" in err
+        assert "(failed)" in err
+
+    def test_the_benchmark_parses_what_the_downloader_emits(self, capsys):
+        """
+        The two halves of the contract, checked against each other rather than against a
+        hand-written sample -- a format change in one must not silently pass here.
+        """
+        with pdl.phase("download", 4 * MIB):
+            pass
+        with pdl.phase("verify", 4 * MIB):
+            pass
+        err = capsys.readouterr().err
+        parsed = dict(
+            (m.group(1), float(m.group(2)))
+            for m in re.finditer(r"k9pdl-phase (\w+) ([\d.]+)s", err)
+        )
+        assert sorted(parsed) == ["download", "verify"]
+
+    def test_route_a_times_download_and_verify_separately(self, tmp_path, capsys):
+        """
+        End to end on the route LocalizeToDisk uses, where verify is a full re-read.
+        """
+        payload = os.urandom(300000)
+        with Server(payload) as server:
+            dest = str(tmp_path / "obj.bin")
+            rc = pdl.main([
+                "--url", server.url(), "--dest", dest, "--size", str(len(payload)),
+                "--connections", "4", "--min-chunk", "65536",
+                "--check-md5", hashlib.md5(payload).hexdigest(),
+            ])
+        assert rc == pdl.EXIT_OK
+        err = capsys.readouterr().err
+        assert "k9pdl-phase download" in err
+        assert "k9pdl-phase verify" in err

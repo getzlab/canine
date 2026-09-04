@@ -556,8 +556,9 @@ Expect roughly `300 GB ÷ (the §6.2 plateau)`. Report it as **"4 h → X h"** a
 behaviour, not as the sweep's internal speedup.
 
 **Record the download/verify split.** `verify()` reads the whole object back on this
-route, so the wall-clock is download plus a 300 GB re-read. The downloader logs both
-phases; note them separately. That split is what decides §10's machine-type question — a
+route, so the wall-clock is download plus a 300 GB re-read. The downloader emits
+`k9pdl-phase download …` and `k9pdl-phase verify …`, and the benchmark parses both into
+its `--json` output and prints a `download vs verify` summary with a recommendation. That split is what decides §10's machine-type question — a
 large verify share means the cores are doing real work.
 
 Record alongside it the thing that makes this configuration valuable and the alternatives

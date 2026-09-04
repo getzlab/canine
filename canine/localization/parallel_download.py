@@ -1981,6 +1981,38 @@ def normalize_expected_md5(value):
     return binascii.hexlify(raw).decode()
 
 
+class phase:
+    """
+    Time a phase and log it in a machine-readable form.
+
+    Localization is not one cost but two -- moving the bytes, then re-reading them to
+    hash -- and until now the log reported neither. That made it impossible to answer the
+    question that decides whether hashing during the transfer is worth building, or
+    whether a smaller instance type would do: how much of the wall clock is the transfer
+    and how much is verification.
+
+    The `k9pdl-phase` prefix is there so a harness can parse it without guessing.
+    """
+
+    def __init__(self, name, size=None):
+        self.name = name
+        self.size = size
+        self.seconds = None
+
+    def __enter__(self):
+        self.start = time.monotonic()
+        return self
+
+    def __exit__(self, exc_type, *_):
+        self.seconds = time.monotonic() - self.start
+        rate = ""
+        if self.size and self.seconds > 0:
+            rate = ", {:.1f} MB/s".format(self.size / 1e6 / self.seconds)
+        log("k9pdl-phase {} {:.1f}s{}{}".format(
+            self.name, self.seconds, rate, "" if exc_type is None else " (failed)"))
+        return False
+
+
 def verify(path, options):
     """
     Verification is an absolute guarantee, not a best-effort optimization: when a hash
@@ -2101,7 +2133,8 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
 
     try:
-        downloader.run()
+        with phase("relay", size):
+            downloader.run()
     except PermanentError as e:
         log("permanent failure: {}".format(e))
         return EXIT_FAIL
@@ -2134,7 +2167,8 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
                 index, recorded, stored))
             return EXIT_FAIL
 
-    composed = compose_tree(client, bucket, object_name, part_names)
+    with phase("compose"):
+        composed = compose_tree(client, bucket, object_name, part_names)
     if int(composed.get("size", -1)) != size:
         log("composed object is {} bytes, expected {}".format(composed.get("size"), size))
         return EXIT_FAIL
@@ -2326,16 +2360,19 @@ def run_staged_route(options, decision, source, size, chunks, chunk_size, plan_i
         log("staged copy is already verified; re-publishing without re-downloading")
         digest = verified.get("hash")
     else:
-        status, manifest = download_to_local_file(
-            options, source, size, chunks, chunk_size, plan_id, staged,
-            staged_manifest, probe_seek_hole(staging),
-        )
+        with phase("download", size):
+            status, manifest = download_to_local_file(
+                options, source, size, chunks, chunk_size, plan_id, staged,
+                staged_manifest, probe_seek_hole(staging),
+            )
         if status != EXIT_OK:
             return status
 
         # Verify BEFORE publishing, so a corrupt download never costs an upload.
         try:
-            digest = verify(staged, options)
+            with phase("verify",
+                       size if (options.check_md5 or options.check_etag) else None):
+                digest = verify(staged, options)
         except PermanentError as e:
             log("verification failed on the staged copy: {}".format(e))
             discard(staged, manifest)
@@ -2346,7 +2383,8 @@ def run_staged_route(options, decision, source, size, chunks, chunk_size, plan_i
             manifest.unlink()
 
     try:
-        publish_staged_file(staged, dest, size)
+        with phase("publish", size):
+            publish_staged_file(staged, dest, size)
     except (TransientError, IOError, OSError) as e:
         log("publish failed: {}; the staged copy is kept for the next attempt".format(e))
         return EXIT_REQUEUE
@@ -2685,15 +2723,19 @@ def run(options):
     target = dest + ".k9pdl.gz" if options.gunzip else dest
     target_manifest = sidecar_paths(target)[0] if options.gunzip else manifest_path
 
-    status, manifest = download_to_local_file(
-        options, source, size, chunks, chunk_size, plan_id, target, target_manifest,
-        seek_hole,
-    )
+    with phase("download", size):
+        status, manifest = download_to_local_file(
+            options, source, size, chunks, chunk_size, plan_id, target, target_manifest,
+            seek_hole,
+        )
     if status != EXIT_OK:
         return status
 
     try:
-        digest = verify(target, options)
+        # On this route verification is a full re-read of the object, so its share of the
+        # wall clock is worth knowing on its own.
+        with phase("verify", size if (options.check_md5 or options.check_etag) else None):
+            digest = verify(target, options)
     except PermanentError as e:
         log("verification failed: {}".format(e))
         discard(target, manifest)
@@ -2701,7 +2743,8 @@ def run(options):
 
     if options.gunzip:
         try:
-            expanded = gunzip_to(target, dest)
+            with phase("gunzip", size):
+                expanded = gunzip_to(target, dest)
         except PermanentError as e:
             log("{}".format(e))
             discard(target, manifest)

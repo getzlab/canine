@@ -629,7 +629,16 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
             time.sleep(0.25)
         stderr = process.stderr.read().decode("utf-8", "replace")
 
+    # The downloader emits "k9pdl-phase <name> <secs>s[, rate]" per phase. Capturing the
+    # split matters because localization is two costs, not one: moving the bytes, then
+    # re-reading them to hash. Which dominates decides whether hashing during the
+    # transfer is worth building and whether a smaller instance type would do.
+    phases = {}
+    for match in re.finditer(r"k9pdl-phase (\w+) ([\d.]+)s", stderr):
+        phases[match.group(1)] = float(match.group(2))
+
     return {
+        "phases": phases,
         "connections": connections,
         "returncode": process.returncode,
         "seconds": round(sampler.seconds, 2),
@@ -865,11 +874,41 @@ def command_sweep(args):
             human(outcome["peak_rss"]) if outcome["peak_rss"] else "?",
             "ok" if outcome["verified"] else
             ("-" if outcome["verified"] is None else "BAD")))
+        if outcome["phases"]:
+            say("        phases: {}".format("  ".join(
+                "{} {:.1f}s".format(k, v) for k, v in outcome["phases"].items())))
         if not args.keep:
             try:
                 os.unlink(dest)
             except OSError:
                 pass
+
+    # download vs verify: the split that decides §10's machine-type question and whether
+    # in-transfer hashing is worth building
+    # `in`, not `.get()`: a verify of 0.0s is falsy, and a fast verify is precisely the
+    # result that argues the node can be sized down. Dropping it would hide that.
+    splits = [r["phases"] for r in results if "verify" in r["phases"]]
+    if splits:
+        heading("download vs verify")
+        dl = sum(s.get("download", 0) for s in splits) / len(splits)
+        vf = sum(s["verify"] for s in splits) / len(splits)
+        total = dl + vf
+        say("mean download : {:.1f}s ({:.0f}%)".format(dl, 100*dl/total if total else 0))
+        say("mean verify   : {:.1f}s ({:.0f}%)".format(vf, 100*vf/total if total else 0))
+        say()
+        if total and vf/total > 0.25:
+            say("Verification is {:.0f}% of the wall clock. On the in-place route that is a".format(
+                100*vf/total))
+            say("full re-read of the object, and it is avoidable: chunk boundaries are")
+            say("already snapped to S3 part boundaries, so each part's md5 could be")
+            say("computed as the bytes stream past instead of afterwards.")
+            say("-> worth building. It also means the node's cores are doing real work,")
+            say("   so do not size the instance down on the assumption localization is")
+            say("   pure IO.")
+        else:
+            say("Verification is a small share, so hashing during the transfer would buy")
+            say("little, and the cores are mostly idle -- a smaller instance type is")
+            say("worth investigating (§10).")
 
     heading("verdict")
     best = max(results, key=lambda r: r["throughput_bytes_per_s"])
