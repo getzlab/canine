@@ -5,9 +5,9 @@ Step-by-step procedure for `benchmark_localization.py` on a mock-up wolF worker 
 Everything in the 794-test unit suite runs against fakes. This measures what a fake cannot,
 and settles the `connections` default before it ships.
 
-**Read §0 before creating anything.** The disk, not the network, is likely to be the
-binding constraint once the downloader lands, and §0 changes both what you run first and
-what you can expect to get.
+**Read §0 before creating anything.** It explains why §4.1's ten-minute `dd` gates
+everything else: whether the persistent disk is a real constraint on this path is unsettled,
+and the answer decides whether §10 matters at all or can be skipped outright.
 
 ---
 
@@ -36,51 +36,54 @@ far the biggest cost lever here, and it is why §6 is ordered the way it is: con
 scaling is a property of the source's per-connection limits, and a free GCS object exhibits
 that behaviour well enough to pick a default.
 
-### Read this first: the disk caps you at ~1.8×, and the type is not negotiable
+### Read this first: measure the disk before believing anything about it
 
 The workload driving this work is **~300 GB BAMs from non-GCS sources, currently taking
 upwards of 4 hours**. That is ~21 MB/s, and it is the number to beat.
 
-The localization disk is `pd-standard` (`base.py:1002`), whose throughput is provisioned
-**per gigabyte** — GCP documents ~0.12 MB/s/GB for both read and write.
-`create_persistent_disk` sizes it at the object size plus 5%, which for 300 GB is **316 GB**:
+**Earlier revisions of this document claimed the disk caps the achievable speedup at ~1.8×.
+That claim is retracted.** It came from applying GCP's per-gigabyte pd-standard throughput
+figures (~0.12 MB/s/GB, so ~38 MB/s at the 316 GB disk `create_persistent_disk` provisions)
+to the localization write, and concluding that today's 21 MB/s was already 55% of a hard
+ceiling.
 
-| Disk type at 316 GB | Write ceiling | Best case for 300 GB | Read-only fan-out |
-|---|---|---|---|
-| `pd-standard` (today) | ~38 MB/s | **2.2 h** | **unlimited** |
-| `pd-balanced` | ~89 MB/s | 0.94 h | max 10 VMs |
-| `pd-ssd` | ~152 MB/s | 0.55 h | max 10 VMs |
+The Getz Lab's evidence points the other way: **the throughput limit that actually bites is
+on the transfer, not on read/write to a disk attached to a VM.** Reference disks are 10 GB
+and would be unusable at the 1.2 MB/s the per-GB model predicts for them — and they are not.
 
-Today's 21 MB/s is already **55% of the pd-standard ceiling**. So parallel downloading
-alone — however perfectly it works — can win at most **1.8×** on this path, taking 4 hours
-to about 2.2. The §8.5 target of ≥4× is *unreachable on pd-standard at this object size*,
-and no `connections` value changes that.
+If that is right, then:
 
-**`pd-standard` is a deliberate design choice, not an oversight.** It is the only type that
-attaches read-only to an unlimited number of VMs; `pd-balanced` and `pd-ssd` cap at 10. The
-localization disk's whole purpose is to be re-attached as a rodisk and fanned out across
-however many shards consume it, so the faster types are simply not available for the
-*published* artifact. Do not "fix" this by changing the type.
+* 21 MB/s is **source-bound, not disk-bound** — a single-stream limitation, which is
+  precisely what parallel ranged GETs fix;
+* the downloader has **full headroom**, and ≥4× is available rather than arithmetically
+  impossible;
+* **§10's entire sizing discussion is moot.** Oversizing the disk would buy nothing,
+  because the disk was never the constraint.
 
-That leaves two directions, and this document measures the first:
+That is the best available outcome, and it is the hypothesis to test first.
 
-1. **Disk conversion** — download to a fast single-attach disk, then convert it to
-   pd-standard via snapshot, and delete the download disk. The writer is single-attach so
-   its type is unconstrained; only the published disk needs the fan-out. Whether this wins
-   at all is pure arithmetic on two rates nobody has measured — see §4.2, which settles it
-   in about half an hour.
-2. **A GCS bucket with read caching**, which sidesteps persistent disks entirely and has no
-   fan-out limit at all. Being benchmarked separately on canine's `fuse-localize` branch;
-   out of scope here.
+**So: run §4.1's `dd` before drawing any conclusion, and read it as the gate.**
 
-Two consequences for how you run this:
+| §4.1 `dd` on a 316 GB pd-standard | What it means |
+|---|---|
+| **≫ 38 MB/s** (say 100 MB/s+) | The per-GB model does not describe this path. The disk is not the limit, the downloader is the whole fix, and §10 can be ignored entirely. **This is what the evidence predicts.** |
+| **≈ 38 MB/s** | The per-GB model holds after all, the 1.8× ceiling is real, and §10's sizing analysis applies as written. |
 
-* **§4.1 and §4.2 are the most important measurements in this document.** They cost under
-  an hour, no egress, and no downloads, and they bound everything §6 can achieve. Do them
-  before any download benchmark.
-* **Do not sweep at 300 GB.** Five settings × 2.2 h is eleven hours. §6 finds the knee on a
-  12 GB object in tmpfs, then does a single confirmation run at full size — about three
-  hours instead of eleven.
+Everything in §10 is written for the second row. It is retained because it is worked
+through and because a measurement might yet support it — but it is **conditional**, and I
+had been presenting it as settled.
+
+One thing that is *not* conditional: **`pd-standard` is required, not an oversight.** It is
+the only type that attaches read-only to an unlimited number of VMs; `pd-balanced` and
+`pd-ssd` cap at 10, and unlimited fan-out is what the rodisk exists to provide. Whatever
+§4.1 says, do not "fix" anything by changing the type.
+
+Two notes on running order:
+
+* **§4.1 first, always.** Ten minutes, no egress, no downloads, and it decides whether the
+  rest of §4 and all of §10 are relevant.
+* **Do not sweep at 300 GB.** Five settings would be hours. §6 finds the knee on a 12 GB
+  object in tmpfs, then does one full-size run.
 
 ### Use a non-preemptible node
 
@@ -303,11 +306,14 @@ read-only as a rodisk and read by every downstream consumer.
 
 Compare against the predictions and against today's 21 MB/s:
 
-| Measured write | Reading |
+| Measured write on 316 GB pd-standard | Reading |
 |---|---|
-| pd-standard ≈ 38 MB/s | Table in §0 confirmed. Parallelism alone tops out at **1.8×**; ≥4× needs a different disk type. This is the expected outcome. |
-| pd-standard ≫ 38 MB/s | The per-GB model does not apply here (check whether the disk was created at the size you think). Re-plan using the measured number. |
-| pd-balanced ≈ 89 MB/s | ≥4× is reachable *if* the source can be parallelized that far — which §6.2 measures. |
+| **≫ 38 MB/s** — e.g. 100 MB/s+ | **The likely outcome, per §0.** The per-GB model does not describe this path; the disk is not the localization bottleneck; today's 21 MB/s is source-bound; the downloader has full headroom and ≥4× is available. **Skip §4.1b, §4.1c, §4.2 and §10 entirely** and go to §6. |
+| **≈ 38 MB/s** | The per-GB model holds. The 1.8× ceiling in §10 is real and its sizing analysis applies. Continue with §4.1b. |
+
+Take the **read** number too, and against a small disk as well as a large one — a 10 GB
+disk reading at ~1.2 MB/s versus ~100 MB/s is the same question in its starkest form, and
+reference disks live at that size (§10).
 
 **If pd-standard confirms at ~38 MB/s, stop and decide the disk question before spending
 hours on download benchmarks.** The change is one word in `base.py:1002`; the tradeoff is
@@ -748,7 +754,16 @@ gcloud compute disks list --filter="name~canine-bench"    # confirm nothing is l
 ```
 
 ---
-## 10. What to do about the disk
+## 10. What to do about the disk — CONDITIONAL on §4.1
+
+> **Skip this section if §4.1's `dd` shows the 316 GB disk writing well above 38 MB/s.**
+> Everything below assumes the per-gigabyte throughput model governs this path, and the
+> available evidence suggests it does not: the limit that bites in practice is on the
+> transfer, not on read/write to an attached disk. If that holds, the disk was never the
+> constraint, oversizing buys nothing, and the parallel downloader is the entire fix.
+>
+> This section is kept because the analysis is worked through and a measurement might yet
+> support it — but it is a contingency, not a plan.
 
 `pd-standard` stays — it is the only type with unlimited read-only fan-out, and that is what
 the rodisk exists for. But its throughput is provisioned **per gigabyte**, so the speed is
