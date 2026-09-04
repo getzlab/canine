@@ -17,63 +17,96 @@ import shutil
 import uuid
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
-from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, isatty, canine_logging
+from ..utils import (
+    get_default_gcp_zone,
+    get_default_gcp_project,
+    gcp_hourly_cost,
+    isatty,
+    canine_logging,
+)
 
 from requests.exceptions import ConnectionError as RConnectionError, ReadTimeout
 from urllib3.exceptions import ProtocolError
 
 import pandas as pd
 
-from slurm_gcp_docker.test_controller_environment import check_all as _slurm_gcp_check_all
+from slurm_gcp_docker.test_controller_environment import (
+    check_all as _slurm_gcp_check_all,
+)
 
 import threading
 
 gce_lock = threading.Lock()
 
-class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
+
+class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
     def __init__(
-        self, cluster_name, *,
-        action_on_stop = "delete",
-        image_family = "slurm-gcp-docker-v3",
-        image_project = "broad-getzlab-workflows",
-        image = None,
-        storage_namespace = "workspace", storage_bucket = None, storage_disk = None, storage_disk_size = "100",
-        user = None, shutdown_on_exit = False, **kwargs
+        self,
+        cluster_name,
+        *,
+        action_on_stop="delete",
+        image_family="gsfuse-local",
+        image_project="broad-getzlab-workflows",
+        image=None,
+        storage_namespace="workspace",
+        storage_bucket=None,
+        storage_disk=None,
+        storage_disk_size="100",
+        user=None,
+        shutdown_on_exit=False,
+        **kwargs,
     ):
         if user is None:
             if "USER" in os.environ:
                 user = os.environ["USER"]
             else:
-                raise ValueError("$USER not set in environment. Must explicitly pass user argument")
+                raise ValueError(
+                    "$USER not set in environment. Must explicitly pass user argument"
+                )
 
         if storage_bucket is not None and storage_disk is not None:
-            canine_logging.warning("You specified both a persistent disk and cloud bucket to store workflow outputs; will only store to bucket!")
+            canine_logging.warning(
+                "You specified both a persistent disk and cloud bucket to store workflow outputs; will only store to bucket!"
+            )
 
         if "image" not in kwargs:
             kwargs["image"] = image
 
-        super().__init__(**{**kwargs, **{ "slurm_conf_path" : "" }})
+        # names the localization bucket canine-<project>-<storage_namespace>
+        kwargs.setdefault("workflow_name", storage_namespace)
+
+        super().__init__(**{**kwargs, **{"slurm_conf_path": ""}})
 
         self.config = {
-          "cluster_name" : cluster_name,
-          "worker_prefix" : socket.gethostname(),
-          "action_on_stop" : action_on_stop,
-          "image_family" : image_family,
-          "image_project" : image_project,
-          "clust_frac" : 1.0,
-          "user" : user,
-          "storage_namespace" : storage_namespace,
-          "storage_bucket" : storage_bucket,
-          "storage_disk" : storage_disk,
-          "storage_disk_size" : storage_disk_size,
-          "storage_uuid" : str(uuid.uuid4().hex[0:4]),
-          "nfs_disk_type" : kwargs["nfs_disk_type"] if "nfs_disk_type" in kwargs else "pd-standard",
-          **{ k : v for k, v in self.config.items() if k not in { "worker_prefix", "user", "action_on_stop" } }
+            "cluster_name": cluster_name,
+            "worker_prefix": socket.gethostname(),
+            "action_on_stop": action_on_stop,
+            "image_family": image_family,
+            "image_project": image_project,
+            "clust_frac": 1.0,
+            "user": user,
+            "storage_namespace": storage_namespace,
+            "storage_bucket": storage_bucket,
+            "storage_disk": storage_disk,
+            "storage_disk_size": storage_disk_size,
+            "storage_uuid": str(uuid.uuid4().hex[0:4]),
+            "nfs_disk_type": (
+                kwargs["nfs_disk_type"] if "nfs_disk_type" in kwargs else "pd-standard"
+            ),
+            **{
+                k: v
+                for k, v in self.config.items()
+                if k not in {"worker_prefix", "user", "action_on_stop"}
+            },
         }
-        self.config["image"] = self.get_latest_image(
-          image_family = self.config["image_family"],
-          project = self.config["image_project"],
-        )["name"] if image is None else image
+        self.config["image"] = (
+            self.get_latest_image(
+                image_family=self.config["image_family"],
+                project=self.config["image_project"],
+            )["name"]
+            if image is None
+            else image
+        )
 
         # placeholder for Docker API
         self.dkr = None
@@ -95,12 +128,15 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
         # query /etc/passwd for UID/GID information if we are running as a different user
         # FIXME: how should this work for OS Login/LDAP/etc.?
-        uid = None; gid = None
+        uid = None
+        gid = None
         if self.config["user"] != os.environ["USER"]:
             uinfo = pwd.getpwnam(self.config["user"])
-            uid = uinfo.pw_uid; gid = uinfo.pw_gid
+            uid = uinfo.pw_uid
+            gid = uinfo.pw_gid
         else:
-            uid = os.getuid(); gid = os.getgid()
+            uid = os.getuid()
+            gid = os.getgid()
 
         # initialize Docker API
         self.dkr = docker.from_env()
@@ -111,19 +147,23 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         try:
             image = self.dkr.images.get(image_ref)
         except docker.errors.ImageNotFound:
-            canine_logging.info1(f"Slurm Docker image not found locally; pulling {image_ref} ...")
+            canine_logging.info1(
+                f"Slurm Docker image not found locally; pulling {image_ref} ..."
+            )
             image = self.dkr.images.pull(image_ref)
         except RConnectionError as e:
             if isinstance(e.args[0], ProtocolError):
                 if isinstance(e.args[0].args[1], PermissionError):
                     raise PermissionError("You do not have permission to run Docker!")
                 elif isinstance(e.args[0].args[1], ConnectionRefusedError):
-                    raise ConnectionRefusedError("The Docker daemon does not appear to be running on this machine. Please start it.")
+                    raise ConnectionRefusedError(
+                        "The Docker daemon does not appear to be running on this machine. Please start it."
+                    )
             raise Exception("Unknown problem connecting to the Docker daemon")
         except Exception as e:
-            raise Exception("Problem starting Slurm Docker: {}: {}".format(
-              type(e).__name__, e 
-            ))
+            raise Exception(
+                "Problem starting Slurm Docker: {}: {}".format(type(e).__name__, e)
+            )
 
         #
         # create NFS/rclone bucket mountpoints
@@ -143,20 +183,31 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # create the Slurm container if it's not already present
         canine_logging.info1("Starting Slurm controller ...")
-        if self.config["cluster_name"] not in [x.name for x in self.dkr.containers.list()]:
+        if self.config["cluster_name"] not in [
+            x.name for x in self.dkr.containers.list()
+        ]:
             self.dkr.containers.run(
-              image = image.tags[0], detach = True, network_mode = "host",
-              mounts = [
-                docker.types.Mount(
-                  target = "/mnt", source = "/mnt", type = "bind", propagation = "rshared"
-                ),
-                docker.types.Mount(
-                  target = "/dev", source = "/dev", type = "bind", propagation = "rshared"
-                )
-              ],
-              name = self.config["cluster_name"], command = "/bin/bash",
-              stdin_open = True, remove = True, privileged = True,
-              environment = { "HOST_USER" : self.config["user"], "HOST_UID" : uid, "HOST_GID" : gid }
+                image=image.tags[0],
+                detach=True,
+                network_mode="host",
+                mounts=[
+                    docker.types.Mount(
+                        target="/mnt", source="/mnt", type="bind", propagation="rshared"
+                    ),
+                    docker.types.Mount(
+                        target="/dev", source="/dev", type="bind", propagation="rshared"
+                    ),
+                ],
+                name=self.config["cluster_name"],
+                command="/bin/bash",
+                stdin_open=True,
+                remove=True,
+                privileged=True,
+                environment={
+                    "HOST_USER": self.config["user"],
+                    "HOST_UID": str(uid),
+                    "HOST_GID": str(gid),
+                },
             )
             self.container = self._get_container(self.config["cluster_name"])
 
@@ -172,7 +223,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # wait until the container is fully started, or error out if it failed
         # to start
-        self.wait_for_container_to_be_ready(timeout = 60)
+        self.wait_for_container_to_be_ready(timeout=60)
 
         #
         # initialize storage
@@ -181,21 +232,25 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #
         # save the configuration to disk so that Slurm knows how to configure
         # the nodes it creates
-        subprocess.check_call("""
+        subprocess.check_call(
+            """
           [ ! -d /mnt/nfs/clust_conf/canine ] && mkdir -p /mnt/nfs/clust_conf/canine ||
             echo -n
-          """, shell = True, executable = '/bin/bash')
+          """,
+            shell=True,
+            executable="/bin/bash",
+        )
         with open("/mnt/nfs/clust_conf/canine/backend_conf.pickle", "wb") as f:
             pickle.dump(self.config, f)
 
     def init_nodes(self):
-        self.wait_for_cluster_ready(elastic = True, timeout=60)
+        self.wait_for_cluster_ready(elastic=True, timeout=60)
 
         # list all the nodes that Slurm is aware of; this may be useful subsequently?
-        #allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
+        # allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
 
-    def stop(self): 
-        # remove any bucket mount commands created by this instance 
+    def stop(self):
+        # remove any bucket mount commands created by this instance
         if os.path.exists(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh"):
             os.remove(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh")
 
@@ -205,9 +260,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             # delete node configuration file
             try:
                 subprocess.check_call(
-                  "rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle",
-                  shell = True,
-                  timeout = 10
+                    "rm -f /mnt/nfs/clust_conf/canine/backend_conf.pickle",
+                    shell=True,
+                    timeout=10,
                 )
             except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
                 canine_logging.error("Couldn't delete node configuration file:")
@@ -225,8 +280,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 # it exists.
                 try:
                     extant_nodes = self.list_instances_all_zones()
-                    self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"]) &
-                                   (allnodes["machine_type"] != "nfs")]
+                    self.nodes = allnodes.loc[
+                        allnodes.index.isin(extant_nodes["name"])
+                        & (allnodes["machine_type"] != "nfs")
+                    ]
                 except:
                     self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
 
@@ -250,8 +307,10 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                     container = self.dkr.containers.get(container_name)
                     break
                 except ReadTimeout:
-                    canine_logging.warning(f"Request to controller Docker timed out; retrying in {int(10*backoff_factor)} seconds ...")
-                    time.sleep(10*backoff_factor)
+                    canine_logging.warning(
+                        f"Request to controller Docker timed out; retrying in {int(10*backoff_factor)} seconds ..."
+                    )
+                    time.sleep(10 * backoff_factor)
                     backoff_factor *= 1.1
             return container
 
@@ -269,7 +328,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 subprocess.check_call(f"sudo chown {uid}:{gid} /mnt/nfs", shell=True)
             except:
                 # TODO: be more specific about exception catching
-                canine_logging.error("Could not create NFS mountpoint; see stack trace for details")
+                canine_logging.error(
+                    "Could not create NFS mountpoint; see stack trace for details"
+                )
                 raise
 
         ## create root mountpoint for rclone bucket filesystems (will be bind mounted
@@ -280,7 +341,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                 subprocess.check_call(f"sudo chown {uid}:{gid} /mnt/rclone", shell=True)
             except:
                 # TODO: be more specific about exception catching
-                canine_logging.error("Could not create rclone; see stack trace for details")
+                canine_logging.error(
+                    "Could not create rclone; see stack trace for details"
+                )
                 raise
 
     def init_storage(self):
@@ -288,28 +351,36 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         # this is so that Canine's system for detecting whether files to be
         # localized won't symlink things that reside outside /mnt/nfs but on the same
         # actual filesystem as /mnt/nfs
-        subprocess.check_call("""[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
-          sudo mount --bind /mnt/nfs /mnt/nfs""", shell=True, executable="/bin/bash")
+        subprocess.check_call(
+            """[ $(df -P /mnt/nfs/ | awk 'NR > 1 { print $6 }') == '/mnt/nfs' ] || \
+          sudo mount --bind /mnt/nfs /mnt/nfs""",
+            shell=True,
+            executable="/bin/bash",
+        )
 
         ## mount bucket via rclone (unstable!)
         if self.config["storage_bucket"] is not None:
-            canine_logging.info1(f"Saving workflow results to bucket {self.config['storage_bucket']} mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
+            canine_logging.info1(
+                f"Saving workflow results to bucket {self.config['storage_bucket']} mounted at /mnt/nfs/{self.config['storage_namespace']} ..."
+            )
 
             # TODO: check if bucket exists; create it if not
 
             # generate cache disk if it doesn't exist
             rc, stdout, stderr = self.invoke(
-              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone} {nfs_disk_type}".format(
-                disk_name = f'cache-disk-{self.config["worker_prefix"]}',
-                disk_size = 100,
-                mount_prefix = "/tmp/rclone_cache",
-                node_name = self.config["worker_prefix"],
-                node_zone = get_default_gcp_zone(),
-                nfs_disk_type = self.config["nfs_disk_type"]
-              )
+                "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone} {nfs_disk_type}".format(
+                    disk_name=f'cache-disk-{self.config["worker_prefix"]}',
+                    disk_size=100,
+                    mount_prefix="/tmp/rclone_cache",
+                    node_name=self.config["worker_prefix"],
+                    node_zone=get_default_gcp_zone(),
+                    nfs_disk_type=self.config["nfs_disk_type"],
+                )
             )
             if rc != 0:
-                canine_logging.error(f"Could not generate bucket mountpoint; see error log for details:")
+                canine_logging.error(
+                    f"Could not generate bucket mountpoint; see error log for details:"
+                )
                 canine_logging.error(stderr.read().decode())
                 raise RuntimeError()
 
@@ -319,7 +390,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
             # and bind mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> (in order to access it on the controller)
             # workers will NFS mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> for consistent paths.
             rc, stdout, stderr = self.invoke(
-              """bash -c \
+                """bash -c \
                 'set -e; export GOOGLE_APPLICATION_CREDENTIALS=$CLOUDSDK_CONFIG/application_default_credentials.json; \
                  [ ! -d {mountpoint} ] && mkdir {mountpoint}; \
                  [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; \
@@ -332,53 +403,80 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                    --config /sgcpd/conf/rclone.conf; \
                  df -t fuse.rclone {bind_mountpoint} || \
                   mount --bind {mountpoint} {bind_mountpoint}'""".format(
-                bucket_name = self.config["storage_bucket"][5:] if self.config["storage_bucket"].startswith("gs://") else self.config["storage_bucket"],
-                mountpoint = f'/mnt/rclone/{self.config["storage_namespace"]}',
-                bind_mountpoint = f'/mnt/nfs/{self.config["storage_namespace"]}'
-              ),
-              user = "root"
+                    bucket_name=(
+                        self.config["storage_bucket"][5:]
+                        if self.config["storage_bucket"].startswith("gs://")
+                        else self.config["storage_bucket"]
+                    ),
+                    mountpoint=f'/mnt/rclone/{self.config["storage_namespace"]}',
+                    bind_mountpoint=f'/mnt/nfs/{self.config["storage_namespace"]}',
+                ),
+                user="root",
             )
             if rc != 0:
-                canine_logging.error(f"Could not mount bucket; see error log for details:")
+                canine_logging.error(
+                    f"Could not mount bucket; see error log for details:"
+                )
                 canine_logging.error(stderr.read().decode())
                 raise RuntimeError()
 
             # export mount
-            subprocess.check_call(f"sudo exportfs -o fsid=1,rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/rclone/{self.config['storage_namespace']}", shell=True)
+            subprocess.check_call(
+                f"sudo exportfs -o fsid=1,rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/rclone/{self.config['storage_namespace']}",
+                shell=True,
+            )
 
             # save rclone mountpoint list (worker nodes will subsequently read this in to know what directories to mount after starting up)
             # this file will be erased when backend is torn down
             # TODO: use flock to remove file if backend crashes; when starting backend, check for unlocked files and remove them
             # will need try/except on worker nodes to avoid them freezing up if they inadvertently attempt to mount non-exported buckets
-            with open(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh", "w") as f:
-                f.write("if ! mountpoint -q /mnt/nfs/{mount_dir}; then sudo timeout -k 30 30 mount -o defaults,hard,intr ${{CONTROLLER_NAME}}:/mnt/rclone/{mount_dir} /mnt/nfs/{mount_dir} || echo 'Could not mount rclone mountpoint /mnt/rclone/{mount_dir}'; fi".format(mount_dir = self.config['storage_namespace']))
+            with open(
+                f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh", "w"
+            ) as f:
+                f.write(
+                    "if ! mountpoint -q /mnt/nfs/{mount_dir}; then sudo timeout -k 30 30 mount -o defaults,hard,intr ${{CONTROLLER_NAME}}:/mnt/rclone/{mount_dir} /mnt/nfs/{mount_dir} || echo 'Could not mount rclone mountpoint /mnt/rclone/{mount_dir}'; fi".format(
+                        mount_dir=self.config["storage_namespace"]
+                    )
+                )
 
         ## create disk
         # note that bucket takes priority if both are specified
         elif self.config["storage_disk"] is not None:
             # GCP disks must match regex '^[a-z]([a-z0-9-]*[a-z0-9])?'; raise error if not
-            if re.match('^[a-z]([a-z0-9-]*[a-z0-9])?$', self.config["storage_disk"]) is None:
-                raise ValueError(f"\"{self.config['storage_disk']}\" is an invalid storage namespace. Storage namespaces can only contain lowercase letters, numbers, and dashes, must start with a letter, and must end with a letter/number.")
+            if (
+                re.match("^[a-z]([a-z0-9-]*[a-z0-9])?$", self.config["storage_disk"])
+                is None
+            ):
+                raise ValueError(
+                    f"\"{self.config['storage_disk']}\" is an invalid storage namespace. Storage namespaces can only contain lowercase letters, numbers, and dashes, must start with a letter, and must end with a letter/number."
+                )
 
-            canine_logging.info1(f"Saving workflow results to persistent disk {self.config['storage_disk']} ({self.config['storage_disk_size']}GB) mounted at /mnt/nfs/{self.config['storage_namespace']} ...")
+            canine_logging.info1(
+                f"Saving workflow results to persistent disk {self.config['storage_disk']} ({self.config['storage_disk_size']}GB) mounted at /mnt/nfs/{self.config['storage_namespace']} ..."
+            )
             # use procedure to create RW disk from localization, inside docker
             rc, stdout, stderr = self.invoke(
-              "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone} {nfs_disk_type}".format(
-                disk_name = self.config["storage_disk"],
-                disk_size = f"{self.config['storage_disk_size']}",
-                mount_prefix = f"/mnt/nfs/{self.config['storage_namespace']}",
-                node_name = self.config["worker_prefix"],
-                node_zone = get_default_gcp_zone(),
-                nfs_disk_type = self.config["nfs_disk_type"]
-              )
+                "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone} {nfs_disk_type}".format(
+                    disk_name=self.config["storage_disk"],
+                    disk_size=f"{self.config['storage_disk_size']}",
+                    mount_prefix=f"/mnt/nfs/{self.config['storage_namespace']}",
+                    node_name=self.config["worker_prefix"],
+                    node_zone=get_default_gcp_zone(),
+                    nfs_disk_type=self.config["nfs_disk_type"],
+                )
             )
             if rc != 0:
-                canine_logging.error("Error attaching workflow results disk; see error log for details:")
+                canine_logging.error(
+                    "Error attaching workflow results disk; see error log for details:"
+                )
                 canine_logging.error(stderr.read().decode())
                 raise RuntimeError()
 
         ## Check disk usage and warn user if it is small
-        free_space_gb = int(shutil.disk_usage(f"/mnt/nfs/{self.config['storage_namespace']}").free/(1024**3))
+        free_space_gb = int(
+            shutil.disk_usage(f"/mnt/nfs/{self.config['storage_namespace']}").free
+            / (1024**3)
+        )
         if free_space_gb < 300:
             canine_logging.warning(
                 f"Workflow results disk low on space ({free_space_gb} GB remaining)"
@@ -388,26 +486,41 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         #       count is low (bad network IO)
 
         ## export NFS
-        subprocess.check_call("sudo exportfs -o fsid=0,rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs", shell=True)
+        subprocess.check_call(
+            "sudo exportfs -o fsid=0,rw,async,no_subtree_check,insecure,no_root_squash,crossmnt *.internal:/mnt/nfs",
+            shell=True,
+        )
 
     def copy_cloud_credentials(self):
         ## gcloud
         # TODO: check that we are properly authenticated
         # TODO: check $CLOUDSDK_CONFIG environment variable
-        gcloud_conf_dir = subprocess.check_output("echo -n ~/.config/gcloud", shell = True).decode()
+        gcloud_conf_dir = subprocess.check_output(
+            "echo -n ~/.config/gcloud", shell=True
+        ).decode()
         if os.path.isdir(gcloud_conf_dir):
             if not os.path.isdir("/mnt/nfs/credentials/gcloud"):
                 os.makedirs("/mnt/nfs/credentials/gcloud")
-            subprocess.run(f'cp -rf $(find {gcloud_conf_dir} -mindepth 1 -maxdepth 1 ! -name "logs") /mnt/nfs/credentials/gcloud', shell = True)
+            subprocess.run(
+                f'cp -rf $(find {gcloud_conf_dir} -mindepth 1 -maxdepth 1 ! -name "logs") /mnt/nfs/credentials/gcloud',
+                shell=True,
+            )
 
-    def get_latest_image(self, image_family = None, project = None):
-        image_family = self.config["image_family"] if image_family is None else image_family
+    def get_latest_image(self, image_family=None, project=None):
+        image_family = (
+            self.config["image_family"] if image_family is None else image_family
+        )
         project = self.config["project"] if project is None else project
         with gce_lock:
-            ans = get_gce_client().images().getFromFamily(family = image_family, project = project).execute()
+            ans = (
+                get_gce_client()
+                .images()
+                .getFromFamily(family=image_family, project=project)
+                .execute()
+            )
         return ans
 
-    def invoke(self, command, interactive = False, bypass_docker = False, user = None):
+    def invoke(self, command, interactive=False, bypass_docker=False, user=None):
         """
         Set bypass_docker to True to execute the command directly on the host,
         rather than in the controller container. Useful for debugging.
@@ -421,11 +534,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         local_invoke = super(TransientImageSlurmBackend, self).invoke
         if self.container is not None and self.container().status == "running":
             if not bypass_docker:
-                cmd = "docker exec --user {user} {ti_flag} {container} {command}".format(
-                  user = user,
-                  ti_flag = "-ti" if interactive else "",
-                  container = self.config["cluster_name"],
-                  command = command
+                cmd = (
+                    "docker exec --user {user} {ti_flag} {container} {command}".format(
+                        user=user,
+                        ti_flag="-ti" if interactive else "",
+                        container=self.config["cluster_name"],
+                        command=command,
+                    )
                 )
                 # if command fails for a recoverable reason, retry up to 7 times
                 # with exponential backoff (max ~2 minute wait)
@@ -442,19 +557,24 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
 
                     # stderr corresponds to a known Docker failure mode than can
                     # be recovered from
-                    if any([reason in stderr_str for reason in [
-                      "Error response from daemon: No such exec instance",
-                      "OCI runtime exec failed: exec failed",
-                      "Unable to contact slurm controller (connect failure)",
-                      "Socket timed out on send/recv operation"
-                    ]]):
+                    if any(
+                        [
+                            reason in stderr_str
+                            for reason in [
+                                "Error response from daemon: No such exec instance",
+                                "OCI runtime exec failed: exec failed",
+                                "Unable to contact slurm controller (connect failure)",
+                                "Socket timed out on send/recv operation",
+                            ]
+                        ]
+                    ):
                         canine_logging.warning(
-                          'Command {cmd} failed with known recoverable error reason "{err}"; retrying in {timeout} seconds up to {tries} more times'.format(
-                            cmd = command,
-                            err = stderr_str,
-                            timeout = timeout,
-                            tries = 7 - tries
-                          )
+                            'Command {cmd} failed with known recoverable error reason "{err}"; retrying in {timeout} seconds up to {tries} more times'.format(
+                                cmd=command,
+                                err=stderr_str,
+                                timeout=timeout,
+                                tries=7 - tries,
+                            )
                         )
                         time.sleep(timeout)
                         timeout *= 2
@@ -464,10 +584,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
                     # since this may indicate something is wrong
                     else:
                         canine_logging.debug(
-                          'Command {cmd} returned stderr "{err}"'.format(
-                            cmd = command,
-                            err = stderr_str
-                          )
+                            'Command {cmd} returned stderr "{err}"'.format(
+                                cmd=command, err=stderr_str
+                            )
                         )
                         break
             else:
@@ -477,37 +596,49 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend): # {{{
         else:
             return (1, io.BytesIO(), io.BytesIO(b"Container is not running!"))
 
-    def wait_for_container_to_be_ready(self, timeout = 3000):
-        canine_logging.info1("Waiting up to {} seconds for Slurm controller to start ...".format(timeout))
-        (rc, _, _) = self.invoke(
-          "timeout {} bash -c 'while [ ! -f /.started ]; do sleep 1; done'".format(timeout),
-          interactive = True,
-          user = "root"
+    def wait_for_container_to_be_ready(self, timeout=3000):
+        canine_logging.info1(
+            "Waiting up to {} seconds for Slurm controller to start ...".format(timeout)
+        )
+        rc, _, _ = self.invoke(
+            "timeout {} bash -c 'while [ ! -f /.started ]; do sleep 1; done'".format(
+                timeout
+            ),
+            interactive=True,
+            user="root",
         )
         if rc == 124:
-            raise TimeoutError("Slurm controller did not start within {} seconds!".format(timeout))
+            raise TimeoutError(
+                "Slurm controller did not start within {} seconds!".format(timeout)
+            )
         canine_logging.info1("Started Slurm controller.")
 
+
 # }}}
+
 
 class LocalDockerSlurmBackend(DockerTransientImageSlurmBackend):
     def __enter__(self):
         self.dkr = docker.from_env()
         self.container = self._get_container(self.config["cluster_name"])
         return self
+
     def __exit__(self, *args):
         pass
+
 
 # Python version of checks in docker_run.sh
 def ready_for_docker():
     #
     # check if Slurm/mysql/Munge are already running
-    already_running = [["slurmctld", "A Slurm controller"],
-                       ["slurmdbd", "The Slurm database daemon"],
-                       ["mysqld", "mysql"],
-                       ["munged", "Munge"]]
+    already_running = [
+        ["slurmctld", "A Slurm controller"],
+        ["slurmdbd", "The Slurm database daemon"],
+        ["mysqld", "mysql"],
+        ["munged", "Munge"],
+    ]
 
-    all_procs = { x.name() : x.pid for x in psutil.process_iter() }
+    all_procs = {x.name(): x.pid for x in psutil.process_iter()}
 
     for proc, desc in already_running:
         # is the process is running at all?
@@ -517,4 +648,8 @@ def ready_for_docker():
                 if parent_proc.name().startswith("containerd"):
                     break
                 if parent_proc.pid == 1:
-                    raise Exception("{desc} is already running on this machine (outside of a Docker container). Please run `[sudo] killall {proc}' and try again.".format(desc = desc, proc = proc))
+                    raise Exception(
+                        "{desc} is already running on this machine (outside of a Docker container). Please run `[sudo] killall {proc}' and try again.".format(
+                            desc=desc, proc=proc
+                        )
+                    )
