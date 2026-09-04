@@ -769,6 +769,19 @@ def _invalidate_gce_disk_client():
 _DISK_INFO_CACHE = {}
 _DISK_INFO_CACHE_LOCK = threading.Lock()
 
+# Serializes every actual GCE API call this module makes for disk info --
+# same rationale as _PRICE_FETCH_LOCK: get_gce_disk_client()'s underlying
+# discovery client is httplib2-backed, and concurrent .execute() calls from
+# multiple threads on the same client instance are unsafe. Confirmed live:
+# without this, many wolF tasks calling get_live_disk_info() concurrently
+# (one call per node, per task -- wolF runs many tasks at once) corrupted
+# the shared client's connection state, surfacing as
+# "[SSL: RECORD_LAYER_FAILURE]"/read-timeout errors on nearly every call --
+# not genuine network flakiness, and not fixable by _invalidate_gce_disk_client()
+# alone, since a freshly-rebuilt client immediately gets corrupted again by
+# whichever other thread is still mid-.execute() on it.
+_GCE_DISK_FETCH_LOCK = threading.Lock()
+
 _GCE_DISK_TYPE_URL_ALIASES = {"pd-standard": "pd-standard", "pd-ssd": "pd-ssd", "pd-balanced": "pd-balanced"}
 
 
@@ -808,6 +821,11 @@ def get_live_disk_info(disk_name, zone, project, ttl_seconds = 300):
     the billing client: a read timeout can leave the underlying connection in
     a bad state that a bare retry against the same client wouldn't recover
     from.
+
+    Everything past the first cache check is serialized behind
+    _GCE_DISK_FETCH_LOCK -- see that lock's own comment for why (this is the
+    same real constraint/incident class get_price() already guards against
+    via _PRICE_FETCH_LOCK, not a new concern).
     """
     key = (project, zone, disk_name)
     now = time.monotonic()
@@ -816,33 +834,41 @@ def get_live_disk_info(disk_name, zone, project, ttl_seconds = 300):
         if cached is not None and now - cached[0] < ttl_seconds:
             return cached[1]
 
-    result = (None, None)
-    last_exc = None
-    for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
-        try:
-            client = get_gce_disk_client()
-            disk = client.disks().get(project = project, zone = zone, disk = disk_name).execute()
-            result = (float(disk["sizeGb"]), _parse_gce_disk_type(disk.get("type")))
-            break
-        except _TRANSIENT_FETCH_ERRORS as e:
-            last_exc = e
-            canine_logging.warning(
-              "Transient error fetching live disk info for {}/{}/{} (attempt {}/{}): {} -- retrying with a fresh client".format(
-                project, zone, disk_name, attempt, _MAX_FETCH_ATTEMPTS, e))
-            _invalidate_gce_disk_client()
-            if attempt < _MAX_FETCH_ATTEMPTS:
-                time.sleep(attempt)
-        except Exception as e:
-            canine_logging.warning("Could not fetch live disk info for {}/{}/{}: {}".format(project, zone, disk_name, e))
-            break
-    else:
-        canine_logging.warning(
-          "Could not fetch live disk info for {}/{}/{} after {} attempts: {}".format(
-            project, zone, disk_name, _MAX_FETCH_ATTEMPTS, last_exc))
+    with _GCE_DISK_FETCH_LOCK:
+        # re-check: another thread may have already fetched (and cached)
+        # this exact disk while we were waiting on the lock.
+        with _DISK_INFO_CACHE_LOCK:
+            cached = _DISK_INFO_CACHE.get(key)
+            if cached is not None and now - cached[0] < ttl_seconds:
+                return cached[1]
 
-    with _DISK_INFO_CACHE_LOCK:
-        _DISK_INFO_CACHE[key] = (now, result)
-    return result
+        result = (None, None)
+        last_exc = None
+        for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            try:
+                client = get_gce_disk_client()
+                disk = client.disks().get(project = project, zone = zone, disk = disk_name).execute()
+                result = (float(disk["sizeGb"]), _parse_gce_disk_type(disk.get("type")))
+                break
+            except _TRANSIENT_FETCH_ERRORS as e:
+                last_exc = e
+                canine_logging.warning(
+                  "Transient error fetching live disk info for {}/{}/{} (attempt {}/{}): {} -- retrying with a fresh client".format(
+                    project, zone, disk_name, attempt, _MAX_FETCH_ATTEMPTS, e))
+                _invalidate_gce_disk_client()
+                if attempt < _MAX_FETCH_ATTEMPTS:
+                    time.sleep(attempt)
+            except Exception as e:
+                canine_logging.warning("Could not fetch live disk info for {}/{}/{}: {}".format(project, zone, disk_name, e))
+                break
+        else:
+            canine_logging.warning(
+              "Could not fetch live disk info for {}/{}/{} after {} attempts: {}".format(
+                project, zone, disk_name, _MAX_FETCH_ATTEMPTS, last_exc))
+
+        with _DISK_INFO_CACHE_LOCK:
+            _DISK_INFO_CACHE[key] = (now, result)
+        return result
 
 
 

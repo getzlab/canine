@@ -1147,6 +1147,47 @@ class TestGetLiveDiskInfo:
     def setup_method(self):
         cost._DISK_INFO_CACHE.clear()
 
+    def test_concurrent_lookups_for_different_nodes_are_serialized_not_raced(self):
+        # Confirmed live: get_gce_disk_client()'s discovery client is
+        # httplib2-backed, same as get_billing_client() -- concurrent
+        # .execute() calls from multiple threads on the same client instance
+        # are unsafe. Many wolF tasks calling get_live_disk_info() for their
+        # own (different) nodes at the same time, with no lock around the
+        # actual API call, corrupted the shared client's connection state
+        # and surfaced as "[SSL: RECORD_LAYER_FAILURE]"/read-timeout errors
+        # on nearly every call in production. Deliberately uses a different
+        # disk_name per thread (unlike a same-key cache race) to prove the
+        # lock covers *any* concurrent use of the shared client, not just
+        # concurrent misses on one key.
+        concurrent = [0]
+        max_concurrent = [0]
+
+        def fake_execute():
+            concurrent[0] += 1
+            max_concurrent[0] = max(max_concurrent[0], concurrent[0])
+            time.sleep(0.05)
+            concurrent[0] -= 1
+            return {"sizeGb": "25", "type": ".../diskTypes/pd-standard"}
+
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.side_effect = fake_execute
+
+        results = []
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            threads = [
+              threading.Thread(target=lambda i=i: results.append(
+                cost.get_live_disk_info(f"worker{i}", "us-central1-a", "my-project")
+              ))
+              for i in range(8)
+            ]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join()
+
+        assert all(r == (25.0, "pd-standard") for r in results)
+        assert max_concurrent[0] == 1
+
     def test_successful_lookup(self):
         fake_client = MagicMock()
         fake_client.disks.return_value.get.return_value.execute.return_value = {
