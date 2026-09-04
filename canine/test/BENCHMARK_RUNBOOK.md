@@ -555,52 +555,15 @@ pdl sweep --s3-bucket "$BAM_BUCKET" --s3-key "$BAM_KEY" \
 Expect roughly `300 GB ÷ (the §6.2 plateau)`. Report it as **"4 h → X h"** against today's
 behaviour, not as the sweep's internal speedup.
 
+**Record the download/verify split.** `verify()` reads the whole object back on this
+route, so the wall-clock is download plus a 300 GB re-read. The downloader logs both
+phases; note them separately. That split is what decides §10's machine-type question — a
+large verify share means the cores are doing real work.
+
 Record alongside it the thing that makes this configuration valuable and the alternatives
 expensive: **time to `finished=yes`**. That label is when the data becomes available to
 every other workflow waiting on it (§6.7), and on this path it lands the moment the
 download completes.
-
-### 6.7 Contention: several workflows localizing the same inputs
-
-The case the existing design is built around, and the one an alternative is most likely to
-break. `create_persistent_disk` derives the disk name from a hash of the inputs, so
-concurrent workflows needing the same data converge on **one** disk, and the protocol is
-carried entirely by that single object:
-
-| State of the disk | What an arriving worker does |
-|---|---|
-| has label `finished=yes` | mount read-only, no localization at all |
-| exists, listed `users` (attached elsewhere) | `exit 5` — requeue and wait for the builder |
-| exists, no users, no `finished` | resume building it |
-| absent | create it |
-
-`finished=yes` is applied only after localization succeeds (`base.py:1564`, and gated on
-`CANINE_JOB_RC -eq 0` in the teardown variant), so it is a single atomic commit on the same
-object that holds the work in progress. That identity is what makes the race safe.
-
-Measure it, because the numbers matter for judging alternatives:
-
-```bash
-# from your workstation: three workers, same inputs, staggered starts
-for i in 1 2 3; do
-  wolf ... &     # or three sbatch submissions of the same LocalizeToDisk task
-  sleep 120
-done
-```
-
-Record:
-
-* **time to `finished=yes`** from the first worker's start — this is first-availability, and
-  it is what every waiting workflow actually experiences;
-* that workers 2 and 3 **exit 5 and park** rather than each starting a duplicate download;
-* that exactly **one** disk is created, and no orphans are left
-  (`gcloud compute disks list --filter="name~canine-"`);
-* what happens if the *builder* is preempted mid-download — another waiter should take over
-  and resume, not restart.
-
-The last one is the interesting interaction with this project: resume state now lives in
-`.k9pdl.json` **on the disk being built**, so a second worker taking over inherits it and
-continues rather than re-downloading. Worth confirming directly.
 
 ### 6.4 Correctness against the real sources
 
@@ -730,6 +693,17 @@ The case worth engineering deliberately: kill the worker in the window **between
 download finishing and the disk being labelled `finished=yes`. The `.k9pdl.done` marker
 should make that resume without re-downloading anything.
 
+**One interaction worth confirming while you are there**, since it is a property of this
+change rather than of the existing design: resume state lives in `.k9pdl.json` **on the
+disk being built**. So when a second worker takes over a disk whose builder died, it
+inherits that state and should continue rather than restart. The existing protocol already
+parks other workers on `exit 5` while a disk has `users`, so this is the natural
+hand-off — but nothing has verified that the successor actually resumes.
+
+That is the whole of the multi-worker question worth testing here. A wider contention or
+scale test is out of scope: per-disk costs compound at hundreds of concurrent disks, but
+that is arithmetic (§10), not something a benchmark needs to reproduce.
+
 ---
 
 ## 8. NFS destination
@@ -763,190 +737,67 @@ gcloud compute disks list --filter="name~canine-bench"    # confirm nothing is l
 ```
 
 ---
-## 10. What to do about the disk — CONDITIONAL on §4.1
+## 10. The cost decision
 
-> This is the **decision** section: what to do given §4's measurements. It assumes the
-> per-gigabyte throughput model governs this path, which §4.1b tests. If the disk turns out
-> not to be a constraint, the sizing question below simply does not arise — the parallel
-> downloader is the entire fix.
->
-> Read it after §4, not instead of it.
+> Read after §4, not instead of it. §4 measures; this section decides.
 
-### The objective: total cost of localizing, not localization speed
+The objective is a **cheaper** localization, not merely a faster one. So price the whole
+thing: VM-hours plus disk-hours, on preemptible workers (`gcpTransient.py` defaults
+`preemptible=True`, and the downloader is preemption-safe), 48 h retention.
 
-The goal is a **cheaper** localization, not merely a faster one. So price the whole thing:
-VM-hours plus disk-hours, on preemptible workers (`gcpTransient.py` defaults
-`preemptible=True`, and the downloader is preemption-safe by design), 48 h retention, and
-**300 concurrent unique BAM disks**, which is the scale these run at.
+The ×300 column is **arithmetic, not a test** — these run at hundreds of concurrent unique
+BAM disks, so per-disk differences compound. Nothing in this runbook asks you to create 300
+disks.
 
-Per BAM, and per 300-disk batch:
+| Scenario | VM | disk | total | ×300 |
+|---|---|---|---|---|
+| today: 4.0 h, n1-standard-8 | $0.32 | $0.83 | $1.15 | $345 |
+| downloader 4×: 1.0 h, same VM | $0.08 | $0.83 | $0.91 | **$273** |
+| …and oversize the disk to 742 GB | $0.08 | $1.95 | $2.03 | **$608** |
+| …instead, localize on a 2-vCPU node | $0.01 | $0.83 | $0.85 | **$254** |
 
-| Scenario | VM | disk | total | ×300 batch | vs today |
-|---|---|---|---|---|---|
-| today: 4.0 h, n1-standard-8 | $0.32 | $0.83 | $1.15 | **$345** | — |
-| downloader 4×: 1.0 h, same VM | $0.08 | $0.83 | $0.91 | **$273** | **−$72** |
-| …and oversize the disk to 742 GB | $0.08 | $1.95 | $2.03 | **$608** | **+$263** |
-| …instead, run localization on `n1-highcpu-8` | $0.06 | $0.83 | $0.89 | $267 | −$78 |
-| …instead, on a 2-vCPU node | $0.01 | $0.83 | $0.85 | **$254** | **−$91** |
+**1. The disk is the larger line item, and the downloader cannot touch it.** At 48 h
+retention the disk costs $0.83 against $0.32 of VM time, and retention is set by reuse, not
+by how fast the disk was filled. The downloader's cost ceiling is the VM share — about 21%.
+It is still worth shipping; it is just not where most of the money is.
 
-Three things fall out of that table, and only the first was expected.
+**2. Do not oversize the disk.** A disk exists for 48 h but is *written* for a few of them,
+so paying for gigabytes across the whole lifetime to save time in a small fraction of it
+never recovers: +$1.12/disk of storage against $0.10/disk of preemptible VM time. Earlier
+revisions of this document recommended 742 GB; that used on-demand pricing and a single-disk
+view, and is withdrawn. The reasoning is preserved in `update_localization.md` §13.16 and
+§13.18.
 
-**1. The disk, not the VM, is the larger line item — and the downloader cannot touch it.**
-At 48 h retention the disk is $0.83 against $0.32 of VM time. Localizing faster shortens
-the VM hours only; the disk is retained for reuse regardless of how quickly it was filled.
-So the downloader's cost ceiling is the VM share, about **21%** of total.
+**3. The machine type is worth questioning, but localization is not as CPU-free as I
+first claimed.** `LocalizeToDisk` pins `n1-standard-8` with `--exclusive`
+(`wolF/wolF/localization.py:35`). §2 justified that as "the download owns the whole node" —
+an argument that nothing should *compete* with localization, not that it needs 8 vCPUs and
+28 GB of RAM. Even a 2-vCPU n1 has a ~500 MB/s egress cap, far above any rate in play.
 
-**2. Oversizing is decisively wrong at this scale.** A 316 GB disk exists for 48 h but is
-*written* for only a few of them, so paying for more gigabytes across the whole lifetime to
-save time in a small fraction of it never recovers. Concretely: +$1.12/disk of storage to
-save $0.10/disk of preemptible VM time — **−$1.02 per disk, −$306 per batch.** My earlier
-recommendation of 742 GB used on-demand VM pricing and priced a single disk; both errors
-pushed the same way, and at your pricing and scale the conclusion inverts.
+But **verification is a genuine multi-core workload**, which I had waved away as "a few
+minutes of one core":
 
-**3. The biggest untapped lever is the machine type, which nothing here had questioned.**
-`LocalizeToDisk` pins `n1-standard-8` with `--exclusive` (`wolF/wolF/localization.py:35`).
-§2 justified that as "the download owns the whole node" — but that is an argument that
-nothing should *compete* with localization, not that localization needs 8 vCPUs and 28 GB
-of RAM. It is pure IO: the downloader buffers ~1 MiB per connection, and md5 over 300 GB is
-a few minutes of one core. Even a 2-vCPU n1 has a **4 Gbps (~500 MB/s) egress cap**, far
-above any download rate in play here.
+* on the in-place route, `verify()` is a **full read-back of the object** — 300 GB
+  downloaded, then 300 GB read again. The per-part digests computed during transfer live
+  on `BucketChunkSink`, so only Route B skips this;
+* for an S3 **multipart** ETag the read-back parallelizes across parts (each part's md5 is
+  independent), and now does — so it will use as many cores as `connections`;
+* a **whole-file** md5 cannot be parallelized at all, so it is one core for as long as it
+  takes to read 300 GB.
 
-If that holds, localization on a small node costs **$0.01 instead of $0.32** — a larger
-saving than the speedup itself, and it composes with it. Worth measuring directly, and
-§6 can: run the sweep on a smaller machine type and see whether the knee and the plateau
-move at all. Note `slurm_gcp_docker/conf/nodetypes.json` has no 2-vCPU entry, so this needs
-a partition added before it can be tried.
+So the smaller-node question is really "how many cores does verification want, and does the
+read-back or the download dominate?" — which §6.3 answers directly, since its wall-clock
+includes both. **Measure the split before choosing a machine type**: if verification is a
+large share, cores are doing real work and the saving is smaller than the table suggests.
+`slurm_gcp_docker/conf/nodetypes.json` has no 2-vCPU entry, so a partition would have to be
+added before this could be tried at all.
 
-**What actually reduces total cost, ranked:** retention (the dominant term, but a workflow
-decision), then machine type, then localization speed. Oversizing moves it the wrong way.
+**Ranked by effect on total cost:** retention (dominant, but a workflow decision), then
+machine type, then localization speed. Oversizing moves it backwards.
 
----
-
-`pd-standard` stays — it is the only type with unlimited read-only fan-out, and that is what
-the rodisk exists for. But its throughput is provisioned **per gigabyte**, so the speed is
-available from a *bigger pd-standard*: no type change, no snapshot, no new failure modes.
-The rest of this section works that sizing question through; per the table above it is a
-**net loss at scale**, and is retained for the reasoning rather than as a recommendation.
-
-Costs below are simply **provisioned size × how long the disk exists**, which is how these
-disks are actually billed — there is no snapshot-and-rehydrate step in the current design,
-so nothing else enters into it. Retention is **24-48 hours**.
-
-### The saving that is unconditional: localization latency
-
-Localization blocks. Nothing that needs the data proceeds until `finished=yes` lands, and
-under contention every parked workflow waits on it (§6.7). So this saving is real regardless
-of what the consumers look like:
-
-| Disk | Write | 300 GB takes | Time saved | extra @24h | extra @48h | cost per hour saved @48h |
-|---|---|---|---|---|---|---|
-| 316 GB (today) | ~38 MB/s | 2.20 h | — | — | — | — |
-| **742 GB** | ~89 MB/s | **0.94 h** | 1.26 h | $0.56 | $1.12 | **$0.89/h** |
-| 1000 GB | ~120 MB/s | 0.69 h | 1.50 h | $0.90 | $1.80 | $1.20/h |
-| 2000 GB | ~240 MB/s | 0.35 h | 1.85 h | $2.21 | $4.43 | $2.39/h |
-
-742 GB is the most efficient point on that last column, and 0.94 h against today's 4 hours
-is **4.3×** — clearing the §8.5 target that 316 GB pd-standard cannot reach at all.
-
-### The saving that is conditional: IO-bound consumers only
-
-Reads are per-attachment (§4.1c), so a bigger disk reads faster for every consumer
-independently. **But that only helps tasks whose runtime is actually IO-limited.** A
-process-bound task computes while it reads and does not care what the disk can do, so for
-those the read saving is **zero**. Only genuinely IO-bound consumers count:
-
-| IO-bound consumers | 742 GB net @24h | net @48h |
-|---|---|---|
-| 0 | −$0.08 | −$0.64 |
-| 1 | +$0.40 | −$0.16 |
-| 2 | +$0.87 | +$0.31 |
-| 5 | +$2.31 | +$1.75 |
-
-So the number that decides whether oversizing is cost-*positive* is not the consumer count
-but the **IO-bound** consumer count, which is a property of the pipelines, not of the data.
-
-### ~~Recommendation: 742 GB~~ — RETRACTED, see the cost model above
-
-**This recommendation is withdrawn.** It rested on two errors that both pushed the same
-way: on-demand VM pricing (~$0.38/h, where preemptible is ~$0.08/h, overstating the time
-saving by nearly 5×) and a per-disk view (where 300 concurrent disks multiply the storage
-penalty). At the real pricing and scale a 742 GB disk is **−$1.02 per disk and −$306 per
-batch**. The latency argument still holds in wall-clock terms — 1.26 h off a blocking step
-is real — but the stated objective is total cost, and on that measure this loses.
-
-Going beyond 742 GB gets steadily worse value — $2.39 per hour saved at 2000 GB versus
-$0.89 — so only go bigger if you know a specific input is read by many IO-bound tasks.
-
-### Reference disks are a different regime
-
-Not all these disks are 300 GB localization caches. **Reference disks are MB to low tens of
-GB and are kept for a week or more**, and they invert every assumption above:
-
-| | Localization disk | Reference disk |
-|---|---|---|
-| Size | ~316 GB | 10 GB - low tens |
-| Retention | 24-48 h | **a week or more** |
-| Predicted throughput | 38 MB/s | **1.2 MB/s at 10 GB** |
-| Written | once, by one worker | once, rarely |
-| Read | by that workflow's tasks | by **everything**, repeatedly |
-
-Two things follow, in opposite directions.
-
-**Oversizing is nearly free here, in absolute terms.** 10 GB → 200 GB is a 20× throughput
-increase for **$1.75/week** per disk. Against a disk that every task mounts, that is
-trivially worth it — *if* the small-disk penalty is real (§4.1b tests it; I suspect it is
-not, and say why there).
-
-**But the floor multiplies by disk count, which is where it could get expensive.** A 200 GB
-floor costs +$1.75/week per disk, so:
-
-| Concurrent reference disks | Extra cost/week |
-|---|---|
-| 10 | $17 |
-| 50 | $87 |
-| 100 | $175 |
-
-That is the one number I would need to set a floor responsibly, and I do not have it.
-
-### If it becomes a code change: a floor, not a threshold
-
-My earlier suggestion — `natural_size if natural_size < 50 else natural_size * 2.35` —
-was wrong, because it leaves small disks at exactly the size where pd-standard is worst.
-A rule with a **floor** covers both regimes:
-
-```python
-disk_gb = max(int(natural_size * 2.35), FLOOR_GB)
-```
-
-| Data | natural | → with FLOOR=100 | → with FLOOR=200 |
-|---|---|---|---|
-| 3 GB reference | 10 GB | 100 GB (12 MB/s) | 200 GB (24 MB/s) |
-| 10 GB | 11 GB | 100 GB | 200 GB |
-| 30 GB | 32 GB | 100 GB | 200 GB |
-| 300 GB BAM | 316 GB | 742 GB (89 MB/s) | 742 GB |
-
-Note the multiplier is what governs the large case and the floor governs the small one, so
-they can be tuned independently. Do not set `FLOOR_GB` until §4.1b says whether small disks
-are actually slow and you know the concurrent disk count — a floor is a standing cost on
-every disk, unlike the multiplier, which only bites on the large ones that benefit most.
-
-### Where that leaves the alternatives
-
-* **Conversion** — dead on arithmetic, bounded at about eleven cents. See §4.2; the
-  argument does not depend on the consumer profile, because oversizing is justified by
-  *write* latency alone and an oversized disk already writes fast.
-* **`fuse-localize`** — still the cleanest answer to the underlying problem, and unaffected
-  by any of this. Benchmarked separately.
-
-### What to measure
-
-1. **§4.1b**, the size sweep — confirm 742 GB really gives ~89 MB/s before believing any of
-   the above. Ten minutes, no egress.
-2. **§6.3**, direct to pd-standard at full size — the baseline, and with the downloader it
-   may already be enough at 316 GB.
-3. **§6.7**, contention — that `finished=yes` timing and the exit-5 parking behave as
-   expected, since that is what the latency argument rests on.
-4. ~~§4.1c fan-out~~ and ~~§4.2 conversion~~ — both closed, no measurement needed.
+One thing that holds regardless: **`pd-standard` is required.** It is the only type that
+attaches read-only to an unlimited number of VMs (`pd-balanced` and `pd-ssd` cap at 10), and
+unlimited fan-out is what the rodisk exists for. Do not change the type.
 
 ---
 

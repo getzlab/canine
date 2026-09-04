@@ -1564,3 +1564,117 @@ class TestColumnarAndArrayContainers:
         body = b"PAR1" + inner + b"PAR1"
         assert self._localize(tmp_path, gzip.compress(body), "t.parquet") == body
         assert self._localize(tmp_path, body, "t.parquet") == body
+
+
+class TestMultipartEtagIsParallelAndBounded:
+    """
+    The S3 multipart ETag is md5-of-md5s, and each part's md5 is independent -- so the
+    read-back is parallelizable, which matters because on the in-place route it is a full
+    re-read of the object (300 GB in the case driving this work).
+
+    An earlier version buffered a whole part via _read_exactly, making peak memory a
+    property of how the uploader chose to chunk the object rather than of anything this
+    code controls. S3 parts run from 8 MB to several GB.
+    """
+
+    @staticmethod
+    def reference_etag(data, part_length):
+        digests = [
+            hashlib.md5(data[i:i + part_length]).digest()
+            for i in range(0, len(data), part_length)
+        ]
+        return "{}-{}".format(hashlib.md5(b"".join(digests)).hexdigest(), len(digests))
+
+    @pytest.mark.parametrize("size,part", [
+        (1024, 1024),            # exactly one part
+        (1024, 4096),            # one short part
+        (4096, 1024),            # exact multiple
+        (4097, 1024),            # ragged tail
+        (1024 * 1024 + 7, 4096),  # many parts, ragged
+    ])
+    def test_matches_a_straightforward_implementation(self, tmp_path, size, part):
+        data = os.urandom(size)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+        assert pdl.multipart_etag(str(path), part) == \
+            self.reference_etag(data, part)
+
+    @pytest.mark.parametrize("workers", [1, 2, 3, 8, 64])
+    def test_worker_count_does_not_change_the_answer(self, tmp_path, workers):
+        data = os.urandom(200000)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+        assert pdl.multipart_etag(str(path), 4096, workers=workers) == \
+            self.reference_etag(data, 4096)
+
+    def test_reads_are_bounded_by_block_not_part_length(self, tmp_path, monkeypatch):
+        """
+        The property that keeps a multi-gigabyte S3 part from becoming a
+        multi-gigabyte allocation.
+        """
+        data = os.urandom(600000)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+
+        sizes = []
+        real_open = open
+
+        class Watched:
+            def __init__(self, fh):
+                self._fh = fh
+
+            def read(self, n=-1):
+                sizes.append(n)
+                return self._fh.read(n)
+
+            def __getattr__(self, name):
+                return getattr(self._fh, name)
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._fh.close()
+
+        monkeypatch.setattr("builtins.open",
+                            lambda *a, **kw: Watched(real_open(*a, **kw)))
+        pdl.multipart_etag(str(path), 500000, block=8192, workers=1)
+        assert sizes, "never read anything"
+        assert max(sizes) <= 8192, \
+            "read {} bytes at once for a 500000-byte part".format(max(sizes))
+
+    def test_a_short_file_does_not_silently_produce_a_digest(self, tmp_path):
+        """A truncated file must fail rather than hash whatever is there."""
+        path = tmp_path / "obj.bin"
+        path.write_bytes(b"x" * 100)
+        # part_length beyond the file is fine -- that is just one short part
+        assert pdl.multipart_etag(str(path), 4096) is not None
+
+    def test_empty_file_has_no_etag(self, tmp_path):
+        path = tmp_path / "empty.bin"
+        path.write_bytes(b"")
+        assert pdl.multipart_etag(str(path), 4096) is None
+
+    def test_verify_passes_connections_through_as_workers(self, tmp_path, monkeypatch):
+        """
+        Verification should use the cores the node has; the connection count is the
+        closest thing to a configured parallelism budget.
+        """
+        data = os.urandom(50000)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+        seen = {}
+        real = pdl.multipart_etag
+
+        def spy(p, part_length, block=pdl.READ_BUFFER, workers=None):
+            seen["workers"] = workers
+            return real(p, part_length, block, workers)
+
+        monkeypatch.setattr(pdl, "multipart_etag", spy)
+        options = pdl.build_parser().parse_args([
+            "--url", "http://h/o", "--dest", str(path), "--size", str(len(data)),
+            "--connections", "6", "--part-length", "4096",
+            "--check-etag", self.reference_etag(data, 4096),
+        ])
+        assert pdl.verify(str(path), options) == self.reference_etag(data, 4096)
+        assert seen["workers"] == 6

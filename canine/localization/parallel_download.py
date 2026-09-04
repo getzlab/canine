@@ -1892,32 +1892,79 @@ def file_md5(path, block=READ_BUFFER):
     return digest.hexdigest()
 
 
-def multipart_etag(path, part_length, block=READ_BUFFER):
+def multipart_etag(path, part_length, block=READ_BUFFER, workers=None):
     """
-    S3's multipart ETag is md5-of-md5s with a "-N" part-count suffix. Computed here by
-    reading the finished file; when chunk boundaries were snapped to part boundaries
-    the per-part digests are already in the manifest, so this pass is avoidable.
+    S3's multipart ETag is md5-of-md5s with a "-N" part-count suffix.
+
+    Each part's md5 is independent of every other, so this is embarrassingly parallel and
+    is computed across a thread pool: hashlib releases the GIL for buffers of this size,
+    so the hashing genuinely overlaps rather than merely interleaving. On a 300 GB object
+    the read-back is the dominant cost of verification, and it is worth using the cores
+    the localization node has.
+
+    Deliberately NOT materializing a whole part: S3 part sizes run from 8 MB to several
+    GB, so buffering one would make peak memory a property of how the uploader happened
+    to chunk the object. Each worker holds `block` bytes, so memory is
+    `workers * block` regardless of part size.
     """
-    digests = []
-    with open(path, "rb") as fh:
-        while True:
-            part = _read_exactly(fh, part_length, block)
-            if not part:
-                break
-            digests.append(hashlib.md5(part).digest())
-    if not digests:
+    size = os.path.getsize(path)
+    if size == 0:
         return None
+    n_parts = (size + part_length - 1) // part_length
+
+    if workers is None:
+        workers = min(n_parts, max(1, (os.cpu_count() or 2)))
+
+    digests = [None] * n_parts
+
+    def hash_part(index):
+        start = index * part_length
+        remaining = min(part_length, size - start)
+        digest = hashlib.md5()
+        # A private handle per worker: a shared one would need locking around every
+        # seek/read pair and would serialize exactly what this is parallelizing.
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            while remaining:
+                piece = fh.read(min(block, remaining))
+                if not piece:
+                    break
+                digest.update(piece)
+                remaining -= len(piece)
+        if remaining:
+            raise PermanentError(
+                "short read hashing part {} of {}".format(index, path)
+            )
+        digests[index] = digest.digest()
+
+    if workers <= 1:
+        for index in range(n_parts):
+            hash_part(index)
+    else:
+        errors = []
+
+        def run(indices):
+            for index in indices:
+                try:
+                    hash_part(index)
+                except Exception as e:                       # noqa: BLE001
+                    errors.append(e)
+                    return
+
+        threads = []
+        for offset in range(workers):
+            indices = range(offset, n_parts, workers)
+            thread = threading.Thread(target=run, args=(indices,), daemon=True)
+            thread.start()
+            threads.append(thread)
+        for thread in threads:
+            thread.join()
+        if errors:
+            raise errors[0]
+
+    if any(d is None for d in digests):
+        raise PermanentError("failed to hash every part of {}".format(path))
     return "{}-{}".format(hashlib.md5(b"".join(digests)).hexdigest(), len(digests))
-
-
-def _read_exactly(fh, count, block):
-    buf = bytearray()
-    while len(buf) < count:
-        piece = fh.read(min(block, count - len(buf)))
-        if not piece:
-            break
-        buf.extend(piece)
-    return bytes(buf)
 
 
 def normalize_expected_md5(value):
@@ -1941,9 +1988,19 @@ def verify(path, options):
     unable to check is a hard failure rather than a silent pass.
 
     Returns the digest that was verified, or None when no check was requested.
+
+    Note what this costs on the in-place route: it is a full read-back of the object.
+    The per-part digests computed during the transfer live on BucketChunkSink, so only
+    Route B can skip this pass -- on Route A a 300 GB object is downloaded and then read
+    again to hash it. `multipart_etag` at least parallelizes that read; a whole-file md5
+    cannot be parallelized at all, being inherently sequential over the byte stream.
     """
     if options.check_etag and options.part_length:
-        actual = multipart_etag(path, options.part_length)
+        # getattr, not attribute access: verify() takes anything options-shaped, and a
+        # missing connection count just means "decide from the CPU count".
+        connections = getattr(options, "connections", None)
+        actual = multipart_etag(path, options.part_length,
+                                workers=max(1, connections) if connections else None)
         expected = options.check_etag.strip().strip('"')
         if actual != expected:
             raise PermanentError(
