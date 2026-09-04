@@ -5,9 +5,10 @@ Step-by-step procedure for `benchmark_localization.py` on a mock-up wolF worker 
 Everything in the 794-test unit suite runs against fakes. This measures what a fake cannot,
 and settles the `connections` default before it ships.
 
-**Read §0 before creating anything.** It explains why §4.1's ten-minute `dd` gates
-everything else: whether the persistent disk is a real constraint on this path is unsettled,
-and the answer decides whether §10 matters at all or can be skipped outright.
+**Read §0 before creating anything.** It explains why §4.1's ten-minute `dd` comes first:
+whether the persistent disk is a real constraint on this path is unsettled, and that answer
+underpins every other number here. §4 is measurement, §10 is the cost decision that
+consumes it — run all of §4 regardless of what you expect §10 to conclude.
 
 ---
 
@@ -66,12 +67,14 @@ That is the best available outcome, and it is the hypothesis to test first.
 
 | §4.1 `dd` on a 316 GB pd-standard | What it means |
 |---|---|
-| **≫ 38 MB/s** (say 100 MB/s+) | The per-GB model does not describe this path. The disk is not the limit, the downloader is the whole fix, and §10 can be ignored entirely. **This is what the evidence predicts.** |
-| **≈ 38 MB/s** | The per-GB model holds after all, the 1.8× ceiling is real, and §10's sizing analysis applies as written. |
+| **≫ 38 MB/s** (say 100 MB/s+) | The per-GB model does not describe this path. The disk is not the localization bottleneck, today's 21 MB/s is source-bound, and the downloader has full headroom. **This is what the evidence predicts.** |
+| **≈ 38 MB/s** | The per-GB model holds. The disk is close to binding, and the achievable localization time — hence the VM-hours in §10's cost model — is set by disk size. |
 
-Everything in §10 is written for the second row. It is retained because it is worked
-through and because a measurement might yet support it — but it is **conditional**, and I
-had been presenting it as settled.
+**Run the whole of §4 either way.** Earlier revisions told you to skip parts of it once the
+economics looked settled, which was wrong twice over: the measurements are what *validate*
+the model every cost estimate rests on, and a benchmark exists to find out what is true, not
+to confirm a decision already taken. §4 is measurement; §10 is the decision that consumes
+it. Keeping them separate is the point.
 
 One thing that is *not* conditional: **`pd-standard` is required, not an oversight.** It is
 the only type that attaches read-only to an unlimited number of VMs; `pd-balanced` and
@@ -80,8 +83,8 @@ the only type that attaches read-only to an unlimited number of VMs; `pd-balance
 
 Two notes on running order:
 
-* **§4.1 first, always.** Ten minutes, no egress, no downloads, and it decides whether the
-  rest of §4 and all of §10 are relevant.
+* **§4.1 first, always.** Ten minutes, no egress, no downloads, and every cost estimate in
+  §10 is derived from its result.
 * **Do not sweep at 300 GB.** Five settings would be hours. §6 finds the knee on a 12 GB
   object in tmpfs, then does one full-size run.
 
@@ -308,16 +311,18 @@ Compare against the predictions and against today's 21 MB/s:
 
 | Measured write on 316 GB pd-standard | Reading |
 |---|---|
-| **≫ 38 MB/s** — e.g. 100 MB/s+ | **The likely outcome, per §0.** The per-GB model does not describe this path; the disk is not the localization bottleneck; today's 21 MB/s is source-bound; the downloader has full headroom and ≥4× is available. **Skip §4.1b, §4.1c, §4.2 and §10 entirely** and go to §6. |
-| **≈ 38 MB/s** | The per-GB model holds. The 1.8× ceiling in §10 is real and its sizing analysis applies. Continue with §4.1b. |
+| **≫ 38 MB/s** — e.g. 100 MB/s+ | **The likely outcome, per §0.** The per-GB model does not describe this path; the disk is not the localization bottleneck; today's 21 MB/s is source-bound; the downloader has full headroom and ≥4× is available. |
+| **≈ 38 MB/s** | The per-GB model holds. The disk is close to binding, and achievable localization time is set by disk size. |
+
+Then continue to §4.1b either way — a single size tells you the rate, but only the sweep
+tells you whether the rate *scales with size*, which is the actual claim under test.
 
 Take the **read** number too, and against a small disk as well as a large one — a 10 GB
 disk reading at ~1.2 MB/s versus ~100 MB/s is the same question in its starkest form, and
 reference disks live at that size (§10).
 
-**If pd-standard confirms at ~38 MB/s, stop and decide the disk question before spending
-hours on download benchmarks.** The change is one word in `base.py:1002`; the tradeoff is
-in §10.
+Whatever it shows, record it — this is the number every cost estimate in §10 depends on,
+and it is the cheapest measurement in the document.
 
 Also re-run `pdl probe` now that a disk is mounted — it prints the PD type, provisioned size
 and implied per-GB cap, which should agree with `dd`. If they disagree, trust `dd`.
@@ -397,11 +402,15 @@ how §10's table is computed.
 
 No measurement required here. Skip to §4.2, or straight to §6 if you accept §10's
 conclusion.
-### 4.2 Disk conversion — bounded at $0.22, so do not measure it
+### 4.2 Disk conversion — off the critical path, but here is what it would tell you
 
-**Nothing to run here. The arithmetic bounds the prize below the complexity cost whatever
-the snapshot rates turn out to be**, which is a better outcome than a measurement: it does
-not depend on any GCP behaviour that might be misremembered.
+**Optional.** The arithmetic bounds the prize below the complexity cost whatever the
+snapshot rates turn out to be, so no result here can change the conversion decision — but
+that is a statement about the *decision*, not a reason the numbers are worthless. Snapshot
+creation and hydration rates for a 300 GB disk are useful to know for their own sake
+(recovery, re-hydrating an expired cache, any future design that leans on snapshots), and
+nobody here has measured them. Run it if you want the datum; skip it if you are short on
+time. It costs roughly half an hour and no egress.
 
 Two facts settled by the Getz Lab independently, both of which I had wrong:
 
@@ -756,19 +765,68 @@ gcloud compute disks list --filter="name~canine-bench"    # confirm nothing is l
 ---
 ## 10. What to do about the disk — CONDITIONAL on §4.1
 
-> **Skip this section if §4.1's `dd` shows the 316 GB disk writing well above 38 MB/s.**
-> Everything below assumes the per-gigabyte throughput model governs this path, and the
-> available evidence suggests it does not: the limit that bites in practice is on the
-> transfer, not on read/write to an attached disk. If that holds, the disk was never the
-> constraint, oversizing buys nothing, and the parallel downloader is the entire fix.
+> This is the **decision** section: what to do given §4's measurements. It assumes the
+> per-gigabyte throughput model governs this path, which §4.1b tests. If the disk turns out
+> not to be a constraint, the sizing question below simply does not arise — the parallel
+> downloader is the entire fix.
 >
-> This section is kept because the analysis is worked through and a measurement might yet
-> support it — but it is a contingency, not a plan.
+> Read it after §4, not instead of it.
+
+### The objective: total cost of localizing, not localization speed
+
+The goal is a **cheaper** localization, not merely a faster one. So price the whole thing:
+VM-hours plus disk-hours, on preemptible workers (`gcpTransient.py` defaults
+`preemptible=True`, and the downloader is preemption-safe by design), 48 h retention, and
+**300 concurrent unique BAM disks**, which is the scale these run at.
+
+Per BAM, and per 300-disk batch:
+
+| Scenario | VM | disk | total | ×300 batch | vs today |
+|---|---|---|---|---|---|
+| today: 4.0 h, n1-standard-8 | $0.32 | $0.83 | $1.15 | **$345** | — |
+| downloader 4×: 1.0 h, same VM | $0.08 | $0.83 | $0.91 | **$273** | **−$72** |
+| …and oversize the disk to 742 GB | $0.08 | $1.95 | $2.03 | **$608** | **+$263** |
+| …instead, run localization on `n1-highcpu-8` | $0.06 | $0.83 | $0.89 | $267 | −$78 |
+| …instead, on a 2-vCPU node | $0.01 | $0.83 | $0.85 | **$254** | **−$91** |
+
+Three things fall out of that table, and only the first was expected.
+
+**1. The disk, not the VM, is the larger line item — and the downloader cannot touch it.**
+At 48 h retention the disk is $0.83 against $0.32 of VM time. Localizing faster shortens
+the VM hours only; the disk is retained for reuse regardless of how quickly it was filled.
+So the downloader's cost ceiling is the VM share, about **21%** of total.
+
+**2. Oversizing is decisively wrong at this scale.** A 316 GB disk exists for 48 h but is
+*written* for only a few of them, so paying for more gigabytes across the whole lifetime to
+save time in a small fraction of it never recovers. Concretely: +$1.12/disk of storage to
+save $0.10/disk of preemptible VM time — **−$1.02 per disk, −$306 per batch.** My earlier
+recommendation of 742 GB used on-demand VM pricing and priced a single disk; both errors
+pushed the same way, and at your pricing and scale the conclusion inverts.
+
+**3. The biggest untapped lever is the machine type, which nothing here had questioned.**
+`LocalizeToDisk` pins `n1-standard-8` with `--exclusive` (`wolF/wolF/localization.py:35`).
+§2 justified that as "the download owns the whole node" — but that is an argument that
+nothing should *compete* with localization, not that localization needs 8 vCPUs and 28 GB
+of RAM. It is pure IO: the downloader buffers ~1 MiB per connection, and md5 over 300 GB is
+a few minutes of one core. Even a 2-vCPU n1 has a **4 Gbps (~500 MB/s) egress cap**, far
+above any download rate in play here.
+
+If that holds, localization on a small node costs **$0.01 instead of $0.32** — a larger
+saving than the speedup itself, and it composes with it. Worth measuring directly, and
+§6 can: run the sweep on a smaller machine type and see whether the knee and the plateau
+move at all. Note `slurm_gcp_docker/conf/nodetypes.json` has no 2-vCPU entry, so this needs
+a partition added before it can be tried.
+
+**What actually reduces total cost, ranked:** retention (the dominant term, but a workflow
+decision), then machine type, then localization speed. Oversizing moves it the wrong way.
+
+---
 
 `pd-standard` stays — it is the only type with unlimited read-only fan-out, and that is what
 the rodisk exists for. But its throughput is provisioned **per gigabyte**, so the speed is
 available from a *bigger pd-standard*: no type change, no snapshot, no new failure modes.
-This is a sizing question.
+The rest of this section works that sizing question through; per the table above it is a
+**net loss at scale**, and is retained for the reasoning rather than as a recommendation.
 
 Costs below are simply **provisioned size × how long the disk exists**, which is how these
 disks are actually billed — there is no snapshot-and-rehydrate step in the current design,
@@ -807,14 +865,14 @@ those the read saving is **zero**. Only genuinely IO-bound consumers count:
 So the number that decides whether oversizing is cost-*positive* is not the consumer count
 but the **IO-bound** consumer count, which is a property of the pipelines, not of the data.
 
-### Recommendation: 742 GB, framed as buying latency rather than saving money
+### ~~Recommendation: 742 GB~~ — RETRACTED, see the cost model above
 
-**Worst case — 48 h retention, not one IO-bound consumer — a 742 GB disk costs $0.64 more
-per disk and takes 1.26 hours off a blocking step.** That is the honest floor, and it is
-the right way to think about this: it is not a cost optimisation, it is buying pipeline
-latency for well under a dollar. Given that the entire premise of this work is that 4 hours
-is too long, sixty-four cents for the first 1.26 of those hours is a straightforward trade.
-With two or more IO-bound consumers it also pays for itself outright.
+**This recommendation is withdrawn.** It rested on two errors that both pushed the same
+way: on-demand VM pricing (~$0.38/h, where preemptible is ~$0.08/h, overstating the time
+saving by nearly 5×) and a per-disk view (where 300 concurrent disks multiply the storage
+penalty). At the real pricing and scale a 742 GB disk is **−$1.02 per disk and −$306 per
+batch**. The latency argument still holds in wall-clock terms — 1.26 h off a blocking step
+is real — but the stated objective is total cost, and on that measure this loses.
 
 Going beyond 742 GB gets steadily worse value — $2.39 per hour saved at 2000 GB versus
 $0.89 — so only go bigger if you know a specific input is read by many IO-bound tasks.
