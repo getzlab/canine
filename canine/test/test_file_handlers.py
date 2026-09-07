@@ -109,6 +109,15 @@ class TestHandleBucketMountURLHash:
         f = HandleBucketMountURL(url)
         assert f._get_hash() == url
 
+    def test_per_localization_bucket_layout_returns_full_url(self):
+        """
+        One-bucket-per-localization layout: the content address is the bucket
+        name itself, and the object path is just <input>/<basename>.
+        """
+        url = "bucketmount://wolf-406002258908-us-central1-abc123def456789012/filename/reads.bam"
+        f = HandleBucketMountURL(url)
+        assert f._get_hash() == url
+
     def test_invalid_url_no_path_raises(self):
         with pytest.raises(ValueError):
             HandleBucketMountURL("bucketmount://my-bucket/canine-abc").  _get_hash()

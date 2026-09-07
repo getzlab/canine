@@ -4,6 +4,7 @@ The legacy test_utils.py has randomized ArgumentHelper round-trip tests; this fi
 adds deterministic, scenario-specific coverage including pricing and hashing.
 """
 import io
+import re
 import subprocess
 import pytest
 from canine.utils import (
@@ -13,6 +14,8 @@ from canine.utils import (
     base32,
     sha1_base32,
     check_call,
+    localization_bucket_name,
+    LOCALIZATION_BUCKET_HASH_LEN,
 )
 
 
@@ -290,3 +293,60 @@ class TestCheckCall:
     def test_none_streams_no_crash(self):
         with pytest.raises(subprocess.CalledProcessError):
             check_call("cmd", 1, stdout=None, stderr=None)
+
+
+# ---------------------------------------------------------------------------
+# localization_bucket_name
+# ---------------------------------------------------------------------------
+
+MD5 = "0123456789abcdef0123456789abcdef"  # 32 hex chars, as hash_set() returns
+PN = "406002258908"                       # 12 digits, as real project numbers are
+
+
+class TestLocalizationBucketName:
+
+    def test_shape(self):
+        assert localization_bucket_name(PN, "us-central1", MD5) == \
+          "wolf-406002258908-us-central1-" + MD5[:21]
+
+    def test_stable_for_identical_inputs(self):
+        assert localization_bucket_name(PN, "us-central1", MD5) == \
+               localization_bucket_name(PN, "us-central1", MD5)
+
+    def test_differs_across_regions(self):
+        """Buckets are regional: the same content in two regions needs two names."""
+        assert localization_bucket_name(PN, "us-central1", MD5) != \
+               localization_bucket_name(PN, "us-east1", MD5)
+
+    def test_differs_across_content(self):
+        other = "f" * 32
+        assert localization_bucket_name(PN, "us-central1", MD5) != \
+               localization_bucket_name(PN, "us-central1", other)
+
+    @pytest.mark.parametrize("region", [
+        "us-east1", "us-central1", "europe-west1", "asia-southeast1",
+        "southamerica-east1", "australia-southeast1", "northamerica-northeast1",
+    ])
+    def test_fits_63_chars_in_every_region(self, region):
+        """northamerica-northeast1 (23 chars) is the boundary case: exactly 63."""
+        name = localization_bucket_name(PN, region, MD5)
+        assert len(name) <= 63, "{} -> {} chars".format(region, len(name))
+
+    def test_longest_region_is_exactly_at_the_boundary(self):
+        name = localization_bucket_name(PN, "northamerica-northeast1", MD5)
+        assert len(name) == 63
+
+    def test_hash_truncated_not_full_md5(self):
+        name = localization_bucket_name(PN, "us-central1", MD5)
+        assert name.endswith(MD5[:LOCALIZATION_BUCKET_HASH_LEN])
+        assert MD5 not in name  # the full 32-char hash would overflow
+
+    def test_rejects_oversized_name(self):
+        """A longer future project number must fail loudly, not reach GCS."""
+        with pytest.raises(ValueError):
+            localization_bucket_name("9" * 40, "northamerica-northeast1", MD5)
+
+    def test_lowercase_and_legal_charset(self):
+        name = localization_bucket_name(PN, "US-CENTRAL1", MD5)
+        assert name == name.lower()
+        assert re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', name)

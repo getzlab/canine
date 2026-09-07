@@ -913,7 +913,10 @@ class HandleBucketMountURL(FileType):
         if bmURL is None or bmURL[3] == "":
             raise ValueError("Invalid bucketmount URL specified ({})!".format(self.path))
 
-        if not bmURL[2].startswith("canine-"):
+        # the content address lives in the bucket name ("wolf-<project>-<region>
+        # -<hash>") for a per-localization bucket, or in the first object path
+        # segment ("canine-<hash>") for the legacy shared-bucket layout
+        if not (bmURL[1].startswith("wolf-") or bmURL[2].startswith("canine-")):
             canine_logging.debug("Bucket-mount input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
 
         # the whole URL (bucket + content hash + file path) serves as the hash

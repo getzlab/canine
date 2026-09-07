@@ -231,6 +231,58 @@ def _zone_to_region(zone: str) -> str:
     """
     return zone.rsplit('-', 1)[0]
 
+@functools.lru_cache(maxsize=None)
+def get_project_number(project: str) -> str:
+    """
+    Numeric ID of `project`. Used in localization bucket names because, unlike
+    the project ID, it is stable across project renames. Cached: this shells out
+    once per project per process.
+    """
+    proc = subprocess.run(
+        ["gcloud", "projects", "describe", project, "--format=value(projectNumber)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    check_call(
+        "gcloud projects describe {}".format(project),
+        proc.returncode, io.BytesIO(proc.stdout), io.BytesIO(proc.stderr)
+    )
+    number = proc.stdout.decode().strip()
+    if not number.isdigit():
+        raise ValueError("Could not resolve a numeric project ID for {!r} (got {!r})".format(project, number))
+    return number
+
+## Longest hash that still fits in a 63-char bucket name for every current GCP
+## region. With a 12-digit project number the budget is
+## 63 - len("wolf-") - len(project_number) - len(region) - 2 separators, which
+## bottoms out at 21 for "northamerica-northeast1" (23 chars, the longest region
+## name). A fixed 21 is used everywhere so names are uniform regardless of where
+## the cluster runs. 21 hex = 84 bits; collision odds at 1e6 buckets are ~5e-14.
+LOCALIZATION_BUCKET_HASH_LEN = 21
+
+def localization_bucket_name(project_number: str, region: str, content_hash: str) -> str:
+    """
+    Deterministic name of the bucket backing one localization:
+    wolf-<project_number>-<region>-<21 chars of content_hash>.
+
+    The region is part of the name because buckets are regional -- one bucket
+    cannot serve two regions, so the same content localized in two regions needs
+    two distinct (globally unique) names. The project number, rather than the
+    project ID, keeps the name stable across project renames.
+
+    `content_hash` is the same hash_set() value used for the old RODISK name, so
+    identical input sets still converge on one bucket.
+    """
+    name = "wolf-{}-{}-{}".format(
+      _sanitize_bucket_name_component(str(project_number)),
+      _sanitize_bucket_name_component(region),
+      content_hash[:LOCALIZATION_BUCKET_HASH_LEN],
+    )
+    # A longer future project number or a new, longer region name must fail here
+    # rather than reach GCS as an invalid name.
+    if not re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', name):
+        raise ValueError("Computed an invalid GCS bucket name: {!r}".format(name))
+    return name
+
 def get_or_create_workflow_bucket(zone: str, project: str, workflow_name: typing.Optional[str] = None) -> str:
     """
     Get or create the standard regional bucket backing bucket-mounted
