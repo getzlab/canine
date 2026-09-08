@@ -320,13 +320,26 @@ def get_or_create_workflow_bucket(zone: str, project: str, workflow_name: typing
 
     return bucket_name
 
-def get_or_create_rapid_cache(bucket: str, zone: str, ttl: str = "7d", ingest_on_write: bool = True):
+def get_or_create_rapid_cache(bucket: str, zone: str, ttl: str = "1d", ingest_on_write: bool = True):
     """
     Get or create a Rapid Cache (formerly Anywhere Cache) instance for
     `bucket` in `zone`. Callers should treat failure here as best-effort/
     non-fatal: Rapid Cache degrades gracefully to normal bucket latency on
     a miss or absent cache, so a failure to provision it should not fail
     the workflow the way a bucket-creation failure does.
+
+    Callers opt in explicitly -- this is not free. Cache storage bills per
+    GiB-hour (Rapid Cache Storage Iowa: $0.0001233/GiB-hour, ~$0.089/GiB-month,
+    about 4x standard regional storage), while the data transfer it would save
+    is $0/GiB within North America. So a workload whose bucket and workers share
+    a region pays purely for read latency, which is worth it for an input read by
+    many shards and wasteful for read-once work.
+
+    `ttl` defaults to 1 day to match the localization bucket's own
+    daysSinceCustomTime expiry (AbstractLocalizer.localization_expiry_days). Keep
+    the two aligned: a longer cache TTL means paying to cache objects that have
+    already been deleted -- at 7d against a 1d expiry that was ~7x the cache bill
+    for no benefit. If you raise one, raise the other.
     """
     list_proc = subprocess.run(
         ["gcloud", "storage", "buckets", "anywhere-caches", "list", "gs://{}".format(bucket), "--format=value(zone)"],

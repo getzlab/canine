@@ -87,7 +87,8 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None,
         action_on_stop: str = "stop",
         workflow_name: typing.Optional[str] = None,
-        rapid_cache_ttl: str = "7d",
+        rapid_cache: bool = False,
+        rapid_cache_ttl: str = "1d",
         **kwargs
     ):
         #
@@ -149,6 +150,7 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "slurm_conf_path" : slurm_conf_path,
             "action_on_stop" : action_on_stop,
             "workflow_name" : workflow_name,
+            "rapid_cache" : rapid_cache,
             "rapid_cache_ttl" : rapid_cache_ttl
         }
 
@@ -177,20 +179,27 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
                 self.config["compute_zone"], self.config["project"], self.config["workflow_name"]
             )
 
-            # Rapid Cache acceleration is best-effort: it only affects read
-            # speed, not correctness, so a failure here is logged and
-            # startup continues rather than aborting
-            try:
-                get_or_create_rapid_cache(
-                    self.config["storage_bucket"], self.config["compute_zone"],
-                    ttl = self.config["rapid_cache_ttl"]
-                )
-            except Exception as e:
-                canine_logging.warning(
-                    "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
-                        self.config["storage_bucket"], e
+            # Rapid Cache is opt-in per workflow (rapid_cache=True), because it
+            # is not free and not always a win: cache storage bills per GiB-hour
+            # at roughly 4x standard storage, while the transfer it would save
+            # is $0 for a same-region read, so an in-region workload pays purely
+            # for read latency. Worth it for inputs read by many shards, wasteful
+            # for read-once work.
+            #
+            # Best-effort when enabled: it affects read speed, not correctness,
+            # so a failure is logged and startup continues rather than aborting.
+            if self.config["rapid_cache"]:
+                try:
+                    get_or_create_rapid_cache(
+                        self.config["storage_bucket"], self.config["compute_zone"],
+                        ttl = self.config["rapid_cache_ttl"]
                     )
-                )
+                except Exception as e:
+                    canine_logging.warning(
+                        "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
+                            self.config["storage_bucket"], e
+                        )
+                    )
 
             # start nodes
             self.init_nodes()

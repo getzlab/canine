@@ -56,7 +56,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
         controller_disk_size: int = 200, gpu_type: typing.Optional[str] = None, gpu_count: int = 0,
         compute_script: str = "", controller_script: str = "", secondary_disk_size: int = 0, project: typing.Optional[str]  = None,
         external_compute_ips: bool = False, workflow_name: typing.Optional[str] = None,
-        rapid_cache_ttl: str = "7d", **kwargs : typing.Any
+        rapid_cache: bool = False, rapid_cache_ttl: str = "1d", **kwargs : typing.Any
     ):
         self.project = project if project is not None else get_default_gcp_project()
         if self.project is None:
@@ -99,6 +99,7 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
           **kwargs
         }
         self.workflow_name = workflow_name
+        self.rapid_cache = rapid_cache
         self.rapid_cache_ttl = rapid_cache_ttl
 
         if gpu_type is not None and gpu_count > 0:
@@ -240,19 +241,26 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
                 self.config["zone"], self.project, self.workflow_name
             )
 
-            # Rapid Cache acceleration is best-effort: it only affects read
-            # speed, not correctness, so a failure here is logged and
-            # startup continues rather than aborting
-            try:
-                get_or_create_rapid_cache(
-                    self.config["storage_bucket"], self.config["zone"], ttl = self.rapid_cache_ttl
-                )
-            except Exception as e:
-                canine_logging.warning(
-                    "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
-                        self.config["storage_bucket"], e
+            # Rapid Cache is opt-in per workflow (rapid_cache=True), because it
+            # is not free and not always a win: cache storage bills per GiB-hour
+            # at roughly 4x standard storage, while the transfer it would save
+            # is $0 for a same-region read, so an in-region workload pays purely
+            # for read latency. Worth it for inputs read by many shards, wasteful
+            # for read-once work.
+            #
+            # Best-effort when enabled: it affects read speed, not correctness,
+            # so a failure is logged and startup continues rather than aborting.
+            if self.rapid_cache:
+                try:
+                    get_or_create_rapid_cache(
+                        self.config["storage_bucket"], self.config["zone"], ttl = self.rapid_cache_ttl
                     )
-                )
+                except Exception as e:
+                    canine_logging.warning(
+                        "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
+                            self.config["storage_bucket"], e
+                        )
+                    )
 
             return self
         except:
