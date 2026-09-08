@@ -18,6 +18,9 @@ consumes it — run all of §4 regardless of what you expect §10 to conclude.
 
 * `gcloud` authenticated, with permission to create instances, disks and snapshots.
   (§4.2 only; snapshots are not needed for the main measurements.)
+* Both `gcloud auth login` **and** `gcloud auth application-default login` run **on the
+  node** — see §2. The second is what `gcsfuse` and the client libraries read, and §3
+  mounts the file it writes into the container.
 * Quota for one `n1-standard-8` and ~1 TB of persistent disk in your zone (§4 creates
   several 316 GB disks, though not all at once).
 * Test objects of ~12 GB and ~300 GB, and their md5s (§2 makes both).
@@ -148,9 +151,45 @@ You need **two**: a ~12 GB object for the sweeps (§6.1, §6.2) and a ~300 GB on
 single confirmation run (§6.3). Generate them on the node — it is faster than uploading
 from anywhere else, and it gives you the md5 in the same pass:
 
+### Authenticate on the node first
+
 ```bash
 gcloud compute ssh $NODE --project $PROJECT --zone $ZONE
 
+# on the node -- one command, one browser round-trip
+gcloud auth login --no-launch-browser --update-adc --add-quota-project-to-adc
+```
+
+**`--update-adc` is why this is one command and not three.** Authenticating the `gcloud`
+CLI and writing `application_default_credentials.json` are separate things: the CLI reads
+its own credential store, while client libraries and `gcsfuse` read the ADC file. Without
+`--update-adc` you would need `gcloud auth application-default login` as a second browser
+round-trip, and §6.6 would fail to mount a bucket while every `gcloud` command appeared to
+work fine. `--add-quota-project-to-adc` folds in what would otherwise be a third command,
+`gcloud auth application-default set-quota-project`.
+
+> Confirm both flag names with `gcloud auth login --help` on the image you are using.
+> `--update-adc` is long-standing; `--add-quota-project-to-adc` is the one I am less sure
+> of, and if it is unavailable run `gcloud auth application-default set-quota-project
+> $PROJECT` afterwards instead. (Two GCP specifics in this document have already needed
+> correcting, so treat my recollection of flag names as a starting point.)
+
+`--no-launch-browser` because there is no browser on the VM: it prints a URL to open
+locally and a code to paste back.
+
+Note that this puts **user** credentials into ADC rather than a service account's. That is
+what production does too — `docker_copy_gcloud_credentials.sh` propagates user credentials
+over NFS (§3) — so it is the identity worth testing with.
+
+**Why authenticate at all**, when the node already has a service account? Because that is
+the default compute SA, and your scratch bucket and source objects are likely reachable by
+*you* rather than by it. If the SA does have access, skip this — but check rather than
+assume, since the failure otherwise surfaces as an opaque 403 partway through a 300 GB
+transfer.
+
+### Create the objects
+
+```bash
 # on the node
 export BUCKET=your-scratch-bucket
 
@@ -207,11 +246,24 @@ table are the real ones, so the benchmark must run there too.
 # on the node
 sudo docker run -dti --rm --pid host --network host --privileged \
   -v /dev:/dev \
+  -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
   --entrypoint /bin/bash --name slurm broadinstitute/slurm_gcp_docker
 ```
 
 These are `worker_startup_script.sh:60`'s flags minus the NFS and docker-socket mounts,
-which need a controller. Note what is **not** here: `/mnt/rwdisks` is not bind-mounted in
+which need a controller — **plus a credentials mount, which replaces a step we are
+skipping.**
+
+The real worker runs `docker_copy_gcloud_credentials.sh`, which copies gcloud credentials
+out of `/mnt/nfs/credentials/gcloud/` into the container: in production the container
+authenticates with **user credentials propagated over NFS**, not with the node's service
+account. Starting the container by hand bypasses that entirely, so without the mount above
+it has no gcloud configuration at all — `gcloud auth print-access-token` fails and only the
+metadata server answers.
+
+Mounting `~/.config/gcloud` read-only reaches the same end state as that script, and it is
+why §2's `application-default login` must happen **before** this step: the file it writes
+is what gets mounted. Note what is **not** here: `/mnt/rwdisks` is not bind-mounted in
 the real worker either, which is exactly why the localization disk has to be mounted from
 inside the container (§4) and why probing the host tells you nothing.
 
@@ -544,8 +596,8 @@ Cross-reference §6.1, §6.2 and the `dd` figure from §4.1:
 * **peak NIC vs. peak disk write** in the output should corroborate whichever it is.
 
 Note the 12 GB object gets a 316 GB disk here, so the per-GB ceiling is the *300 GB* one —
-that is deliberate. Sizing the disk to the small object would give a ~13 GB disk at ~1.6 MB/s
-and measure a situation that never occurs.
+that is deliberate. Sizing the disk to the small object would give a ~13 GB disk at
+~1.6 MB/s and measure a situation that never occurs.
 
 ### 6.3 Direct to pd-standard at full size — the primary result
 
@@ -576,8 +628,9 @@ behaviour, not as the sweep's internal speedup.
 **Record the download/verify split.** `verify()` reads the whole object back on this
 route, so the wall-clock is download plus a 300 GB re-read. The downloader emits
 `k9pdl-phase download …` and `k9pdl-phase verify …`, and the benchmark parses both into
-its `--json` output and prints a `download vs verify` summary with a recommendation. That split is what decides §10's machine-type question — a
-large verify share means the cores are doing real work.
+its `--json` output and prints a `download vs verify` summary with a recommendation.
+That split is what decides §10's machine-type question — a large verify share means the
+cores are doing real work.
 
 Record alongside it the thing that makes this configuration valuable and the alternatives
 expensive: **time to `finished=yes`**. That label is when the data becomes available to
@@ -670,14 +723,23 @@ SIGKILLs the download at 25%, 50% and 75%, then lets it finish. Check:
 
 ### 6.6 the bucket-compose route against real GCS
 
-The bucket-compose route has never touched real infrastructure — not the auth path, not resumable sessions,
-not compose. It needs a bucket mounted in the container so `select_route` sees a non-POSIX
+The bucket-compose route has never touched real infrastructure — not the auth path, not
+resumable sessions, not compose. It needs a bucket mounted in the container so `select_route` sees a non-POSIX
 destination. In this deployment those mounts come from the `.rclone*.sh` scripts on NFS, so
 on a mock node create one by hand:
 
 ```bash
-sudo docker exec slurm bash -c \
-  'gcsfuse --implicit-dirs '"$BUCKET"' /mnt/bucket || echo "gcsfuse not in the image"'
+sudo docker exec slurm bash -c '
+  # gcsfuse resolves credentials via ADC and does NOT read CLOUDSDK_CONFIG, so point it
+  # at the file explicitly. Without this the authenticating identity is whatever ADC
+  # happens to resolve to -- the metadata-server SA or the mounted user credentials --
+  # which silently works in one project and fails in another. This mirrors what the
+  # fuse-localize branch does in base.py before mounting.
+  ADC=/root/.config/gcloud/application_default_credentials.json
+  [ -f "$ADC" ] && export GOOGLE_APPLICATION_CREDENTIALS=$ADC \
+    || echo "no ADC in the container -- did §2 run application-default login before §3?" >&2
+  mkdir -p /mnt/bucket
+  gcsfuse --implicit-dirs '"$BUCKET"' /mnt/bucket || echo "gcsfuse not in the image"'
 
 pdl routeb --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
            --gs-url gs://$BUCKET/pdl-routeb-out.bin \
@@ -685,11 +747,16 @@ pdl routeb --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
            --json /tmp/routeb.json
 ```
 
-The token source line matters: **metadata server** is what a real worker uses; a **gcloud
-fallback** means the metadata path failed and is worth investigating on its own.
+**Read the token source line carefully, because this is where the mock node can diverge
+from production.** A real worker authenticates with user credentials copied from NFS by
+`docker_copy_gcloud_credentials.sh`, so it takes the `gcloud` path. With §3's credentials
+mount in place, `gcloud` should work here too — that is what the mount is for. If it
+reports the **metadata server** instead, the mount is missing or unreadable and you are
+exercising the compute service account rather than the identity production uses, which may
+have different bucket permissions.
 
-If `gcsfuse` is not in the image, the bucket-compose route cannot be reached this way — note it as unverified
-rather than assuming it works.
+If `gcsfuse` is not in the image, the bucket-compose route cannot be reached this way —
+note it as unverified rather than assuming it works.
 
 ---
 
