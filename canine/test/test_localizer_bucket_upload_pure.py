@@ -271,6 +271,32 @@ class TestCreateBucketMountLayouts:
         # no "canine-<hash>/" prefix segment: the bucket *is* the content address
         assert "/canine-" not in url
 
+    def test_compute_zone_config_key_is_honoured(self):
+        """
+        Regression: only gcpTransient records the zone as "zone". imageTransient
+        -- and therefore DockerTransient, the backend wolF actually runs --
+        records it as "compute_zone" and has no "zone" key at all, so reading
+        only "zone" meant the configured zone was never seen and auto-detection
+        ran every time. get_default_gcp_zone is patched to explode: reaching it
+        at all is the failure.
+        """
+        loc = make_localizer()
+        loc.backend.config = {"compute_zone": "europe-west4-a"}
+        loc.project = "proj"
+        with patch("canine.localization.base.get_project_number", return_value="406002258908"), \
+             patch("canine.localization.base.get_default_gcp_zone",
+                   side_effect=AssertionError("must not auto-detect a configured zone")):
+            _, _, paths, _ = loc.create_bucket_mount(self._inputs(), dry_run=True)
+        assert "-europe-west4-" in paths["filename"][0]
+
+    def test_explicit_zone_key_wins_over_compute_zone(self):
+        loc = make_localizer()
+        loc.backend.config = {"zone": "us-central1-c", "compute_zone": "europe-west4-a"}
+        loc.project = "proj"
+        with patch("canine.localization.base.get_project_number", return_value="406002258908"):
+            _, _, paths, _ = loc.create_bucket_mount(self._inputs(), dry_run=True)
+        assert "-us-central1-" in paths["filename"][0]
+
     def test_identical_inputs_converge_on_one_bucket(self):
         """Content addressing: the same input set must reuse the same bucket."""
         names = []

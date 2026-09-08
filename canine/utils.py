@@ -166,6 +166,7 @@ def make_interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.Bina
     stderr.seek(0,0)
     return channel.recv_exit_status(), stdout, stderr
 
+@functools.lru_cache()
 def get_default_gcp_zone():
     try:
         response = requests.get(
@@ -185,8 +186,15 @@ def get_default_gcp_zone():
             return response.stdout.strip().decode()
     except subprocess.CalledProcessError:
         pass
-    # gcloud config not happy, just return default
-    return 'us-central1-a'
+    # Both sources are exhausted. Returning a hardcoded zone here silently
+    # places zonal resources (Anywhere Caches, disks) and regional ones
+    # (localization buckets) somewhere the cluster isn't, which costs money and
+    # leaves nothing in the logs to explain it. A wrong zone is worse than none.
+    raise ValueError(
+        "Could not determine a default GCP zone: the GCE metadata server is unreachable "
+        "and `gcloud config get-value compute/zone` is unset. Pass the zone explicitly "
+        "(e.g. compute_zone=... to the backend) or run `gcloud config set compute/zone <zone>`."
+    )
 
 __DEFAULT_GCP_PROJECT__ = None
 

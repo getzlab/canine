@@ -3,12 +3,19 @@ Pure unit tests for canine.utils — no SLURM cluster, no GCP credentials requir
 The legacy test_utils.py has randomized ArgumentHelper round-trip tests; this file
 adds deterministic, scenario-specific coverage including pricing and hashing.
 """
+import ast
+import inspect
 import io
 import re
 import subprocess
+import warnings
+from unittest.mock import MagicMock, patch
+
 import pytest
+import requests
 from canine.utils import (
     ArgumentHelper,
+    get_default_gcp_zone,
     _get_mtype_cost,
     gcp_hourly_cost,
     base32,
@@ -350,3 +357,118 @@ class TestLocalizationBucketName:
         name = localization_bucket_name(PN, "US-CENTRAL1", MD5)
         assert name == name.lower()
         assert re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', name)
+
+
+# ---------------------------------------------------------------------------
+# get_default_gcp_zone
+# ---------------------------------------------------------------------------
+
+def _unreachable_metadata():
+    return patch("canine.utils.requests.get",
+                 side_effect=requests.exceptions.ConnectionError())
+
+
+def _metadata_says(zone_path, status=200):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = zone_path
+    return patch("canine.utils.requests.get", return_value=resp)
+
+
+def _gcloud_says(stdout, returncode=0):
+    return patch("canine.utils.subprocess.run",
+                 return_value=MagicMock(returncode=returncode, stdout=stdout))
+
+
+class TestGetDefaultGcpZone:
+    """
+    A zone this function makes up is worse than no zone at all: it silently
+    places the Anywhere Cache and localization buckets away from the cluster,
+    which costs money and logs nothing. So the last resort is an exception.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_zone_cache(self):
+        get_default_gcp_zone.cache_clear()
+        yield
+        get_default_gcp_zone.cache_clear()
+
+    def test_metadata_server_wins(self):
+        with _metadata_says("projects/406002258908/zones/us-central1-c"):
+            assert get_default_gcp_zone() == "us-central1-c"
+
+    def test_metadata_response_is_reduced_to_the_bare_zone(self):
+        """The endpoint returns a full resource path; only the last segment is a zone."""
+        with _metadata_says("projects/406002258908/zones/europe-west4-a"):
+            assert "/" not in get_default_gcp_zone()
+
+    def test_falls_through_to_gcloud_config(self):
+        with _unreachable_metadata(), _gcloud_says(b"us-east1-b\n"):
+            assert get_default_gcp_zone() == "us-east1-b"
+
+    def test_raises_when_both_sources_are_exhausted(self):
+        with _unreachable_metadata(), _gcloud_says(b"(unset)\n"):
+            with pytest.raises(ValueError) as e:
+                get_default_gcp_zone()
+        assert "compute/zone" in str(e.value), "the error must say how to fix it"
+
+    def test_raises_when_gcloud_itself_fails(self):
+        with _unreachable_metadata(), _gcloud_says(b"ERROR: not authenticated", returncode=1):
+            with pytest.raises(ValueError):
+                get_default_gcp_zone()
+
+    def test_non_200_from_metadata_is_not_treated_as_a_zone(self):
+        with _metadata_says("nope", status=404), _gcloud_says(b"(unset)\n"):
+            with pytest.raises(ValueError):
+                get_default_gcp_zone()
+
+    def test_error_does_not_name_a_zone_as_if_it_were_usable(self):
+        """The removed fallback looked like a working answer; that was the danger."""
+        with _unreachable_metadata(), _gcloud_says(b"(unset)\n"):
+            with pytest.raises(ValueError) as e:
+                get_default_gcp_zone()
+        assert "us-central1-a" not in str(e.value)
+
+    def test_success_is_cached(self):
+        with _metadata_says("projects/1/zones/us-central1-c") as m:
+            get_default_gcp_zone()
+            get_default_gcp_zone()
+        assert m.call_count == 1
+
+    def test_failure_is_not_cached(self):
+        """
+        lru_cache does not memoize exceptions, so a process that starts before
+        the zone is configured recovers without a restart.
+        """
+        with _unreachable_metadata(), _gcloud_says(b"(unset)\n"):
+            with pytest.raises(ValueError):
+                get_default_gcp_zone()
+        with _metadata_says("projects/1/zones/us-central1-c"):
+            assert get_default_gcp_zone() == "us-central1-c"
+
+
+class TestNoZoneLookupAtImportTime:
+
+    def test_localization_base_has_no_module_level_zone(self):
+        from canine.localization import base
+        assert not hasattr(base, "ZONE")
+
+    def test_no_module_scope_call_anywhere_in_localization_base(self):
+        """
+        CI regression guard. Now that this function raises, a single module-scope
+        call makes `import canine` fail outright on any machine that is not on
+        GCE and has no compute/zone set -- GitHub Actions included, which is
+        where the whole suite runs.
+        """
+        from canine.localization import base
+        with warnings.catch_warnings():
+            # base.py has pre-existing invalid escapes in its embedded bash;
+            # re-parsing it here would otherwise re-emit them as suite noise
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(inspect.getsource(base))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # calls inside a def are lazy by definition
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "get_default_gcp_zone":
+                    pytest.fail("module-scope zone lookup at base.py line {}".format(sub.lineno))

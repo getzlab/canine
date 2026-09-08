@@ -18,7 +18,6 @@ import uuid
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
 from ..utils import (
-    get_default_gcp_zone,
     get_default_gcp_project,
     gcp_hourly_cost,
     isatty,
@@ -373,7 +372,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                     disk_size=100,
                     mount_prefix="/tmp/rclone_cache",
                     node_name=self.config["worker_prefix"],
-                    node_zone=get_default_gcp_zone(),
+                    node_zone=self.config["compute_zone"],
                     nfs_disk_type=self.config["nfs_disk_type"],
                 )
             )
@@ -461,7 +460,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                     disk_size=f"{self.config['storage_disk_size']}",
                     mount_prefix=f"/mnt/nfs/{self.config['storage_namespace']}",
                     node_name=self.config["worker_prefix"],
-                    node_zone=get_default_gcp_zone(),
+                    node_zone=self.config["compute_zone"],
                     nfs_disk_type=self.config["nfs_disk_type"],
                 )
             )

@@ -36,7 +36,6 @@ def gcloud_disk_client():
             DISK_CLIENT = google.cloud.compute_v1.DisksClient()
     return DISK_CLIENT
 
-ZONE = get_default_gcp_zone()
 PROJECT = get_default_gcp_project()
 
 Localization = namedtuple("Localization", ['type', 'path'])
@@ -809,12 +808,16 @@ class AbstractLocalizer(abc.ABC):
         disk_mountpoint = mount_prefix + "/" + disk_name
 
         ## Check if the disk already exists
+        # resolved here rather than at import time so that importing canine does
+        # not require a discoverable zone; once outside the retry loop so the
+        # backoff path doesn't re-query the metadata server on every iteration
+        zone = get_default_gcp_zone()
         disk_client = gcloud_disk_client()
         disk_exists = False
         backoff = 60 + random.randint(0, 10)
         while True:
             try:
-                disk_attrs = disk_client.get(disk = disk_name, zone = ZONE, project = PROJECT)
+                disk_attrs = disk_client.get(disk = disk_name, zone = zone, project = PROJECT)
                 disk_exists = True
                 break
             except google.api_core.exceptions.NotFound:
@@ -998,6 +1001,20 @@ class AbstractLocalizer(abc.ABC):
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
+    def backend_zone(self):
+        """
+        Zone this cluster's nodes live in, used to pick the localization bucket's
+        region. gcpTransient records it under "zone"; imageTransient -- and
+        therefore DockerTransient -- under "compute_zone", so both keys have to
+        be consulted or the configured zone is silently ignored. Auto-detection
+        is the last resort and raises if it can't determine one.
+        """
+        return (
+          self.backend.config.get("zone")
+          or self.backend.config.get("compute_zone")
+          or get_default_gcp_zone()
+        )
+
     def create_bucket_mount(self,
       file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
       dry_run = False
@@ -1080,7 +1097,7 @@ class AbstractLocalizer(abc.ABC):
         # created on demand, labelled with its state, mounted read-only by
         # consumers, never explicitly deleted (objects age out via the lifecycle
         # rule applied at creation).
-        zone = self.backend.config.get("zone") or get_default_gcp_zone()
+        zone = self.backend_zone()
         bucket = localization_bucket_name(
           get_project_number(self.project), _zone_to_region(zone), content_hash
         )
@@ -1485,7 +1502,7 @@ class AbstractLocalizer(abc.ABC):
             # script is emitted unconditionally. That is exactly what makes a
             # concurrent sibling wait instead of re-uploading the same content.
             if not self.persistent_disk_dry_run and len(upload_plan):
-                zone = self.backend.config.get("zone") or get_default_gcp_zone()
+                zone = self.backend_zone()
                 localization_tasks += self.bucket_upload_script(
                   upload_plan, bucket_prefix, _zone_to_region(zone)
                 )
