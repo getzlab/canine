@@ -148,14 +148,62 @@ token the bucket-compose route needs, straight from the metadata server.
 ## 2. Create the test objects
 
 You need **two**: a ~12 GB object for the sweeps (§6.1, §6.2) and a ~300 GB one for the
-single confirmation run (§6.3). Generate them on the node — it is faster than uploading
-from anywhere else, and it gives you the md5 in the same pass:
+§6.3 confirmation run. Both are generated on the node, which is faster than uploading from
+anywhere else and yields the md5 in the same pass.
 
-### Authenticate on the node first
+Everything from here to §8 runs on the node, so set that shell up first.
+
+### Log in, and set the node's shell up
+
+`$PROJECT`, `$ZONE` and `$NODE` were exported on your **workstation**. Logging in gives
+you a fresh shell on the VM where none of them exist — and most of §2 and §4 runs there,
+with `gcloud` commands that reference all three. Re-establish them from the metadata
+server rather than retyping, so they cannot disagree with the node you are actually on:
 
 ```bash
+# from your workstation, where these are still set
 gcloud compute ssh $NODE --project $PROJECT --zone $ZONE
+```
 
+```bash
+# on the node
+md() { curl -s -H Metadata-Flavor:Google \
+       "http://metadata.google.internal/computeMetadata/v1/$1"; }
+export PROJECT=$(md project/project-id)
+export NODE=$(md instance/name)
+export ZONE=$(basename "$(md instance/zone)")
+export BUCKET=your-scratch-bucket
+
+echo "$PROJECT / $ZONE / $NODE"      # sanity-check before creating anything
+```
+
+**Then start tmux, before anything long.** §2 generates a 300 GB object and §6.3 runs a
+multi-hour download; both die with the ssh session if they are in the foreground of it.
+The container survives a disconnect — it is a daemon — but the `pdl` wrapper and every
+`gcloud` command are foreground processes in your shell.
+
+```bash
+# on the node
+if ! command -v tmux >/dev/null; then
+  sudo apt-get update -qq && sudo apt-get install -y tmux
+fi
+tmux new -s bench
+```
+
+Export the variables **before** starting tmux, or re-export them inside it: a session you
+attach to later keeps the environment of the shell that created it, not of the shell
+attaching. To get back after a disconnect:
+
+```bash
+gcloud compute ssh $NODE --project $PROJECT --zone $ZONE --command 'tmux attach -t bench'
+# or, once logged in:  tmux attach -t bench
+```
+
+`Ctrl-b d` detaches and leaves the work running.
+
+### Authenticate
+
+```bash
 # on the node -- one browser round-trip
 gcloud auth login --no-launch-browser --update-adc
 
@@ -186,9 +234,7 @@ transfer.
 ### Create the objects
 
 ```bash
-# on the node
-export BUCKET=your-scratch-bucket
-
+# on the node, inside tmux -- the 300 GB object takes ~10 minutes
 make_object() {   # make_object <gib> <name>
   local bytes=$(( $1 * 1024 * 1024 * 1024 ))
   openssl enc -aes-256-ctr -pass pass:pdlbench$1 -nosalt < /dev/zero 2>/dev/null \
