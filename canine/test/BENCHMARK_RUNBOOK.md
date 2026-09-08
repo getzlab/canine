@@ -156,23 +156,19 @@ from anywhere else, and it gives you the md5 in the same pass:
 ```bash
 gcloud compute ssh $NODE --project $PROJECT --zone $ZONE
 
-# on the node -- one command, one browser round-trip
-gcloud auth login --no-launch-browser --update-adc --add-quota-project-to-adc
+# on the node -- one browser round-trip
+gcloud auth login --no-launch-browser --update-adc
+
+# only if ADC then warns that no quota project is set
+gcloud auth application-default set-quota-project $PROJECT
 ```
 
-**`--update-adc` is why this is one command and not three.** Authenticating the `gcloud`
-CLI and writing `application_default_credentials.json` are separate things: the CLI reads
-its own credential store, while client libraries and `gcsfuse` read the ADC file. Without
+**`--update-adc` is the flag that matters.** Authenticating the `gcloud` CLI and writing
+`application_default_credentials.json` are separate things: the CLI reads its own
+credential store, while client libraries and `gcsfuse` read the ADC file. Without
 `--update-adc` you would need `gcloud auth application-default login` as a second browser
-round-trip, and §6.6 would fail to mount a bucket while every `gcloud` command appeared to
-work fine. `--add-quota-project-to-adc` folds in what would otherwise be a third command,
-`gcloud auth application-default set-quota-project`.
-
-> Confirm both flag names with `gcloud auth login --help` on the image you are using.
-> `--update-adc` is long-standing; `--add-quota-project-to-adc` is the one I am less sure
-> of, and if it is unavailable run `gcloud auth application-default set-quota-project
-> $PROJECT` afterwards instead. (Two GCP specifics in this document have already needed
-> correcting, so treat my recollection of flag names as a starting point.)
+round-trip — and if you skip ADC altogether, §6.6 fails to mount a bucket while every
+`gcloud` command appears to work fine.
 
 `--no-launch-browser` because there is no browser on the VM: it prints a URL to open
 locally and a code to paste back.
@@ -724,7 +720,8 @@ SIGKILLs the download at 25%, 50% and 75%, then lets it finish. Check:
 ### 6.6 the bucket-compose route against real GCS
 
 The bucket-compose route has never touched real infrastructure — not the auth path, not
-resumable sessions, not compose. It needs a bucket mounted in the container so `select_route` sees a non-POSIX
+resumable sessions, not compose. It needs a bucket mounted in the container so that
+`select_route` sees a non-POSIX
 destination. In this deployment those mounts come from the `.rclone*.sh` scripts on NFS, so
 on a mock node create one by hand:
 
