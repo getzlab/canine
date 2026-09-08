@@ -116,7 +116,7 @@ gcloud compute instances create $NODE \
   --machine-type    n1-standard-8 \
   --image-family    slurm-gcp-docker-v3 \
   --image-project   broad-getzlab-workflows \
-  --boot-disk-size  50GB \
+  --boot-disk-size  200GB \
   --boot-disk-type  pd-standard \
   --scopes          cloud-platform \
   --tags            caninetransientimage
@@ -245,13 +245,99 @@ make_object() {   # make_object <gib> <name>
 }
 
 make_object  12 pdl-bench-12g.bin
-make_object 300 pdl-bench-300g.bin      # ~10 min at GB/s, uploads as it generates
+make_object 300 pdl-bench-300g.bin      # ~90 min -- measured, see below
 ```
 
 `openssl` as a pseudorandom source runs at GB/s, where `/dev/urandom` would take an hour at
 this size. Incompressible data matters: zeros would let transport compression distort the
 throughput numbers. Nothing is ever written to local disk — the data streams straight to
 GCS, so the node needs no space for it.
+
+#### Measured: ~57-59 MiB/s, so budget ~90 minutes for the 300 GB object
+
+| Object | Rate | Elapsed |
+|---|---|---|
+| 12 GiB | 59.4 MiB/s | ~3.5 min |
+| 300 GiB | 57.1 MiB/s | **~90 min** |
+
+(Bucket in the same region as the node, different project.) An earlier draft of this
+document guessed "~10 min at GB/s" — wrong by 9×. Run it inside tmux.
+
+**What the number means, and what it does not.** The two rates differ by 4% across a 25×
+size difference, so this is a stable plateau rather than a warm-up effect. It is also only
+**3% of the ~2 GB/s the NIC is supposed to do**, and about 2.9× today's 21 MB/s BAM
+download.
+
+Do not read it as a single-stream network rate yet. **There are three candidate limiters,
+and one of them is the node's own boot disk** — §1 creates it as 50 GB `pd-standard`, and
+`gcloud storage cp -` reading from a pipe may buffer through it, since a non-seekable input
+cannot be chunked for a resumable upload without staging:
+
+| Candidate | How to rule it out |
+|---|---|
+| the generating pipeline (openssl / tee / md5sum) | run it to `/dev/null` and time it |
+| the **50 GB boot disk**, via stdin buffering | watch the boot disk's write counter during an upload |
+| single-stream rate to GCS | what remains once the other two are excluded |
+
+The boot-disk possibility is worth taking seriously in both directions, because the
+arithmetic is startling either way:
+
+* the per-GB model predicts a 50 GB `pd-standard` sustains **6 MB/s**;
+* we observed **60 MB/s**.
+
+So if the data *did* pass through the boot disk, that disk beat the per-GB model by **10×**
+— which is direct evidence for what §4.1 is trying to establish, arriving early and by
+accident. If it did not, the boot disk is irrelevant here and 60 MB/s is a network figure.
+
+Both control tests, together, take about a minute:
+
+```bash
+# on the node. 1: the pipeline with the upload removed -- generator ceiling only
+time { openssl enc -aes-256-ctr -pass pass:ctl -nosalt < /dev/zero 2>/dev/null \
+       | head -c $((4 * 1024 * 1024 * 1024)) \
+       | tee >(md5sum > /dev/null) > /dev/null; }
+
+# 2: does an upload actually touch the boot disk? Compare sectors written before/after.
+BOOT=$(lsblk -no PKNAME "$(findmnt -no SOURCE /)" 2>/dev/null || echo sda)
+before=$(awk -v d="$BOOT" '$3==d {print $10}' /proc/diskstats)
+openssl enc -aes-256-ctr -pass pass:ctl2 -nosalt < /dev/zero 2>/dev/null \
+  | head -c $((4 * 1024 * 1024 * 1024)) \
+  | gcloud storage cp - gs://$BUCKET/disktest.bin
+after=$(awk -v d="$BOOT" '$3==d {print $10}' /proc/diskstats)
+echo "boot disk wrote $(( (after - before) * 512 / 1024 / 1024 )) MiB during a 4096 MiB upload"
+gcloud storage rm gs://$BUCKET/disktest.bin
+```
+
+Roughly 4 GiB written means gcloud is staging through the boot disk and the rate is a disk
+measurement. Near zero means it is streaming, and ~57 MiB/s **is** the single-stream rate
+to GCS in-region — in which case it becomes the baseline §6.1's `connections 1` row should
+land near, and anything substantially above it at higher connection counts is this
+project's thesis confirmed on measured ground.
+
+**None of this affects the actual localization measurements.** The downloader `pwrite`s
+straight into the destination on the localization disk and `verify()` reads back from the
+same place; §6.1 writes to tmpfs. The boot disk is in the path only for generating the test
+objects. If it does turn out to be the limiter, raise `--boot-disk-size` in §1 — 200 GB
+costs about three cents for a three-hour session — and regenerate.
+
+#### Faster alternative: compose the big object server-side
+
+90 minutes of VM time is avoidable. Upload the 12 GiB object once, then have GCS build the
+300 GiB one from 25 copies of it — a metadata operation that transfers no data:
+
+```bash
+for i in $(seq 1 25); do
+  gcloud storage cp gs://$BUCKET/pdl-bench-12g.bin gs://$BUCKET/part-$i.bin &
+done; wait                          # server-side copies, also no data transfer
+gcloud storage compose $(for i in $(seq 1 25); do echo gs://$BUCKET/part-$i.bin; done) \
+  gs://$BUCKET/pdl-bench-300g.bin
+```
+
+**The tradeoff is verification.** A composite object has no `md5Hash` — only crc32c — so
+the benchmark will report the 300 GB runs as unverified. That is acceptable *if* §6.4 and
+§6.3's real-BAM run carry the correctness load, which they do: the real BAM has a genuine
+ETag. Use compose for throughput, the real BAM for correctness, and do not let the
+convenient object silently become the only thing you tested.
 
 Record for later:
 
