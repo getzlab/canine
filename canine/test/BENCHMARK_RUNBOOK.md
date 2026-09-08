@@ -100,10 +100,15 @@ own.
 
 ```bash
 export ZONE=us-central1-a          # match your data's region to avoid egress charges
-export PROJECT=$(gcloud config get-value project)
+export PROJECT=your-project        # or: $(gcloud config get-value project)
 export NODE=pdl-bench
 
+# `gcloud config get-value project` prints "(unset)" rather than failing, which would
+# turn every command below into a confusing error. Check it before creating anything.
+case "$PROJECT" in ""|"(unset)") echo "PROJECT is not set" >&2; return 2>/dev/null || exit 1;; esac
+
 gcloud compute instances create $NODE \
+  --project         $PROJECT \
   --zone            $ZONE \
   --machine-type    n1-standard-8 \
   --image-family    slurm-gcp-docker-v3 \
@@ -113,6 +118,13 @@ gcloud compute instances create $NODE \
   --scopes          cloud-platform \
   --tags            caninetransientimage
 ```
+
+**`--project` is on every `gcloud compute` command in this document, deliberately.** §9
+deletes an instance, its disks and the test objects; if the active configuration points
+somewhere else those commands either fail confusingly or, worse, find something with a
+matching name to delete. `--image-project` is separate and stays
+`broad-getzlab-workflows` — that is where the worker image lives, not where your node
+goes.
 
 Two deliberate choices:
 
@@ -137,7 +149,7 @@ single confirmation run (§6.3). Generate them on the node — it is faster than
 from anywhere else, and it gives you the md5 in the same pass:
 
 ```bash
-gcloud compute ssh $NODE --zone $ZONE
+gcloud compute ssh $NODE --project $PROJECT --zone $ZONE
 
 # on the node
 export BUCKET=your-scratch-bucket
@@ -208,7 +220,7 @@ itself, so the two files must keep that layout:
 
 ```bash
 # from your workstation, in the canine repo
-gcloud compute scp --zone $ZONE \
+gcloud compute scp --project $PROJECT --zone $ZONE \
   canine/test/benchmark_localization.py \
   canine/localization/parallel_download.py \
   $NODE:/tmp/
@@ -258,9 +270,9 @@ Mirrors `base.py:1000-1060` — same type, same `mkfs` flags, same mount options
 export DISK=canine-bench-$(date +%s)
 export DISK_GB=316                   # 1 + 300e9/0.95e9, as create_persistent_disk computes
 
-gcloud compute disks create $DISK \
+gcloud compute disks create $DISK --project $PROJECT \
   --size $DISK_GB"GB" --type pd-standard --zone $ZONE --labels wolf=canine
-gcloud compute instances attach-disk $NODE \
+gcloud compute instances attach-disk $NODE --project $PROJECT \
   --zone $ZONE --disk $DISK --device-name $DISK
 
 # mount INSIDE the container, as the real localization script does
@@ -284,8 +296,10 @@ and measure each:
 # on the node
 for TYPE in pd-standard pd-balanced pd-ssd; do
   D=ddtest-$TYPE
-  gcloud compute disks create $D --size 316GB --type $TYPE --zone $ZONE --quiet
-  gcloud compute instances attach-disk $NODE --zone $ZONE --disk $D --device-name $D
+  gcloud compute disks create $D --project $PROJECT \
+    --size 316GB --type $TYPE --zone $ZONE --quiet
+  gcloud compute instances attach-disk $NODE --project $PROJECT \
+    --zone $ZONE --disk $D --device-name $D
   sudo docker exec slurm bash -c "
     while [ ! -b /dev/disk/by-id/google-$D ]; do sleep 1; done
     mkfs.ext4 -q -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard \
@@ -298,8 +312,9 @@ for TYPE in pd-standard pd-balanced pd-ssd; do
     echo -n '$TYPE  read : '
     dd if=/mnt/dd/$D/f of=/dev/null bs=1M iflag=direct 2>&1 | tail -1
     umount /mnt/dd/$D"
-  gcloud compute instances detach-disk $NODE --zone $ZONE --disk $D --quiet
-  gcloud compute disks delete $D --zone $ZONE --quiet
+  gcloud compute instances detach-disk $NODE --project $PROJECT --zone $ZONE \
+    --disk $D --quiet
+  gcloud compute disks delete $D --project $PROJECT --zone $ZONE --quiet
 done
 ```
 
@@ -336,8 +351,10 @@ Confirm the model and find the real per-instance ceiling:
 ```bash
 for GB in 10 50 100 200 316 742 2000; do
   D=ddsize-$GB
-  gcloud compute disks create $D --size ${GB}GB --type pd-standard --zone $ZONE --quiet
-  gcloud compute instances attach-disk $NODE --zone $ZONE --disk $D --device-name $D
+  gcloud compute disks create $D --project $PROJECT \
+    --size ${GB}GB --type pd-standard --zone $ZONE --quiet
+  gcloud compute instances attach-disk $NODE --project $PROJECT \
+    --zone $ZONE --disk $D --device-name $D
   sudo docker exec slurm bash -c "
     while [ ! -b /dev/disk/by-id/google-$D ]; do sleep 1; done
     echo -n '${GB}GB write: '
@@ -345,8 +362,9 @@ for GB in 10 50 100 200 316 742 2000; do
        oflag=direct conv=fdatasync 2>&1 | tail -1
     echo -n '${GB}GB read : '
     dd if=/dev/disk/by-id/google-$D of=/dev/null bs=1M count=8000 iflag=direct 2>&1 | tail -1"
-  gcloud compute instances detach-disk $NODE --zone $ZONE --disk $D --quiet
-  gcloud compute disks delete $D --zone $ZONE --quiet
+  gcloud compute instances detach-disk $NODE --project $PROJECT --zone $ZONE \
+    --disk $D --quiet
+  gcloud compute disks delete $D --project $PROJECT --zone $ZONE --quiet
 done
 ```
 
@@ -724,18 +742,30 @@ different ceilings averaged together hides both.
 
 ```bash
 # from your workstation
-gcloud compute scp --zone $ZONE "$NODE:/tmp/*.json" ./benchmark-results/
+gcloud compute scp --project $PROJECT --zone $ZONE \
+  "$NODE:/tmp/*.json" ./benchmark-results/
 ```
 
 Teardown — **the disk outlives the instance and keeps billing**:
 
 ```bash
-gcloud compute instances delete $NODE --zone $ZONE --quiet
-gcloud compute disks delete $DISK --zone $ZONE --quiet
+gcloud compute instances delete $NODE --project $PROJECT --zone $ZONE --quiet
+gcloud compute disks delete $DISK --project $PROJECT --zone $ZONE --quiet
 gcloud storage rm gs://$BUCKET/pdl-bench-12g.bin gs://$BUCKET/pdl-bench-300g.bin \
                   gs://$BUCKET/pdl-routeb-out.bin
-gcloud compute disks list --filter="name~canine-bench"    # confirm nothing is left
+
+# confirm nothing is left behind
+gcloud compute disks list --project $PROJECT --filter="name~canine-bench"
+gcloud compute disks list --project $PROJECT --filter="name~ddsize- OR name~ddtest- OR name~conv-"
 ```
+
+The `gcloud storage` lines carry no `--project`: bucket names are global, so the path
+alone identifies the object. Every `gcloud compute` line needs one, because there the
+project decides which resource is found.
+
+The second `disks list` catches the scratch disks §4.1 and §4.1b create in loops — if a
+loop was interrupted partway, its `detach-disk`/`delete` never ran and a 316 GB or 2000 GB
+disk is still billing.
 
 ---
 ## 10. The cost decision
