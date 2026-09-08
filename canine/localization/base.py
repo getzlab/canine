@@ -85,6 +85,7 @@ class AbstractLocalizer(abc.ABC):
         allow_requester_pays: bool = False,
         bucket_upload_wait_tries: int = 60,
         localization_expiry_days: int = 1,
+        bucketmount_heartbeat_seconds: int = 3600,
         **kwargs
     ):
         """
@@ -174,6 +175,17 @@ class AbstractLocalizer(abc.ABC):
 
         self.bucket_upload_wait_tries = bucket_upload_wait_tries
         self.localization_expiry_days = localization_expiry_days
+        # A mount held longer than the expiry window would otherwise have its own
+        # lease -- and its data objects -- deleted out from under it, so the
+        # heartbeat has to fire well inside that window. Fail here rather than as
+        # a mid-run deletion.
+        if bucketmount_heartbeat_seconds >= localization_expiry_days * 86400 / 4:
+            raise ValueError(
+              "bucketmount_heartbeat_seconds ({}) must be well inside the {}-day expiry window; "
+              "content held by a long-running job would expire between beats."
+              .format(bucketmount_heartbeat_seconds, localization_expiry_days)
+            )
+        self.bucketmount_heartbeat_seconds = bucketmount_heartbeat_seconds
 
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
@@ -1337,6 +1349,58 @@ class AbstractLocalizer(abc.ABC):
           'echo "${CANINE_BUCKETMOUNT_LEASE}" >> ${CANINE_JOB_INPUTS}/.bucketmount_leases',
         ]
 
+    def bucketmount_heartbeat_start(self):
+        """
+        Commands starting a background loop that re-stamps customTime on this
+        bucket's contents for as long as the job holds the mount.
+
+        customTime is otherwise written once and never renewed, so a job holding
+        a mount longer than localization_expiry_days loses two things at once:
+
+          * its own _MOUNTS/ lease, after which a sibling flow's
+            DeleteLocalizedFiles sees no holder and deletes content that is
+            actively mounted; and
+          * the data objects themselves -- the lifecycle rule carries no prefix
+            filter, so GCS deletes the inputs out from under gcsfuse with no
+            second flow involved at all. gcsfuse pins the object generation at
+            open(), so an in-flight read fails rather than returning wrong
+            bytes, but it fails.
+
+        One bucket-wide update covers the lease and the data objects together.
+        Failure to refresh is never fatal -- same reasoning as the lease write --
+        and if the worker dies the loop dies with it, so content expires on the
+        normal schedule rather than being pinned forever.
+        """
+        return [
+          'CANINE_BUCKETMOUNT_HB=${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_${CANINE_BUCKETMOUNT}.sh',
+          # Quoted heredoc: the body is written verbatim, so $(date) is evaluated
+          # per beat rather than frozen at write time. That also means the bucket
+          # cannot come from CANINE_BUCKETMOUNT -- it is a plain shell variable,
+          # never exported, so the child would see an empty string and update
+          # "gs:///**". Pass it as $1 instead.
+          "cat > \"${CANINE_BUCKETMOUNT_HB}\" <<'CANINE_HEARTBEAT_EOF'",
+          'while true; do',
+          '  sleep {}'.format(int(self.bucketmount_heartbeat_seconds)),
+          '  gcloud storage objects update "gs://$1/**" --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :',
+          'done',
+          'CANINE_HEARTBEAT_EOF',
+          'set +e; bash "${CANINE_BUCKETMOUNT_HB}" "${CANINE_BUCKETMOUNT}" & echo $! >> ${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids; set -e',
+        ]
+
+    def bucketmount_heartbeat_stop(self):
+        """
+        Teardown counterpart to bucketmount_heartbeat_start(): stops this job's
+        refresh loops so the content resumes ageing normally once nobody holds it.
+        """
+        return [
+          'if [ -f ${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids ]; then',
+          '  while read -r pid; do',
+          '    kill $pid 2> /dev/null || :',
+          '  done < ${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids',
+          '  rm -f ${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids',
+          'fi',
+        ]
+
     def bucketmount_lease_release(self):
         """
         Teardown counterpart to bucketmount_lease_register(): drops this job's
@@ -1883,7 +1947,7 @@ class AbstractLocalizer(abc.ABC):
               # another job's teardown
               "flock -os ${CANINE_BUCKETMOUNT_LOCK} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids",
 
-            ] + self.bucketmount_lease_register() + [
+            ] + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + [
 
               'echo "INFO: Successfully mounted bucket ${CANINE_BUCKETMOUNT}." >&2',
 
@@ -1987,7 +2051,10 @@ class AbstractLocalizer(abc.ABC):
                 'done)',
 
                 # unmount all bucket mounts, if they're not in use
-                # first, release all locks obtained by this job
+                # first, stop refreshing customTime -- we are done holding this
+                # content, so it should resume ageing normally
+            ] + self.bucketmount_heartbeat_stop() + [
+                # then release all locks obtained by this job
                 'if [ -f ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids ]; then',
                 '  while read -r pid; do',
                 '    kill $pid',

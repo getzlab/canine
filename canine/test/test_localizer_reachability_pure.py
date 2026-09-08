@@ -218,3 +218,78 @@ class TestMountLeases:
             proc = subprocess.run([BASH, "-n"], input=("set -e\n" + script).encode(),
                                   capture_output=True)
             assert proc.returncode == 0, proc.stderr.decode()
+
+
+class TestMountHeartbeat:
+    """
+    customTime is otherwise stamped once at mount and never renewed, so a job
+    holding a mount longer than localization_expiry_days loses its own lease AND
+    has its data objects deleted by the lifecycle rule while gcsfuse still has
+    them mounted. The heartbeat re-stamps both for as long as the mount is held.
+    """
+
+    def _start(self, seconds=3600):
+        loc = BatchedLocalizer(MagicMock(), bucketmount_heartbeat_seconds=seconds)
+        return "\n".join(loc.bucketmount_heartbeat_start())
+
+    def _stop(self):
+        return "\n".join(BatchedLocalizer(MagicMock()).bucketmount_heartbeat_stop())
+
+    def test_refresh_covers_the_whole_bucket(self):
+        """One update must cover the _MOUNTS/ lease and the data objects alike."""
+        s = self._start()
+        assert "objects update" in s
+        assert '/**' in s, "must be bucket-wide, not just the lease"
+        assert "--custom-time=" in s
+
+    def test_bucket_is_passed_as_an_argument_not_inherited(self):
+        """
+        Regression: the loop runs in a child bash. CANINE_BUCKETMOUNT is a plain
+        shell variable, never exported, so referencing it inside the quoted
+        heredoc made the child update "gs:///**".
+        """
+        s = self._start()
+        assert 'gs://$1/**' in s
+        assert '"${CANINE_BUCKETMOUNT}"' in s.splitlines()[-1], "bucket must be passed to the script"
+
+    def test_timestamp_is_evaluated_per_beat(self):
+        """
+        A quoted heredoc keeps $(date) literal so each beat stamps 'now'. An
+        unquoted one would freeze the write-time value and renew nothing.
+        """
+        s = self._start()
+        assert "<<'CANINE_HEARTBEAT_EOF'" in s
+        assert '$(date -u' in s
+
+    def test_interval_is_configurable(self):
+        assert "sleep 60" in self._start(seconds=60)
+        assert "sleep 3600" in self._start()
+
+    def test_refresh_failure_is_non_fatal(self):
+        line = [l for l in self._start().splitlines() if "objects update" in l][0]
+        assert "|| :" in line
+
+    def test_pid_is_recorded_for_teardown(self):
+        assert ".bucketmount_heartbeat_pids" in self._start()
+
+    def test_stop_kills_recorded_pids(self):
+        s = self._stop()
+        assert "kill $pid" in s
+        assert ".bucketmount_heartbeat_pids" in s
+        assert "rm -f" in s
+
+    def test_interval_must_sit_inside_the_expiry_window(self):
+        """A beat slower than expiry renews nothing; fail at construction."""
+        with pytest.raises(ValueError) as e:
+            BatchedLocalizer(MagicMock(), localization_expiry_days=1,
+                             bucketmount_heartbeat_seconds=86400)
+        assert "expiry window" in str(e.value)
+
+    def test_default_interval_is_valid_for_the_default_expiry(self):
+        BatchedLocalizer(MagicMock())  # must not raise
+
+    def test_generated_shell_is_valid(self):
+        for script in (self._start(), self._stop()):
+            proc = subprocess.run([BASH, "-n"], input=("set -e\n" + script).encode(),
+                                  capture_output=True)
+            assert proc.returncode == 0, proc.stderr.decode()
