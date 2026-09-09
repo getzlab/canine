@@ -944,13 +944,13 @@ pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
           --s3-endpoint-url "$S3_ENDPOINT" --no-sign-request \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-public.json
 
-# presigned-URL path -- the preferred one, no `aws` process per chunk.
-# probe reports the presigned URL and the size; take both from its output:
-export PRESIGNED_URL=$(pdl probe --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
-                         --s3-endpoint-url "$S3_ENDPOINT" --json /tmp/p.json >/dev/null \
-                       && python3 -c "import json;print(json.load(open('/tmp/p.json'))['s3'].get('presigned_url',''))")
-export S3_SIZE=$(python3 -c "import json;print(json.load(open('/tmp/p.json'))['s3']['size'])")
-pdl sweep --url "$PRESIGNED_URL" --size $S3_SIZE \
+# presigned-URL path -- the preferred one, and what production uses when presign works.
+# Pass BOTH: --url carries the transfer, --s3-* supply the metadata. The S3 coordinates
+# are used for head-object only, so the size, ETag and part length are still derived
+# automatically while the bytes move over plain ranged HTTP.
+export PRESIGNED_URL=$(aws s3 presign "s3://$S3_BUCKET/$S3_KEY")
+pdl sweep --url "$PRESIGNED_URL" \
+          --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-presigned.json
 
 # GDC
@@ -966,6 +966,14 @@ Worth running **both** S3 paths where presigning works: they are different code
 (`HttpSource` versus `S3ApiSource`, the latter spawning one `aws` process per chunk), and
 the throughput gap between them is a real finding — it tells you what the per-chunk process
 overhead costs, and therefore how much it matters that presigning keeps working.
+
+How the two are selected, since it is easy to get the wrong one by accident:
+
+| Arguments | Source | Notes |
+|---|---|---|
+| `--url` alone | `HttpSource` | no size/ETag derivation — you must supply `--size` |
+| `--url` **and** `--s3-bucket/--s3-key` | `HttpSource` | transfer over HTTP, metadata from `head-object`. **Use this for the presigned path.** |
+| `--s3-bucket/--s3-key` alone | `S3ApiSource` | one `aws` process per chunk |
 
 ### S3-compatible stores that are not Amazon's
 
