@@ -116,7 +116,7 @@ gcloud compute instances create $NODE \
   --machine-type    n1-standard-8 \
   --image-family    slurm-gcp-docker-v3 \
   --image-project   broad-getzlab-workflows \
-  --boot-disk-size  200GB \
+  --boot-disk-size  50GB \
   --boot-disk-type  pd-standard \
   --scopes          cloud-platform \
   --tags            caninetransientimage
@@ -268,28 +268,33 @@ size difference, so this is a stable plateau rather than a warm-up effect. It is
 **3% of the ~2 GB/s the NIC is supposed to do**, and about 2.9× today's 21 MB/s BAM
 download.
 
-Do not read it as a single-stream network rate yet. **There are three candidate limiters,
-and one of them is the node's own boot disk** — §1 creates it as 50 GB `pd-standard`, and
-`gcloud storage cp -` reading from a pipe may buffer through it, since a non-seekable input
-cannot be chunked for a resumable upload without staging:
+**Three candidates were possible; two are now measured out.**
 
-| Candidate | How to rule it out |
-|---|---|
-| the generating pipeline (openssl / tee / md5sum) | run it to `/dev/null` and time it |
-| the **50 GB boot disk**, via stdin buffering | watch the boot disk's write counter during an upload |
-| single-stream rate to GCS | what remains once the other two are excluded |
+| Candidate | Result | Verdict |
+|---|---|---|
+| the generating pipeline | `openssl \| head \| tee >(md5sum)` → **408 MiB/s** (4 GiB in 10.0 s) | not the limit — 6.2× headroom |
+| the 50 GB boot disk, via stdin staging | **0 MiB written** during a 4096 MiB upload | not in the path at all |
+| the NIC | 69 MB/s is **3.4%** of ~2 GB/s | not the limit |
 
-The boot-disk possibility is worth taking seriously in both directions, because the
-arithmetic is startling either way:
+Note the control pipeline included a full `md5sum` pass the upload path does *not* have,
+and still ran 6.2× faster — so the headroom is a lower bound. **By elimination, ~57-66
+MiB/s is the single-stream rate**, and today's 21 MB/s BAM download is a third of even
+that, presumably source-side per-connection throttling.
 
-* the per-GB model predicts a 50 GB `pd-standard` sustains **6 MB/s**;
-* we observed **60 MB/s**.
+**One confound survives**, and §6.1 settles it for free: `gcloud storage` is Python and
+hashes crc32c inline, so some of the 60 MB/s may be its own overhead rather than the
+stream. §6.1's `connections 1` row is `curl`, not gcloud —
 
-So if the data *did* pass through the boot disk, that disk beat the per-GB model by **10×**
-— which is direct evidence for what §4.1 is trying to establish, arriving early and by
-accident. If it did not, the boot disk is irrelevant here and 60 MB/s is a network figure.
+* **curl also lands near 60 MB/s** → the stream is genuinely the limit, and the whole
+  premise of this work is confirmed on measured ground;
+* **curl reaches 200+ MB/s** → gcloud's Python was the limit, the real single-stream
+  baseline is much higher, and the speedup available from parallelism is correspondingly
+  smaller.
 
-Both control tests, together, take about a minute:
+Either way, record it: the single-stream number is the denominator of every speedup figure
+this benchmark produces.
+
+The commands that produced the table above, for reference:
 
 ```bash
 # on the node. 1: the pipeline with the upload removed -- generator ceiling only
