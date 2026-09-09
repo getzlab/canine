@@ -977,8 +977,33 @@ reports the **metadata server** instead, the mount is missing or unreadable and 
 exercising the compute service account rather than the identity production uses, which may
 have different bucket permissions.
 
-If `gcsfuse` is not in the image, the bucket-compose route cannot be reached this way —
-note it as unverified rather than assuming it works.
+**`gcsfuse` is not in the image on `wolf-2.0-update`**, and neither is `rclone` — its
+Dockerfile install is commented out, though `conf/rclone.conf` ships. Only `fuse-overlayfs`
+is present, for podman. So this step needs one of:
+
+* `apt-get install` gcsfuse in the running container (needs Google's gcsfuse apt repo);
+* the `fuse-localize` image, which is where this is being evaluated anyway;
+* recording the bucket-compose route as **unverified**, which is the honest default given
+  that branch is benchmarked separately.
+
+### Why the mount goes inside the container
+
+A reasonable alternative is to mount the bucket on the *host* and let the container see it.
+That works, but only with **`rshared` mount propagation** — a plain bind mount is
+point-in-time, so the container sees whatever was at the path when it started and a *later*
+host mount is invisible to it. FUSE adds a second condition: mounts are private to the
+mounting user, so a container process gets `EACCES` unless the mount was made with
+`allow_other`.
+
+canine does both, on the controller: `dockerTransient.py:151` bind-mounts `/mnt` and `/dev`
+with `propagation="rshared"`, and its `rclone mount` passes `--allow-other` along with
+`--uid $HOST_UID --gid $HOST_GID`.
+
+But the **worker** does not. `worker_startup_script.sh:60` binds only `/mnt/nfs`, with no
+propagation flag and no `/mnt`. And canine creates its FUSE mounts *inside* the container
+regardless — `dockerTransient.py` invokes `rclone mount` through `self.invoke(...)`, not on
+the host. Mounting inside the container therefore matches production on both counts, which
+is why the command above does that rather than adding `rshared` to §3.
 
 ---
 
