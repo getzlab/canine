@@ -469,21 +469,23 @@ gcloud compute scp --project $PROJECT --zone $ZONE \
   $NODE:/tmp/
 
 # on the node
-sudo docker exec slurm mkdir -p /opt/bench
-sudo docker cp /tmp/benchmark_localization.py slurm:/opt/bench/
-sudo docker cp /tmp/parallel_download.py      slurm:/opt/bench/
+sudo docker exec slurm mkdir -p /tmp/pdl
+sudo docker cp /tmp/benchmark_localization.py slurm:/tmp/pdl/
+sudo docker cp /tmp/parallel_download.py      slurm:/tmp/pdl/
 ```
 
 Two single-file `docker cp`s, so re-running this to update the scripts overwrites them.
-(Copying a *directory* onto an existing directory nests it instead —
-`docker cp dir c:/opt/bench` would produce `/opt/bench/dir` and silently leave the old
-files in place. Use `dir/.` if you ever do copy a tree.)
+
+That is the point of copying files rather than the directory: `docker cp dir c:/tmp/pdl`
+onto an existing `/tmp/pdl` **nests** it, producing `/tmp/pdl/dir` and silently leaving the
+old scripts in place — so an update appears to succeed while `pdl` keeps running the stale
+copy. Verified against a real container. Use `dir/.` if you ever do need to copy a tree.
 
 Confirm the container is running what you think it is:
 
 ```bash
-sudo docker exec slurm md5sum /opt/bench/benchmark_localization.py \
-                              /opt/bench/parallel_download.py
+sudo docker exec slurm md5sum /tmp/pdl/benchmark_localization.py \
+                              /tmp/pdl/parallel_download.py
 md5sum /tmp/benchmark_localization.py /tmp/parallel_download.py
 ```
 
@@ -491,7 +493,7 @@ Define a shorthand — every later step uses it:
 
 ```bash
 # on the node
-pdl() { sudo docker exec slurm python3 /opt/bench/benchmark_localization.py "$@"; }
+pdl() { sudo docker exec slurm python3 /tmp/pdl/benchmark_localization.py "$@"; }
 ```
 
 Your shell expands `$URL` and friends before `docker exec` sees them, so the variables stay
