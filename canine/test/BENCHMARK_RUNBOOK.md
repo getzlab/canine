@@ -379,39 +379,23 @@ The localization script runs as a SLURM job step, and `slurmd` runs **inside** t
 slurm_gcp_docker container. That is the context whose `/bin/sh`, tool inventory and mount
 table are the real ones, so the benchmark must run there too.
 
-```bash
-# on the node
-sudo docker run -dti --rm --pid host --network host --privileged \
-  -v /dev:/dev \
-  -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
-  -v $HOME/.aws:/root/.aws:ro \
-  --entrypoint /bin/bash --name slurm broadinstitute/slurm_gcp_docker
-```
+### First: both mount sources must already exist
 
-These are `worker_startup_script.sh:60`'s flags minus the NFS and docker-socket mounts,
-which need a controller — **plus a credentials mount, which replaces a step we are
-skipping.**
+The container mounts `~/.config/gcloud` and `~/.aws` from the node. **Docker creates a
+missing bind-mount source as a directory owned by `root`**, so starting the container
+first leaves you with a root-owned `~/.aws` that your own `scp` into it then fails to
+write, with a permission error that does not obviously point back here. Populate both
+before `docker run`, not after.
 
-The real worker runs `docker_copy_gcloud_credentials.sh`, which copies gcloud credentials
-out of `/mnt/nfs/credentials/gcloud/` into the container: in production the container
-authenticates with **user credentials propagated over NFS**, not with the node's service
-account. Starting the container by hand bypasses that entirely, so without the mount above
-it has no gcloud configuration at all — `gcloud auth print-access-token` fails and only the
-metadata server answers.
+`~/.config/gcloud` is already there if you ran §2's `gcloud auth login --update-adc` —
+that is the file this mount exists to carry, and the reason authentication comes before
+this section.
 
-Mounting `~/.config/gcloud` read-only reaches the same end state as that script, and it is
-why §2's `application-default login` must happen **before** this step: the file it writes
-is what gets mounted.
-
-`~/.aws` is mounted for the same reason. The measurements run inside the container via
-`docker exec`, so the `aws` CLI needs credentials *there*; a copy on the node alone is
-invisible to it.
-
-**Put them at the canonical path and nothing has to carry them.** Both `aws` and the
-benchmark find `~/.aws/credentials` on their own, so no key ever appears in a command
-line — where it would be visible in `ps` to every user on the box and recorded in shell
-history. That matters more when the keys are issued by someone else and you cannot rotate
-them at will.
+`~/.aws` needs creating. Put the credentials at the canonical path and nothing has to
+carry them: both `aws` and the benchmark find `~/.aws/credentials` on their own, so no key
+ever appears in a command line — where it would be visible in `ps` to every user on the
+box and recorded in shell history. That matters more when the keys are issued by someone
+else and you cannot rotate them at will.
 
 ```bash
 # from your workstation
@@ -431,16 +415,48 @@ endpoint_url = https://your-object-store.example.org
 EOF
 ```
 
-`probe` reports which *source* it resolved — a path and a profile name — and never the
-key itself. Use `--s3-profile NAME` for a non-default profile; if no credentials are found
-anywhere, `--no-sign-request` is added automatically, so a private bucket fails as a clear
-403 rather than a confusing signature error.
+Check both exist and are yours before continuing — if either is `root`-owned, remove it
+with `sudo rm -rf` and redo the step above:
 
-Both mounts are `:ro` deliberately — nothing in the benchmark should be able to modify
-your credentials, and a read-only mount makes that structural rather than a matter of
-care. Note what is **not** here: `/mnt/rwdisks` is not bind-mounted in
-the real worker either, which is exactly why the localization disk has to be mounted from
-inside the container (§4) and why probing the host tells you nothing.
+```bash
+# on the node
+ls -ld ~/.aws ~/.config/gcloud
+```
+
+### Then start the container
+
+```bash
+# on the node
+sudo docker run -dti --rm --pid host --network host --privileged \
+  -v /dev:/dev \
+  -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
+  -v $HOME/.aws:/root/.aws:ro \
+  --entrypoint /bin/bash --name slurm broadinstitute/slurm_gcp_docker
+```
+
+These are `worker_startup_script.sh:60`'s flags minus the NFS and docker-socket mounts,
+which need a controller — **plus the two credentials mounts, which replace a step we are
+skipping.**
+
+The real worker runs `docker_copy_gcloud_credentials.sh`, which copies gcloud credentials
+out of `/mnt/nfs/credentials/gcloud/` into the container: in production the container
+authenticates with **user credentials propagated over NFS**, not with the node's service
+account. Starting the container by hand bypasses that entirely, so without these mounts it
+has no credentials at all — `gcloud auth print-access-token` fails, only the metadata
+server answers, and the `aws` CLI has nothing to sign with. The measurements run inside the
+container via `docker exec`, so a copy on the node alone is invisible to them.
+
+Both mounts are `:ro` deliberately — nothing in the benchmark should be able to modify your
+credentials, and a read-only mount makes that structural rather than a matter of care.
+
+`probe` reports which credential *source* it resolved — a path and a profile name — and
+never the key itself. Use `--s3-profile NAME` for a non-default profile; if no credentials
+are found anywhere, `--no-sign-request` is added automatically, so a private bucket fails
+as a clear 403 rather than a confusing signature error.
+
+Note what is **not** mounted: `/mnt/rwdisks` is not bind-mounted in the real worker either,
+which is exactly why the localization disk has to be mounted from inside the container (§4)
+and why probing the host tells you nothing.
 
 The script locates the downloader at `../localization/parallel_download.py` relative to
 itself, so the two files must keep that layout:
