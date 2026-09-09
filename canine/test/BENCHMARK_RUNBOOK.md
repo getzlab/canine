@@ -319,11 +319,15 @@ to GCS in-region — in which case it becomes the baseline §6.1's `connections 
 land near, and anything substantially above it at higher connection counts is this
 project's thesis confirmed on measured ground.
 
-**None of this affects the actual localization measurements.** The downloader `pwrite`s
-straight into the destination on the localization disk and `verify()` reads back from the
-same place; §6.1 writes to tmpfs. The boot disk is in the path only for generating the test
-objects. If it does turn out to be the limiter, raise `--boot-disk-size` in §1 — 200 GB
-costs about three cents for a three-hour session — and regenerate.
+**None of this affects the actual localization measurements** in any case. The downloader
+`pwrite`s straight into the destination on the localization disk and `verify()` reads back
+from the same place; §6.1 writes to tmpfs. The boot disk was only ever in the path for
+generating the test objects — and the 0 MiB result above says it was not even there.
+
+Worth being precise about the configuration, since it is what makes the result usable: the
+0 MiB was measured on the **50 GB** boot disk §1 specifies, not on an enlarged one. So
+there is no gap between what was tested and what the runbook tells you to create, and no
+reason to size it up.
 
 #### Faster alternative: compose the big object server-side
 
