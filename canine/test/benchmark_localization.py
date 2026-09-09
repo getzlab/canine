@@ -62,7 +62,30 @@ import tempfile
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-DOWNLOADER = os.path.join(HERE, os.pardir, "localization", "parallel_download.py")
+# Where parallel_download.py lives, resolved rather than assumed. In the repo it sits at
+# ../localization/; when the two files are copied onto a node there is no reason to
+# reconstruct that tree, so a sibling copy is checked first. An earlier version of this
+# script hardcoded the repo-relative path, which forced anyone deploying it to build a
+# ../localization/ directory for a single file -- a layout imposed by this constant rather
+# than by anything real.
+DOWNLOADER_CANDIDATES = (
+    os.path.join(HERE, "parallel_download.py"),                            # side by side
+    os.path.join(HERE, os.pardir, "localization", "parallel_download.py"),  # repo layout
+)
+
+
+DOWNLOADER = None      # resolved in main(); see downloader_path
+
+
+def downloader_path(args=None):
+    """The downloader to drive: --downloader, then $K9PDL_DOWNLOADER, then the candidates."""
+    explicit = getattr(args, "downloader", None) or os.environ.get("K9PDL_DOWNLOADER")
+    if explicit:
+        return os.path.abspath(explicit)
+    for candidate in DOWNLOADER_CANDIDATES:
+        if os.path.exists(candidate):
+            return os.path.abspath(candidate)
+    return None
 
 MIB = 1024 * 1024
 GIB = 1024 * MIB
@@ -763,7 +786,7 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     so that row is genuinely today's behaviour and the right baseline for the speedup
     claim -- it is not the new code throttled to one connection.
     """
-    command = [sys.executable, os.path.abspath(DOWNLOADER)] + list(source) + [
+    command = [sys.executable, DOWNLOADER] + list(source) + [
         "--dest", dest, "--size", str(size),
         "--connections", str(connections), "--min-chunk", str(min_chunk)]
     if verification is not None:
@@ -1371,6 +1394,9 @@ def build_parser():
                        help="where to write; use the localization disk to measure the "
                             "path that matters (default: %(default)s)")
         p.add_argument("--min-chunk", type=int, default=64 * MIB)
+        p.add_argument("--downloader", metavar="PATH",
+                       help="parallel_download.py to drive; defaults to one beside this "
+                            "script, else the repo's ../localization/ copy")
         p.add_argument("--json", metavar="PATH", help="also write results as JSON")
         add_s3(p)
 
@@ -1404,8 +1430,13 @@ def build_parser():
 def main(argv=None):
     args = build_parser().parse_args(argv)
 
-    if not os.path.exists(DOWNLOADER):
-        say("cannot find the downloader at {}".format(DOWNLOADER))
+    global DOWNLOADER
+    DOWNLOADER = downloader_path(args)
+    if DOWNLOADER is None:
+        say("cannot find parallel_download.py. Put it beside this script, or pass")
+        say("--downloader PATH, or set $K9PDL_DOWNLOADER. Looked in:")
+        for candidate in DOWNLOADER_CANDIDATES:
+            say("  {}".format(os.path.abspath(candidate)))
         return 1
 
     handlers = {

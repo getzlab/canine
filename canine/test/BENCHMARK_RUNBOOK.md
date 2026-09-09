@@ -458,8 +458,8 @@ Note what is **not** mounted: `/mnt/rwdisks` is not bind-mounted in the real wor
 which is exactly why the localization disk has to be mounted from inside the container (§4)
 and why probing the host tells you nothing.
 
-The script locates the downloader at `../localization/parallel_download.py` relative to
-itself, so the two files must keep that layout:
+Copy both scripts into **one directory** in the container. The benchmark looks for
+`parallel_download.py` beside itself first, so no directory tree needs reconstructing:
 
 ```bash
 # from your workstation, in the canine repo
@@ -469,31 +469,29 @@ gcloud compute scp --project $PROJECT --zone $ZONE \
   $NODE:/tmp/
 
 # on the node
-mkdir -p /tmp/pdl/test /tmp/pdl/localization
-cp /tmp/benchmark_localization.py /tmp/pdl/test/
-cp /tmp/parallel_download.py      /tmp/pdl/localization/
-
-# note the trailing "/." -- it copies the CONTENTS. Without it, and with /tmp/pdl
-# already present in the container, docker cp nests the source inside the destination
-# (/tmp/pdl/pdl/...) and leaves the old scripts in place. No error, and `pdl` keeps
-# running the stale copy, which makes this exactly the kind of thing to get wrong twice.
-sudo docker cp /tmp/pdl/. slurm:/tmp/pdl
+sudo docker exec slurm mkdir -p /opt/bench
+sudo docker cp /tmp/benchmark_localization.py slurm:/opt/bench/
+sudo docker cp /tmp/parallel_download.py      slurm:/opt/bench/
 ```
 
-To confirm what the container is actually running, rather than what you copied:
+Two single-file `docker cp`s, so re-running this to update the scripts overwrites them.
+(Copying a *directory* onto an existing directory nests it instead —
+`docker cp dir c:/opt/bench` would produce `/opt/bench/dir` and silently leave the old
+files in place. Use `dir/.` if you ever do copy a tree.)
+
+Confirm the container is running what you think it is:
 
 ```bash
-sudo docker exec slurm md5sum /tmp/pdl/test/benchmark_localization.py \
-                             /tmp/pdl/localization/parallel_download.py
-md5sum /tmp/pdl/test/benchmark_localization.py \
-       /tmp/pdl/localization/parallel_download.py
+sudo docker exec slurm md5sum /opt/bench/benchmark_localization.py \
+                              /opt/bench/parallel_download.py
+md5sum /tmp/benchmark_localization.py /tmp/parallel_download.py
 ```
 
 Define a shorthand — every later step uses it:
 
 ```bash
 # on the node
-pdl() { sudo docker exec slurm python3 /tmp/pdl/test/benchmark_localization.py "$@"; }
+pdl() { sudo docker exec slurm python3 /opt/bench/benchmark_localization.py "$@"; }
 ```
 
 Your shell expands `$URL` and friends before `docker exec` sees them, so the variables stay

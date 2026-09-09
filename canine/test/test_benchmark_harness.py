@@ -152,3 +152,57 @@ class TestEndpointResolution:
     def test_absent_config_means_amazon(self, aws_home):
         assert bench.aws_config_endpoint(args_for()) is None
         assert "--endpoint-url" not in bench.s3_extra_args(args_for(s3_bucket="b"))
+
+
+class TestDownloaderResolution:
+    """
+    The benchmark used to hardcode ../localization/parallel_download.py, which forced
+    anyone deploying two files onto a node to reconstruct that directory tree for a single
+    file. The layout was imposed by the constant, not by anything real.
+    """
+
+    def test_a_sibling_copy_is_found_first(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(bench, "HERE", str(tmp_path))
+        sibling = tmp_path / "parallel_download.py"
+        sibling.write_text("# downloader\n")
+        monkeypatch.setattr(bench, "DOWNLOADER_CANDIDATES", (
+            str(sibling), str(tmp_path / "up" / "localization" / "parallel_download.py")))
+        assert bench.downloader_path() == str(sibling)
+
+    def test_the_repo_layout_still_works(self, tmp_path, monkeypatch):
+        repo = tmp_path / "localization"
+        repo.mkdir()
+        target = repo / "parallel_download.py"
+        target.write_text("# downloader\n")
+        monkeypatch.setattr(bench, "DOWNLOADER_CANDIDATES", (
+            str(tmp_path / "parallel_download.py"), str(target)))
+        assert bench.downloader_path() == str(target)
+
+    def test_explicit_flag_wins(self, tmp_path, monkeypatch):
+        sibling = tmp_path / "parallel_download.py"
+        sibling.write_text("x")
+        chosen = tmp_path / "elsewhere.py"
+        chosen.write_text("x")
+        monkeypatch.setattr(bench, "DOWNLOADER_CANDIDATES", (str(sibling),))
+        args = bench.build_parser().parse_args(
+            ["sweep", "--url", "u", "--size", "1", "--dest-dir", "/d",
+             "--downloader", str(chosen)])
+        assert bench.downloader_path(args) == str(chosen)
+
+    def test_environment_override(self, tmp_path, monkeypatch):
+        chosen = tmp_path / "from-env.py"
+        chosen.write_text("x")
+        monkeypatch.setenv("K9PDL_DOWNLOADER", str(chosen))
+        monkeypatch.setattr(bench, "DOWNLOADER_CANDIDATES", ())
+        assert bench.downloader_path() == str(chosen)
+
+    def test_none_when_nothing_is_found(self, tmp_path, monkeypatch):
+        monkeypatch.delenv("K9PDL_DOWNLOADER", raising=False)
+        monkeypatch.setattr(bench, "DOWNLOADER_CANDIDATES",
+                            (str(tmp_path / "nope.py"),))
+        assert bench.downloader_path() is None
+
+    def test_the_real_repo_layout_resolves(self):
+        """Guards against the candidate list drifting from the actual repo."""
+        assert bench.downloader_path() is not None, \
+            "cannot find parallel_download.py from the repo checkout"
