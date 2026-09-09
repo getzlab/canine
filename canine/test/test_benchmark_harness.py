@@ -206,3 +206,57 @@ class TestDownloaderResolution:
         """Guards against the candidate list drifting from the actual repo."""
         assert bench.downloader_path() is not None, \
             "cannot find parallel_download.py from the repo checkout"
+
+
+class TestRunbookVariablesAreDefinedBeforeUse:
+    """
+    The runbook is a procedure someone follows top to bottom, so a variable referenced
+    before the section that exports it is a defect in the document -- it renders as an
+    empty flag rather than an error.
+
+    This has happened three times: $PROJECT/$ZONE/$NODE were exported on the workstation
+    and used on the node, ~/.aws was mounted before it existed, and $S3_* were used in §3
+    but defined in §6.4. Each was caught by a human reading carefully. This checks it
+    mechanically instead.
+    """
+
+    RUNBOOK = os.path.join(os.path.dirname(__file__), "BENCHMARK_RUNBOOK.md")
+
+    # Provided by the shell or by a construct the checker does not model.
+    AMBIENT = {
+        "PATH", "HOME", "PWD", "USER", "SHELL", "PS1", "IFS", "OLDPWD", "RANDOM",
+        "BASH_VERSION", "GOOGLE_APPLICATION_CREDENTIALS", "CLOUDSDK_CONFIG",
+        "1", "2", "3", "@", "*", "?", "$", "!", "#", "0",
+    }
+
+    def undefined_uses(self):
+        import re
+        with open(self.RUNBOOK) as handle:
+            text = handle.read()
+        defined, problems = set(self.AMBIENT), []
+        for block in re.findall(r"```bash\n(.*?)```", text, re.S):
+            for line in block.split("\n"):
+                stripped = line.strip()
+                if stripped.startswith("#"):
+                    continue
+                for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", line):
+                    if name not in defined:
+                        problems.append((name, stripped))
+                for name in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=", stripped):
+                    defined.add(name)
+                for name in re.findall(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b",
+                                      stripped):
+                    defined.add(name)
+        return problems
+
+    def test_no_variable_is_used_before_it_is_defined(self):
+        problems = self.undefined_uses()
+        assert not problems, "\n".join(
+            "${} used before definition: {}".format(n, l[:70]) for n, l in problems)
+
+    def test_the_checker_would_notice(self, tmp_path, monkeypatch):
+        """A checker that cannot fail is not a check."""
+        broken = tmp_path / "broken.md"
+        broken.write_text("```bash\necho $NEVER_SET\n```\n")
+        monkeypatch.setattr(self, "RUNBOOK", str(broken))
+        assert any(n == "NEVER_SET" for n, _ in self.undefined_uses())

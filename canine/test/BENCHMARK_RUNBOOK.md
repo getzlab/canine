@@ -365,6 +365,29 @@ slow today — that is the actual subject of the exercise, and §6.3 against it 
 worth quoting. Note it will be BGZF, so already incompressible, and its `Content-Length`
 is its true size.
 
+Export it here, because §3's probe and §6.3 both use it:
+
+```bash
+# on the node -- the real source under test
+export S3_BUCKET=your-bucket
+export S3_KEY=path/to/CTSP-....WholeGenome.bam
+export S3_ENDPOINT=https://your-object-store.example.org   # omit if set in ~/.aws/config
+```
+
+No `--size` or `--md5` for this one: `head-object` reports the size, and the ETag is the
+md5 for a single-part object or the md5-of-md5s for a multipart one. §3's probe confirms
+which before anything is transferred.
+
+If you also have a plain-HTTP GDC source to compare, set those too — that path supplies
+size and hash out of band rather than from a HEAD:
+
+```bash
+# on the node -- optional, only for §6.4's GDC comparison
+export GDC_URL=https://api.gdc.cancer.gov/data/...
+export GDC_SIZE=...
+export GDC_MD5=...
+```
+
 > Using a pre-existing object instead? Get its size and md5 with
 > `gcloud storage objects describe gs://B/O --format='value(size,md5_hash)'`. The md5 comes
 > back base64 — convert with
@@ -807,7 +830,12 @@ is measured against.
 Read from the output:
 
 * **the knee** — the lowest connection count within 5% of the best. This is the default to
-  ship (currently 8);
+  ship (currently 8). Export it, since §6.2 and §6.3 both use it:
+
+  ```bash
+  export KNEE=8        # whatever the sweep reported
+  ```
+
 * **peak throughput**, which is the ceiling any disk-destined run is bounded by;
 * **peak RSS**, which should be flat across settings and unrelated to object size;
 * **md5 ok** at every setting.
@@ -857,7 +885,7 @@ pdl sweep --url "$URL_300G" --size $SIZE_300G --md5 "$MD5_300G" \
 Run it against the real slow BAM too, since that is the actual subject:
 
 ```bash
-pdl sweep --s3-bucket "$BAM_BUCKET" --s3-key "$BAM_KEY" \
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
           --s3-endpoint-url "$S3_ENDPOINT" \
           --dest-dir /mnt/rwdisks/$DISK --connections $KNEE \
           --json /tmp/direct-300g-realbam.json
@@ -889,17 +917,11 @@ both: the ETag is the md5 for a single-part object and the md5-of-md5s for a mul
 and the benchmark derives the size, picks `--check-md5` or `--check-etag --part-length`
 accordingly, and recomputes the digest itself to check the result independently.
 
-Set the source up once. A non-Amazon endpoint needs a scheme on the URL, and the key may
-contain slashes, so quote it:
+`$S3_BUCKET`, `$S3_KEY` and `$S3_ENDPOINT` come from §2. A non-Amazon endpoint needs a
+scheme on the URL, and a key containing slashes wants quoting — both already handled there.
 
-```bash
-# on the node
-export S3_BUCKET=your-bucket
-export S3_KEY=path/to/object.bam
-export S3_ENDPOINT=https://your-object-store.example.org   # omit if in ~/.aws/config
-```
-
-**Probe the endpoint before transferring anything.** It costs one HEAD and one 1 KiB
+**Probe the endpoint before transferring anything**, if you skipped that in §3. It costs
+one HEAD and one 1 KiB
 ranged GET, and it tells you whether the store honours `Range`, what its ETag means, and
 whether presigning works — the three things that differ between S3 implementations:
 
@@ -922,7 +944,12 @@ pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
           --s3-endpoint-url "$S3_ENDPOINT" --no-sign-request \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-public.json
 
-# presigned-URL path -- the preferred one, no `aws` per chunk. `probe` prints the URL.
+# presigned-URL path -- the preferred one, no `aws` process per chunk.
+# probe reports the presigned URL and the size; take both from its output:
+export PRESIGNED_URL=$(pdl probe --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+                         --s3-endpoint-url "$S3_ENDPOINT" --json /tmp/p.json >/dev/null \
+                       && python3 -c "import json;print(json.load(open('/tmp/p.json'))['s3'].get('presigned_url',''))")
+export S3_SIZE=$(python3 -c "import json;print(json.load(open('/tmp/p.json'))['s3']['size'])")
 pdl sweep --url "$PRESIGNED_URL" --size $S3_SIZE \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-presigned.json
 
