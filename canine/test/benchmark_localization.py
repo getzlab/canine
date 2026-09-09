@@ -436,14 +436,46 @@ def probe_s3_endpoint(args):
         say("              Localize these inputs with check_hash off, or supply an md5")
         say("              out of band.")
 
-    # ranged GET, the assumption the whole design rests on
+    # ranged GET, the assumption the whole design rests on.
+    #
+    # The body goes to a temp FILE, not /dev/stdout. Two reasons, both learned the hard
+    # way against a real BAM: the bytes are binary (BGZF starts 1f 8b) and capturing them
+    # as text raises UnicodeDecodeError; and if the store were to IGNORE Range -- exactly
+    # what this check exists to detect -- capturing stdout would pull the entire object
+    # into memory. With an outfile, stdout is just the JSON metadata, which is text.
+    out["accept_ranges"] = meta.get("AcceptRanges")
     probe_size = min(1024, out["size"] or 1024)
-    ranged = aws("s3api get-object --bucket {} --key {} --range {} /dev/stdout".format(
-        shlex.quote(args.s3_bucket), shlex.quote(args.s3_key),
-        shlex.quote("bytes=0-{}".format(probe_size - 1))))
-    out["range_supported"] = ranged.returncode == 0
-    say("ranged GET  : {}".format("yes" if out["range_supported"] else "NO -- chunked "
-                                  "download cannot work against this endpoint"))
+    handle, tmp_path = tempfile.mkstemp(prefix=".k9pdl-range-")
+    os.close(handle)
+    try:
+        ranged = aws(
+            "s3api get-object --bucket {} --key {} --range {} {}".format(
+                shlex.quote(args.s3_bucket), shlex.quote(args.s3_key),
+                shlex.quote("bytes=0-{}".format(probe_size - 1)),
+                shlex.quote(tmp_path)),
+            timeout=60)
+        got = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+
+    out["range_bytes_returned"] = got
+    # honoured means the RIGHT number of bytes came back, not merely that it exited 0 --
+    # a store that ignores Range succeeds and returns everything.
+    out["range_supported"] = ranged.returncode == 0 and got == probe_size
+    if out["range_supported"]:
+        say("ranged GET  : yes ({} bytes for a {}-byte request)".format(got, probe_size))
+    elif ranged.returncode != 0:
+        say("ranged GET  : FAILED -- {}".format(
+            (ranged.stderr or "").strip().splitlines()[-1:] or ranged.returncode))
+    else:
+        say("ranged GET  : NOT HONOURED -- asked for {} bytes, got {}. Chunked download"
+            .format(probe_size, got))
+        say("              cannot work against this endpoint.")
+    if out["accept_ranges"]:
+        say("accept-ranges: {} (advertised by head-object)".format(out["accept_ranges"]))
 
     # presign, which decides which source the downloader uses
     if getattr(args, "no_sign_request", False):

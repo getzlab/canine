@@ -8,8 +8,10 @@ visible in `ps` to every user on the box and lands in shell history. When the ke
 issued by someone else, that matters.
 """
 
+import glob
 import importlib.util
 import os
+import tempfile
 
 import pytest
 
@@ -260,3 +262,93 @@ class TestRunbookVariablesAreDefinedBeforeUse:
         broken.write_text("```bash\necho $NEVER_SET\n```\n")
         monkeypatch.setattr(self, "RUNBOOK", str(broken))
         assert any(n == "NEVER_SET" for n, _ in self.undefined_uses())
+
+
+class TestRangeProbeHandlesBinaryBodies:
+    """
+    The range probe crashed on the first real object it was pointed at:
+
+        UnicodeDecodeError: 'utf-8' codec can't decode byte 0x8b in position 1
+
+    0x8b at position 1 is gzip magic -- a BAM is BGZF. The probe was writing the body to
+    /dev/stdout and capturing it with text=True, so any binary object killed it, which is
+    every object this tool exists for.
+
+    The second bug in the same call was latent and worse: capturing stdout meant that a
+    store which IGNORED Range -- precisely what the check detects -- would have had its
+    entire object pulled into memory.
+    """
+
+    def fake_aws(self, tmp_path, body, honour_range=True):
+        """An `aws` stand-in writing a real body to the outfile it is given."""
+        script = tmp_path / "aws"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import base64, json, os, sys\n"
+            "argv = sys.argv[1:]\n"
+            "BODY = base64.b64decode({!r})\n"
+            "HONOUR = {!r}\n"
+            "if 'head-object' in argv:\n"
+            "    if '--part-number' in argv:\n"
+            "        print(json.dumps({{'ContentLength': len(BODY)}}))\n"
+            "    else:\n"
+            "        print(json.dumps({{'ContentLength': len(BODY),\n"
+            "                          'ETag': '\\\"d41d8cd98f00b204e9800998ecf8427e-3\\\"',\n"
+            "                          'PartsCount': 3, 'AcceptRanges': 'bytes'}}))\n"
+            "    sys.exit(0)\n"
+            "if 'get-object' in argv:\n"
+            "    out = argv[-1]\n"
+            "    n = 1024\n"
+            "    if '--range' in argv:\n"
+            "        spec = argv[argv.index('--range')+1].split('=')[1]\n"
+            "        a, _, b = spec.partition('-')\n"
+            "        n = int(b) - int(a) + 1\n"
+            "    data = BODY[:n] if HONOUR else BODY\n"
+            "    open(out, 'wb').write(data)\n"
+            "    print(json.dumps({{'ContentLength': len(data)}}))\n"
+            "    sys.exit(0)\n"
+            "sys.exit(2)\n".format(__import__("base64").b64encode(body).decode(),
+                                   honour_range))
+        script.chmod(0o755)
+        return script
+
+    def probe_with(self, tmp_path, monkeypatch, body, honour_range=True):
+        self.fake_aws(tmp_path, body, honour_range)
+        monkeypatch.setenv("PATH", "{}:{}".format(tmp_path, os.environ["PATH"]))
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "FAKE")
+        args = bench.build_parser().parse_args(
+            ["probe", "--s3-bucket", "b", "--s3-key", "k"])
+        return bench.probe_s3_endpoint(args)
+
+    def test_a_gzip_magic_body_does_not_raise(self, tmp_path, monkeypatch, capsys):
+        """The exact failure: BGZF starts 1f 8b, which is not valid UTF-8."""
+        body = b"\x1f\x8b\x08\x04" + os.urandom(4092)
+        out = self.probe_with(tmp_path, monkeypatch, body)
+        assert out["range_supported"] is True
+        assert out["range_bytes_returned"] == 1024
+
+    def test_arbitrary_binary_is_fine(self, tmp_path, monkeypatch, capsys):
+        out = self.probe_with(tmp_path, monkeypatch, bytes(range(256)) * 20)
+        assert out["range_supported"] is True
+
+    def test_a_store_ignoring_range_is_detected_not_buffered(
+            self, tmp_path, monkeypatch, capsys):
+        """
+        The check's whole purpose. Exiting 0 is not enough -- the byte count must match,
+        or a store returning the entire object reads as success.
+        """
+        body = b"\x1f\x8b" + os.urandom(60000)
+        out = self.probe_with(tmp_path, monkeypatch, body, honour_range=False)
+        assert out["range_supported"] is False
+        assert out["range_bytes_returned"] == len(body)
+        assert "NOT HONOURED" in capsys.readouterr().out
+
+    def test_no_temp_file_is_left_behind(self, tmp_path, monkeypatch, capsys):
+        before = set(glob.glob(os.path.join(tempfile.gettempdir(), ".k9pdl-range-*")))
+        self.probe_with(tmp_path, monkeypatch, b"\x1f\x8b" + os.urandom(4094))
+        after = set(glob.glob(os.path.join(tempfile.gettempdir(), ".k9pdl-range-*")))
+        assert after == before
+
+    def test_accept_ranges_is_reported(self, tmp_path, monkeypatch, capsys):
+        out = self.probe_with(tmp_path, monkeypatch, b"\x1f\x8b" + os.urandom(4094))
+        assert out["accept_ranges"] == "bytes"
