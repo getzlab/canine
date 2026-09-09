@@ -384,6 +384,7 @@ table are the real ones, so the benchmark must run there too.
 sudo docker run -dti --rm --pid host --network host --privileged \
   -v /dev:/dev \
   -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
+  -v $HOME/.aws:/root/.aws:ro \
   --entrypoint /bin/bash --name slurm broadinstitute/slurm_gcp_docker
 ```
 
@@ -400,7 +401,22 @@ metadata server answers.
 
 Mounting `~/.config/gcloud` read-only reaches the same end state as that script, and it is
 why §2's `application-default login` must happen **before** this step: the file it writes
-is what gets mounted. Note what is **not** here: `/mnt/rwdisks` is not bind-mounted in
+is what gets mounted.
+
+`~/.aws` is mounted for the same reason. The measurements run inside the container via
+`docker exec`, so the `aws` CLI needs credentials *there*; a copy on the node alone is
+invisible to it. Get them onto the node first, from your workstation:
+
+```bash
+# from your workstation
+gcloud compute ssh $NODE --project $PROJECT --zone $ZONE --command 'mkdir -p ~/.aws'
+gcloud compute scp --project $PROJECT --zone $ZONE \
+  ~/.aws/credentials "$NODE:~/.aws/credentials"
+```
+
+Both mounts are `:ro` deliberately — nothing in the benchmark should be able to modify
+your credentials, and a read-only mount makes that structural rather than a matter of
+care. Note what is **not** here: `/mnt/rwdisks` is not bind-mounted in
 the real worker either, which is exactly why the localization disk has to be mounted from
 inside the container (§4) and why probing the host tells you nothing.
 
@@ -784,6 +800,24 @@ deliberately.
 both: the ETag is the md5 for a single-part object and the md5-of-md5s for a multipart one,
 and the benchmark derives the size, picks `--check-md5` or `--check-etag --part-length`
 accordingly, and recomputes the digest itself to check the result independently.
+
+Set the source up once. A non-Amazon endpoint needs a scheme on the URL, and the key may
+contain slashes, so quote it:
+
+```bash
+# on the node
+export S3_BUCKET=your-bucket
+export S3_KEY=path/to/object.bam
+export S3_ENDPOINT=https://your-object-store.example.org
+```
+
+**Probe the endpoint before transferring anything.** It costs one HEAD and one 1 KiB
+ranged GET, and it tells you whether the store honours `Range`, what its ETag means, and
+whether presigning works — the three things that differ between S3 implementations:
+
+```bash
+pdl probe --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" --s3-endpoint-url "$S3_ENDPOINT"
+```
 
 ```bash
 # S3 API path -- one `aws` process per chunk, and what runs when presigning is unavailable
