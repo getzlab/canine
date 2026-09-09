@@ -495,12 +495,24 @@ Confirm before going further:
 
 * **"Running INSIDE a container"** — if it warns instead, you are on the host and every
   answer below it is the wrong machine's.
-* **`/bin/sh` → dash.** The image is `ubuntu:22.04`, so this is the shell that rejects the
-  `[[ ]]` and process substitution the emitted commands use. This is the empirical
-  confirmation of §13.3.
-* **`python3` is 3.8** on the current image. `parallel_download.py` is stdlib-only and
-  parses under 3.8, so §8.5 is not blocked on the image's 3.8 → 3.14 upgrade.
-* **`curl`, `gcloud`, `aws` all present.**
+* **`/bin/sh` → `/usr/bin/dash`, `BASH_VERSION=<not bash>`.** **Confirmed on the image.**
+  This is the shell that rejects the `[[ ]]` and process substitution every emitted command
+  uses, so pinning `executable=/bin/bash` throughout was load-bearing rather than
+  defensive — `shell=True` alone would have run them under dash.
+* **`python3` is 3.14.6.** The image has already been through its 3.8 → 3.14 upgrade, so
+  the earlier note about `parallel_download.py` parsing under 3.8 is moot (still true,
+  just no longer relevant).
+* **8 cpus / 29.38 GiB**, matching the `n1-standard-8` entry in `nodetypes.json`.
+* **`curl`, `gcloud`, `aws`, `md5sum`, `od` all present.** `gcsfuse` may not be — the probe
+  now reports it, and §6.6 is the only thing that needs it.
+* **Every candidate destination will be `overlay` at this point**, which is the container's
+  own writable layer on the boot disk rather than a localization disk. The probe says so
+  and declines to draw a frontier conclusion from it. **Re-run `probe` after §4** mounts the
+  real disk; that result is the one to record.
+
+Note also `punch-hole : no` on overlay. `FALLOC_FL_PUNCH_HOLE` is not supported there, so
+§6.5's page-cache-loss test needs the ext4 localization disk — another reason the
+post-§4 probe is the meaningful one.
 
 ---
 

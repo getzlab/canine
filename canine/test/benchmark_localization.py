@@ -300,6 +300,26 @@ def disk_details(device):
 # GCP's documented sustained write throughput, provisioned per GB.
 PD_WRITE_MB_S_PER_GB = {"pd-standard": 0.12, "pd-balanced": 0.28, "pd-ssd": 0.48}
 
+# Which filesystems are a real localization destination and which are the container
+# talking to itself. Probing `overlay` measures the image's own writable layer on the boot
+# disk, not the persistent disk a job would localize to -- and drawing conclusions from it
+# is worse than having no result, because it looks like a result.
+REAL_BACKING = ("ext4", "xfs", "btrfs", "ext3")
+CONTAINER_INTERNAL = ("overlay", "overlayfs", "aufs")
+MEMORY_BACKED = ("tmpfs", "ramfs")
+
+
+def backing_kind(fstype):
+    if fstype in REAL_BACKING:
+        return "block device"
+    if fstype in CONTAINER_INTERNAL:
+        return "container overlay -- NOT a real destination"
+    if fstype in MEMORY_BACKED:
+        return "memory"
+    if (fstype or "").startswith(("nfs", "fuse")):
+        return "network/FUSE"
+    return "unknown"
+
 
 def probe_s3_endpoint(args):
     """
@@ -466,11 +486,16 @@ def command_probe(args=None):
 
     heading("tools the emitted commands rely on")
     result["tools"] = {}
+    # gcsfuse is not used by the emitted commands, but §6.6 cannot mount a bucket
+    # without it -- better to learn that here than after setting up the route.
     for tool in ("bash", "curl", "python3", "gzip", "gunzip", "od", "aws", "gcloud",
-                 "gsutil", "stat", "md5sum"):
+                 "gsutil", "stat", "md5sum", "gcsfuse"):
         path = shutil.which(tool)
         result["tools"][tool] = path
-        say("  {:<9} {}".format(tool, path or "MISSING"))
+        say("  {:<9} {}{}".format(
+            tool, path or "MISSING",
+            "   (needed only for the bucket-compose/stage-publish routes, §6.6)"
+            if tool == "gcsfuse" and not path else ""))
 
     heading("candidate destinations")
     result["destinations"] = {}
@@ -513,19 +538,43 @@ def command_probe(args=None):
             "yes" if seek["supported"] else "NO -- checkpoint fallback would be used",
             "" if seek["supported"] else " (hole_at={})".format(seek.get("hole_at"))))
         say("    punch-hole : {}".format("yes" if punch["supported"] else "no"))
+        kind = backing_kind(mount.get("fstype"))
+        result["destinations"][directory]["backing"] = kind
+        say("    backing    : {}".format(kind))
 
     if getattr(args, "s3_bucket", None) and getattr(args, "s3_key", None):
         result["s3"] = probe_s3_endpoint(args)
 
     heading("what this means")
-    frontier = [d for d, v in result["destinations"].items() if v["seek_hole"]["supported"]]
+    dests = result["destinations"]
+    real = {d: v for d, v in dests.items() if v.get("backing") == "block device"}
+    frontier = [d for d, v in real.items() if v["seek_hole"]["supported"]]
+
+    if not real:
+        say("No candidate is backed by a block device. Every directory above is the")
+        say("container's own overlay or memory, so their SEEK_HOLE and punch-hole")
+        say("results describe the image's writable layer -- NOT the disk a job would")
+        say("localize to.")
+        say()
+        say("This is the expected state before §4 creates and mounts the localization")
+        say("disk. Re-run `probe` afterwards; that result is the one that matters, and")
+        say("nothing here should be recorded as an answer about the frontier path.")
+        return result
+
     if frontier:
-        say("SEEK_HOLE passes on: {}".format(", ".join(frontier)))
-        say("-> the frontier path is live here. It has NEVER been integration-tested,")
-        say("   because it fails the probe on the development machine (APFS).")
+        say("SEEK_HOLE passes on block-device-backed: {}".format(", ".join(frontier)))
+        say("-> the frontier path is live for real destinations. It has NEVER been")
+        say("   integration-tested, because it fails the probe on the development")
+        say("   machine (APFS), so this is its first exposure.")
     else:
-        say("SEEK_HOLE passes nowhere -- every download would use the 8 MiB checkpoint")
-        say("fallback. Worth understanding before trusting the resume numbers.")
+        say("SEEK_HOLE fails on every block-device-backed candidate -- downloads there")
+        say("would use the checkpoint fallback. Worth understanding before trusting any")
+        say("resume numbers.")
+
+    ignored = [d for d in dests if d not in real]
+    if ignored:
+        say()
+        say("Ignored as not-a-real-destination: {}".format(", ".join(ignored)))
     return result
 
 
