@@ -27,7 +27,7 @@ Localization (canine/localization/)
 **Key files:**
 - `canine/orchestrator.py` — `Orchestrator` class; version string lives here (`version = 'x.y.z'`)
 - `canine/backends/gcpTransient.py` — GCP ephemeral cluster backend (most commonly used)
-- `canine/localization/base.py` — core localization logic, **heavy pandas use** — highest pandas migration risk
+- `canine/localization/base.py` — core localization logic, **heavy pandas use** — highest pandas migration risk. See **`LOCALIZATION.md`** for how bucket-mounted localization works end to end: bucket naming/creation, the label state machine, the three upload paths, mount leases, the customTime heartbeat, and every localizer/backend option.
 - `canine/localization/remote.py` — GCS ↔ cluster transfer logic
 
 ## Setup & Dev Installation
