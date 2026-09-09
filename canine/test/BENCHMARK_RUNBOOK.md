@@ -472,7 +472,21 @@ gcloud compute scp --project $PROJECT --zone $ZONE \
 mkdir -p /tmp/pdl/test /tmp/pdl/localization
 cp /tmp/benchmark_localization.py /tmp/pdl/test/
 cp /tmp/parallel_download.py      /tmp/pdl/localization/
-sudo docker cp /tmp/pdl slurm:/tmp/pdl
+
+# note the trailing "/." -- it copies the CONTENTS. Without it, and with /tmp/pdl
+# already present in the container, docker cp nests the source inside the destination
+# (/tmp/pdl/pdl/...) and leaves the old scripts in place. No error, and `pdl` keeps
+# running the stale copy, which makes this exactly the kind of thing to get wrong twice.
+sudo docker cp /tmp/pdl/. slurm:/tmp/pdl
+```
+
+To confirm what the container is actually running, rather than what you copied:
+
+```bash
+sudo docker exec slurm md5sum /tmp/pdl/test/benchmark_localization.py \
+                             /tmp/pdl/localization/parallel_download.py
+md5sum /tmp/pdl/test/benchmark_localization.py \
+       /tmp/pdl/localization/parallel_download.py
 ```
 
 Define a shorthand — every later step uses it:
