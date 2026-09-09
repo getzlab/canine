@@ -405,14 +405,36 @@ is what gets mounted.
 
 `~/.aws` is mounted for the same reason. The measurements run inside the container via
 `docker exec`, so the `aws` CLI needs credentials *there*; a copy on the node alone is
-invisible to it. Get them onto the node first, from your workstation:
+invisible to it.
+
+**Put them at the canonical path and nothing has to carry them.** Both `aws` and the
+benchmark find `~/.aws/credentials` on their own, so no key ever appears in a command
+line — where it would be visible in `ps` to every user on the box and recorded in shell
+history. That matters more when the keys are issued by someone else and you cannot rotate
+them at will.
 
 ```bash
 # from your workstation
-gcloud compute ssh $NODE --project $PROJECT --zone $ZONE --command 'mkdir -p ~/.aws'
+gcloud compute ssh $NODE --project $PROJECT --zone $ZONE --command 'mkdir -m 700 -p ~/.aws'
 gcloud compute scp --project $PROJECT --zone $ZONE \
   ~/.aws/credentials "$NODE:~/.aws/credentials"
+gcloud compute ssh $NODE --project $PROJECT --zone $ZONE --command 'chmod 600 ~/.aws/credentials'
 ```
+
+The endpoint can live there too, which keeps it off command lines as well:
+
+```bash
+# on the node -- optional; --s3-endpoint-url overrides it
+cat > ~/.aws/config <<'EOF'
+[default]
+endpoint_url = https://your-object-store.example.org
+EOF
+```
+
+`probe` reports which *source* it resolved — a path and a profile name — and never the
+key itself. Use `--s3-profile NAME` for a non-default profile; if no credentials are found
+anywhere, `--no-sign-request` is added automatically, so a private bucket fails as a clear
+403 rather than a confusing signature error.
 
 Both mounts are `:ro` deliberately — nothing in the benchmark should be able to modify
 your credentials, and a read-only mount makes that structural rather than a matter of
@@ -808,7 +830,7 @@ contain slashes, so quote it:
 # on the node
 export S3_BUCKET=your-bucket
 export S3_KEY=path/to/object.bam
-export S3_ENDPOINT=https://your-object-store.example.org
+export S3_ENDPOINT=https://your-object-store.example.org   # omit if in ~/.aws/config
 ```
 
 **Probe the endpoint before transferring anything.** It costs one HEAD and one 1 KiB

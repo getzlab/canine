@@ -44,6 +44,7 @@ disk: BENCHMARK_RUNBOOK.md, beside this file.
 """
 
 import argparse
+import configparser
 import errno
 import glob
 import hashlib
@@ -318,10 +319,25 @@ def probe_s3_endpoint(args):
         if not, the fallback spawns one `aws` process per chunk, which costs throughput.
     """
     extra = s3_extra_args(args)
-    out = {"endpoint": getattr(args, "s3_endpoint_url", None) or "aws (default)",
+    endpoint = getattr(args, "s3_endpoint_url", None) or aws_config_endpoint(args)
+    creds = aws_credentials_source(args)
+    out = {"endpoint": endpoint or "amazon (default)",
+           "endpoint_from": ("--s3-endpoint-url" if getattr(args, "s3_endpoint_url", None)
+                             else ("aws config" if endpoint else "default")),
+           "credentials_found": creds["found"],
+           "credentials_from": creds["how"],
            "extra_args": extra}
 
     heading("S3 endpoint: {}".format(out["endpoint"]))
+    say("endpoint via : {}".format(out["endpoint_from"]))
+    # the source, never the secret -- see aws_credentials_source
+    say("credentials  : {}".format(
+        creds["how"] if creds["found"] else "NOT FOUND -- {}".format(creds["how"])))
+    if not creds["found"] and not getattr(args, "no_sign_request", False):
+        say("               falling back to --no-sign-request, which only works for a")
+        say("               public bucket. For a private one, put the credentials at {}"
+            .format(aws_credentials_file()))
+    say()
     if not shutil.which("aws"):
         say("the `aws` CLI is missing, so no S3 path can work here")
         out["aws"] = False
@@ -530,16 +546,112 @@ def peak_rss(pid):
         return None
 
 
+def _aws_ini(path):
+    """
+    Parse an aws credentials/config file.
+
+    RawConfigParser rather than ConfigParser: these files are not ours, and the default
+    parser performs `%` interpolation on values, which turns a stray percent sign in
+    somebody else's secret into a crash. Nothing here needs interpolation.
+    """
+    parser = configparser.RawConfigParser()
+    with open(path) as handle:
+        parser.read_file(handle)
+    return parser
+
+
+def aws_credentials_file():
+    """Path the `aws` CLI would read, honouring the standard override."""
+    return os.environ.get("AWS_SHARED_CREDENTIALS_FILE") or os.path.expanduser(
+        os.path.join("~", ".aws", "credentials"))
+
+
+def aws_config_file():
+    return os.environ.get("AWS_CONFIG_FILE") or os.path.expanduser(
+        os.path.join("~", ".aws", "config"))
+
+
+def aws_profile(args=None):
+    return (getattr(args, "s3_profile", None)
+            or os.environ.get("AWS_PROFILE") or "default")
+
+
+def aws_credentials_source(args=None):
+    """
+    Where the `aws` CLI will get credentials from, described but never quoted.
+
+    Credentials belong in the canonical file, not on a command line: an argument is
+    visible in `ps` to every user on the box and lands in shell history, and keys issued
+    by someone else (GDC, in this case) should not be handled that carelessly. So this
+    only ever reports the *source* -- a path and a profile name. It does not read the
+    secret, and nothing in this script prints or forwards one.
+    """
+    if os.environ.get("AWS_ACCESS_KEY_ID"):
+        return {"found": True, "how": "AWS_ACCESS_KEY_ID in the environment"}
+
+    path, profile = aws_credentials_file(), aws_profile(args)
+    if not os.path.exists(path):
+        return {"found": False, "how": "no {}".format(path), "path": path}
+
+    try:
+        parser = _aws_ini(path)
+    except (configparser.Error, OSError) as e:
+        return {"found": False, "path": path,
+                "how": "could not parse {} ({})".format(path, e)}
+
+    if parser.has_option(profile, "aws_access_key_id"):
+        return {"found": True, "path": path, "profile": profile,
+                "how": "{} [{}]".format(path, profile)}
+    return {"found": False, "path": path, "profile": profile,
+            "how": "{} exists but has no [{}] with aws_access_key_id".format(
+                path, profile)}
+
+
+def aws_config_endpoint(args=None):
+    """
+    `endpoint_url` from the aws config file, so a non-Amazon endpoint need not be passed
+    on the command line either.
+    """
+    path, profile = aws_config_file(), aws_profile(args)
+    if not os.path.exists(path):
+        return None
+    try:
+        parser = _aws_ini(path)
+    except (configparser.Error, OSError):
+        return None
+    # the config file spells non-default profiles "[profile name]"; the credentials file
+    # spells them "[name]". Try both so either layout works.
+    for section in ("default" if profile == "default" else "profile " + profile, profile):
+        if parser.has_option(section, "endpoint_url"):
+            return parser.get(section, "endpoint_url").strip()
+    return None
+
+
 def s3_extra_args(args):
     """
     The `aws` flags HandleAWSURL would assemble: an explicit endpoint for a store that is
-    not Amazon's, and unsigned requests for a public bucket.
+    not Amazon's, and unsigned requests where there is nothing to sign with.
+
+    The endpoint comes from --s3-endpoint-url if given, otherwise from the aws config
+    file, so neither it nor the credentials need to appear in a command line.
+    `--no-sign-request` is added automatically when no credentials can be found, because
+    that is the only thing that could then work -- and it is what makes the failure a
+    clear 403 rather than a confusing signature error.
     """
     parts = []
-    if getattr(args, "s3_endpoint_url", None):
-        parts.append("--endpoint-url {}".format(shlex.quote(args.s3_endpoint_url)))
+    endpoint = getattr(args, "s3_endpoint_url", None) or aws_config_endpoint(args)
+    if endpoint:
+        parts.append("--endpoint-url {}".format(shlex.quote(endpoint)))
+
+    profile = getattr(args, "s3_profile", None)
+    if profile:
+        parts.append("--profile {}".format(shlex.quote(profile)))
+
     if getattr(args, "no_sign_request", False):
         parts.append("--no-sign-request")
+    elif not aws_credentials_source(args)["found"]:
+        parts.append("--no-sign-request")
+
     if getattr(args, "s3_extra_args", None):
         parts.append(args.s3_extra_args)
     return " ".join(parts)
@@ -575,7 +687,11 @@ def source_args(args, dest, size):
         session-token-only credentials and endpoints that cannot presign;
       * both, when you want to measure the presigned path against a non-Amazon store.
     """
-    if args.s3_bucket and args.s3_key and not (args.url or "").strip():
+    # getattr throughout: this is called with whatever namespace the subcommand built,
+    # and `probe` has no --url. Mixing direct access with getattr made it crash on one
+    # shape while tolerating another.
+    url = (getattr(args, "url", None) or "").strip()
+    if getattr(args, "s3_bucket", None) and getattr(args, "s3_key", None) and not url:
         return ["--url", "",                      # empty: "presign produced nothing"
                 "--s3-bucket", args.s3_bucket,
                 "--s3-key", args.s3_key,
@@ -584,7 +700,7 @@ def source_args(args, dest, size):
                 # option unless it happens to contain a space.
                 "--s3-extra-args={}".format(s3_extra_args(args)),
                 "--legacy-cmd", s3_legacy_command(args, dest, size)]
-    return ["--url", args.url]
+    return ["--url", url]
 
 
 def run_download(source, dest, size, connections, min_chunk, extra=(), verification=None,
@@ -762,7 +878,11 @@ class Verification:
 
 
 def describe_source(args):
-    if args.s3_bucket and args.s3_key and not (args.url or "").strip():
+    # getattr throughout: this is called with whatever namespace the subcommand built,
+    # and `probe` has no --url. Mixing direct access with getattr made it crash on one
+    # shape while tolerating another.
+    url = (getattr(args, "url", None) or "").strip()
+    if getattr(args, "s3_bucket", None) and getattr(args, "s3_key", None) and not url:
         return "s3://{}/{} via {} (S3ApiSource)".format(
             args.s3_bucket, args.s3_key,
             args.s3_endpoint_url or "amazon")
@@ -1177,8 +1297,12 @@ def build_parser():
                                 "--endpoint-url on every aws call, as "
                                 "HandleAWSURL's aws_endpoint_url does")
         group.add_argument("--no-sign-request", action="store_true",
-                           help="public bucket: no credentials, and the object URL is "
-                                "built path-style against the endpoint")
+                           help="force unsigned requests. Added automatically when no "
+                                "credentials can be found, so it is only needed to "
+                                "override credentials that do exist")
+        group.add_argument("--s3-profile", metavar="NAME",
+                           help="profile in ~/.aws/credentials and ~/.aws/config "
+                                "(default: $AWS_PROFILE, else 'default')")
         group.add_argument("--s3-extra-args", default="",
                            help="any further aws flags, passed through verbatim")
 
