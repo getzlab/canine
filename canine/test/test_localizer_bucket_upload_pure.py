@@ -316,7 +316,7 @@ class TestCreateBucketMountLayouts:
         all-local localization the plan came back empty, so bucket_upload_script
         was skipped entirely, the bucket was never created, and the consumer
         tried to gcsfuse-mount a bucket that did not exist. This is the ordinary
-        `LocalizeToDisk(files=upstream["out"])` pattern.
+        `LocalizeToBucket(files=upstream["out"])` pattern.
         """
         loc = make_localizer()
         loc.staging_dir = "/mnt/nfs/workspace"
@@ -347,7 +347,7 @@ class TestCreateBucketMountLayouts:
         Regression: the reachability guard originally required the path to sit
         under self.staging_dir -- the *current task's* directory. Upstream
         outputs live in sibling task dirs on the same shared mount, so the
-        ordinary LocalizeToDisk(files=upstream["out"]) pattern was rejected
+        ordinary LocalizeToBucket(files=upstream["out"]) pattern was rejected
         outright on a live cluster.
         """
         loc = make_localizer()

@@ -1040,7 +1040,7 @@ class AbstractLocalizer(abc.ABC):
             carries the state (see bucket_upload_script).
           * bucketmount_paths: dict of input name -> [bucketmount:// URLs],
             for the caller to save in self.rodisk_paths (same attribute
-            used for disk-backed RODISKs, since wolf.localization.LocalizeToDisk
+            used for disk-backed RODISKs, since wolf.localization.LocalizeToBucket
             reads it generically regardless of backing mechanism).
           * upload_plan: list of UploadItem for bucket_upload_script() to emit.
             url-mode inputs only -- "local" inputs are controller-side files that
@@ -1532,7 +1532,7 @@ class AbstractLocalizer(abc.ABC):
 
                 # if this is a dry run, we are only interested in the bucketmount URL string literals;
                 # we will not actually be attempting to mount it. this is mainly
-                # for wolf.LocalizeToDisk, which returns bucketmount path inputs
+                # for wolf.LocalizeToBucket, which returns bucketmount path inputs
                 # as its outputs. this would likely not be useful for most others
                 # tasks, since they would have no idea what to do with a bucketmount string
                 # literal
