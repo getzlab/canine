@@ -499,10 +499,17 @@ pdl() { sudo docker exec slurm python3 /tmp/pdl/benchmark_localization.py "$@"; 
 Your shell expands `$URL` and friends before `docker exec` sees them, so the variables stay
 on the host side and nothing needs `-e`.
 
-### Probe
+### Probe — run it twice, for different reasons
+
+The two halves of `probe` have different prerequisites, so it is worth running here **and**
+again after §4.
+
+**Now**, with the S3 source if you have one. Nothing in this part needs the localization
+disk, and it gates §6.4:
 
 ```bash
 pdl probe
+pdl probe --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" --s3-endpoint-url "$S3_ENDPOINT"
 ```
 
 Confirm before going further:
@@ -527,6 +534,23 @@ Confirm before going further:
 Note also `punch-hole : no` on overlay. `FALLOC_FL_PUNCH_HOLE` is not supported there, so
 §6.5's page-cache-loss test needs the ext4 localization disk — another reason the
 post-§4 probe is the meaningful one.
+
+With S3 arguments it additionally reports, none of which needs the disk:
+
+* **`credentials`** — the resolved source, a path and profile name, never the key. NOT
+  FOUND here means the container predates §3's `~/.aws` mount and must be restarted, since
+  mounts cannot be added to a running container.
+* **`ranged GET`** — the assumption the whole design rests on. A store that ignores `Range`
+  cannot be chunked at all.
+* **the ETag shape** — `<32 hex>-<N>` is multipart, so neither `--size` nor `--md5` is
+  needed anywhere. Opaque means this store does not follow AWS semantics and hash
+  verification would fail on correct data.
+* **`presign`** — whether the fast single-code-path source is available, or every chunk
+  pays an `aws` process.
+
+The `backing` lines and `gcsfuse` in the tool list are also the visible proof that an
+updated script is the one running — stronger evidence than `md5sum`, since it is what the
+container actually executed.
 
 ---
 
