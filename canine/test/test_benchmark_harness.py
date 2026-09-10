@@ -1024,3 +1024,83 @@ class TestDuplicateFetchingIsVisible:
         """
         self.sweep(tmp_path, monkeypatch, {1: 1.2, 16: 1.4})
         assert "DUPLICATE FETCHING" not in capsys.readouterr().out
+
+
+class TestAMissingConcurrencyFigureIsLoud:
+    """
+    A 4 GiB run made specifically to read the concurrency figure came back without it.
+    The benchmark was current -- its own new `wire:` line printed -- but the downloader in
+    the container was stale, and `k9pdl-streams` comes from the downloader. So the number
+    the run existed to produce was simply absent, and absent is indistinguishable from
+    "concurrency was zero", which is the opposite conclusion.
+
+    The verdict did have a branch for this, but it lived inside the speedup block, which
+    is skipped when there is no connections=1 row. On a single-setting run it never fired.
+    """
+
+    def sweep(self, tmp_path, monkeypatch, connections, streams):
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, conns, min_chunk, **kw):
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            return {"connections": conns, "returncode": 0, "seconds": 10.0,
+                    "killed": False, "peak_rss": 1 << 20,
+                    "phases": {"download": 10.0},
+                    "nic_bytes": len(payload), "disk_bytes": len(payload),
+                    "peak_nic_bytes_per_s": 1e8, "peak_disk_bytes_per_s": 1e3,
+                    "mean_streams": streams.get(conns),
+                    "workers": conns if streams.get(conns) else None,
+                    "stderr_tail": []}
+
+        downloader = tmp_path / "parallel_download.py"
+        downloader.write_bytes(b"# stand-in for the real downloader\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(downloader))
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload), bench.Verification("md5", digest)))
+        bench.command_sweep(bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+             "--dest-dir", str(tmp_path),
+             "--connections"] + [str(c) for c in connections]))
+
+    def test_a_single_setting_run_without_the_figure_says_so(
+            self, tmp_path, monkeypatch, capsys):
+        """The exact shape of the run that went wrong: one row, no baseline, no figure."""
+        self.sweep(tmp_path, monkeypatch, [16], {})
+        out = capsys.readouterr().out
+        assert "NO CONCURRENCY FIGURE" in out
+        assert "stale downloader" in out, "the likely cause must be named"
+
+    def test_the_figure_present_is_not_flagged(self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch, [16], {16: 15.8})
+        assert "NO CONCURRENCY FIGURE" not in capsys.readouterr().out
+
+    def test_the_connections_one_row_is_not_expected_to_have_one(
+            self, tmp_path, monkeypatch, capsys):
+        """
+        connections=1 takes the legacy command and never enters the worker pool, so it
+        has no concurrency to report. Counting it would make the warning fire on every
+        correct sweep, and a warning that always fires is not read.
+        """
+        self.sweep(tmp_path, monkeypatch, [1, 16], {16: 15.8})
+        assert "NO CONCURRENCY FIGURE" not in capsys.readouterr().out
+
+    def test_the_header_identifies_the_downloader(self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch, [16], {16: 15.8})
+        out = capsys.readouterr().out
+        assert "downloader:" in out
+        assert "md5" in out.split("downloader:")[1].splitlines()[0], out
+
+    def test_the_downloader_md5_is_the_file_actually_used(self, tmp_path, monkeypatch):
+        """A digest of the wrong file is worse than none -- it would read as confirmation."""
+        fake = tmp_path / "parallel_download.py"
+        fake.write_bytes(b"# not the real one\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(fake))
+        expected = hashlib.md5(fake.read_bytes()).hexdigest()
+        assert expected in bench.describe_downloader()
+
+    def test_a_missing_downloader_does_not_crash_the_header(self, monkeypatch):
+        monkeypatch.setattr(bench, "DOWNLOADER", None)
+        assert bench.describe_downloader() == "not found"

@@ -1187,6 +1187,26 @@ def redact_url(url):
     return "{}?<{} bytes of query string redacted>".format(base, len(query))
 
 
+def describe_downloader():
+    """
+    Path and md5 of the downloader being measured.
+
+    A stale copy in the container is invisible otherwise, and it does not fail -- it
+    quietly omits whatever the new build was supposed to report. That happened: a run
+    made specifically to read the concurrency figure came back without it, and the
+    missing line was indistinguishable from concurrency of zero. Comparing this md5
+    against the workstation's is one glance.
+    """
+    if not DOWNLOADER:
+        return "not found"
+    try:
+        with open(DOWNLOADER, "rb") as handle:
+            digest = hashlib.md5(handle.read()).hexdigest()
+    except OSError as e:
+        return "{} (unreadable: {})".format(DOWNLOADER, e)
+    return "{} (md5 {})".format(DOWNLOADER, digest)
+
+
 def describe_source(args):
     # getattr throughout: this is called with whatever namespace the subcommand built,
     # and `probe` has no --url. Mixing direct access with getattr made it crash on one
@@ -1271,6 +1291,7 @@ def command_sweep(args):
     say("object    : {}".format(describe_source(args)))
     say("size      : {}".format(human(size)))
     say("dest dir  : {}".format(args.dest_dir))
+    say("downloader: {}".format(describe_downloader()))
     say("verify    : {}".format(verification.label))
     if getattr(args, "prefix", False):
         say("baseline  : ranged curl (--prefix), so connections=1 fetches the same "
@@ -1476,6 +1497,24 @@ def command_sweep(args):
                     say("  this as a measurement of the source.")
     else:
         say("no connections=1 row, so there is no baseline to compare against")
+
+    # Independent of the speedup block below, which is skipped entirely when there is no
+    # connections=1 row -- so its own "no streams figure" branch did not fire on a
+    # single-setting run, and the run reported nothing at all about concurrency.
+    silent = [r for r in usable
+              if r["connections"] > 1 and r.get("mean_streams") is None]
+    if silent:
+        heading("NO CONCURRENCY FIGURE")
+        say("{} of {} parallel settings reported no `streams:` line, so this run does"
+            .format(len(silent), len([r for r in usable if r["connections"] > 1])))
+        say("NOT tell you whether the requests were concurrent -- which is the question a")
+        say("flat sweep exists to answer.")
+        say()
+        say("The usual cause is a stale downloader in the container: `k9pdl-streams` is")
+        say("emitted by parallel_download.py, not by this script, so updating only the")
+        say("benchmark leaves the figure missing while everything else looks new. Check")
+        say("the `downloader:` md5 in the header against your working copy.")
+        say()
 
     wire = [r["nic_bytes"] / float(args.size) for r in usable
             if r.get("nic_bytes") and args.size]
