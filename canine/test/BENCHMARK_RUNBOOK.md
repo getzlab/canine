@@ -601,68 +601,63 @@ sudo docker exec slurm bash -c '
   mount -o discard,defaults /dev/disk/by-id/google-'"$DISK"' /mnt/rwdisks/'"$DISK"'
 '
 ```
+### 4.1 `dd` the disk you just created — the gate
 
-### 4.1 The disk-type comparison — do this before anything else
-
-Ten minutes, no egress, no downloads, and it decides whether the rest of the project can
-reach its target. Create all three types at the size `create_persistent_disk` would pick,
-and measure each:
+Ten minutes, no egress, no downloads, **and no additional disks**: measure the localization
+disk §4 created. An earlier version of this section created three more (pd-standard,
+pd-balanced, pd-ssd) to compare types, which is ~950 GB of provisioning to answer a
+question the fan-out constraint has since closed — `pd-balanced` and `pd-ssd` cap at 10
+read-only attachments and cannot back the published artifact whatever their throughput
+(§10). The only live question is whether the per-gigabyte model describes this path at all.
 
 ```bash
 # on the node
-for TYPE in pd-standard pd-balanced pd-ssd; do
-  D=ddtest-$TYPE
-  gcloud compute disks create $D --project $PROJECT \
-    --size 316GB --type $TYPE --zone $ZONE --quiet
-  gcloud compute instances attach-disk $NODE --project $PROJECT \
-    --zone $ZONE --disk $D --device-name $D
-  sudo docker exec slurm bash -c "
-    while [ ! -b /dev/disk/by-id/google-$D ]; do sleep 1; done
-    mkfs.ext4 -q -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard \
-      /dev/disk/by-id/google-$D
-    mkdir -p /mnt/dd/$D && mount -o discard,defaults /dev/disk/by-id/google-$D /mnt/dd/$D
-    echo -n '$TYPE  write: '
-    dd if=/dev/zero of=/mnt/dd/$D/f bs=1M count=8000 oflag=direct conv=fdatasync 2>&1 \
-      | tail -1
-    sync; echo 3 > /proc/sys/vm/drop_caches
-    echo -n '$TYPE  read : '
-    dd if=/mnt/dd/$D/f of=/dev/null bs=1M iflag=direct 2>&1 | tail -1
-    umount /mnt/dd/$D"
-  gcloud compute instances detach-disk $NODE --project $PROJECT --zone $ZONE \
-    --disk $D --quiet
-  gcloud compute disks delete $D --project $PROJECT --zone $ZONE --quiet
-done
+sudo docker exec slurm bash -c '
+  set -e
+  D=/mnt/rwdisks/'"$DISK"'
+  echo -n "write: "
+  dd if=/dev/zero of=$D/ddtest bs=1M count=8000 oflag=direct conv=fdatasync 2>&1 | tail -1
+  sync
+  echo -n "read : "
+  dd if=$D/ddtest of=/dev/null bs=1M iflag=direct 2>&1 | tail -1
+  rm -f $D/ddtest'
 ```
 
 `oflag=direct` / `iflag=direct` bypass the page cache, so these are the disk and not RAM.
-The read number matters as much as the write one — the localization disk is re-attached
-read-only as a rodisk and read by every downstream consumer.
+8000 MiB is enough to be past any burst behaviour and small enough to finish quickly even
+if the pessimistic figure is right.
 
-Compare against the predictions and against today's 21 MB/s:
+**Take the read number too.** It is what every downstream consumer of the rodisk
+experiences, and — more immediately — what `verify()`'s full 279 GB read-back will run at,
+which §6.3 reports as its own phase.
 
-| Measured write on 316 GB pd-standard | Reading |
+| Measured write on the 316 GB pd-standard | Reading |
 |---|---|
-| **≫ 38 MB/s** — e.g. 100 MB/s+ | **The likely outcome, per §0.** The per-GB model does not describe this path; the disk is not the localization bottleneck; today's 21 MB/s is source-bound; the downloader has full headroom and ≥4× is available. |
-| **≈ 38 MB/s** | The per-GB model holds. The disk is close to binding, and achievable localization time is set by disk size. |
+| **≫ 38 MB/s** — e.g. 100 MB/s+ | **The likely outcome, per §0.** The per-GB model does not describe this path; the disk is not the localization bottleneck; today's 21 MB/s is source-bound; the downloader has full headroom and ≥4× is available. §10 does not apply. |
+| **≈ 38 MB/s** | The per-GB model holds. The disk is close to binding, achievable localization time is set by disk size, and §10's analysis is live. |
 
-Then continue to §4.1b either way — a single size tells you the rate, but only the sweep
-tells you whether the rate *scales with size*, which is the actual claim under test.
+Then **re-run `pdl probe`**. There is now a block-device-backed candidate, so it reports
+for the first time on a real destination:
 
-Take the **read** number too, and against a small disk as well as a large one — a 10 GB
-disk reading at ~1.2 MB/s versus ~100 MB/s is the same question in its starkest form, and
-reference disks live at that size (§10).
+* **`SEEK_HOLE`** on ext4 — if yes, frontier recovery is live, and it has never executed on
+  any machine (it fails the probe on APFS, so every local test used the checkpoint
+  fallback);
+* **`punch-hole`** — unsupported on overlay, and needed for §6.5's page-cache-loss test,
+  the one case SIGKILL cannot simulate;
+* **`pd type` / `write cap`** — the per-GB prediction, to set against what `dd` just
+  measured. If they disagree, trust `dd`.
 
-Whatever it shows, record it — this is the number every cost estimate in §10 depends on,
-and it is the cheapest measurement in the document.
+### 4.1b Does the rate scale with size? — optional, and quota-heavy
 
-Also re-run `pdl probe` now that a disk is mounted — it prints the PD type, provisioned size
-and implied per-GB cap, which should agree with `dd`. If they disagree, trust `dd`.
+**Run this only if §4.1 came back near 38 MB/s.** A single measurement tells you the rate;
+only a sweep tells you whether it *scales with size*, which is the per-GB model's actual
+claim. But if §4.1 already showed ~100 MB/s on a 316 GB disk, the model is dead and there
+is nothing left for a curve to establish.
 
-### 4.1b Oversized pd-standard: the same speed without changing type
-
-pd-standard throughput is provisioned per gigabyte, so the fast disk does not have to be a
-different *type* — it can be a bigger pd-standard, which keeps unlimited read-only fan-out.
-Confirm the model and find the real per-instance ceiling:
+Note the cost before running it: seven disks totalling **~3.4 TB** of transient
+provisioning. If regional quota is tight, the informative subset is the **small** end —
+`10 50 100 200` is 380 GB and answers the reference-disk question in §10, which is the one
+with a live decision attached.
 
 ```bash
 for GB in 10 50 100 200 316 742 2000; do
@@ -690,8 +685,9 @@ Predicted, at 0.12 MB/s/GB with a ~240 MB/s per-instance ceiling:
 |---|---|---|---|---|---|---|---|
 | MB/s | 1.2 | 6 | 12 | 24 | 38 | 89 | 240 |
 
-The large end tells you whether §10's sizing table is real: if 2000 GB gives ~240 MB/s, a
-300 GB download takes **21 minutes** rather than 2.2 hours.
+The large end tells you whether §10's sizing table is real — though §10 concludes against
+oversizing on cost grounds regardless, so this is now confirmation of a model rather than
+input to a decision.
 
 **The small end may matter more, and is the reason to include it.** Reference disks are
 MB to low tens of GB and are kept for a week or more, so the model predicts a 10 GB
