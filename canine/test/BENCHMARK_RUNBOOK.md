@@ -1567,10 +1567,26 @@ different ceilings averaged together hides both.
 
 ## 9. Collect and tear down
 
+**The JSONs are inside the container, not on the node.** `pdl` is `docker exec`, so every
+`--json /tmp/x.json` wrote to the container's `/tmp`. Copying from `$NODE:/tmp/*.json`
+collects *nothing* — and the next command deletes the instance holding the only copy. Get
+them out of the container first:
+
+```bash
+# on the node
+mkdir -p ~/results
+for f in $(sudo docker exec slurm sh -c 'ls /tmp/*.json'); do
+  sudo docker cp "slurm:$f" ~/results/
+done
+sudo chown -R "$USER" ~/results
+ls -l ~/results        # must be non-empty before you tear anything down
+```
+
 ```bash
 # from your workstation
 gcloud compute scp --project $PROJECT --zone $ZONE \
-  "$NODE:/tmp/*.json" ./benchmark-results/
+  "$NODE:~/results/*.json" ./benchmark-results/
+ls -l ./benchmark-results/     # again: confirm before teardown
 ```
 
 Teardown — **the disk outlives the instance and keeps billing**:

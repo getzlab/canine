@@ -1187,6 +1187,20 @@ def redact_url(url):
     return "{}?<{} bytes of query string redacted>".format(base, len(query))
 
 
+def container_path_note():
+    """
+    Say when a written path is inside the container.
+
+    Every invocation goes through `docker exec`, so `--json /tmp/x.json` lands in the
+    container's /tmp and not the node's -- and "results written to /tmp/x.json" reads as
+    though it were the node's. That cost one failed command, and worse, the runbook's own
+    teardown scp'd $NODE:/tmp/*.json, which would have collected nothing and then deleted
+    the instance holding the only copy.
+    """
+    return "  (inside the container -- `docker cp` it out before teardown)" \
+        if os.path.exists("/.dockerenv") else ""
+
+
 def describe_downloader():
     """
     Path and md5 of the downloader being measured.
@@ -1893,7 +1907,7 @@ def main(argv=None):
         with open(path, "w") as fh:
             json.dump(result, fh, indent=2, default=str)
         say()
-        say("results written to {}".format(path))
+        say("results written to {}{}".format(path, container_path_note()))
     return 0
 
 

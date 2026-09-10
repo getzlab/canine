@@ -1104,3 +1104,33 @@ class TestAMissingConcurrencyFigureIsLoud:
     def test_a_missing_downloader_does_not_crash_the_header(self, monkeypatch):
         monkeypatch.setattr(bench, "DOWNLOADER", None)
         assert bench.describe_downloader() == "not found"
+
+
+class TestWrittenPathsSayWhichFilesystem:
+    """
+    `pdl` is `docker exec`, so --json writes to the CONTAINER's /tmp. "results written to
+    /tmp/x.json" reads as the node's path. That cost a failed command, and the runbook's
+    teardown scp'd $NODE:/tmp/*.json -- collecting nothing, then deleting the instance
+    holding the only copy of every result.
+    """
+
+    def test_inside_a_container_the_note_is_added(self, monkeypatch):
+        monkeypatch.setattr(bench.os.path, "exists", lambda p: p == "/.dockerenv")
+        note = bench.container_path_note()
+        assert "inside the container" in note
+        assert "docker cp" in note, "the note must say how to get the file out"
+
+    def test_outside_a_container_there_is_no_note(self, monkeypatch):
+        monkeypatch.setattr(bench.os.path, "exists", lambda p: False)
+        assert bench.container_path_note() == ""
+
+    def test_the_runbook_does_not_collect_from_the_node_tmp(self):
+        """
+        The specific command that would have lost the results. Pinned because it looks
+        correct and its failure mode is silent -- an empty scp followed by a delete.
+        """
+        with open(os.path.join(os.path.dirname(__file__), "BENCHMARK_RUNBOOK.md")) as fh:
+            text = fh.read()
+        assert '"$NODE:/tmp/*.json"' not in text
+        assert "docker cp" in text.split("## 9.")[1], \
+            "9 must copy the results out of the container first"
