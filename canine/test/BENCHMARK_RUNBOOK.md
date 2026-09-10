@@ -1198,11 +1198,12 @@ Rather than enumerate config sources and hope the list is complete, ask curl wha
 
 ```bash
 # on the node -- covers the arms below
-curl -v -sS -r 0-0 -o /dev/null "$PRESIGNED_URL" 2>&1 | grep -Ei "connected to|proxy|HTTP/"
+curl -v -sS -r 0-0 -o /dev/null "$PRESIGNED_URL" 2>&1 \
+  | grep -E '^\* Connected to|[Pp]roxy|^< HTTP/'
 
 # in the container -- covers the sweep's baseline row
 sudo docker exec slurm sh -c 'curl -v -sS -r 0-0 -o /dev/null "'"$PRESIGNED_URL"'" 2>&1' \
-  | grep -Ei "connected to|proxy|HTTP/"
+  | grep -E '^\* Connected to|[Pp]roxy|^< HTTP/' 
 
 # and the config sources, in the right places
 env | grep -i proxy || echo "node: no proxy env"
@@ -1211,6 +1212,12 @@ sudo docker exec slurm sh -c '
   env | grep -i proxy || echo "container: no proxy env"
   ls -la /root/.curlrc 2>/dev/null || echo "container: no /root/.curlrc"'
 ```
+
+**Anchor those patterns.** A bare `grep -Ei "HTTP/"` also matches curl's `> GET ...` trace
+line, which is the whole request URL — so it prints `X-Amz-Credential` (your access key ID)
+and `X-Amz-Signature` to the terminal. `^< HTTP/` takes only the response status; `^\*
+Connected to` only the connection line. This was learned by doing it the other way and
+putting a live signature in the scrollback.
 
 `Connected to` naming the endpoint host is what you want in both. A different host, a
 `port 3128`, or any `Proxy-` line means a proxy is in the path. `HTTP/2` is not a problem
