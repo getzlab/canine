@@ -1188,10 +1188,42 @@ that can is a proxy — so check for one before starting, since an `http_proxy` 
 from the environment or a `~/.curlrc` would quietly turn all three arms into the same
 measurement:
 
+**Check both contexts, and do not let one stand in for the other.** `docker exec` hands the
+process the *container's* environment, not your shell's, so a node-side `http_proxy` never
+reaches the downloader and a container-side one never appears in the node's `env`. The
+arms below run node-side; the sweep's `connections=1` baseline curl runs inside the
+container, where the file that would affect it is `/root/.curlrc`, not `~/.curlrc`.
+
+Rather than enumerate config sources and hope the list is complete, ask curl what it did:
+
 ```bash
-env | grep -i proxy || echo "no proxy set"
-test -f ~/.curlrc && cat ~/.curlrc || echo "no ~/.curlrc"
+# on the node -- covers the arms below
+curl -v -sS -r 0-0 -o /dev/null "$PRESIGNED_URL" 2>&1 | grep -Ei "connected to|proxy|HTTP/"
+
+# in the container -- covers the sweep's baseline row
+sudo docker exec slurm sh -c 'curl -v -sS -r 0-0 -o /dev/null "'"$PRESIGNED_URL"'" 2>&1' \
+  | grep -Ei "connected to|proxy|HTTP/"
+
+# and the config sources, in the right places
+env | grep -i proxy || echo "node: no proxy env"
+test -f ~/.curlrc && cat ~/.curlrc || echo "node: no ~/.curlrc"
+sudo docker exec slurm sh -c '
+  env | grep -i proxy || echo "container: no proxy env"
+  ls -la /root/.curlrc 2>/dev/null || echo "container: no /root/.curlrc"'
 ```
+
+`Connected to` naming the endpoint host is what you want in both. A different host, a
+`port 3128`, or any `Proxy-` line means a proxy is in the path. `HTTP/2` is not a problem
+here — it multiplexes within one connection held by one process, and these are separate
+processes.
+
+A proxy in the container but not on the node would explain the flat sweep on its own, with
+no per-URL or per-account theory required: the sweep would have been measuring the proxy,
+and the node-side arms would then disagree with it for reasons that have nothing to do
+with signatures.
+
+`urllib` reads `http_proxy`/`https_proxy` from its own environment too, so this applies to
+the downloader's ranged GETs and not only to the baseline curl.
 
 HTTP/2 is the other multiplexing mechanism and is *not* a confound here, for the same
 reason: it multiplexes streams within one connection, held by one process. It would matter
