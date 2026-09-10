@@ -1135,6 +1135,11 @@ pdl sweep --url "$PRESIGNED_URL" \
           --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-presigned.json
 
+# NOTE: pass --s3-* only when downloading the WHOLE object. They make the benchmark
+# derive the ETag from head-object, which describes the full object -- so a truncated
+# --size assembles a different part count, verify() raises, discard() deletes the file,
+# and every row exits 1. For a prefix, omit them (see the knee sweep in §6.1).
+
 # GDC
 pdl sweep --url "$GDC_URL" --size $GDC_SIZE --md5 "$GDC_MD5" \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/gdc.json
