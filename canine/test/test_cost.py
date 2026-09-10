@@ -350,12 +350,82 @@ class TestInvalidateBillingClient:
 class TestGetPrice:
     def setup_method(self):
         self.node_types = pd.DataFrame({"cpus": [8], "realmemory": [7168.0]}, index=pd.Index(["n1-highcpu-8"], name="type"))
+        cost._MACHINE_TYPE_CAPACITY_CACHE.clear()
 
     def test_unknown_machine_type_returns_none_without_api_call(self):
         with patch("canine.cost.get_billing_client") as mock_client:
             result = cost.get_price("unknown-type", "us-central1-a", False, node_types=self.node_types)
         assert result is None
         mock_client.assert_not_called()
+
+    def test_unknown_machine_type_with_no_project_logs_a_warning_not_silent(self, monkeypatch):
+        # Confirmed live: this is exactly what happened for wolF's controller
+        # VM -- its machine type (e.g. "n2-standard-16") is never a SLURM
+        # worker partition type, so it's never in nodetypes.json, and no
+        # project was threaded through to look it up any other way. Before
+        # this fix, get_price() returned None here with zero log output --
+        # indistinguishable from "priced at $0", and the reason the
+        # controller-VM cost lines silently vanished from
+        # Workflow._log_total_cost_across_runs()'s summary with no warning
+        # anywhere.
+        warnings = []
+        monkeypatch.setattr(cost.canine_logging, "warning", lambda msg: warnings.append(msg))
+        with patch("canine.cost.get_billing_client") as mock_client:
+            result = cost.get_price("n2-standard-16", "us-east1-d", False, node_types=self.node_types)
+        assert result is None
+        mock_client.assert_not_called()
+        assert any("n2-standard-16" in w for w in warnings)
+
+    def test_unknown_machine_type_with_project_falls_back_to_compute_api(self):
+        # The controller-VM case: machine type absent from nodetypes.json,
+        # but a project is available (Workflow._controller_price_per_hour()
+        # now passes self.backend.config["project"]) to look its capacity up
+        # directly via the Compute Engine API instead of giving up.
+        fake_gce_client = MagicMock()
+        fake_gce_client.machineTypes.return_value.get.return_value.execute.return_value = {
+          "guestCpus": 16, "memoryMb": 65536,
+        }
+
+        fake_billing_client = MagicMock()
+        services = fake_billing_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [{"displayName": "Compute Engine", "name": "services/x"}]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": [
+          make_sku("N2 Predefined Instance Core running in Americas", "us-east1", tiered_rate_usd=0.03),
+          make_sku("N2 Predefined Instance Ram running in Americas", "us-east1", tiered_rate_usd=0.004),
+        ]}
+        services.skus.return_value.list_next.return_value = None
+
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_gce_client), \
+             patch("canine.cost.get_billing_client", return_value=fake_billing_client), \
+             patch("canine.cost._COMPUTE_ENGINE_SERVICE_NAME", None):
+            result = cost.get_price(
+              "n2-standard-16", "us-east1-d", False, node_types=self.node_types, project="my-project",
+            )
+
+        expected = 0.03 * 16 + 0.004 * (65536 / 1024)
+        assert result == pytest.approx(expected)
+        fake_gce_client.machineTypes.return_value.get.assert_called_once_with(
+          project="my-project", zone="us-east1-d", machineType="n2-standard-16",
+        )
+
+    def test_unknown_machine_type_with_project_but_compute_api_also_fails_warns(self, monkeypatch):
+        warnings = []
+        monkeypatch.setattr(cost.canine_logging, "warning", lambda msg: warnings.append(msg))
+        fake_gce_client = MagicMock()
+        fake_gce_client.machineTypes.return_value.get.return_value.execute.side_effect = RuntimeError("not found")
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_gce_client), \
+             patch("canine.cost.get_billing_client") as mock_billing_client:
+            result = cost.get_price(
+              "bogus-type", "us-east1-d", False, node_types=self.node_types, project="my-project",
+            )
+        assert result is None
+        mock_billing_client.assert_not_called()
+        assert any("bogus-type" in w and "Compute Engine API" in w for w in warnings)
 
     def test_cache_hit_skips_api_call(self, tmp_path):
         cache_path = tmp_path / "price_cache.json"
@@ -1264,6 +1334,59 @@ class TestGetLiveDiskInfo:
             result = cost.get_live_disk_info("worker-gone", "us-central1-a", "my-project")
         assert result == (None, None)
         assert fake_client.disks.return_value.get.return_value.execute.call_count == 1
+
+
+class TestGetMachineTypeCapacity:
+    def setup_method(self):
+        cost._MACHINE_TYPE_CAPACITY_CACHE.clear()
+
+    def test_successful_lookup(self):
+        fake_client = MagicMock()
+        fake_client.machineTypes.return_value.get.return_value.execute.return_value = {
+          "guestCpus": 16, "memoryMb": 65536,
+        }
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            result = cost.get_machine_type_capacity("n2-standard-16", "us-east1-d", "my-project")
+        assert result == (16, 65536.0)
+
+    def test_api_failure_returns_none_none_and_warns(self, monkeypatch):
+        # This is the fallback path _resolve_machine_type_capacity() uses for
+        # a machine type that isn't a SLURM worker type (e.g. wolF's
+        # controller VM) -- confirming it never silently swallows a failure
+        # is what makes get_price()'s own warning for that case reachable.
+        fake_client = MagicMock()
+        fake_client.machineTypes.return_value.get.return_value.execute.side_effect = RuntimeError("machine type not found")
+        warnings = []
+        monkeypatch.setattr(cost.canine_logging, "warning", lambda msg: warnings.append(msg))
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            result = cost.get_machine_type_capacity("bogus-type", "us-east1-d", "my-project")
+        assert result == (None, None)
+        assert any("bogus-type" in w for w in warnings)
+
+    def test_cache_hit_skips_api_call(self):
+        fake_client = MagicMock()
+        fake_client.machineTypes.return_value.get.return_value.execute.return_value = {
+          "guestCpus": 16, "memoryMb": 65536,
+        }
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            first = cost.get_machine_type_capacity("n2-standard-16", "us-east1-d", "my-project")
+            fake_client.machineTypes.return_value.get.reset_mock()
+            second = cost.get_machine_type_capacity("n2-standard-16", "us-east1-d", "my-project")
+        assert first == second == (16, 65536.0)
+        fake_client.machineTypes.return_value.get.assert_not_called()
+
+    def test_retries_on_transient_read_timeout_then_succeeds(self):
+        fake_client = MagicMock()
+        fake_client.machineTypes.return_value.get.return_value.execute.side_effect = [
+          TimeoutError("The read operation timed out"),
+          {"guestCpus": 16, "memoryMb": 65536},
+        ]
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client), \
+             patch("canine.cost._invalidate_gce_disk_client") as mock_invalidate, \
+             patch("canine.cost.time.sleep"):
+            result = cost.get_machine_type_capacity("n2-standard-16", "us-east1-d", "my-project")
+        assert result == (16, 65536.0)
+        mock_invalidate.assert_called_once()
 
 
 class TestMakeLiveBootDiskPriceSource:

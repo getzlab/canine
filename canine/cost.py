@@ -451,7 +451,36 @@ def match_accelerator_price(skus, accelerator_type, region, preemptible):
     return _sku_unit_price_usd(matched[0])
 
 
-def get_price(machine_type, zone, preemptible, accelerator_type = None, accelerator_count = 0, node_types = None):
+def _resolve_machine_type_capacity(machine_type, zone, project, node_types):
+    """
+    (vcpus, mem_gb) for machine_type, or None if it can't be determined --
+    node_types (nodetypes.json) first, since that's a free, already-loaded
+    local lookup for every SLURM worker type; falling back to a live Compute
+    Engine API lookup (get_machine_type_capacity()) when machine_type isn't a
+    worker type at all -- e.g. wolF's controller VM -- and a project was given
+    to look it up against. Logs a warning either way when capacity can't be
+    found, rather than the silent `None` get_price() used to return here (a
+    real bug: it meant a missing/unpriceable machine type -- like a controller
+    VM whose type is never a SLURM partition type -- produced no cost lines
+    and no warning at all).
+    """
+    if machine_type in node_types.index:
+        row = node_types.loc[machine_type]
+        return int(row["cpus"]), float(row["realmemory"]) / 1024
+
+    if project is not None:
+        vcpus, mem_mb = get_machine_type_capacity(machine_type, zone, project)
+        if vcpus is not None:
+            return vcpus, mem_mb / 1024
+
+    canine_logging.warning(
+      "Could not price {}/{}: not a known worker machine type (not in nodetypes.json){}".format(
+        machine_type, zone,
+        "" if project is None else ", and not found via the Compute Engine API either"))
+    return None
+
+
+def get_price(machine_type, zone, preemptible, accelerator_type = None, accelerator_count = 0, node_types = None, project = None):
     """
     Live $/hour for a (machine_type, zone, preemptible[, accelerator]) recipe, via
     the Cloud Billing Catalog API, cached on disk (PRICE_CACHE_PATH) keyed by
@@ -460,9 +489,16 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
     determined; callers should flag this as missing/provisional rather than
     silently treating a job as free.
 
-    `node_types` (from load_node_types()) is required to convert per-core/per-GB
-    SKU prices into a per-instance $/hour rate using that machine type's actual
-    vCPU/RAM counts; loaded automatically if not given.
+    `node_types` (from load_node_types()) is consulted first to convert
+    per-core/per-GB SKU prices into a per-instance $/hour rate using that
+    machine type's actual vCPU/RAM counts; loaded automatically if not given.
+    But `node_types` only lists *SLURM worker* machine types (nodetypes.json is
+    written for the cluster's own elastic partitions) -- a machine type that's
+    never a worker type, e.g. wolF's controller VM (see
+    Workflow._controller_price_per_hour()), will never appear there. If
+    `project` is given, a machine type missing from `node_types` falls back to
+    a live Compute Engine API lookup (get_machine_type_capacity()) instead of
+    silently failing.
 
     Everything past the first cache check is serialized behind
     _PRICE_FETCH_LOCK: get_billing_client()'s httplib2-backed client isn't safe
@@ -472,8 +508,10 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
     threads that can finish concurrently.
     """
     node_types = load_node_types() if node_types is None else node_types
-    if machine_type not in node_types.index:
+    capacity = _resolve_machine_type_capacity(machine_type, zone, project, node_types)
+    if capacity is None:
         return None
+    vcpus, mem_gb = capacity
 
     # host_LuT.pickle stores accelerator_type/accelerator_count as NaN (not
     # None/0) for every non-GPU node -- provision_server.py builds it via a
@@ -526,8 +564,6 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
                         machine_type, zone, preemptible, region))
                     return None
                 cpu_price, ram_price = matched
-                vcpus = int(node_types.loc[machine_type, "cpus"])
-                mem_gb = float(node_types.loc[machine_type, "realmemory"]) / 1024
                 price_per_hour = cpu_price * vcpus + ram_price * mem_gb
 
                 if accelerator_type and accelerator_count:
@@ -870,6 +906,68 @@ def get_live_disk_info(disk_name, zone, project, ttl_seconds = 300):
             _DISK_INFO_CACHE[key] = (now, result)
         return result
 
+
+_MACHINE_TYPE_CAPACITY_CACHE = {}
+_MACHINE_TYPE_CAPACITY_CACHE_LOCK = threading.Lock()
+
+
+def get_machine_type_capacity(machine_type, zone, project):
+    """
+    Live (vcpus, memory_mb) for an arbitrary GCE machine type, via the Compute
+    Engine API's machineTypes().get() -- the fallback _resolve_machine_type_capacity()
+    uses when a machine type isn't in this cluster's own nodetypes.json (e.g.
+    wolF's controller VM, which is provisioned out-of-band and is never
+    itself a SLURM worker partition type).
+
+    Cached in-process indefinitely, unlike get_live_disk_info()'s short TTL:
+    a machine type's core/memory spec in a given zone is a fixed catalog
+    fact, not something that changes over a node's lifetime the way a disk's
+    size can.
+
+    Returns (None, None) on any failure -- never guesses a fallback capacity.
+    Shares get_live_disk_info()'s client/retry/locking machinery
+    (get_gce_disk_client() is the same 'compute' v1 client; machineTypes()
+    and disks() are both methods on it, so reusing it needs no new client
+    singleton) for the same underlying reason: concurrent .execute() calls on
+    the shared httplib2-backed client corrupt its connection state.
+    """
+    key = (project, zone, machine_type)
+    with _MACHINE_TYPE_CAPACITY_CACHE_LOCK:
+        if key in _MACHINE_TYPE_CAPACITY_CACHE:
+            return _MACHINE_TYPE_CAPACITY_CACHE[key]
+
+    with _GCE_DISK_FETCH_LOCK:
+        with _MACHINE_TYPE_CAPACITY_CACHE_LOCK:
+            if key in _MACHINE_TYPE_CAPACITY_CACHE:
+                return _MACHINE_TYPE_CAPACITY_CACHE[key]
+
+        result = (None, None)
+        last_exc = None
+        for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            try:
+                client = get_gce_disk_client()
+                info = client.machineTypes().get(project = project, zone = zone, machineType = machine_type).execute()
+                result = (int(info["guestCpus"]), float(info["memoryMb"]))
+                break
+            except _TRANSIENT_FETCH_ERRORS as e:
+                last_exc = e
+                canine_logging.warning(
+                  "Transient error fetching machine type capacity for {}/{}/{} (attempt {}/{}): {} -- retrying with a fresh client".format(
+                    project, zone, machine_type, attempt, _MAX_FETCH_ATTEMPTS, e))
+                _invalidate_gce_disk_client()
+                if attempt < _MAX_FETCH_ATTEMPTS:
+                    time.sleep(attempt)
+            except Exception as e:
+                canine_logging.warning("Could not fetch machine type capacity for {}/{}/{}: {}".format(project, zone, machine_type, e))
+                break
+        else:
+            canine_logging.warning(
+              "Could not fetch machine type capacity for {}/{}/{} after {} attempts: {}".format(
+                project, zone, machine_type, _MAX_FETCH_ATTEMPTS, last_exc))
+
+        with _MACHINE_TYPE_CAPACITY_CACHE_LOCK:
+            _MACHINE_TYPE_CAPACITY_CACHE[key] = result
+        return result
 
 
 # slurm_gcp_docker's slurm_resume.py's own hardcoded boot-disk provisioning
