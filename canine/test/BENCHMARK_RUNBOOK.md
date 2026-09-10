@@ -976,14 +976,23 @@ sudo docker exec slurm sh -c '
   df -h /mnt/tmpfs'
 ```
 
-Then sweep against whichever you used:
+**The object needs an auth header.** `https://storage.googleapis.com/BUCKET/OBJECT` is
+anonymous, and the bucket §2 uploaded to is private — so every setting fails with 403 in
+under a second. `--header` is how the GCS handlers pass credentials, and the downloader
+forwards it on every ranged GET:
 
 ```bash
+export GCS_AUTH="Authorization: Bearer $(gcloud auth print-access-token)"
+
 pdl sweep --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
-          --dest-dir /dev/shm/pdl \
+          --header "$GCS_AUTH" \
+          --dest-dir /mnt/tmpfs \
           --connections 1 4 8 12 16 \
           --json /tmp/sweep-shm.json
 ```
+
+Access tokens last about an hour, so re-mint it if a long sweep starts failing partway —
+and note that the `connections 1` row shells out to `curl`, which gets the header too.
 
 Make a **separate ~12 GB object** with §2 for this — n1-standard-8 has 28.2 GB of RAM and
 tmpfs is memory. (Omit `--md5` if you would rather skip verification; passing an empty

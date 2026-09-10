@@ -866,8 +866,21 @@ def source_args(args, dest, size):
                 # (e.g. "--no-sign-request"), and argparse treats such a token as an
                 # option unless it happens to contain a space.
                 "--s3-extra-args={}".format(s3_extra_args(args)),
-                "--legacy-cmd", s3_legacy_command(args, dest, size)]
-    return ["--url", url]
+                "--legacy-cmd", s3_legacy_command(args, dest, size)] + header_args(args)
+    return ["--url", url] + header_args(args)
+
+
+def header_args(args):
+    """
+    Headers to forward. The downloader applies them to every ranged GET and, via
+    single_stream_fallback, to the synthesized `curl` too -- so the connections=1
+    baseline authenticates the same way the parallel rows do. Without that, a private
+    source fails on every row and the sweep has nothing to measure.
+    """
+    out = []
+    for header in getattr(args, "header", None) or []:
+        out += ["--header", header]
+    return out
 
 
 def run_download(source, dest, size, connections, min_chunk, extra=(), verification=None,
@@ -1222,21 +1235,37 @@ def command_sweep(args):
             outcome["verified"] = verification.check(dest)
         else:
             outcome["verified"] = False
-        throughput = args.size / outcome["seconds"] if outcome["seconds"] else 0
-        outcome["throughput_bytes_per_s"] = throughput
-        if connections <= 1:
-            baseline = throughput
-        outcome["speedup_vs_single_stream"] = (
-            round(throughput / baseline, 2) if baseline else None)
+
+        # A failed or unverified run is NOT a measurement. Computing size/elapsed
+        # regardless once produced "48.00 GiB/s" over a 2 GB/s NIC and a verdict of
+        # "MEETS the target" for five runs that had downloaded nothing -- the elapsed
+        # time being how long it took to fail. Throughput is only recorded for a run
+        # that finished and verified.
+        outcome["ok"] = outcome["returncode"] == 0 and outcome["verified"] is not False
+        if outcome["ok"]:
+            throughput = args.size / outcome["seconds"] if outcome["seconds"] else 0
+            outcome["throughput_bytes_per_s"] = throughput
+            if connections <= 1:
+                baseline = throughput
+            outcome["speedup_vs_single_stream"] = (
+                round(throughput / baseline, 2) if baseline else None)
+        else:
+            outcome["throughput_bytes_per_s"] = None
+            outcome["speedup_vs_single_stream"] = None
         results.append(outcome)
 
-        say("{:>5}  {:>9}  {:>13}  {:>13}  {:>13}  {:>10}  {:>4}".format(
-            connections, outcome["seconds"], rate(args.size, outcome["seconds"]),
-            rate(outcome["peak_nic_bytes_per_s"] or 0, 1),
-            rate(outcome["peak_disk_bytes_per_s"] or 0, 1),
-            human(outcome["peak_rss"]) if outcome["peak_rss"] else "?",
-            "ok" if outcome["verified"] else
-            ("-" if outcome["verified"] is None else "BAD")))
+        if not outcome["ok"]:
+            say("{:>5}  {:>9}  {:>13}  FAILED (rc={})".format(
+                connections, outcome["seconds"], "--", outcome["returncode"]))
+            for line in outcome["stderr_tail"]:
+                say("         {}".format(line[:100]))
+        else:
+            say("{:>5}  {:>9}  {:>13}  {:>13}  {:>13}  {:>10}  {:>4}".format(
+                connections, outcome["seconds"], rate(args.size, outcome["seconds"]),
+                rate(outcome["peak_nic_bytes_per_s"] or 0, 1),
+                rate(outcome["peak_disk_bytes_per_s"] or 0, 1),
+                human(outcome["peak_rss"]) if outcome["peak_rss"] else "?",
+                "ok" if outcome["verified"] else "-"))
         if outcome["phases"]:
             say("        phases: {}".format("  ".join(
                 "{} {:.1f}s".format(k, v) for k, v in outcome["phases"].items())))
@@ -1246,11 +1275,29 @@ def command_sweep(args):
             except OSError:
                 pass
 
+    # Only a run that finished AND verified is a measurement -- see the `ok` assignment
+    # in the loop above for the failure this guards against.
+    usable = [r for r in results if r["ok"]]
+    if not usable:
+        heading("NO USABLE RESULT")
+        say("Every setting failed or did not verify, so there is nothing to report and")
+        say("no speedup to claim. The stderr above names the reason; the most common is")
+        say("a source the downloader cannot read -- a private GCS object over plain")
+        say("https needs an auth header (see §6.1), and an expired presigned URL looks")
+        say("the same.")
+        say()
+        say("Nothing here should be recorded as a benchmark result.")
+        return {"sweep": results, "usable": 0}
+    if len(usable) < len(results):
+        say()
+        say("NOTE: {} of {} settings failed and are excluded from what follows."
+            .format(len(results) - len(usable), len(results)))
+
     # download vs verify: the split that decides §10's machine-type question and whether
     # in-transfer hashing is worth building
     # `in`, not `.get()`: a verify of 0.0s is falsy, and a fast verify is precisely the
     # result that argues the node can be sized down. Dropping it would hide that.
-    splits = [r["phases"] for r in results if "verify" in r["phases"]]
+    splits = [r["phases"] for r in usable if "verify" in r["phases"]]
     if splits:
         heading("download vs verify")
         dl = sum(s.get("download", 0) for s in splits) / len(splits)
@@ -1274,7 +1321,7 @@ def command_sweep(args):
             say("worth investigating (§10).")
 
     heading("verdict")
-    best = max(results, key=lambda r: r["throughput_bytes_per_s"])
+    best = max(usable, key=lambda r: r["throughput_bytes_per_s"])
     say("fastest        : {} connections at {}".format(
         best["connections"], rate(args.size, best["seconds"])))
     if baseline:
@@ -1287,7 +1334,7 @@ def command_sweep(args):
     # §8.5 wants memory bounded regardless of object size: the design's claim is that
     # only READ_BLOCK per connection is ever buffered, so RSS should be roughly flat
     # across the sweep and utterly unrelated to the 50 GB being moved.
-    memory = [r["peak_rss"] for r in results if r["peak_rss"]]
+    memory = [r["peak_rss"] for r in usable if r["peak_rss"]]
     if memory:
         say()
         say("peak RSS       : {} across the sweep".format(human(max(memory))))
@@ -1297,8 +1344,8 @@ def command_sweep(args):
             else "HIGHER than expected; check for accumulation"))
 
     # the NIC-vs-disk question §2 leaves open
-    peak_nic = max((r["peak_nic_bytes_per_s"] or 0) for r in results)
-    peak_disk = max((r["peak_disk_bytes_per_s"] or 0) for r in results)
+    peak_nic = max((r["peak_nic_bytes_per_s"] or 0) for r in usable)
+    peak_disk = max((r["peak_disk_bytes_per_s"] or 0) for r in usable)
     say()
     say("peak NIC       : {}   (n1-standard-8 cap is ~2 GB/s)".format(rate(peak_nic, 1)))
     say("peak disk write: {}".format(rate(peak_disk, 1)))
@@ -1311,7 +1358,7 @@ def command_sweep(args):
         else:
             say("-> neither is saturated; the source may be the limit.")
 
-    plateau = [r for r in results if r["connections"] > 1]
+    plateau = [r for r in usable if r["connections"] > 1]
     if len(plateau) >= 2:
         top = max(r["throughput_bytes_per_s"] for r in plateau)
         knee = min((r["connections"] for r in plateau
@@ -1565,6 +1612,11 @@ def build_parser():
                        help="where to write; use the localization disk to measure the "
                             "path that matters (default: %(default)s)")
         p.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK)
+        p.add_argument("--header", action="append", default=[], metavar="H",
+                       help="request header, repeatable; forwarded to every ranged GET "
+                            "and to the single-stream fallback. A private GCS object "
+                            "over plain https needs "
+                            "'Authorization: Bearer $(gcloud auth print-access-token)'")
         p.add_argument("--downloader", metavar="PATH",
                        help="parallel_download.py to drive; defaults to one beside this "
                             "script, else the repo's ../localization/ copy")

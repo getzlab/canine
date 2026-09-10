@@ -9,6 +9,7 @@ issued by someone else, that matters.
 """
 
 import glob
+import hashlib
 import importlib.util
 import os
 import tempfile
@@ -539,3 +540,157 @@ class TestDiskIdentification:
         monkeypatch.setattr(bench.glob, "glob", lambda pattern: [])
         self.gcloud_returning(monkeypatch, "")
         assert bench.disk_details("/dev/sdc") is None
+
+
+class TestAFailedRunIsNotAMeasurement:
+    """
+    The sweep once reported "48.00 GiB/s" over a 2 GB/s NIC and concluded "MEETS the
+    target" for five settings that had downloaded nothing: it computed size/elapsed
+    regardless of the exit code, and elapsed was how long the download took to *fail*.
+    The only honest signal in the output was a `BAD` hash column that the verdict ignored.
+
+    A measuring tool inventing measurements is the worst version of this whole class of
+    bug, so it is pinned here.
+    """
+
+    def sweep_with(self, tmp_path, monkeypatch, returncode, verified):
+        """Drive command_sweep with run_download stubbed to a chosen outcome."""
+        calls = []
+
+        def fake_run_download(source, dest, size, connections, min_chunk, **kw):
+            calls.append(connections)
+            if returncode == 0:
+                with open(dest, "wb") as fh:
+                    fh.write(b"x" * 16)
+            return {"connections": connections, "returncode": returncode,
+                    "seconds": 0.25, "killed": False, "peak_rss": 4096,
+                    "phases": {}, "nic_bytes": 0, "disk_bytes": 0,
+                    "peak_nic_bytes_per_s": None, "peak_disk_bytes_per_s": None,
+                    "stderr_tail": ["curl: (22) The requested URL returned error: 403"]}
+
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (12 * 1024 ** 3,
+                                       bench.Verification("md5", "deadbeef")
+                                       if verified else
+                                       bench.Verification(None, reason="none")))
+        args = bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", str(12 * 1024 ** 3),
+             "--dest-dir", str(tmp_path), "--connections", "1", "4", "8"])
+        return bench.command_sweep(args), calls
+
+    def test_no_throughput_is_reported_for_a_failed_run(self, tmp_path, monkeypatch,
+                                                        capsys):
+        result, _ = self.sweep_with(tmp_path, monkeypatch, returncode=1, verified=True)
+        out = capsys.readouterr().out
+        assert result["usable"] == 0
+        assert "NO USABLE RESULT" in out
+        assert "GiB/s" not in out and "MB/s" not in out, \
+            "invented a rate for runs that failed:\n" + out
+        assert "MEETS the target" not in out
+        for row in result["sweep"]:
+            assert row["throughput_bytes_per_s"] is None
+            assert row["speedup_vs_single_stream"] is None
+
+    def test_the_failure_reason_is_shown_not_swallowed(self, tmp_path, monkeypatch,
+                                                       capsys):
+        """It captured the 403 all along and printed only a throughput."""
+        self.sweep_with(tmp_path, monkeypatch, returncode=1, verified=True)
+        assert "403" in capsys.readouterr().out
+
+    def test_a_run_that_completes_but_fails_verification_is_also_excluded(
+            self, tmp_path, monkeypatch, capsys):
+        """
+        rc=0 with a hash mismatch is still not a measurement -- it means the bytes are
+        wrong, so their rate is meaningless.
+        """
+        result, _ = self.sweep_with(tmp_path, monkeypatch, returncode=0, verified=True)
+        # the stub writes 16 bytes, so the md5 cannot match
+        assert result["usable"] == 0
+        assert "NO USABLE RESULT" in capsys.readouterr().out
+
+    def test_a_partial_failure_is_excluded_but_the_rest_still_reports(
+            self, tmp_path, monkeypatch, capsys):
+        payload = b"y" * 4096
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, connections, min_chunk, **kw):
+            if connections == 4:            # one setting fails
+                return {"connections": connections, "returncode": 1, "seconds": 0.1,
+                        "killed": False, "peak_rss": 4096, "phases": {},
+                        "nic_bytes": 0, "disk_bytes": 0,
+                        "peak_nic_bytes_per_s": None, "peak_disk_bytes_per_s": None,
+                        "stderr_tail": ["boom"]}
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            return {"connections": connections, "returncode": 0, "seconds": 1.0,
+                    "killed": False, "peak_rss": 4096, "phases": {},
+                    "nic_bytes": 0, "disk_bytes": 0,
+                    "peak_nic_bytes_per_s": None, "peak_disk_bytes_per_s": None,
+                    "stderr_tail": []}
+
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload),
+                                       bench.Verification("md5", digest)))
+        args = bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+             "--dest-dir", str(tmp_path), "--connections", "1", "4", "8"])
+        result = bench.command_sweep(args)
+        out = capsys.readouterr().out
+        assert "1 of 3 settings failed" in out or "1 of 3 settings failed" in out
+        assert "verdict" in out, "the surviving settings should still be reported"
+        assert sum(1 for r in result["sweep"] if r["ok"]) == 2
+
+
+class TestHeadersReachTheDownloader:
+    """
+    A private GCS object over plain https needs an Authorization header, and the runbook
+    tells you to pass one -- which did nothing until the benchmark accepted `--header`.
+    Both the ranged-GET path and the connections=1 curl fallback need it, or the baseline
+    row fails while the others succeed.
+    """
+
+    def test_headers_are_forwarded_for_a_url_source(self):
+        args = bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", "10", "--dest-dir", "/d",
+             "--header", "Authorization: Bearer tok"])
+        source = bench.source_args(args, "/d/f", 10)
+        assert "--header" in source
+        assert "Authorization: Bearer tok" in source
+
+    def test_multiple_headers_are_all_forwarded(self):
+        args = bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", "10", "--dest-dir", "/d",
+             "--header", "A: 1", "--header", "B: 2"])
+        source = bench.source_args(args, "/d/f", 10)
+        assert source.count("--header") == 2
+        assert "A: 1" in source and "B: 2" in source
+
+    def test_headers_are_forwarded_for_an_s3_source_too(self):
+        args = bench.build_parser().parse_args(
+            ["sweep", "--s3-bucket", "b", "--s3-key", "k", "--size", "10",
+             "--dest-dir", "/d", "--header", "X: y"])
+        source = bench.source_args(args, "/d/f", 10)
+        assert "X: y" in source
+
+    def test_no_headers_means_no_flag(self):
+        args = bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", "10", "--dest-dir", "/d"])
+        assert "--header" not in bench.source_args(args, "/d/f", 10)
+
+    def test_the_downloader_accepts_what_the_benchmark_emits(self):
+        """Checked against the real parser, not a hand-written expectation."""
+        import importlib.util, os as _os
+        spec = importlib.util.spec_from_file_location(
+            "pdl", _os.path.join(_os.path.dirname(__file__), _os.pardir,
+                                 "localization", "parallel_download.py"))
+        pdl = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(pdl)
+        args = bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", "10", "--dest-dir", "/d",
+             "--header", "Authorization: Bearer tok"])
+        opts = pdl.build_parser().parse_args(
+            bench.source_args(args, "/d/f", 10) +
+            ["--dest", "/d/f", "--size", "10", "--connections", "4"])
+        assert opts.header == ["Authorization: Bearer tok"]
