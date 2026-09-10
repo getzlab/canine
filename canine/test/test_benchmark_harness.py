@@ -354,7 +354,7 @@ class TestRangeProbeHandlesBinaryBodies:
         assert out["accept_ranges"] == "bytes"
 
 
-class TestPartLengthUniformity:
+class TestTheStrideIsVerifiedNotAssumed:
     """
     The md5-of-md5s only reproduces the ETag if every non-final part is striden at its
     true length. S3 does NOT require parts to be equal -- only that non-final ones are
@@ -391,14 +391,14 @@ class TestPartLengthUniformity:
         args = self.fake_aws(tmp_path, monkeypatch, 35, 4,
                              {1: 10, 2: 10, 3: 10, 4: 5})
         meta = bench.s3_object_metadata(args)
-        assert meta["parts_uniform"] is True
+        assert meta["stride_verified"] is True
         assert meta["part_length"] == 10
 
     def test_a_differing_interior_part_is_caught(self, tmp_path, monkeypatch):
         # parts 10, 20, 5 -> the identity (3-1)*10 + 5 = 25 != 35
         args = self.fake_aws(tmp_path, monkeypatch, 35, 3, {1: 10, 2: 20, 3: 5})
         meta = bench.s3_object_metadata(args)
-        assert meta["parts_uniform"] is False
+        assert meta["stride_verified"] is False
         assert meta["part_length"] is None, "must not offer a stride it cannot trust"
 
     def test_a_differing_second_part_is_caught_even_if_the_sum_works(
@@ -409,18 +409,37 @@ class TestPartLengthUniformity:
         """
         args = self.fake_aws(tmp_path, monkeypatch, 35, 4, {1: 10, 2: 5, 3: 15, 4: 5})
         meta = bench.s3_object_metadata(args)
-        assert meta["parts_uniform"] is False
+        assert meta["stride_verified"] is False
 
     def test_a_last_part_larger_than_the_first_is_caught(self, tmp_path, monkeypatch):
         args = self.fake_aws(tmp_path, monkeypatch, 25, 2, {1: 10, 2: 15})
         meta = bench.s3_object_metadata(args)
-        assert meta["parts_uniform"] is False
+        assert meta["stride_verified"] is False
 
-    def test_two_parts_need_no_second_probe(self, tmp_path, monkeypatch):
-        """With two parts, part 1 IS the stride and the layout is unambiguous."""
+    def test_two_parts_of_different_lengths_are_normal(self, tmp_path, monkeypatch):
+        """
+        With two parts the last is the remainder, so part 1 != part 2 is the usual case
+        rather than a problem -- striding by part 1 still gives [0, 10) and [10, 15),
+        which are the real boundaries. The property is "part 1 is the stride", not "all
+        parts are equal".
+        """
         args = self.fake_aws(tmp_path, monkeypatch, 15, 2, {1: 10, 2: 5})
         meta = bench.s3_object_metadata(args)
-        assert meta["parts_uniform"] is True and meta["part_length"] == 10
+        assert meta["stride_verified"] is True and meta["part_length"] == 10
+
+    def test_two_equal_parts_also_fine(self, tmp_path, monkeypatch):
+        args = self.fake_aws(tmp_path, monkeypatch, 20, 2, {1: 10, 2: 10})
+        assert bench.s3_object_metadata(args)["stride_verified"] is True
+
+    def test_a_small_first_part_before_a_large_one_is_caught(self, tmp_path, monkeypatch):
+        """
+        Legal in S3 and the reason `last <= first` is the informative check when there
+        are only two parts, where the sum identity is trivially satisfied.
+        """
+        args = self.fake_aws(tmp_path, monkeypatch, 105, 2, {1: 5, 2: 100})
+        meta = bench.s3_object_metadata(args)
+        assert meta["stride_verified"] is False
+        assert meta["part_length"] is None
 
     def test_verification_is_declined_rather_than_wrong(self, tmp_path, monkeypatch):
         args = self.fake_aws(tmp_path, monkeypatch, 35, 3, {1: 10, 2: 20, 3: 5})
@@ -429,7 +448,7 @@ class TestPartLengthUniformity:
         size, verification = bench.resolve_source(args)
         assert size == 35
         assert verification.kind is None
-        assert "not uniform" in verification.label
+        assert "not the stride" in verification.label
 
     def test_an_endpoint_that_rejects_other_part_numbers_still_works(
             self, tmp_path, monkeypatch):
@@ -457,6 +476,43 @@ class TestPartLengthUniformity:
         args = bench.build_parser().parse_args(
             ["probe", "--s3-bucket", "b", "--s3-key", "k"])
         meta = bench.s3_object_metadata(args)
-        assert meta["parts_uniform"] is None, "should be unconfirmed, not failed"
+        assert meta["stride_verified"] is None, "should be unconfirmed, not failed"
         assert meta["part_length"] == 10, "must still use the part-1 stride"
-        assert "unconfirmed" in meta["uniformity"]
+        assert "unconfirmed" in meta["stride_check"]
+
+
+class TestDiskIdentification:
+    """
+    /proc/mounts records the resolved device, not the by-id symlink a GCE disk was mounted
+    through, so the disk name has to be recovered by matching the symlink target. Without
+    this the probe silently omits the PD type and size -- which is the cross-check against
+    §4.1's `dd`.
+    """
+
+    def gcloud_returning(self, monkeypatch, stdout):
+        import subprocess as sp
+        monkeypatch.setattr(bench.shutil, "which", lambda _: "/usr/bin/gcloud")
+        monkeypatch.setattr(bench.subprocess, "run",
+                            lambda cmd, **kw: sp.CompletedProcess(cmd, 0, stdout, ""))
+
+    def test_a_google_by_id_path_is_read_directly(self, monkeypatch):
+        self.gcloud_returning(monkeypatch, "pd-standard\t316\n")
+        out = bench.disk_details("/dev/disk/by-id/google-canine-bench-1789049197")
+        assert out["disk"] == "canine-bench-1789049197"
+        assert out["type"] == "pd-standard" and out["size_gb"] == 316
+
+    def test_a_resolved_device_is_matched_back_through_the_symlinks(
+            self, tmp_path, monkeypatch):
+        """The case that actually occurs on a node: /proc/mounts says /dev/sdb."""
+        real = tmp_path / "sdb"
+        real.write_text("")
+        link = tmp_path / "google-canine-bench-42"
+        link.symlink_to(real)
+        monkeypatch.setattr(bench.glob, "glob", lambda pattern: [str(link)])
+        self.gcloud_returning(monkeypatch, "pd-standard\t316\n")
+        assert bench.disk_details(str(real))["disk"] == "canine-bench-42"
+
+    def test_an_unmatched_device_gives_up_quietly(self, monkeypatch):
+        monkeypatch.setattr(bench.glob, "glob", lambda pattern: [])
+        self.gcloud_returning(monkeypatch, "")
+        assert bench.disk_details("/dev/sdc") is None

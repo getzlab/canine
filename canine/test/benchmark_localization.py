@@ -304,11 +304,21 @@ def disk_details(device):
     that small can be an order of magnitude slower than the NIC, in which case no number
     of connections helps and the sweep will show a flat line.
     """
-    name = os.path.basename(os.path.realpath(device))
-    match = re.search(r"google-(.+)$", device) or re.search(r"^(canine-.+)$", name)
-    if not (match and shutil.which("gcloud")):
+    # /proc/mounts records the resolved device (/dev/sdb), not the
+    # /dev/disk/by-id/google-<name> symlink it was mounted through -- so the disk name
+    # has to come from whichever by-id link points at the same device.
+    disk = None
+    match = re.search(r"google-(.+)$", device or "")
+    if match:
+        disk = match.group(1)
+    else:
+        target = os.path.realpath(device) if device else None
+        for link in glob.glob("/dev/disk/by-id/google-*"):
+            if target and os.path.realpath(link) == target:
+                disk = os.path.basename(link)[len("google-"):]
+                break
+    if not (disk and shutil.which("gcloud")):
         return None
-    disk = match.group(1)
     try:
         out = subprocess.run(
             ["gcloud", "compute", "disks", "describe", disk,
@@ -427,22 +437,24 @@ def probe_s3_endpoint(args):
     elif re.fullmatch(r"[0-9a-f]{32}-\d+", etag or ""):
         out["etag_kind"] = "multipart"
         say("etag        : {}  -- multipart (md5-of-md5s)".format(etag))
-        out["parts_uniform"] = meta.get("parts_uniform")
-        out["uniformity"] = meta.get("uniformity")
+        out["stride_verified"] = meta.get("stride_verified")
+        out["stride_check"] = meta.get("stride_check")
         part = out["part_length"]
-        if meta.get("parts_uniform") is False:
-            say("parts       : {} parts, but NOT uniform -- {}".format(
-                out["parts_count"], meta.get("uniformity")))
-            say("              S3 only requires non-final parts to be >= 5 MiB, so the")
-            say("              stride cannot be inferred. Striding by the wrong value")
-            say("              gives a wrong md5-of-md5s, and verify() would discard a")
-            say("              byte-perfect download as an ETag mismatch. ETag")
-            say("              verification is therefore DISABLED for this object.")
+        if meta.get("stride_verified") is False:
+            say("parts       : {} parts, but part 1's length is NOT the stride -- {}"
+                .format(out["parts_count"], meta.get("stride_check")))
+            say("              S3 only requires non-final parts to be >= 5 MiB, so a")
+            say("              5 MiB part followed by a 100 MiB one is legal. Striding")
+            say("              by the wrong value gives a wrong md5-of-md5s, and")
+            say("              verify() would discard a byte-perfect download as an")
+            say("              ETag mismatch. ETag verification is DISABLED here.")
         if part:
             # measured from head-object --part-number 1, not size/parts: the final part
             # is short, so dividing understates the real part length.
-            say("parts       : {} x {} (from --part-number 1; the last is shorter)"
-                .format(out["parts_count"], human(part)))
+            say("parts       : {} x {} stride, last part {} ({})".format(
+                out["parts_count"], human(part),
+                human(meta.get("last_part_length") or 0),
+                meta.get("stride_check") or "unchecked"))
             min_chunk = getattr(args, "min_chunk", None) or DEFAULT_MIN_CHUNK
             chunk = max(part, -(-min_chunk // part) * part)
             out["implied_chunk"] = chunk
@@ -959,8 +971,12 @@ def s3_object_metadata(args):
            # helper's caller onto it silently dropped the field, which a test caught
            "accept_ranges": meta.get("AcceptRanges"),
            "part_length": None,
-           "parts_uniform": None,
-           "uniformity": None}
+           # Not "are all the parts the same size" -- with two parts they nearly never
+           # are, since the last is the remainder. The question is narrower and is the
+           # one that matters: does striding the file by part 1's length reproduce the
+           # real part boundaries, so that md5-of-md5s reproduces the ETag?
+           "stride_verified": None,
+           "stride_check": None}
     if out["parts_count"] <= 1:
         return out
 
@@ -996,17 +1012,23 @@ def s3_object_metadata(args):
     out["last_part_length"] = last
 
     if first is None or size is None or last is None:
-        out["parts_uniform"] = None
-        out["uniformity"] = "unconfirmed (endpoint did not answer for part {})".format(
+        out["stride_verified"] = None
+        out["stride_check"] = "unconfirmed (endpoint did not answer for part {})".format(
             count)
         return out
 
     reasons = []
+    # For exactly two parts this identity is trivially true -- first + last is the size
+    # by definition -- so `last <= first` below is the only informative check there. It
+    # is also sufficient: with one non-final part, striding by it gives [0, first) and
+    # [first, size), which are the real boundaries.
     expected = (count - 1) * first + last
     if expected != size:
         reasons.append(
             "(count-1)*first + last = {} but the object is {}".format(expected, size))
     if last > first:
+        # legal in S3 -- only non-final parts must be >= 5 MiB -- but then part 1 is not
+        # the stride, e.g. a 5 MiB part followed by a 100 MiB one
         reasons.append("last part {} exceeds part 1 {}".format(last, first))
     if count >= 3:
         second = optional_head("--part-number 2")
@@ -1014,8 +1036,8 @@ def s3_object_metadata(args):
         if second is not None and second != first:
             reasons.append("part 2 is {}, part 1 is {}".format(second, first))
 
-    out["parts_uniform"] = not reasons
-    out["uniformity"] = "; ".join(reasons) if reasons else "consistent"
+    out["stride_verified"] = not reasons
+    out["stride_check"] = "; ".join(reasons) if reasons else "confirmed"
     if reasons:
         # The stride is unknown, so the ETag cannot be reproduced from it. Better no
         # verification than a verification that fails on correct data.
@@ -1108,10 +1130,10 @@ def resolve_source(args):
                     verification = Verification(
                         None, reason="multipart, but the ETag {!r} is not AWS-style "
                                      "md5-of-md5s".format(etag))
-            elif meta["parts_count"] > 1 and meta.get("parts_uniform") is False:
+            elif meta["parts_count"] > 1 and meta.get("stride_verified") is False:
                 verification = Verification(
-                    None, reason="parts are not uniform ({}), so the md5-of-md5s stride "
-                                 "is unknown".format(meta.get("uniformity")))
+                    None, reason="part 1 is not the stride ({}), so md5-of-md5s cannot "
+                                 "be reproduced".format(meta.get("stride_check")))
             else:
                 verification = Verification(
                     None, reason="the ETag {!r} is not an md5; this store does not follow "
