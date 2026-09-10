@@ -2962,7 +2962,11 @@ def run(options):
     attempt = 0
     while True:
         try:
-            source.probe_range(size)
+            # object_size, not size: when only a prefix of the object is wanted, the
+            # server's Content-Range total is the WHOLE object and comparing it against
+            # the prefix length declares the server broken. Defaults to size, so a
+            # production run -- where size is always the whole object -- is unchanged.
+            source.probe_range(options.object_size or size)
             break
         except RangeNotSupported as e:
             return single_stream_fallback(options, str(e))
@@ -3195,6 +3199,16 @@ def build_parser():
                         help="expected S3 multipart ETag")
     parser.add_argument("--part-length", dest="part_length", type=int,
                         help="S3 multipart part length, for ETag verification")
+    # Only a benchmark passes this. A prefix run asks for `--size` bytes of an object
+    # that is `--object-size` long, and probe_range's total-size equality check is
+    # otherwise correct and otherwise fatal: it sees the full object's length, does not
+    # match it against the prefix, raises RangeNotSupported and drops to a single stream.
+    # That is what happened -- every row of two GDC sweeps ran the same single curl while
+    # reporting per-connection results, and the transfer looked healthy at every other
+    # observable.
+    parser.add_argument("--object-size", dest="object_size", type=int, default=None,
+                        help="total size of the object when --size is only a prefix of "
+                             "it; defaults to --size")
     parser.add_argument("--url-refresh-cmd", dest="url_refresh_cmd",
                         help="shell command printing a fresh signed URL")
     parser.add_argument("--work-dir", action="append", default=[], dest="work_dir",

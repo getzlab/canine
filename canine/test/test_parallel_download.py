@@ -2123,3 +2123,86 @@ class TestEachChunkGetsItsOwnConnection:
         # the reading of a flat sweep.
         assert seen["requests"] >= 8, seen
         assert seen["connections"] == seen["requests"], seen
+
+
+class TestAPrefixOfALargerObjectStaysParallel:
+    """
+    probe_range compares the server's declared total against the size it was given. When
+    only a prefix is wanted those differ legitimately, and the check called the server
+    broken: RangeNotSupported, then single_stream_fallback. Both GDC sweeps ran every row
+    as one curl while reporting 1/4/8/12/16 connections, and every other observable --
+    byte count, hash, NIC ratio, throughput -- was consistent with a healthy transfer.
+
+    --object-size separates "how long the object is" from "how much of it to fetch".
+    """
+
+    def test_without_object_size_a_prefix_falls_back(self, tmp_path):
+        """The bug, pinned: this is what produced two void sweeps."""
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, MIB,          # 1 MiB of 4 MiB
+                                  "--connections", 4, "--min-chunk", 256 * 1024,
+                                  "--legacy-cmd",
+                                  "head -c {} /dev/zero > {}".format(MIB, dest))
+        assert proc.returncode == 0, proc.stderr
+        assert "falling back to a single stream" in proc.stderr
+        assert "k9pdl-streams" not in proc.stderr
+
+    def test_with_object_size_the_same_prefix_runs_parallel(self, tmp_path):
+        # 4 MiB of an 8 MiB object at 1 MiB chunks -> 4 chunks, 4 workers. min-chunk
+        # below CHUNK_ALIGN (1 MiB) rounds up, which would give one chunk and one worker
+        # and prove nothing about concurrency.
+        payload = os.urandom(8 * MIB)
+        with Server(payload) as server:
+            server.state.throttle_bytes = 32 * 1024
+            server.state.throttle_delay = 0.01
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, 4 * MIB,
+                                  "--object-size", len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        assert "falling back to a single stream" not in proc.stderr, proc.stderr
+        match = re.search(r"k9pdl-streams mean ([\d.]+) of (\d+) workers", proc.stderr)
+        assert match, proc.stderr
+        assert float(match.group(1)) > 1.5, match.group(0)
+
+    def test_the_prefix_bytes_are_correct(self, tmp_path):
+        """Parallel is worthless if it fetches the wrong bytes."""
+        payload = os.urandom(8 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, 4 * MIB,
+                                  "--object-size", len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        with open(dest, "rb") as fh:
+            got = fh.read()
+        assert got == payload[:4 * MIB]
+        assert len(got) == 4 * MIB, "the prefix must stop at --size"
+
+    def test_a_whole_object_download_is_unchanged(self, tmp_path):
+        """
+        Production never passes --object-size, and the check it relaxes is a real one
+        there: a declared total that differs from the handler's size means stale
+        metadata. Omitting the flag must still reject that.
+        """
+        payload = os.urandom(2 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, MIB,   # lie about the size
+                                  "--connections", 4, "--min-chunk", 256 * 1024,
+                                  "--legacy-cmd", "true")
+        assert "falling back to a single stream" in proc.stderr
+        assert "299" not in proc.stderr        # sanity: it is our mismatch, not a stub
+        assert "but {} was expected".format(MIB) in proc.stderr, proc.stderr
+
+    def test_object_size_equal_to_size_behaves_like_omitting_it(self, tmp_path):
+        payload = os.urandom(MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--object-size", len(payload),
+                                  "--connections", 4, "--min-chunk", 256 * 1024)
+        assert proc.returncode == 0, proc.stderr
+        assert "falling back to a single stream" not in proc.stderr

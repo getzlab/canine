@@ -54,6 +54,7 @@ import os
 import platform
 import random
 import re
+import urllib.request
 import shlex
 import shutil
 import signal
@@ -900,6 +901,11 @@ def source_args(args, dest, size):
     if getattr(args, "prefix", False):
         # otherwise the connections=1 row fetches the whole object, not `size` bytes
         base += ["--legacy-cmd", url_legacy_command(args, dest, size)]
+        # and without this the parallel rows are not parallel at all -- see
+        # url_object_size
+        total = getattr(args, "object_size", None)
+        if total:
+            base += ["--object-size", str(total)]
     return base
 
 
@@ -973,8 +979,15 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     # the worker pool.
     streams = re.search(r"k9pdl-streams mean ([\d.]+) of (\d+) workers", stderr)
 
+    # The downloader announces this and then behaves correctly, so nothing downstream
+    # notices: the bytes arrive, the hash matches, the throughput is real. What is not
+    # real is the connection count in the table. Two whole GDC sweeps were reported as
+    # per-connection results when every row was the same single curl.
+    fell_back = re.search(r"falling back to a single stream: (.*)", stderr)
+
     return {
         "phases": phases,
+        "fell_back": fell_back.group(1).strip() if fell_back else None,
         "mean_streams": float(streams.group(1)) if streams else None,
         "workers": int(streams.group(2)) if streams else None,
         "connections": connections,
@@ -1171,6 +1184,48 @@ class Verification:
         return "NOT VERIFIED -- {}".format(self.reason or "no digest available")
 
 
+def parsed_headers(args):
+    out = {}
+    for item in getattr(args, "header", None) or []:
+        name, _, value = item.partition(":")
+        if value:
+            out[name.strip()] = value.strip()
+    return out
+
+
+def url_object_size(args):
+    """
+    The object's total length, from `Content-Range` on a one-byte ranged GET.
+
+    Needed only in --prefix mode, and needed there because probe_range compares the
+    server's declared total against the size it was given. Handed a prefix length it
+    concludes the server is not honouring Range, raises RangeNotSupported, and the
+    downloader drops to a single stream -- which is exactly what happened: every row of
+    two GDC sweeps ran the same single curl while the table reported them as 1, 4, 8, 12
+    and 16 connections. Nothing else looked wrong; the byte count, the wire ratio and the
+    throughput were all consistent with a healthy transfer, because it was one.
+
+    Returns None if the total cannot be determined, which leaves --object-size unset and
+    the old behaviour in place rather than guessing.
+    """
+    request = urllib.request.Request(args.url, headers=parsed_headers(args))
+    request.add_header("Range", "bytes=0-0")
+    try:
+        response = urllib.request.urlopen(request, timeout=60)
+    except Exception as e:                      # noqa: BLE001 -- any failure is "unknown"
+        say("could not determine the object size ({}); --object-size unset".format(e))
+        return None
+    try:
+        content_range = (response.headers.get("Content-Range") or "").strip()
+    finally:
+        response.close()
+    match = re.match(r"^bytes 0-0/(\d+)$", content_range)
+    if not match:
+        say("Content-Range was {!r}; --object-size unset".format(content_range))
+        return None
+    return int(match.group(1))
+
+
 def redact_url(url):
     """
     Drop the query string, keeping enough of the URL to identify the object.
@@ -1286,6 +1341,11 @@ def resolve_source(args):
             None, reason="no --md5 given and the source carries no usable digest")
     if size is None:
         raise SystemExit("--size is required for this source (only S3 can report it)")
+
+    # Once, here, rather than per row: source_args runs for every setting and this is a
+    # network round trip.
+    if getattr(args, "prefix", False) and (getattr(args, "url", None) or "").strip():
+        args.object_size = url_object_size(args)
     return size, verification
 
 
@@ -1306,6 +1366,12 @@ def command_sweep(args):
     say("size      : {}".format(human(size)))
     say("dest dir  : {}".format(args.dest_dir))
     say("downloader: {}".format(describe_downloader()))
+    if getattr(args, "prefix", False):
+        total = getattr(args, "object_size", None)
+        say("object size: {}".format(
+            "{} -- fetching a {} prefix".format(human(total), human(size)) if total
+            else "UNKNOWN -- probe_range will reject the prefix and every row will "
+                 "fall back to a single stream"))
     say("verify    : {}".format(verification.label))
     if getattr(args, "prefix", False):
         say("baseline  : ranged curl (--prefix), so connections=1 fetches the same "
@@ -1376,6 +1442,9 @@ def command_sweep(args):
         if outcome["phases"]:
             say("        phases: {}".format("  ".join(
                 "{} {:.1f}s".format(k, v) for k, v in outcome["phases"].items())))
+        if outcome.get("fell_back"):
+            say("        NOT PARALLEL: fell back to a single stream -- {}".format(
+                outcome["fell_back"]))
         if outcome.get("mean_streams") is not None:
             say("        streams: {:.2f} of {} concurrent on average".format(
                 outcome["mean_streams"], outcome["workers"]))
@@ -1515,8 +1584,25 @@ def command_sweep(args):
     # Independent of the speedup block below, which is skipped entirely when there is no
     # connections=1 row -- so its own "no streams figure" branch did not fire on a
     # single-setting run, and the run reported nothing at all about concurrency.
+    dropped = [r for r in usable if r["connections"] > 1 and r.get("fell_back")]
+    if dropped:
+        heading("NOT A PARALLEL MEASUREMENT")
+        say("{} of {} parallel settings fell back to a single stream, so the connection"
+            .format(len(dropped), len([r for r in usable if r["connections"] > 1])))
+        say("count in the table above is fiction for those rows -- they ran the same one")
+        say("request. Reason given:")
+        say()
+        for row in dropped:
+            say("  {:>3} connections: {}".format(row["connections"], row["fell_back"]))
+        say()
+        say("Nothing here measures parallelism. The most likely cause in --prefix mode is")
+        say("a missing --object-size: probe_range compares the server's declared total")
+        say("against the size it was given, and a prefix does not match it.")
+        say()
+
     silent = [r for r in usable
-              if r["connections"] > 1 and r.get("mean_streams") is None]
+              if r["connections"] > 1 and r.get("mean_streams") is None
+              and not r.get("fell_back")]
     if silent:
         heading("NO CONCURRENCY FIGURE")
         say("{} of {} parallel settings reported no `streams:` line, so this run does"

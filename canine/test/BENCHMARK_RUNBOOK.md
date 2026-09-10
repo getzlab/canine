@@ -1100,6 +1100,28 @@ Pooling those (one connection per worker) is an optimization available to the pr
 path and not taken; if the sweep shows the two paths closer than the startup estimate
 predicts, handshake cost dominating both is the likely reason.
 
+**A prefix run needs `--object-size`, and the benchmark discovers it for you.** This is
+the trap that voided the first two GDC sweeps. `probe_range` compares the server's
+declared total against the size it was given; handed a 4 GiB prefix of a 279 GiB object it
+concluded Range was not honoured, raised `RangeNotSupported`, and the downloader dropped
+to a single stream — for **every** row, while the table went on reporting them as 1, 4, 8,
+12 and 16 connections. Nothing else looked wrong: right byte count, `wire: 1.01x`, real
+throughput. The flat line everyone read as "this source caps aggregate bandwidth" was one
+curl measured five times.
+
+Two things now prevent a repeat. `--prefix` makes the benchmark learn the object's total
+from `Content-Range` on a one-byte GET and pass it as `--object-size`, and the header says
+what it found:
+
+```
+object size: 278.94 GiB -- fetching a 4.00 GiB prefix
+```
+
+`UNKNOWN` there means the probe failed and every row is about to fall back — stop and fix
+that first. And any row that falls back is now marked `NOT PARALLEL` with the server's own
+reason, with a `NOT A PARALLEL MEASUREMENT` section in the verdict, so the connection
+column can never again be read as real when it isn't.
+
 **`--prefix` is not optional when `--size` is smaller than the object.** The parallel rows
 plan chunks over `[0, size)` and stop there, but the `connections=1` row is the legacy path,
 and the downloader's single-stream fallback synthesizes `curl -C - -sSL -o dest url` with

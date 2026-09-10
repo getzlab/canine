@@ -1134,3 +1134,164 @@ class TestWrittenPathsSayWhichFilesystem:
         assert '"$NODE:/tmp/*.json"' not in text
         assert "docker cp" in text.split("## 9.")[1], \
             "9 must copy the results out of the container first"
+
+
+class TestASilentFallbackIsNotAParallelMeasurement:
+    """
+    Both GDC sweeps reported results for connections 1, 4, 8, 12 and 16 while every row
+    ran the same single curl. probe_range compares the server's declared total against
+    the size it was given; in --prefix mode that total is the whole 279 GiB object and
+    the size is a 4 GiB slice, so it concluded Range was not honoured, raised
+    RangeNotSupported, and the downloader fell back to a single stream.
+
+    Nothing else looked wrong. The bytes arrived, `wire:` was 1.01x, the throughput was
+    real -- 16.62, 16.69, 16.51, 15.81, 16.73 MiB/s, which reads as a flat source and was
+    in fact a constant experiment. The conclusion drawn from it (that this source caps
+    aggregate bandwidth) was about nothing at all.
+    """
+
+    def sweep(self, tmp_path, monkeypatch, rows):
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, conns, min_chunk, **kw):
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            spec = rows[conns]
+            return {"connections": conns, "returncode": 0, "seconds": 10.0,
+                    "killed": False, "peak_rss": 1 << 20,
+                    "phases": {"download": 10.0}, "nic_bytes": len(payload),
+                    "disk_bytes": len(payload), "peak_nic_bytes_per_s": 1e8,
+                    "peak_disk_bytes_per_s": 1e3, "stderr_tail": [],
+                    "fell_back": spec.get("fell_back"),
+                    "mean_streams": spec.get("streams"),
+                    "workers": conns if spec.get("streams") else None}
+
+        downloader = tmp_path / "parallel_download.py"
+        downloader.write_bytes(b"# stand-in\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(downloader))
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload), bench.Verification("md5", digest)))
+        bench.command_sweep(bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+             "--dest-dir", str(tmp_path),
+             "--connections"] + [str(c) for c in sorted(rows)]))
+
+    def test_a_fallen_back_row_is_marked(self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch,
+                   {16: {"fell_back": "server reports size 299481061742 but 4294967296 "
+                                      "was expected"}})
+        out = capsys.readouterr().out
+        assert "NOT PARALLEL" in out
+        assert "299481061742" in out, "the server's own reason must be shown"
+
+    def test_the_verdict_refuses_to_call_it_a_measurement(self, tmp_path, monkeypatch,
+                                                          capsys):
+        self.sweep(tmp_path, monkeypatch, {16: {"fell_back": "range not honoured"}})
+        out = capsys.readouterr().out
+        assert "NOT A PARALLEL MEASUREMENT" in out
+        assert "--object-size" in out, "the likely cause must be named"
+
+    def test_a_real_parallel_run_is_not_flagged(self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch, {16: {"streams": 15.8}})
+        out = capsys.readouterr().out
+        assert "NOT PARALLEL" not in out
+        assert "NOT A PARALLEL MEASUREMENT" not in out
+
+    def test_a_fallback_does_not_also_trip_the_missing_figure_warning(
+            self, tmp_path, monkeypatch, capsys):
+        """
+        A fallen-back row legitimately has no streams figure. Reporting both would bury
+        the real cause under a guess about a stale downloader.
+        """
+        self.sweep(tmp_path, monkeypatch, {16: {"fell_back": "range not honoured"}})
+        assert "NO CONCURRENCY FIGURE" not in capsys.readouterr().out
+
+    def test_the_connections_one_row_may_fall_back_without_complaint(
+            self, tmp_path, monkeypatch, capsys):
+        """connections=1 IS the fallback -- it is the baseline, not a defect."""
+        self.sweep(tmp_path, monkeypatch,
+                   {1: {"fell_back": "connections <= 1"}, 16: {"streams": 15.8}})
+        assert "NOT A PARALLEL MEASUREMENT" not in capsys.readouterr().out
+
+
+class TestThePrefixRunLearnsTheObjectSize:
+    """Without --object-size the prefix rows are not parallel at all."""
+
+    def args(self, *extra):
+        return bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", "1024",
+             "--dest-dir", "/d"] + list(extra))
+
+    def test_the_size_is_forwarded_when_known(self):
+        args = self.args("--prefix")
+        args.object_size = 299481061742
+        source = bench.source_args(args, "/d/f", 1024)
+        assert "--object-size" in source
+        assert source[source.index("--object-size") + 1] == "299481061742"
+
+    def test_nothing_is_forwarded_without_prefix(self):
+        args = self.args()
+        args.object_size = 299481061742
+        assert "--object-size" not in bench.source_args(args, "/d/f", 1024)
+
+    def test_an_unknown_size_forwards_nothing(self):
+        """Better to leave the flag off than to guess a total."""
+        args = self.args("--prefix")
+        args.object_size = None
+        assert "--object-size" not in bench.source_args(args, "/d/f", 1024)
+
+    def test_the_total_comes_from_content_range(self, monkeypatch):
+        class FakeResponse:
+            headers = {"Content-Range": "bytes 0-0/299481061742"}
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(bench.urllib.request, "urlopen",
+                            lambda *a, **kw: FakeResponse())
+        assert bench.url_object_size(self.args("--prefix")) == 299481061742
+
+    def test_a_missing_content_range_is_reported_not_guessed(self, monkeypatch, capsys):
+        class FakeResponse:
+            headers = {}
+
+            def close(self):
+                pass
+
+        monkeypatch.setattr(bench.urllib.request, "urlopen",
+                            lambda *a, **kw: FakeResponse())
+        assert bench.url_object_size(self.args("--prefix")) is None
+        assert "Content-Range" in capsys.readouterr().out
+
+    def test_headers_reach_the_size_probe(self, monkeypatch):
+        """A private object needs the auth header here too, or the probe 403s."""
+        seen = {}
+
+        class FakeResponse:
+            headers = {"Content-Range": "bytes 0-0/10"}
+
+            def close(self):
+                pass
+
+        def fake_urlopen(request, **kw):
+            seen["headers"] = dict(request.headers)
+            return FakeResponse()
+
+        monkeypatch.setattr(bench.urllib.request, "urlopen", fake_urlopen)
+        bench.url_object_size(self.args("--prefix", "--header", "Authorization: Bearer t"))
+        assert seen["headers"].get("Authorization") == "Bearer t"
+        assert seen["headers"].get("Range") == "bytes=0-0"
+
+    def test_the_header_warns_when_the_size_is_unknown(self, capsys, tmp_path):
+        args = self.args("--prefix")
+        args.object_size = None
+        args.connections = [16]
+        args.dest_dir = str(tmp_path)
+        try:
+            bench.command_sweep(args)
+        except BaseException:
+            pass
+        out = capsys.readouterr().out
+        assert "UNKNOWN" in out and "fall back to a single stream" in out
