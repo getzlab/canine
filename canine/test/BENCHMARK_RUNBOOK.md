@@ -615,17 +615,24 @@ read-only attachments and cannot back the published artifact whatever their thro
 sudo docker exec slurm bash -c '
   set -e
   D=/mnt/rwdisks/'"$DISK"'
-  echo -n "write: "
-  dd if=/dev/zero of=$D/ddtest bs=1M count=8000 oflag=direct conv=fdatasync 2>&1 | tail -1
+  echo "=== write"
+  dd if=/dev/zero of=$D/ddtest bs=1M count=8000 \
+     oflag=direct conv=fdatasync status=progress
   sync
-  echo -n "read : "
-  dd if=$D/ddtest of=/dev/null bs=1M iflag=direct 2>&1 | tail -1
+  echo "=== read"
+  dd if=$D/ddtest of=/dev/null bs=1M iflag=direct status=progress
   rm -f $D/ddtest'
 ```
 
 `oflag=direct` / `iflag=direct` bypass the page cache, so these are the disk and not RAM.
 8000 MiB is enough to be past any burst behaviour and small enough to finish quickly even
 if the pessimistic figure is right.
+
+**`status=progress` and no `| tail -1`, deliberately.** This takes between 35 seconds and
+four minutes depending on which way the answer falls, and an earlier version printed a
+label with `echo -n` and piped `dd` through `tail`, so it emitted `write: ` and then
+nothing until it finished — indistinguishable from a shell waiting for input. Live progress
+costs nothing and removes the ambiguity.
 
 **Take the read number too.** It is what every downstream consumer of the rodisk
 experiences, and — more immediately — what `verify()`'s full 279 GB read-back will run at,
