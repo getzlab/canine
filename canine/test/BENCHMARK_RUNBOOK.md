@@ -685,6 +685,65 @@ for the first time on a real destination:
 * **`pd type` / `write cap`** — the per-GB prediction, to set against what `dd` just
   measured. If they disagree, trust `dd`.
 
+### 4.1a Concurrency: a single stream does not saturate the disk
+
+**§4.1's 92.3 MB/s is the single-stream rate, not the disk's ceiling.** The evidence came
+from an accident: when a straggler `dd` overlapped a fresh one, the fresh one still managed
+**69.5 MB/s — 75% of solo, not 50%**. A fixed-bandwidth device would have given each 46.
+So aggregate was around 139 MB/s, roughly **1.5× solo from two writers**, and the
+relationship is non-linear.
+
+That matters because **nothing in this system writes with one stream.** The downloader
+issues `pwrite` from N threads, and `multipart_etag` reads from N threads. Both are the
+multi-stream case, so the ceiling they see is the aggregate — not 92.
+
+```bash
+# on the node. ~16 GB written at the widest setting; a few minutes total.
+sudo docker exec slurm bash -c '
+  set -e
+  D=/mnt/rwdisks/'"$DISK"'
+  MIB=2000
+  for N in 1 2 4 8; do
+    rm -f $D/cc.*
+    start=$(date +%s)
+    for i in $(seq 1 $N); do
+      dd if=/dev/zero of=$D/cc.$i bs=1M count=$MIB oflag=direct conv=fdatasync \
+        2>/dev/null &
+    done
+    wait
+    el=$(( $(date +%s) - start )); [ $el -eq 0 ] && el=1
+    echo "write $N x ${MIB} MiB in ${el}s = $(( N * MIB / el )) MiB/s aggregate"
+  done
+  sync
+  for N in 1 2 4 8; do
+    start=$(date +%s)
+    for i in $(seq 1 $N); do
+      dd if=$D/cc.$i of=/dev/null bs=1M iflag=direct 2>/dev/null &
+    done
+    wait
+    el=$(( $(date +%s) - start )); [ $el -eq 0 ] && el=1
+    echo "read  $N x ${MIB} MiB in ${el}s = $(( N * MIB / el )) MiB/s aggregate"
+  done
+  rm -f $D/cc.*'
+```
+
+The read sweep reuses the eight files the write sweep leaves, so `N` readers read `N`
+distinct files — which is what the downloader and the verifier actually do, rather than
+several threads contending on one file.
+
+What the answer changes:
+
+* **Aggregate keeps climbing to N=8** → the disk is not the constraint at any realistic
+  connection count. The download is bounded by the source, and §6.1's tmpfs sweep gives the
+  real ceiling.
+* **Aggregate plateaus at some N** → that plateau is the disk-imposed ceiling, and it is the
+  number to divide 279 GiB by. It also caps how much §6's `connections` sweep can ever show.
+* **Read aggregate ≫ 91.6** → parallelising the `verify()` read-back genuinely helps, and
+  `multipart_etag`'s existing thread pool (§13.19) recovers part of the 0.91 h rather than
+  nothing. In-transfer hashing is still strictly better, since it reads zero.
+
+Record all three numbers: single-stream, the plateau, and the N at which it plateaus.
+
 ### 4.1b Does the rate scale with size? — optional, and quota-heavy
 
 **Run this only if §4.1 came back near 38 MB/s.** A single measurement tells you the rate;
