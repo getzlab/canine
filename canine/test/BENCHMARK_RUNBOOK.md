@@ -659,10 +659,20 @@ costs nothing and removes the ambiguity.
 experiences, and — more immediately — what `verify()`'s full 279 GB read-back will run at,
 which §6.3 reports as its own phase.
 
+**MEASURED, 2026-09: 92.3 MB/s write, 91.6 MB/s read** — 2.43× the per-GB model's
+prediction of 37.9 MB/s. The model does not describe this path, so §10 does not apply, and
+today's 21 MB/s is **23% of the disk**: 4.4× headroom.
+
 | Measured write on the 316 GB pd-standard | Reading |
 |---|---|
-| **≫ 38 MB/s** — e.g. 100 MB/s+ | **The likely outcome, per §0.** The per-GB model does not describe this path; the disk is not the localization bottleneck; today's 21 MB/s is source-bound; the downloader has full headroom and ≥4× is available. §10 does not apply. |
-| **≈ 38 MB/s** | The per-GB model holds. The disk is close to binding, achievable localization time is set by disk size, and §10's analysis is live. |
+| **≫ 38 MB/s** — what happened, at 92.3 | The per-GB model does not describe this path; the disk is not the current bottleneck; today's 21 MB/s is source-bound; ≥4× is available and the disk binds at 4.44×. §10 does not apply. |
+| **≈ 38 MB/s** | The per-GB model holds and §10's analysis is live. Did not occur. |
+
+**Read and write are symmetric, which is the consequential part.** `verify()` re-reads the
+whole object on this route, so at 91.6 MB/s that read-back costs 0.91 h against the
+download's 0.90 h — **half the wall clock**, turning 4.44× into 2.21×. See §13.19 and
+§13.31: making the in-place route hash during transfer is worth exactly a doubling, and is
+the highest-value change left.
 
 Then **re-run `pdl probe`**. There is now a block-device-backed candidate, so it reports
 for the first time on a real destination:
