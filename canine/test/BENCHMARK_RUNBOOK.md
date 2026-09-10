@@ -1038,7 +1038,35 @@ pdl sweep --url "$PRESIGNED_URL" --prefix \
 
 No `--s3-*` flags here, for the reason spelled out in §6.4: they would derive the ETag of
 the *whole* 279 GiB object, which a 12 GiB slice cannot match, so every row would fail
-verification.
+verification. (The benchmark now declines rather than letting you find out at row 1.)
+
+**This baseline is not the one your 4-hour localizations ran.** `--url` selects
+`HttpSource`, whose `connections=1` row is a single ranged `curl`. Production's legacy path
+for an `s3://` input is `aws s3api get-object --range` — `file_handlers.py:1239` — and
+`aws` is a Python CLI, which §13.38 measured costing 1.7× against `curl` on the same
+object (`gcloud storage` 60 MB/s versus `curl` 103 MB/s). So the curl baseline probably
+*understates* the speedup, by a factor nobody has measured.
+
+Run the `aws`-based baseline too, then, and report both:
+
+```bash
+# S3ApiSource: --url absent, so connections=1 is `aws s3api get-object --range`,
+# the command production actually replaced
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" --prefix \
+          --size $((12 * 1024 * 1024 * 1024)) \
+          --dest-dir /mnt/tmpfs --connections 1 4 8 12 16 \
+          --json /tmp/knee-gdc-s3api.json
+```
+
+`--prefix` matters here for the same reason: production's range is `bytes=$SZ-`, open-ended
+because there `--size` is always the whole object. Under a truncated `--size` that fetches
+all 279 GiB; `--prefix` bounds it to `bytes=$SZ-<last>`.
+
+Note that this run also measures the per-chunk process cost on the parallel rows — one
+`aws` process per chunk — so its parallel numbers are a *floor*, and the presigned rows
+above are what production would do when presigning works. Two knees, two baselines: the
+honest speedup for the BAM is the `aws s3api` baseline against the presigned parallel rows.
 
 **`--prefix` is not optional when `--size` is smaller than the object.** The parallel rows
 plan chunks over `[0, size)` and stop there, but the `connections=1` row is the legacy path,

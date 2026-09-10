@@ -917,3 +917,52 @@ class TestAPrefixDoesNotBorrowTheWholeObjectsEtag:
         _, verification = bench.resolve_source(self.s3_args("--prefix"))
         assert "NOT VERIFIED" in verification.label
         assert "6.3/6.4" in verification.label
+
+
+class TestTheS3BaselineIsBoundedToo:
+    """
+    The same defect as the URL baseline, in the other legacy command. `bytes=$SZ-` is
+    open-ended: right in production, where self.size is the object's real size, and wrong
+    under a truncated --size, where it fetches all 279 GiB while the parallel rows fetch
+    12. Found by asking why the baseline curls rather than using `aws s3api` -- which for
+    an s3:// source production does, making this the comparator that actually matters.
+    """
+
+    def parse(self, *extra):
+        return bench.build_parser().parse_args(
+            ["sweep", "--s3-bucket", "b", "--s3-key", "k", "--size", "1024",
+             "--dest-dir", "/d"] + list(extra))
+
+    def test_prefix_bounds_the_range(self):
+        command = bench.s3_legacy_command(self.parse("--prefix"), "/d/f", 1024)
+        assert '"bytes=$SZ-1023"' in command, command
+
+    def test_without_prefix_the_range_stays_open_ended(self):
+        """
+        Production parity: HandleAWSURL emits bytes=$SZ- and resumes by appending. If the
+        benchmark bounded it unconditionally it would stop reproducing the command it
+        exists to measure.
+        """
+        command = bench.s3_legacy_command(self.parse(), "/d/f", 1024)
+        assert '"bytes=$SZ-"' in command, command
+
+    def test_the_bound_is_the_last_byte_not_the_length(self):
+        for size in (1, 2, 1024, 12 * 1024 ** 3):
+            command = bench.s3_legacy_command(self.parse("--prefix"), "/d/f", size)
+            assert '"bytes=$SZ-{}"'.format(size - 1) in command, command
+
+    def test_the_s3_baseline_is_what_an_s3_source_gets(self):
+        """--url absent selects S3ApiSource, whose baseline must be the aws command."""
+        source = bench.source_args(self.parse("--prefix"), "/d/f", 1024)
+        command = source[source.index("--legacy-cmd") + 1]
+        assert "aws s3api" in command and "curl" not in command, command
+
+    def test_production_is_not_bounded_by_this_change(self):
+        """
+        The guard belongs to the benchmark only. HandleAWSURL's own fallback must keep
+        its open-ended range -- it always downloads a whole object, and bounding it there
+        would break resume for anything whose size the handler got wrong.
+        """
+        with open(os.path.join(os.path.dirname(__file__), os.pardir,
+                               "localization", "file_handlers.py")) as handle:
+            assert '--range "bytes=$SZ-"' in handle.read()

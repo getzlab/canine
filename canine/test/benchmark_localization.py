@@ -832,14 +832,22 @@ def s3_legacy_command(args, dest, size):
     It cannot be the synthesized `curl -C -` the URL path gets: on the S3 API path there
     is no URL to curl. Uses process substitution, hence bash -- which the downloader
     already runs legacy commands under.
+
+    `bytes=$SZ-` is open-ended, which is right in production -- `self.size` there is
+    always the object's real size -- and wrong here for the same reason the URL baseline
+    was: under a truncated `--size` it fetches the whole object while the parallel rows
+    fetch `size` bytes, so the two are not comparable and the destination fills. Under
+    --prefix the range gets an explicit upper bound.
     """
+    upper = size - 1 if getattr(args, "prefix", False) else ""
     return (
         "[ -f {path} ] && SZ=$(stat --printf '%s' {path}) || SZ=0; "
         "if [ $SZ != {size} ]; then "
         "aws s3api {extra} get-object --bucket {bucket} --key {key} "
-        '--range "bytes=$SZ-" >(cat >> {path}) > /dev/null; fi'
+        '--range "bytes=$SZ-{upper}" >(cat >> {path}) > /dev/null; fi'
     ).format(path=shlex.quote(dest), size=size, extra=s3_extra_args(args),
-             bucket=shlex.quote(args.s3_bucket), key=shlex.quote(args.s3_key))
+             bucket=shlex.quote(args.s3_bucket), key=shlex.quote(args.s3_key),
+             upper=upper)
 
 
 def url_legacy_command(args, dest, size):
