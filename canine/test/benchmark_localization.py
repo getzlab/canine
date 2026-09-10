@@ -45,6 +45,7 @@ disk: BENCHMARK_RUNBOOK.md, beside this file.
 
 import argparse
 import configparser
+import ctypes
 import errno
 import glob
 import hashlib
@@ -241,17 +242,42 @@ def probe_seek_hole(directory):
             pass
 
 
+def punch_hole(fd, offset, length):
+    """
+    fallocate(2) with FALLOC_FL_PUNCH_HOLE, through ctypes.
+
+    Python exposes no fallocate() taking a mode and no FALLOC_FL_* constants -- not
+    os.fallocate, not os.posix_fallocate. An earlier capability probe tested
+    hasattr(os, "fallocate") and therefore reported "unsupported" on every platform,
+    including ext4 where the syscall works, which is why the page-cache-loss test never
+    ran anywhere.
+
+    Raises OSError when the platform or filesystem cannot do it, which is the honest
+    signal -- macOS has no fallocate(2) at all (it uses fcntl F_PUNCHHOLE).
+    """
+    FALLOC_FL_KEEP_SIZE = 0x01
+    FALLOC_FL_PUNCH_HOLE = 0x02
+    libc = ctypes.CDLL(None, use_errno=True)
+    if not hasattr(libc, "fallocate"):
+        raise OSError(errno.ENOSYS, "libc has no fallocate(2)")
+    libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int64, ctypes.c_int64]
+    libc.fallocate.restype = ctypes.c_int
+    if libc.fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                      offset, length) != 0:
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
 def probe_punch_hole(directory):
-    if not (hasattr(os, "fallocate") and hasattr(os, "FALLOC_FL_PUNCH_HOLE")):
-        return {"supported": False, "reason": "no FALLOC_FL_PUNCH_HOLE on this platform"}
     path = os.path.join(directory, ".benchpunch.{}".format(os.getpid()))
     try:
         with open(path, "wb") as fh:
             fh.write(b"A" * (4 * MIB))
         fd = os.open(path, os.O_RDWR)
         try:
-            os.fallocate(fd, os.FALLOC_FL_PUNCH_HOLE | os.FALLOC_FL_KEEP_SIZE,
-                         MIB, MIB)
+            punch_hole(fd, MIB, MIB)
+            os.fsync(fd)
         finally:
             os.close(fd)
         with open(path, "rb") as fh:
@@ -1359,8 +1385,8 @@ def command_resume(args):
         say("machine for lack of FALLOC_FL_PUNCH_HOLE, so it runs here for the first time.")
         fd = os.open(dest, os.O_RDWR)
         try:
-            os.fallocate(fd, os.FALLOC_FL_PUNCH_HOLE | os.FALLOC_FL_KEEP_SIZE,
-                         args.size // 3, min(64 * MIB, args.size // 4))
+            punch_hole(fd, args.size // 3, min(64 * MIB, args.size // 4))
+            os.fsync(fd)
         finally:
             os.close(fd)
         marker = os.path.join(os.path.dirname(dest),

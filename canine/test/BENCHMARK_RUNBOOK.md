@@ -554,9 +554,11 @@ Confirm before going further:
   and declines to draw a frontier conclusion from it. **Re-run `probe` after §4** mounts the
   real disk; that result is the one to record.
 
-Note also `punch-hole : no` on overlay. `FALLOC_FL_PUNCH_HOLE` is not supported there, so
-§6.5's page-cache-loss test needs the ext4 localization disk — another reason the
-post-§4 probe is the meaningful one.
+**Do not trust a `punch-hole : no` from before this was fixed.** The probe gated on
+`hasattr(os, "fallocate")`, and Python exposes no `fallocate()` taking a mode — so it
+answered "no" on every platform and filesystem, ext4 included. It now calls `fallocate(2)`
+through ctypes, so the answer means something. Whether overlay supports hole punching is
+genuinely unknown until a fixed probe reports on it; ext4 should say yes.
 
 With S3 arguments it additionally reports, none of which needs the disk:
 

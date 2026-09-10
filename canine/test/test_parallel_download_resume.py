@@ -18,6 +18,7 @@ output, so these tests assert on outcomes rather than on the mechanism, and the
 mechanism-specific arithmetic is unit-tested in test_parallel_download.py.
 """
 
+import ctypes
 import hashlib
 import json
 import os
@@ -437,25 +438,55 @@ def punch_hole(path, offset, length):
     SIGKILL does not discard dirty pages, so bytes the killed process wrote still reach
     disk, whereas a vanished VM loses them.
 
-    Linux/ext4 (the localization PD, and CI) has FALLOC_FL_PUNCH_HOLE. macOS exposes
-    fcntl F_PUNCHHOLE, but it returns EINVAL on APFS here, so these tests skip locally
-    and run where the production filesystem actually is.
+    Linux/ext4 -- the localization PD -- supports it. macOS has no fallocate(2) at all
+    (it exposes fcntl F_PUNCHHOLE instead), so this returns False there and the test
+    skips.
+
+    Called through ctypes because **Python exposes no fallocate() taking a mode, and no
+    FALLOC_FL_* constants** -- not os.fallocate, not os.posix_fallocate. This function
+    previously gated on `hasattr(os, "fallocate")`, which is False on every platform, so
+    it returned False unconditionally and this test skipped everywhere including ext4.
+    The skip message said "platform/filesystem", which read like a macOS limitation
+    rather than a broken predicate, and it went unexamined for the whole of development.
     """
-    if not (hasattr(os, "fallocate") and hasattr(os, "FALLOC_FL_PUNCH_HOLE")):
+    FALLOC_FL_KEEP_SIZE = 0x01
+    FALLOC_FL_PUNCH_HOLE = 0x02
+    libc = ctypes.CDLL(None, use_errno=True)
+    if not hasattr(libc, "fallocate"):
         return False
+    libc.fallocate.argtypes = [ctypes.c_int, ctypes.c_int,
+                               ctypes.c_int64, ctypes.c_int64]
+    libc.fallocate.restype = ctypes.c_int
     try:
         fd = os.open(path, os.O_RDWR)
     except OSError:
         return False
     try:
-        os.fallocate(
-            fd, os.FALLOC_FL_PUNCH_HOLE | os.FALLOC_FL_KEEP_SIZE, offset, length
-        )
+        if libc.fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE,
+                          offset, length) != 0:
+            return False
+        os.fsync(fd)
         return True
-    except OSError:
-        return False
     finally:
         os.close(fd)
+
+
+def test_nothing_may_gate_punch_hole_on_the_os_module():
+    """
+    Python exposes no fallocate() taking a mode and no FALLOC_FL_* constants, so a check
+    like `hasattr(os, "fallocate")` is False on every platform and silently disables
+    whatever it guards.
+
+    This exists because exactly that dead predicate hid the page-cache-loss test -- the
+    one case SIGKILL cannot simulate -- for the whole of development, behind a skip
+    message that read like a macOS limitation. If a future Python gains the API this will
+    fail, which is the right prompt to revisit punch_hole() rather than to leave a
+    ctypes call in place unnecessarily.
+    """
+    assert not hasattr(os, "fallocate"), \
+        "os.fallocate now exists; punch_hole() can be simplified"
+    assert not hasattr(os, "FALLOC_FL_PUNCH_HOLE"), \
+        "os.FALLOC_FL_PUNCH_HOLE now exists; punch_hole() can be simplified"
 
 
 def rebuild_completed_manifest(dest, url, payload_len, connections, expected_hash):
@@ -502,7 +533,13 @@ class TestSimulatedPageCacheLoss:
 
             # blow away a window in the middle of the written region
             if not punch_hole(dest, 4 * MIB, 2 * MIB):
-                pytest.skip("no punch-hole support on this platform/filesystem")
+                pytest.skip(
+                    "fallocate(2) unavailable: {}. On Linux/ext4 this test runs; on "
+                    "macOS there is no fallocate(2) at all. A skip here should mean "
+                    "the former is absent, never that a predicate is broken -- see "
+                    "punch_hole().".format(
+                        "libc has no fallocate" if not hasattr(
+                            ctypes.CDLL(None), "fallocate") else "call failed"))
 
             server.state.throttle_delay = 0
             run_to_completion(server, dest, len(payload), "--min-chunk", MIB,
