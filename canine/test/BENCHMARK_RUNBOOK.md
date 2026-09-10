@@ -1136,12 +1136,39 @@ The consequence is that this run is **throughput only**. A silently truncated tr
 would not be caught, so correctness against this source rests on §6.3 and §6.4 at full
 size, which are also the only runs that exercise in-transfer part hashing.
 
-### 6.1a Where is the ceiling? — four hypotheses, one experiment
+### 6.1a Where is the ceiling? — ANSWERED: per connection
 
-**Run this before believing anything else about the real source.** The first knee sweep
-against the GDC endpoint came out flat — 16.62 MiB/s at one connection, 16.73 at sixteen,
-1.01× — and a flat line is consistent with four different ceilings that call for four
-different responses:
+**Do not run this section.** It is kept for the reasoning, not the procedure. The flat
+sweep it was designed to explain was an artifact: `probe_range` rejected every prefix
+request and the downloader fell back to a single stream on all five rows, so the sweep
+measured one curl five times. With `--object-size` supplied, the same source and the same
+node give:
+
+| | throughput | streams | note |
+|---|---|---|---|
+| 1 connection (ranged curl) | 16.62 MiB/s | — | the legacy path, unaffected by the bug |
+| 16 connections | **230.11 MiB/s** | 15.05 of 16 | `wire: 1.01x`, so no duplicate fetching |
+
+**13.85×**, against a target of ≥4×. 230.11 / 15.05 effective streams is 15.29 MiB/s per
+stream, essentially the single-stream rate — so throughput is *linear* in connections and
+the cap is **per connection**, the first row of the table below. No experiment is needed
+to choose between the four; the arms would only reconfirm it.
+
+Two consequences worth carrying forward:
+
+* **The disk is now the binding limit, not the source.** pd-standard writes at 92.3 MB/s
+  (88.0 MiB/s, §4.1), which is reached at about **5.3 connections**. For the 279 GiB BAM:
+  4.77 h single-stream, 54 min disk-bound, 21 min if the destination could keep up. So
+  §6.2 — the same sweep to the localization disk — is the measurement that now decides
+  the project, and §10's cost model has to be rebuilt around a disk ceiling rather than a
+  source ceiling.
+* **`MAX_CONNECTIONS` is 16 and 16 was still scaling.** That matters only for destinations
+  faster than pd-standard; for the primary case the disk saturates first, so raising it is
+  not obviously worth the extra sockets. Worth revisiting if a run ever targets tmpfs or a
+  local SSD for real.
+
+The original reasoning, for the record. A flat line is consistent with four different
+ceilings that call for four different responses:
 
 | Ceiling is per… | What would lift it | Cost to exploit |
 |---|---|---|
