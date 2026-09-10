@@ -1123,7 +1123,14 @@ pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
 # Pass BOTH: --url carries the transfer, --s3-* supply the metadata. The S3 coordinates
 # are used for head-object only, so the size, ETag and part length are still derived
 # automatically while the bytes move over plain ranged HTTP.
-export PRESIGNED_URL=$(aws s3 presign "s3://$S3_BUCKET/$S3_KEY")
+# `aws` lives in the CONTAINER, not on the node -- probe reports /usr/local/bin/aws
+# because probe itself runs via docker exec. And --expires-in because the default is one
+# hour, which a multi-setting sweep of a large object can outlast; the sweep would then
+# fail partway with a signature error that looks like a source problem.
+export PRESIGNED_URL=$(sudo docker exec slurm \
+  aws --endpoint-url "$S3_ENDPOINT" s3 presign "s3://$S3_BUCKET/$S3_KEY" \
+      --expires-in 43200)
+test -n "$PRESIGNED_URL" || echo "presign produced nothing -- check the endpoint and creds"
 pdl sweep --url "$PRESIGNED_URL" \
           --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/s3-presigned.json
