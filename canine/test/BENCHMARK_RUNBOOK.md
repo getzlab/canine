@@ -749,9 +749,47 @@ Two consequences, both acted on:
   have run at 62 MiB/s instead of 86 — **21 minutes slower** on a 279 GiB object. Now
   `VERIFY_READ_WORKERS = 2`, which costs ~1% here and leaves headroom for a destination
   where hashing rather than IO binds (tmpfs, local SSD).
-* the read-back therefore costs **0.92 h and cannot be parallelised away**, so it genuinely
-  doubles localization to 1.81 h (2.21×). The only way to recover it is to not read the
-  object at all — in-transfer hashing, task #19.
+* the read-back therefore costs roughly **1 h**, and no amount of read concurrency removes
+  it. The only way to recover it is to not read the object at all — in-transfer hashing,
+  task #19.
+
+#### Measure `multipart_etag` directly, rather than modelling it
+
+Read throughput alone does not predict the read-back's rate, because each worker reads and
+hashes **serially** — a lone worker leaves the disk idle while it hashes. With md5 measured
+at 700 MiB/s and the disk at 86, one worker achieves `1/(1/86 + 1/700) = 77 MiB/s`, and
+overlapping two recovers about 5%. That is a model with assumptions in it; measure the real
+thing:
+
+```bash
+# on the node -- needs a multi-part-sized file on the disk
+sudo docker exec slurm bash -c '
+  D=/mnt/rwdisks/'"$DISK"'
+  [ -f $D/hashtest ] || dd if=/dev/zero of=$D/hashtest bs=1M count=4000 oflag=direct
+  F=$D/hashtest python3 - <<'"'"'PY'"'"'
+import importlib.util, os, time
+spec = importlib.util.spec_from_file_location("pdl", "/tmp/pdl/parallel_download.py")
+pdl = importlib.util.module_from_spec(spec); spec.loader.exec_module(pdl)
+path, part = os.environ["F"], 29 * 1024 * 1024
+size = os.path.getsize(path)
+for n in (1, 2, 3, 4, 8):
+    os.system("sync")
+    dropped = os.system("echo 3 > /proc/sys/vm/drop_caches") == 0
+    t0 = time.monotonic()
+    pdl.multipart_etag(path, part, workers=n)
+    el = time.monotonic() - t0
+    print("workers={:<2} {:>6.1f} MiB/s{}".format(
+        n, size / 1048576 / el, "" if dropped else "   (CACHED -- meaningless)"))
+PY
+  rm -f $D/hashtest'
+```
+
+**If it cannot drop caches the numbers are worthless** — every run after the first reads
+from RAM — so the script says so rather than reporting a fiction. `--privileged` should
+allow it.
+
+Whatever the peak is, set `VERIFY_READ_WORKERS` to it. The constant currently says 2 on the
+strength of the model above.
 
 ### 4.1b Does the rate scale with size? — optional, and quota-heavy
 

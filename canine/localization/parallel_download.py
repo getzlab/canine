@@ -87,10 +87,25 @@ CHUNK_ALIGN = 1024 * 1024
 
 READ_BUFFER = 8 * 1024 * 1024
 
-# Readers used for the verification read-back. Deliberately small and NOT tied to the
-# connection count: on a persistent disk aggregate read throughput falls as concurrency
-# rises (measured 86 / 85 / 76 / 62 MiB/s at 1 / 2 / 4 / 8 readers), while md5 outruns any
-# such disk on a single core. See verify().
+# Readers used for the verification read-back.
+#
+# Two competing effects, both measured, and the optimum is where they cross:
+#
+#   * aggregate read throughput FALLS as readers are added -- 86 / 85 / 76 / 62 MiB/s at
+#     1 / 2 / 4 / 8 on a 316 GB pd-standard -- because the device is fixed-bandwidth and
+#     extra streams only add interleaving;
+#   * but each worker reads and hashes SERIALLY, so one worker leaves the disk idle while
+#     it hashes. At md5's measured 700 MiB/s a lone worker achieves
+#     1/(1/86 + 1/700) = 77 MiB/s, not 86.
+#
+# Overlapping the two recovers most of that: N=2 models at 80 MiB/s, ~5% better than one
+# worker, and it is the peak -- N=4 falls to 74 and N=8 to 61 as the read penalty
+# overtakes the overlap. Emphatically not `connections`, which at the default of 8 made
+# the read-back of a 279 GiB object 21 minutes slower than a single reader.
+#
+# On a destination fast enough that hashing rather than IO binds -- tmpfs, local SSD --
+# the balance shifts and more workers would scale nearly linearly to the core count. This
+# constant is tuned for a persistent disk, which is where LocalizeToDisk writes.
 VERIFY_READ_WORKERS = 2
 
 # How much is read before being written out. This is deliberately much smaller than a
@@ -2040,16 +2055,8 @@ def verify(path, options):
     the byte stream.
     """
     if options.check_etag and options.part_length:
-        # NOT `connections`, which is what this used to pass. Measured on a 316 GB
-        # pd-standard: aggregate read throughput DECLINES with concurrency --
-        # 86 MiB/s at 1 reader, 85 at 2, 76 at 4, 62 at 8 -- because the device is
-        # fixed-bandwidth and extra streams only add interleaving. At 8 workers the
-        # read-back of a 279 GiB object took 21 minutes longer than single-threaded.
-        #
-        # md5 runs at several hundred MB/s per core, far above any persistent disk, so
-        # one reader already keeps up and the parallelism has nothing to win. 2 is kept
-        # rather than 1 because it costs ~1% here and leaves headroom for a destination
-        # fast enough that hashing, not IO, is the limit (tmpfs, local SSD).
+        # A small fixed count, not `connections` -- see VERIFY_READ_WORKERS for the two
+        # measured effects that put the optimum at 2.
         actual = multipart_etag(path, options.part_length,
                                 workers=VERIFY_READ_WORKERS)
         expected = options.check_etag.strip().strip('"')
