@@ -1063,10 +1063,26 @@ pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
 because there `--size` is always the whole object. Under a truncated `--size` that fetches
 all 279 GiB; `--prefix` bounds it to `bytes=$SZ-<last>`.
 
-Note that this run also measures the per-chunk process cost on the parallel rows — one
-`aws` process per chunk — so its parallel numbers are a *floor*, and the presigned rows
-above are what production would do when presigning works. Two knees, two baselines: the
-honest speedup for the BAM is the `aws s3api` baseline against the presigned parallel rows.
+This run also measures the per-chunk process cost on the parallel rows, which is the
+reason the presigned path is preferred — so its parallel numbers are a *floor*, and the
+presigned rows above are what production does when presigning works. Two knees, two
+baselines: the honest speedup for the BAM is the `aws s3api` baseline against the
+presigned parallel rows.
+
+How big that per-chunk cost is, stated as a prediction so the run can contradict it:
+chunks are `align_up(64 MiB, 29 MiB)` = **87 MiB**, so the 279 GiB object is **3283
+chunks** — three parts each, not one process per part. Only `connections` processes run at
+once and each overlaps a full chunk's transfer, so at ~1 s of Python startup and 8
+connections that is roughly **7 minutes** spread across the download, not a serial pile of
+startups. If the gap between the two paths' parallel rows is far wider than that, the cost
+is something else and worth chasing.
+
+One thing this comparison does *not* turn on is connection reuse. `HttpSource` calls
+`urllib.request.urlopen` per chunk, and urllib neither pools nor keeps alive — it sends
+`Connection: close` — so both paths pay a TCP and TLS handshake per chunk, 3283 apiece.
+Pooling those (one connection per worker) is an optimization available to the presigned
+path and not taken; if the sweep shows the two paths closer than the startup estimate
+predicts, handshake cost dominating both is the likely reason.
 
 **`--prefix` is not optional when `--size` is smaller than the object.** The parallel rows
 plan chunks over `[0, size)` and stop there, but the `connections=1` row is the legacy path,

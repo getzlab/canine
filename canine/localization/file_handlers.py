@@ -1106,6 +1106,12 @@ def gcp_auth_session():
 class HandleAWSURL(FileType):
     localization_mode = "url"
 
+    # Twelve hours. The default `aws s3 presign` window is one hour, which a 279 GiB
+    # object at 60 MB/s outlasts -- and an expired signature is a 403, which the
+    # downloader treats as permanent. Overridable per-file so an unusually slow source
+    # or an unusually strict signing policy can move it in either direction.
+    default_presign_expiry = 12 * 60 * 60
+
     # TODO: use boto3 API; overhead for calling out to aws shell command might be high
     #       this would also allow us to run on systems that don't have the aws tool installed
     # TODO: support directories
@@ -1116,6 +1122,7 @@ class HandleAWSURL(FileType):
         * aws_access_key_id
         * aws_secret_access_key
         * aws_endpoint_url
+        * presign_expiry (seconds; default 12 h)
         """
         super().__init__(path, **kwargs)
 
@@ -1131,6 +1138,13 @@ class HandleAWSURL(FileType):
         # compute extra arguments for s3 commands
         # TODO: add requester pays check here
         self.aws_endpoint_url = self.extra_args.get("aws_endpoint_url")
+
+        # int() rather than trusting the caller: this lands inside an emitted shell
+        # command, so a string carrying anything shell-significant would be injected
+        # into the presign call. A bad value should raise here, host-side.
+        self.presign_expiry = int(
+            self.extra_args.get("presign_expiry") or self.default_presign_expiry
+        )
 
         self.s3_extra_args = []
         if self.command_env["AWS_ACCESS_KEY_ID"] is None and self.command_env["AWS_SECRET_ACCESS_KEY"] is None:
@@ -1249,6 +1263,7 @@ class HandleAWSURL(FileType):
 
         cmd = [f"[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :"]
 
+        url_refresh_cmd = None
         if "--no-sign-request" in self.s3_extra_args:
             # A public bucket needs no presigning, so the object URL is built host-side
             # and there is nothing to mint on the node.
@@ -1258,17 +1273,34 @@ class HandleAWSURL(FileType):
             # Feeding a presigned URL into the generic ranged-HTTP path means one code
             # path for every source and no `aws` process per chunk.
             #
+            # `--expires-in`, because the default is one hour and the objects this exists
+            # for do not finish in one hour. A 279 GiB BAM at the ~60 MB/s measured
+            # against the GDC endpoint takes about 80 minutes, so the signature expires
+            # mid-transfer; `open_range` then gets a 403, which is a PermanentError, so
+            # the download fails do-not-retry with most of the object already on disk.
+            # The exact case this work exists to fix.
+            #
+            # The cost of a longer window is a longer-lived credential in the emitted
+            # script and in the environment of whatever the node runs, which is why this
+            # is 12 hours rather than the 7 days SigV4 permits.
+            #
+            # Passed as --url-refresh-cmd as well, the way HandleDRSURI does: a clock
+            # skew, a retried task resuming near the end of the window, or an object
+            # slower than 12 hours all still expire, and re-minting resumes in place
+            # where a PermanentError throws the transfer away.
+            presigner = "{env} aws s3 {extra_args} presign {url} --expires-in {expiry}".format(
+                env = self.command_env_str,
+                extra_args = self.s3_extra_args_str,
+                url = self.path,
+                expiry = self.presign_expiry,
+            ).lstrip()
             # `|| :` keeps a presign failure from aborting the script under set -e, and an
             # empty result makes the downloader fall through to its per-chunk
             # `aws s3api get-object --range` source instead -- which is what covers
             # session-token-only credentials and exotic endpoints.
-            cmd += ["export K9_S3_URL=$({env} aws s3 {extra_args} presign {url} "
-                    "2>/dev/null || :)".format(
-                        env = self.command_env_str,
-                        extra_args = self.s3_extra_args_str,
-                        url = self.path,
-                    ).lstrip()]
-            url, url_expr = None, '"$K9_S3_URL"'
+            cmd += ["export K9_S3_URL=$({presigner} 2>/dev/null || :)".format(
+                presigner = presigner)]
+            url, url_expr, url_refresh_cmd = None, '"$K9_S3_URL"', presigner
 
         checksum = etag = part_length = None
         if self.check_hash:
@@ -1289,6 +1321,7 @@ class HandleAWSURL(FileType):
             url_expr = url_expr,
             s3 = {"bucket": bucket, "key": key,
                   "extra_args": self.s3_extra_args_str},
+            url_refresh_cmd = url_refresh_cmd,
             etag = etag,
             part_length = part_length,
             checksum = checksum,

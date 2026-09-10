@@ -204,6 +204,7 @@ class TestEmittedCommandsAreRunAsBash:
         handler.download_min_chunk = 64 * 1024 * 1024
         handler.path = "s3://b/k/o.bam"
         handler.aws_endpoint_url = None
+        handler.presign_expiry = fh.HandleAWSURL.default_presign_expiry
         handler.command_env = {"AWS_ACCESS_KEY_ID": "AK", "AWS_SECRET_ACCESS_KEY": "sk"}
         handler.command_env_str = "AWS_ACCESS_KEY_ID=AK AWS_SECRET_ACCESS_KEY=sk"
         handler.s3_extra_args = []

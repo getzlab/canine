@@ -1180,8 +1180,24 @@ class HttpSource:
 class S3ApiSource:
     """
     Fallback for when `aws s3 presign` cannot be used (session-token-only creds, an
-    exotic endpoint). Costs one `aws` process per chunk attempt, which is why the
-    presigned-URL path through HttpSource is preferred.
+    exotic endpoint).
+
+    It costs one `aws` process per chunk *attempt* -- but only `connections` of them run
+    at a time, and each overlaps a whole chunk's transfer, so the cost is a fraction of
+    the run rather than a serial pile of startups. For a 279 GiB object at 87 MiB chunks
+    that is 3283 invocations; at a plausible 1 s of Python startup and 8 connections,
+    about 7 minutes spread across the download. Real, worth avoiding, not decisive --
+    and 6.4 measures it directly by running both paths against the same object.
+
+    What this path gets in exchange is that it never expires: every invocation signs
+    with live credentials, where a presigned URL has a fixed window (see HandleAWSURL's
+    presign_expiry, and refresh_url below).
+
+    It does NOT lose on connection reuse, which was the assumption. `HttpSource` calls
+    `urllib.request.urlopen` per chunk, and urllib neither pools nor keeps alive -- it
+    sends `Connection: close`. So both paths pay a TCP and TLS handshake per chunk, 3283
+    of them for that object. Pooling those into one connection per worker is an
+    unmeasured optimization available to HttpSource and not taken.
     """
 
     def __init__(self, bucket, key, extra_args="", env=None, timeout=DEFAULT_TIMEOUT):

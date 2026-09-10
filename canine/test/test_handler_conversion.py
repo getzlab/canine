@@ -13,6 +13,7 @@ usable as the baseline to diff against.
 import base64
 import hashlib
 import os
+import shlex
 import subprocess
 
 import pytest
@@ -655,6 +656,20 @@ SINGLE_PART_HEADERS = {
 }
 
 
+def _flag_value(script, flag):
+    """
+    The value of `flag` in an emitted script, unquoted.
+
+    The emitter passes these through shlex.quote, so a naive substring check on the
+    script would pass on a value that the node's shell then parses into something else.
+    Splitting the way the shell will is the only way to assert on what actually runs.
+    """
+    line = [ln for ln in script.splitlines() if flag in ln]
+    assert len(line) == 1, "expected exactly one {} line, got {}".format(flag, len(line))
+    tokens = shlex.split(line[0])
+    return tokens[tokens.index(flag) + 1]
+
+
 def aws_handler(headers=None, **kwargs):
     """
     Build the handler without its __init__, which shells out to `aws s3api head-object`.
@@ -670,6 +685,9 @@ def aws_handler(headers=None, **kwargs):
         "download_min_chunk", fh.DEFAULT_DOWNLOAD_MIN_CHUNK))
     handler.path = S3_PATH
     handler.aws_endpoint_url = kwargs.get("aws_endpoint_url")
+    # from the class attribute, not a literal, so it cannot drift from the default
+    handler.presign_expiry = int(kwargs.get(
+        "presign_expiry") or fh.HandleAWSURL.default_presign_expiry)
     handler.command_env = {
         "AWS_ACCESS_KEY_ID": kwargs.get("aws_access_key_id"),
         "AWS_SECRET_ACCESS_KEY": kwargs.get("aws_secret_access_key"),
@@ -997,6 +1015,135 @@ class TestGSURLTuning:
         """Confirms the handler was left on its own path rather than converted."""
         script = gs_handler().localization_command(DEST)
         assert "K9_PDL" not in script
+
+
+class TestTheSignedUrlOutlivesTheTransfer:
+    """
+    The presigned URL was minted with the AWS CLI default window of one hour and never
+    re-minted. A 279 GiB object at the ~60 MB/s measured against the GDC endpoint takes
+    about 80 minutes, so the signature expired mid-transfer; HttpSource.open_range got a
+    403, HttpSource.refresh_url returned False for want of a --url-refresh-cmd, and the
+    403 became a PermanentError -- exit 1, do-not-retry, with most of the object already
+    written. The exact workload this work exists to speed up was the one guaranteed to
+    hit it.
+    """
+
+    def test_the_presign_has_an_explicit_window(self):
+        script = aws_handler(**PRIVATE).localization_command("/dest/f")
+        assert "presign" in script
+        assert "--expires-in {}".format(12 * 60 * 60) in script, script
+
+    def test_the_window_is_longer_than_the_motivating_transfer(self):
+        """
+        279 GiB at 60 MB/s is ~80 minutes. A window that does not clear that is the bug
+        with a bigger number in it, so assert the margin rather than the literal.
+        """
+        seconds_needed = (279 * 1024 ** 3) / (60 * 1000 ** 2)
+        assert fh.HandleAWSURL.default_presign_expiry > 2 * seconds_needed
+
+    def test_the_downloader_can_re_mint_the_url(self):
+        script = aws_handler(**PRIVATE).localization_command("/dest/f")
+        assert "--url-refresh-cmd" in script, script
+
+    def test_the_refresh_command_presigns_the_same_object(self):
+        script = aws_handler(**PRIVATE).localization_command("/dest/f")
+        refresh = _flag_value(script, "--url-refresh-cmd")
+        assert "presign" in refresh and S3_PATH in refresh, refresh
+
+    def test_the_refresh_command_carries_the_endpoint_and_credentials(self):
+        """
+        A refresh that reaches Amazon instead of the GDC endpoint, or that signs with
+        nothing, produces a URL that 403s -- and the downloader would treat the refresh
+        as having succeeded.
+        """
+        script = aws_handler(
+            aws_endpoint_url="https://s3.example.org", **PRIVATE
+        ).localization_command("/dest/f")
+        refresh = _flag_value(script, "--url-refresh-cmd")
+        assert "--endpoint-url https://s3.example.org" in refresh, refresh
+        assert "AWS_ACCESS_KEY_ID=AKIA" in refresh, refresh
+
+    def test_the_refresh_command_is_the_command_that_minted_the_url(self):
+        """
+        Not merely similar: if the two drift, a refresh silently changes which object or
+        endpoint is being read partway through a transfer.
+        """
+        script = aws_handler(**PRIVATE).localization_command("/dest/f")
+        minting = [line for line in script.splitlines()
+                   if line.startswith("export K9_S3_URL=")][0]
+        refresh = _flag_value(script, "--url-refresh-cmd")
+        assert refresh in minting, (refresh, minting)
+
+    def test_a_public_object_neither_presigns_nor_refreshes(self):
+        """Nothing to sign with, so a refresh command would be a command that fails."""
+        script = aws_handler().localization_command("/dest/f")
+        assert "presign" not in script
+        assert "--url-refresh-cmd" not in script
+
+    def test_the_window_is_overridable(self):
+        script = aws_handler(presign_expiry=600, **PRIVATE).localization_command("/dest/f")
+        assert "--expires-in 600" in script, script
+
+    def test_the_window_cannot_carry_shell_metacharacters(self):
+        """
+        This value is interpolated into an emitted command, so a string is an injection
+        site. int() rejects it host-side rather than on the node.
+        """
+        with pytest.raises(ValueError):
+            aws_handler(presign_expiry="600; rm -rf /", **PRIVATE)
+
+
+class TestTheRealConstructorAgreesWithTheFixtures:
+    """
+    Two test modules build HandleAWSURL with `__new__` and hand-set the fields __init__
+    would, because __init__ shells out to `aws s3api head-object`. Adding presign_expiry
+    broke both -- loudly, as 28 AttributeErrors, which is the benign direction. The
+    dangerous direction is a fixture that keeps setting a field __init__ has stopped
+    setting, or sets a different value: then every test passes against a handler that no
+    longer exists.
+
+    So exercise the emitted-script path once through the real constructor. If the two
+    diverge, the emitted command differs here and nowhere else.
+    """
+
+    HEAD = {"ContentLength": 50 * 1024 * MIB,
+            "ETag": '"{}"'.format(MULTIPART_ETAG),
+            "PartsCount": 800,
+            "PartLength": 64 * MIB}
+
+    def build(self, **kwargs):
+        import json as _json
+        completed = subprocess.CompletedProcess(
+            args="", returncode=0, stdout=_json.dumps(self.HEAD).encode(), stderr=b"")
+        with patch.object(fh.subprocess, "run", return_value=completed) as run:
+            handler = fh.HandleAWSURL(S3_PATH, **kwargs)
+        assert run.called, "head-object was not the call that was mocked"
+        return handler
+
+    def test_the_real_constructor_sets_the_presign_window(self):
+        assert self.build(**PRIVATE).presign_expiry == 12 * 60 * 60
+
+    def test_the_real_constructor_emits_the_same_presign_and_refresh(self):
+        real = self.build(**PRIVATE).localization_command("/dest/f")
+        assert "--expires-in {}".format(12 * 60 * 60) in real, real
+        refresh = _flag_value(real, "--url-refresh-cmd")
+        assert "presign" in refresh and S3_PATH in refresh, refresh
+
+    def test_the_fixture_emits_what_the_real_constructor_emits(self):
+        """
+        The whole point: same inputs, same script. A difference here means the fixtures
+        have drifted and every assertion made through them is about a fiction.
+        """
+        real = self.build(**PRIVATE).localization_command("/dest/f")
+        fake = aws_handler(headers=dict(self.HEAD), **PRIVATE).localization_command("/dest/f")
+        assert real == fake
+
+    def test_the_override_survives_the_real_constructor(self):
+        assert self.build(presign_expiry=600, **PRIVATE).presign_expiry == 600
+
+    def test_a_nonsense_window_is_rejected_host_side(self):
+        with pytest.raises(ValueError):
+            self.build(presign_expiry="600; rm -rf /", **PRIVATE)
 
 
 class TestAWSFallbackIsResumable:
