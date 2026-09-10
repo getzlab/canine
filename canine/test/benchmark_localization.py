@@ -842,6 +842,27 @@ def s3_legacy_command(args, dest, size):
              bucket=shlex.quote(args.s3_bucket), key=shlex.quote(args.s3_key))
 
 
+def url_legacy_command(args, dest, size):
+    """
+    A single-stream baseline that fetches exactly `size` bytes.
+
+    The downloader's own fallback synthesizes `curl -C - -sSL -o dest url` with no range,
+    which is right for production -- there `--size` is always the whole object -- but
+    wrong for a prefix benchmark: the parallel rows plan chunks over [0, size) while the
+    connections=1 row would pull the entire object. Against a 279 GiB object with
+    `--size 12 GiB` that meant curl quietly downloading all 279 GiB into a 16 GiB tmpfs.
+
+    `--fail` matters as much as the range. Without it curl writes an HTTP error body to
+    the output file and exits 0, so a 403 would present as a very fast success -- and in
+    prefix mode there is no verification to catch it.
+    """
+    headers = "".join(" --header {}".format(shlex.quote(h))
+                      for h in (getattr(args, "header", None) or []))
+    return "curl --fail -sSL{headers} -r 0-{last} -o {dest} {url}".format(
+        headers=headers, last=size - 1,
+        dest=shlex.quote(dest), url=shlex.quote(args.url))
+
+
 def source_args(args, dest, size):
     """
     Turn the parsed source options into the downloader's own arguments.
@@ -867,7 +888,11 @@ def source_args(args, dest, size):
                 # option unless it happens to contain a space.
                 "--s3-extra-args={}".format(s3_extra_args(args)),
                 "--legacy-cmd", s3_legacy_command(args, dest, size)] + header_args(args)
-    return ["--url", url] + header_args(args)
+    base = ["--url", url] + header_args(args)
+    if getattr(args, "prefix", False):
+        # otherwise the connections=1 row fetches the whole object, not `size` bytes
+        base += ["--legacy-cmd", url_legacy_command(args, dest, size)]
+    return base
 
 
 def header_args(args):
@@ -1203,6 +1228,9 @@ def command_sweep(args):
     say("size      : {}".format(human(size)))
     say("dest dir  : {}".format(args.dest_dir))
     say("verify    : {}".format(verification.label))
+    if getattr(args, "prefix", False):
+        say("baseline  : ranged curl (--prefix), so connections=1 fetches the same "
+            "{} as the parallel rows".format(human(size)))
     say("egress    : ~{} per setting, {} settings".format(
         human(size), len(args.connections)))
     if size < GIB:
@@ -1649,6 +1677,10 @@ def build_parser():
                        help="where to write; use the localization disk to measure the "
                             "path that matters (default: %(default)s)")
         p.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK)
+        p.add_argument("--prefix", action="store_true",
+                       help="--size is a PREFIX of a larger object. Ranges the "
+                            "single-stream baseline so it fetches the same bytes as the "
+                            "parallel rows; without this it fetches the whole object")
         p.add_argument("--header", action="append", default=[], metavar="H",
                        help="request header, repeatable; forwarded to every ranged GET "
                             "and to the single-stream fallback. A private GCS object "

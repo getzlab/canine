@@ -1924,3 +1924,43 @@ class TestPartDigestsSurviveInterruption:
         manifest = self.manifest_with(tmp_path, str(path), part, {0: wrong})
         actual, _ = pdl.multipart_etag_from_manifest(str(path), part, manifest)
         assert actual != TestInTransferPartHashing.reference_etag(data, part)
+
+
+class TestTheSingleStreamFallbackFailsLoudly:
+    """
+    `curl -sSL` without --fail writes an HTTP error body to the output file and exits 0,
+    so a 403 presents as a successful download of a short "AccessDenied" file. With
+    check_hash on, verification catches it; with check_hash off it would be accepted as
+    the object.
+    """
+
+    def test_the_synthesized_command_uses_fail(self, tmp_path):
+        options = pdl.build_parser().parse_args([
+            "--url", "https://h/o", "--dest", str(tmp_path / "o"), "--size", "10",
+            "--connections", "1"])
+        recorded = {}
+        import subprocess as sp
+
+        def spy(command, **kw):
+            recorded["command"] = command
+            return sp.CompletedProcess(command, 0)
+
+        original = pdl.subprocess.run
+        pdl.subprocess.run = spy
+        try:
+            pdl.single_stream_fallback(options, "test")
+        finally:
+            pdl.subprocess.run = original
+        assert "--fail" in recorded["command"], recorded["command"]
+
+    def test_an_http_error_is_a_nonzero_exit_not_a_short_file(self, tmp_path):
+        """End to end against a server that 403s."""
+        dest = str(tmp_path / "o.bin")
+        with Server(b"unused") as server:
+            server.state.force_status = 403
+            rc = pdl.main([
+                "--url", server.url(), "--dest", dest, "--size", "1000",
+                "--connections", "1"])
+        assert rc != pdl.EXIT_OK
+        assert not (os.path.exists(dest) and os.path.getsize(dest) > 0), \
+            "an error body was written to the destination and treated as the object"

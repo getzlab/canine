@@ -1020,6 +1020,40 @@ real S3/GDC source might differ — plausible, since per-connection throttling i
 source-specific — repeat with a ~12 GB slice of the real source and accept the ~$1 of
 egress. That is much cheaper than discovering it at 300 GB.
 
+#### The same knee, against the real source — and why it needs `--prefix`
+
+```bash
+# presign in the CONTAINER (that is where `aws` lives), with a window long enough
+# to outlast the whole sweep
+export PRESIGNED_URL=$(sudo docker exec slurm \
+  aws --endpoint-url "$S3_ENDPOINT" s3 presign "s3://$S3_BUCKET/$S3_KEY" \
+      --expires-in 43200)
+test -n "$PRESIGNED_URL" || echo "presign produced nothing -- check the endpoint and creds"
+
+pdl sweep --url "$PRESIGNED_URL" --prefix \
+          --size $((12 * 1024 * 1024 * 1024)) \
+          --dest-dir /mnt/tmpfs --connections 1 4 8 12 16 \
+          --json /tmp/knee-gdc.json
+```
+
+No `--s3-*` flags here, for the reason spelled out in §6.4: they would derive the ETag of
+the *whole* 279 GiB object, which a 12 GiB slice cannot match, so every row would fail
+verification.
+
+**`--prefix` is not optional when `--size` is smaller than the object.** The parallel rows
+plan chunks over `[0, size)` and stop there, but the `connections=1` row is the legacy path,
+and the downloader's single-stream fallback synthesizes `curl -C - -sSL -o dest url` with
+**no range** — correct in production, where `--size` is always the whole object, and wrong
+here. Without `--prefix` that one row quietly pulls all 279 GiB into a 16 GiB tmpfs; this
+was observed, it fills the mount, and because the file is unlinked on failure the space
+does not come back until the process is killed. `--prefix` makes the benchmark emit a
+ranged `curl --fail -sSL -r 0-N` baseline instead, so every row fetches the same bytes.
+The sweep header says which baseline it used — check it.
+
+The consequence is that this run is **throughput only**. A silently truncated transfer
+would not be caught, so correctness against this source rests on §6.3 and §6.4 at full
+size, which are also the only runs that exercise in-transfer part hashing.
+
 ### 6.2 The same sweep to the localization disk — where the ceiling bites
 
 Same object, same settings, destination changed:

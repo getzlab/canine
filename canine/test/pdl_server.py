@@ -46,6 +46,10 @@ class ServerState:
         # NO content-length at all, the size lives in x-goog-stored-content-length, and
         # the x-goog-hash digests cover the stored bytes. Ranges are honoured normally.
         self.stored_gzip = False
+        # Reply with this status to every request instead of serving the payload. Lets a
+        # test drive the 403 path, which is what an expired signature or a private object
+        # produces in practice.
+        self.force_status = None
         self.throttle_bytes = None     # write in blocks of this size...
         self.throttle_delay = 0.0      # ...sleeping this long between them
         self.fail_next = 0             # return 500 for the next N requests
@@ -72,6 +76,16 @@ def make_handler(state):
 
         def do_GET(self):
             import time
+
+            with state.lock:
+                forced = state.force_status
+            if forced:
+                self.send_response(forced)
+                body = b"AccessDenied"
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
 
             with state.lock:
                 if state.fail_next > 0:

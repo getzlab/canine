@@ -2673,7 +2673,11 @@ def single_stream_fallback(options, reason):
     if options.legacy_cmd:
         command = options.legacy_cmd
     else:
-        command = "curl -C - -sSL{headers} -o {dest} {url}".format(
+        # --fail, or curl writes a 403/404 error body to the destination and exits 0.
+        # With check_hash on, verification catches that as a mismatch; with it off the
+        # error page would be accepted as the file. A clean nonzero exit is strictly
+        # better than relying on a hash that may not be configured.
+        command = "curl --fail -C - -sSL{headers} -o {dest} {url}".format(
             headers="".join(
                 " --header {}".format(shlex.quote(h)) for h in (options.header or [])
             ),
