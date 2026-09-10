@@ -1656,10 +1656,13 @@ class TestMultipartEtagIsParallelAndBounded:
         path.write_bytes(b"")
         assert pdl.multipart_etag(str(path), 4096) is None
 
-    def test_verify_passes_connections_through_as_workers(self, tmp_path, monkeypatch):
+    def test_verify_does_not_scale_readers_with_connections(self, tmp_path, monkeypatch):
         """
-        Verification should use the cores the node has; the connection count is the
-        closest thing to a configured parallelism budget.
+        This used to pass `connections`, which was measured to be actively harmful: on a
+        316 GB pd-standard aggregate read throughput falls with concurrency (86 / 85 / 76
+        / 62 MiB/s at 1 / 2 / 4 / 8 readers), so 8 readers made the read-back of a 279 GiB
+        object 21 minutes slower than one. md5 outruns any persistent disk on a single
+        core, so the parallelism had nothing to win.
         """
         data = os.urandom(50000)
         path = tmp_path / "obj.bin"
@@ -1678,7 +1681,10 @@ class TestMultipartEtagIsParallelAndBounded:
             "--check-etag", self.reference_etag(data, 4096),
         ])
         assert pdl.verify(str(path), options) == self.reference_etag(data, 4096)
-        assert seen["workers"] == 6
+        assert seen["workers"] == pdl.VERIFY_READ_WORKERS
+        assert seen["workers"] != 6, "must not scale readers with the connection count"
+        assert pdl.VERIFY_READ_WORKERS <= 2, \
+            "more than 2 readers measured slower on a persistent disk"
 
 
 class TestPhaseTiming:

@@ -232,23 +232,32 @@ class TestRunbookVariablesAreDefinedBeforeUse:
     }
 
     def undefined_uses(self):
+        """
+        Position-aware within a line, because `el=$((...)); [ $el -eq 0 ]` assigns and
+        uses on one line and a line-granular check calls that a defect. Uses are compared
+        against definitions that appear earlier in the document, including earlier in the
+        same line.
+        """
         import re
         with open(self.RUNBOOK) as handle:
             text = handle.read()
         defined, problems = set(self.AMBIENT), []
         for block in re.findall(r"```bash\n(.*?)```", text, re.S):
             for line in block.split("\n"):
-                stripped = line.strip()
-                if stripped.startswith("#"):
+                if line.strip().startswith("#"):
                     continue
-                for name in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", line):
-                    if name not in defined:
-                        problems.append((name, stripped))
-                for name in re.findall(r"([A-Za-z_][A-Za-z0-9_]*)=", stripped):
-                    defined.add(name)
-                for name in re.findall(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b",
-                                      stripped):
-                    defined.add(name)
+                events = []
+                for m in re.finditer(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", line):
+                    events.append((m.start(), "use", m.group(1)))
+                for m in re.finditer(r"([A-Za-z_][A-Za-z0-9_]*)=", line):
+                    events.append((m.start(), "def", m.group(1)))
+                for m in re.finditer(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\b", line):
+                    events.append((m.start(), "def", m.group(1)))
+                for _, kind, name in sorted(events):
+                    if kind == "def":
+                        defined.add(name)
+                    elif name not in defined:
+                        problems.append((name, line.strip()))
         return problems
 
     def test_no_variable_is_used_before_it_is_defined(self):
@@ -262,6 +271,20 @@ class TestRunbookVariablesAreDefinedBeforeUse:
         broken.write_text("```bash\necho $NEVER_SET\n```\n")
         monkeypatch.setattr(self, "RUNBOOK", str(broken))
         assert any(n == "NEVER_SET" for n, _ in self.undefined_uses())
+
+    def test_same_line_assignment_then_use_is_not_a_defect(self, tmp_path, monkeypatch):
+        """`el=$(...); [ $el -eq 0 ]` is fine; a line-granular check called it a defect."""
+        ok = tmp_path / "ok.md"
+        ok.write_text("```bash\nel=$(( 1 + 1 )); [ $el -eq 0 ] && el=1\n```\n")
+        monkeypatch.setattr(self, "RUNBOOK", str(ok))
+        assert self.undefined_uses() == []
+
+    def test_use_before_assignment_on_the_same_line_is_still_caught(
+            self, tmp_path, monkeypatch):
+        broken = tmp_path / "broken.md"
+        broken.write_text("```bash\necho $LATER; LATER=1\n```\n")
+        monkeypatch.setattr(self, "RUNBOOK", str(broken))
+        assert any(n == "LATER" for n, _ in self.undefined_uses())
 
 
 class TestRangeProbeHandlesBinaryBodies:

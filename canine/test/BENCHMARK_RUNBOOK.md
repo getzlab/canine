@@ -731,18 +731,27 @@ The read sweep reuses the eight files the write sweep leaves, so `N` readers rea
 distinct files — which is what the downloader and the verifier actually do, rather than
 several threads contending on one file.
 
-What the answer changes:
+**MEASURED, 2026-09 — concurrency does not help, and hurts reads:**
 
-* **Aggregate keeps climbing to N=8** → the disk is not the constraint at any realistic
-  connection count. The download is bounded by the source, and §6.1's tmpfs sweep gives the
-  real ceiling.
-* **Aggregate plateaus at some N** → that plateau is the disk-imposed ceiling, and it is the
-  number to divide 279 GiB by. It also caps how much §6's `connections` sweep can ever show.
-* **Read aggregate ≫ 91.6** → parallelising the `verify()` read-back genuinely helps, and
-  `multipart_etag`'s existing thread pool (§13.19) recovers part of the 0.91 h rather than
-  nothing. In-transfer hashing is still strictly better, since it reads zero.
+| aggregate MiB/s | N=1 | N=2 | N=4 | N=8 |
+|---|---|---|---|---|
+| write | 90 | 86 | 81 | 81 |
+| read | 86 | 85 | 76 | **62** |
 
-Record all three numbers: single-stream, the plateau, and the N at which it plateaus.
+The disk is a **fixed-bandwidth resource at ~85-90 MiB/s**. Write aggregate is flat to
+−10%; read aggregate *declines 28%* from one reader to eight. Extra streams add
+interleaving cost and win nothing, which settles the question §4.1 raised: **92 MB/s is the
+ceiling, not a single-stream figure, and 4.44× is a cap.**
+
+Two consequences, both acted on:
+
+* `verify()` used to pass `workers=connections`, so at the default 8 the read-back would
+  have run at 62 MiB/s instead of 86 — **21 minutes slower** on a 279 GiB object. Now
+  `VERIFY_READ_WORKERS = 2`, which costs ~1% here and leaves headroom for a destination
+  where hashing rather than IO binds (tmpfs, local SSD).
+* the read-back therefore costs **0.92 h and cannot be parallelised away**, so it genuinely
+  doubles localization to 1.81 h (2.21×). The only way to recover it is to not read the
+  object at all — in-transfer hashing, task #19.
 
 ### 4.1b Does the rate scale with size? — optional, and quota-heavy
 

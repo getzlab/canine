@@ -87,6 +87,12 @@ CHUNK_ALIGN = 1024 * 1024
 
 READ_BUFFER = 8 * 1024 * 1024
 
+# Readers used for the verification read-back. Deliberately small and NOT tied to the
+# connection count: on a persistent disk aggregate read throughput falls as concurrency
+# rises (measured 86 / 85 / 76 / 62 MiB/s at 1 / 2 / 4 / 8 readers), while md5 outruns any
+# such disk on a single core. See verify().
+VERIFY_READ_WORKERS = 2
+
 # How much is read before being written out. This is deliberately much smaller than a
 # chunk and is a durability parameter, not a throughput one: HTTPResponse.read(n)
 # blocks until it has all n bytes, so a large value means nothing reaches the disk
@@ -2034,11 +2040,18 @@ def verify(path, options):
     the byte stream.
     """
     if options.check_etag and options.part_length:
-        # getattr, not attribute access: verify() takes anything options-shaped, and a
-        # missing connection count just means "decide from the CPU count".
-        connections = getattr(options, "connections", None)
+        # NOT `connections`, which is what this used to pass. Measured on a 316 GB
+        # pd-standard: aggregate read throughput DECLINES with concurrency --
+        # 86 MiB/s at 1 reader, 85 at 2, 76 at 4, 62 at 8 -- because the device is
+        # fixed-bandwidth and extra streams only add interleaving. At 8 workers the
+        # read-back of a 279 GiB object took 21 minutes longer than single-threaded.
+        #
+        # md5 runs at several hundred MB/s per core, far above any persistent disk, so
+        # one reader already keeps up and the parallelism has nothing to win. 2 is kept
+        # rather than 1 because it costs ~1% here and leaves headroom for a destination
+        # fast enough that hashing, not IO, is the limit (tmpfs, local SSD).
         actual = multipart_etag(path, options.part_length,
-                                workers=max(1, connections) if connections else None)
+                                workers=VERIFY_READ_WORKERS)
         expected = options.check_etag.strip().strip('"')
         if actual != expected:
             raise PermanentError(
