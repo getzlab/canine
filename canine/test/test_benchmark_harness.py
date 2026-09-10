@@ -12,6 +12,7 @@ import glob
 import hashlib
 import importlib.util
 import os
+import shlex
 import tempfile
 
 import pytest
@@ -795,3 +796,124 @@ class TestTheVerdictComparesLikeWithLike:
         out = capsys.readouterr().out
         assert "MULTIPART" in out
         assert "already implemented" in out
+
+
+class TestThePrefixBaselineFetchesOnlyThePrefix:
+    """
+    The connections=1 row is the legacy path: the downloader declines at
+    `connections <= 1` and synthesizes `curl -C - -sSL -o dest url`, which carries no
+    range. Correct in production, where --size is always the whole object; wrong in a
+    sweep, where --size names a slice. Against the 279 GiB BAM with --size 12 GiB it
+    pulled all 279 GiB into a 16 GiB tmpfs -- so the two rows being compared were not
+    fetching the same bytes, and the mount filled.
+    """
+
+    def parse(self, *extra):
+        return bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", "1024",
+             "--dest-dir", "/d"] + list(extra))
+
+    def test_prefix_supplies_a_ranged_legacy_command(self):
+        source = bench.source_args(self.parse("--prefix"), "/d/f", 1024)
+        assert "--legacy-cmd" in source
+        command = source[source.index("--legacy-cmd") + 1]
+        assert "-r 0-1023" in command, command
+
+    def test_the_range_covers_exactly_the_requested_bytes(self):
+        """An off-by-one here is a truncated or over-long baseline, silently."""
+        for size in (1, 2, 1024, 12 * 1024 ** 3):
+            command = bench.url_legacy_command(self.parse("--prefix"), "/d/f", size)
+            assert " -r 0-{} ".format(size - 1) in command, command
+
+    def test_without_prefix_no_legacy_command_is_supplied(self):
+        """
+        Production's unranged fallback stays the default -- the flag has to be the thing
+        that changes behavior, or this test would pass on a benchmark that always ranged
+        (and so never exercised the fallback the handlers actually emit).
+        """
+        assert "--legacy-cmd" not in bench.source_args(self.parse(), "/d/f", 1024)
+
+    def test_the_baseline_fails_on_an_http_error(self):
+        """
+        Without --fail curl writes the error body to the destination and exits 0, so a
+        403 presents as a very fast success -- and in prefix mode there is no
+        verification to catch it.
+        """
+        command = bench.url_legacy_command(self.parse("--prefix"), "/d/f", 1024)
+        assert "--fail" in command
+
+    def test_headers_reach_the_ranged_baseline(self):
+        args = self.parse("--prefix", "--header", "Authorization: Bearer tok")
+        command = bench.url_legacy_command(args, "/d/f", 1024)
+        assert "--header 'Authorization: Bearer tok'" in command, command
+
+    def test_the_command_is_shell_safe(self):
+        args = self.parse("--prefix")
+        args.url = "https://h/o?sig=a&b=c"
+        command = bench.url_legacy_command(args, "/d/f oo", 1024)
+        assert shlex.split(command)[-1] == "https://h/o?sig=a&b=c"
+        assert "/d/f oo" in shlex.split(command)
+
+    def test_the_sweep_says_which_baseline_it_used(self, capsys):
+        """
+        Two commands that look identical in the output and differ in what they fetch is
+        how this went unnoticed. The header has to distinguish them.
+        """
+        args = self.parse("--prefix")
+        args.connections = [1]
+        try:
+            bench.command_sweep(args)
+        except BaseException:
+            pass
+        assert "ranged curl" in capsys.readouterr().out
+
+
+class TestAPrefixDoesNotBorrowTheWholeObjectsEtag:
+    """
+    head-object describes the whole object. Deriving verification from it under --prefix
+    yields the 9849-part ETag of a 279 GiB object, which a 12 GiB prefix (424 parts)
+    cannot match -- so verify() raises, the file is discarded, and every row exits 1.
+    The sweep reports NO USABLE RESULT and the cause appears nowhere in the output.
+    """
+
+    def s3_args(self, *extra):
+        return bench.build_parser().parse_args(
+            ["sweep", "--url", "https://presigned/o", "--s3-bucket", "b",
+             "--s3-key", "k", "--size", str(12 * 1024 ** 3),
+             "--dest-dir", "/d"] + list(extra))
+
+    def whole_object_meta(self):
+        return {"size": 279 * 1024 ** 3, "etag": "d" * 32 + "-9849",
+                "parts_count": 9849, "part_length": 29 * 1024 ** 2,
+                "stride_verified": True, "stride_check": "ok"}
+
+    def test_prefix_declines_the_derived_etag(self, monkeypatch):
+        monkeypatch.setattr(bench, "s3_object_metadata",
+                            lambda args: self.whole_object_meta())
+        _, verification = bench.resolve_source(self.s3_args("--prefix"))
+        assert verification.kind is None
+        assert "prefix" in verification.reason
+
+    def test_without_prefix_the_etag_is_still_derived(self, monkeypatch):
+        """The guard must not disable §6.4's full-size verification."""
+        monkeypatch.setattr(bench, "s3_object_metadata",
+                            lambda args: self.whole_object_meta())
+        _, verification = bench.resolve_source(self.s3_args())
+        assert verification.kind == "etag"
+        assert verification.value == "d" * 32 + "-9849"
+
+    def test_an_explicit_md5_still_wins_under_prefix(self, monkeypatch):
+        """An operator who computed the prefix's md5 can still verify against it."""
+        monkeypatch.setattr(bench, "s3_object_metadata",
+                            lambda args: self.whole_object_meta())
+        _, verification = bench.resolve_source(
+            self.s3_args("--prefix", "--md5", "a" * 32))
+        assert verification.kind == "md5"
+        assert verification.value == "a" * 32
+
+    def test_the_declined_reason_reaches_the_operator(self, monkeypatch):
+        monkeypatch.setattr(bench, "s3_object_metadata",
+                            lambda args: self.whole_object_meta())
+        _, verification = bench.resolve_source(self.s3_args("--prefix"))
+        assert "NOT VERIFIED" in verification.label
+        assert "6.3/6.4" in verification.label

@@ -1182,6 +1182,17 @@ def resolve_source(args):
         meta = s3_object_metadata(args)
         if size is None:
             size = meta["size"]
+        if verification is None and getattr(args, "prefix", False):
+            # head-object describes the WHOLE object. Deriving from it under --prefix
+            # gives the 279 GiB ETag at 9849 parts, which a 12 GiB prefix (424 parts)
+            # cannot match -- so verify() raises, discard() removes the file, and every
+            # row exits 1. The sweep then reports NO USABLE RESULT instead of a knee,
+            # and the cause is nowhere in the output. A note in the runbook was not
+            # enough; refuse here, and say what to do instead.
+            verification = Verification(
+                None, reason="--prefix: head-object describes the whole object, whose "
+                             "ETag a prefix cannot match. Pass --md5 of the prefix to "
+                             "verify, or verify at full size (runbook 6.3/6.4)")
         if verification is None:
             etag = meta["etag"]
             if re.fullmatch(r"[0-9a-f]{32}", etag or ""):
