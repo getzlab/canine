@@ -1098,6 +1098,78 @@ The consequence is that this run is **throughput only**. A silently truncated tr
 would not be caught, so correctness against this source rests on §6.3 and §6.4 at full
 size, which are also the only runs that exercise in-transfer part hashing.
 
+### 6.1a Where is the ceiling? — four hypotheses, one experiment
+
+**Run this before believing anything else about the real source.** The first knee sweep
+against the GDC endpoint came out flat — 16.62 MiB/s at one connection, 16.73 at sixteen,
+1.01× — and a flat line is consistent with four different ceilings that call for four
+different responses:
+
+| Ceiling is per… | What would lift it | Cost to exploit |
+|---|---|---|
+| connection | more connections | nothing — already built |
+| **signed URL** | **one URL per worker** | small change to `HttpSource` |
+| client IP / account | more VMs, or different credentials | large, or impossible |
+| object | nothing on the client side | none — the target is unreachable |
+
+The sweep cannot tell them apart, because it uses **one** presigned URL for every
+connection. Neither can `peak NIC`, which equals throughput under all four. So test it
+directly, with `curl` rather than the downloader, so that a defect in our own code cannot
+be mistaken for a property of the source.
+
+```bash
+# on the node. /dev/null as the destination: this measures the source, nothing else.
+STREAM=$((256 * 1024 * 1024))      # 256 MiB per stream, 4 streams => 1 GiB per arm
+
+presign_one () {   # $1 varies the window, which varies the signature -- see below
+  sudo docker exec slurm aws --endpoint-url "$S3_ENDPOINT" \
+    s3 presign "s3://$S3_BUCKET/$S3_KEY" --expires-in "$1"
+}
+
+# four URLs, each with a different window so each has a different signature
+URLS=()
+for i in 0 1 2 3; do URLS+=("$(presign_one $((43200 + i)))"); done
+test "${URLS[0]}" != "${URLS[1]}" \
+  || echo "URLs are identical -- the windows did not vary the signature"
+
+# --- arm C: baseline. one URL, one stream.
+time curl --fail -sS -r 0-$((STREAM - 1)) -o /dev/null "${URLS[0]}"
+
+# --- arm A: one URL, four concurrent streams on disjoint ranges.
+time ( for i in 0 1 2 3; do
+         S=$((i * STREAM))
+         curl --fail -sS -r $S-$((S + STREAM - 1)) -o /dev/null "${URLS[0]}" &
+       done; wait )
+
+# --- arm B: four DISTINCT URLs, the same four ranges.
+time ( for i in 0 1 2 3; do
+         S=$((i * STREAM))
+         curl --fail -sS -r $S-$((S + STREAM - 1)) -o /dev/null "${URLS[$i]}" &
+       done; wait )
+```
+
+`--expires-in $((43200 + i))` is what makes the four URLs distinct: `X-Amz-Expires` is
+part of the canonical query string SigV4 signs, so changing it by one second changes the
+signature. Calling `presign` four times in the same second with identical arguments
+returns the *same* URL, and arm B would silently become a second copy of arm A — which is
+why the `test "$U0" != "$U1"` line is there rather than assumed.
+
+Reading it, with C as the single-stream time for 256 MiB:
+
+* **B ≈ C, A ≈ 4×C** — per signed URL. Mint one URL per worker and the ceiling lifts.
+  This is the outcome worth hoping for: `HandleAWSURL` already presigns on the node, so it
+  becomes presigning N times and handing `HttpSource` a list.
+* **A ≈ B ≈ 4×C** — neither: concurrency works and the earlier flat sweep was a defect in
+  the downloader, not the source. The `streams:` line added to the sweep output in §6.1
+  will say so directly; re-run that first.
+* **A ≈ B ≈ C** — per IP, per account, or per object. Nothing on this VM lifts it, and the
+  ≥4× target is unreachable against this source from one node. That is a real answer, and
+  it redirects the work to the disk-sharing and caching approaches rather than to
+  parallelism.
+
+Egress is ~3 GiB, a few minutes, well under a dollar. Do not skip it on cost grounds: the
+whole ≥4× premise for the motivating workload rests on which row this lands in.
+
 ### 6.2 The same sweep to the localization disk — where the ceiling bites
 
 Same object, same settings, destination changed:
