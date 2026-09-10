@@ -976,6 +976,22 @@ sudo docker exec slurm sh -c '
   df -h /mnt/tmpfs'
 ```
 
+**That mount exists only inside the container.** `--pid host` shares the PID namespace, not
+the mount namespace, so a node-side `df -h /mnt/tmpfs` reports `No such file or directory`
+and a node-side `ls` shows nothing — which reads like the mount failed when it did not.
+Every check on this destination has to go through `docker exec`:
+
+```bash
+# on the node
+sudo docker exec slurm df -h /mnt/tmpfs
+```
+
+It also does not survive the container. `docker run --rm` means a restarted container comes
+back without it, and `pdl` would then write 12 GiB to the container's overlay filesystem
+instead — a different measurement, on a different backing store, reported as if it were
+this one. `pdl probe --dest-dir /mnt/tmpfs` names the backing, so it is worth one look
+before a long run.
+
 **The object needs an auth header.** `https://storage.googleapis.com/BUCKET/OBJECT` is
 anonymous, and the bucket §2 uploaded to is private — so every setting fails with 403 in
 under a second. `--header` is how the GCS handlers pass credentials, and the downloader
