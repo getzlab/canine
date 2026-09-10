@@ -450,10 +450,16 @@ ls -ld ~/.aws ~/.config/gcloud
 
 ```bash
 # on the node
+# --shm-size from the host, the way worker_startup_script.sh:54 computes it. Docker
+# defaults /dev/shm to 64 MiB, which §6.1 (a 12 GiB write to tmpfs) would exhaust
+# immediately.
+SHM_SIZE=$(df -BM --output=size /dev/shm | sed 1d | tr -d ' ' | tr 'M' 'm')
+
 sudo docker run -dti --rm --pid host --network host --privileged \
   -v /dev:/dev \
   -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
   -v $HOME/.aws:/root/.aws:ro \
+  --shm-size "$SHM_SIZE" \
   --entrypoint /bin/bash --name slurm broadinstitute/slurm_gcp_docker
 ```
 
@@ -953,8 +959,26 @@ what the *source and the NIC* can do, which is the ceiling parallelism could eve
 and the knee it finds is the `connections` default.
 
 ```bash
-sudo docker exec slurm bash -c 'mkdir -p /dev/shm/pdl'
+# on the node -- check there is actually room before writing 12 GiB to it
+sudo docker exec slurm sh -c 'mkdir -p /dev/shm/pdl && df -h /dev/shm'
+```
 
+If that shows **64M**, the container was started without `--shm-size` (see §3) and this
+step cannot run as written. Either restart the container with the flag — it holds no
+state — or mount a tmpfs of your own inside it, which needs no restart since the container
+is `--privileged`:
+
+```bash
+# on the node -- alternative to restarting
+sudo docker exec slurm sh -c '
+  mkdir -p /mnt/tmpfs
+  mountpoint -q /mnt/tmpfs || mount -t tmpfs -o size=16G tmpfs /mnt/tmpfs
+  df -h /mnt/tmpfs'
+```
+
+Then sweep against whichever you used:
+
+```bash
 pdl sweep --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
           --dest-dir /dev/shm/pdl \
           --connections 1 4 8 12 16 \
