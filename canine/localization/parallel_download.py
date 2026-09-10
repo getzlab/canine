@@ -1895,6 +1895,14 @@ class Downloader:
         self.progress = progress
         self.made_progress = False
         self._progress_lock = threading.Lock()
+        # Wall time summed over every chunk's read loop, so `streaming / wall` is the
+        # mean number of requests actually receiving bytes at once. Without it, a run
+        # whose throughput does not move with `connections` is ambiguous between "the
+        # source caps aggregate bandwidth, so parallelism cannot help" and "the requests
+        # were not concurrent" -- two conclusions with opposite consequences, and no
+        # other number in the output distinguishes them.
+        self._stream_seconds = 0.0
+        self._stream_lock = threading.Lock()
 
     def resume_offset(self, index):
         return self.sink.resume_offset(index)
@@ -1922,6 +1930,12 @@ class Downloader:
                 self._backoff(attempts, "chunk {}: {}".format(index, e))
                 continue
 
+            # Counted around the read loop rather than the whole attempt: this measures
+            # time with an open request receiving bytes, which is what "how many streams
+            # were really running" means. Backoff sleeps and the open itself are excluded
+            # deliberately -- counting them would inflate the concurrency figure with
+            # time nothing was being transferred.
+            stream_started = time.time()
             try:
                 while offset < end:
                     want = min(self.sink.read_block, end - offset)
@@ -1948,12 +1962,15 @@ class Downloader:
                             "sink persisted to {} of {} sent".format(durable, sent_to)
                         )
                 attempts = 0
+                self._count_stream_time(stream_started)
             except TransientError as e:
+                self._count_stream_time(stream_started)
                 attempts += 1
                 if attempts > self.options.retries:
                     raise
                 self._backoff(attempts, "chunk {}: {}".format(index, e))
             except (IOError, OSError) as e:
+                self._count_stream_time(stream_started)
                 if e.errno == errno.ENOSPC:
                     self._await_space(index)
                     continue
@@ -1968,6 +1985,45 @@ class Downloader:
                     pass
 
         self.sink.chunk_done(index)
+
+    def _log_concurrency(self, workers, chunks, wall):
+        """
+        Report the mean number of requests that were actually receiving bytes at once.
+
+        This exists because a sweep whose throughput does not move with `connections`
+        has two readings with opposite consequences -- the source caps aggregate
+        bandwidth and parallelism cannot help it, or the requests never ran
+        concurrently and there is a defect to find -- and nothing else in the output
+        tells them apart. Both look like a flat line.
+
+        `mean` well under `workers` is not automatically a defect: the tail of a
+        download has fewer chunks left than workers, and a resumed run may have only a
+        handful pending. It is the combination of `mean` near 1 with many pending chunks
+        that indicts the downloader.
+        """
+        if wall <= 0:
+            return
+        with self._stream_lock:
+            streaming = self._stream_seconds
+        log("k9pdl-streams mean {:.2f} of {} workers "
+            "({} chunks, {:.1f}s wall, {:.1f}s streaming)".format(
+                streaming / wall, workers, chunks, wall, streaming))
+
+    def _count_stream_time(self, started):
+        """
+        Account the time this attempt spent with an open request receiving bytes.
+
+        Called from each exit path of the read loop rather than from a `finally`, so
+        that `_backoff` sleeps -- which run in the handlers, after the loop -- are
+        excluded. Counting them would inflate the concurrency figure with time nothing
+        was transferring, which is the one thing this number exists to rule out.
+
+        Every exit path must call it. TestEveryStreamExitIsAccounted checks that against
+        the source, because a handler added later without a call would silently bias the
+        figure downward -- and a low figure is read as "the requests were not concurrent".
+        """
+        with self._stream_lock:
+            self._stream_seconds += time.time() - started
 
     def _await_space(self, index):
         """
@@ -2001,6 +2057,7 @@ class Downloader:
         if not pending:
             return
         workers = max(1, min(self.options.connections, len(pending), MAX_CONNECTIONS))
+        wall_started = time.time()
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futures = [pool.submit(self.download_chunk, i) for i in pending]
             errors = []
@@ -2009,6 +2066,7 @@ class Downloader:
                     future.result()
                 except Exception as e:  # re-raised below, once every worker has settled
                     errors.append(e)
+        self._log_concurrency(workers, len(pending), time.time() - wall_started)
         if errors:
             for error in errors:
                 if isinstance(error, PermanentError):

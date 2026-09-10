@@ -966,8 +966,17 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     for match in re.finditer(r"k9pdl-phase (\w+) ([\d.]+)s", stderr):
         phases[match.group(1)] = float(match.group(2))
 
+    # "k9pdl-streams mean N.NN of M workers (...)". The mean number of requests actually
+    # receiving bytes at once, which is what separates "the source caps aggregate
+    # bandwidth" from "the requests were never concurrent" on a sweep that comes out
+    # flat. None on the connections=1 row, which runs a legacy command and never enters
+    # the worker pool.
+    streams = re.search(r"k9pdl-streams mean ([\d.]+) of (\d+) workers", stderr)
+
     return {
         "phases": phases,
+        "mean_streams": float(streams.group(1)) if streams else None,
+        "workers": int(streams.group(2)) if streams else None,
         "connections": connections,
         "returncode": process.returncode,
         "seconds": round(sampler.seconds, 2),
@@ -1162,6 +1171,22 @@ class Verification:
         return "NOT VERIFIED -- {}".format(self.reason or "no digest available")
 
 
+def redact_url(url):
+    """
+    Drop the query string, keeping enough of the URL to identify the object.
+
+    A presigned S3 URL carries `X-Amz-Credential` -- which contains the access key ID --
+    and `X-Amz-Signature`, which together are a bearer credential for that object until
+    the window closes. Printing it put both on the terminal, into tmux scrollback, into
+    whatever the operator pasted the output into, and into any log of the run. The
+    object path is what a reader needs; the signature is not.
+    """
+    if "?" not in (url or ""):
+        return url
+    base, _, query = url.partition("?")
+    return "{}?<{} bytes of query string redacted>".format(base, len(query))
+
+
 def describe_source(args):
     # getattr throughout: this is called with whatever namespace the subcommand built,
     # and `probe` has no --url. Mixing direct access with getattr made it crash on one
@@ -1171,7 +1196,7 @@ def describe_source(args):
         return "s3://{}/{} via {} (S3ApiSource)".format(
             args.s3_bucket, args.s3_key,
             args.s3_endpoint_url or "amazon")
-    return args.url
+    return redact_url(args.url)
 
 
 def resolve_source(args):
@@ -1316,6 +1341,9 @@ def command_sweep(args):
         if outcome["phases"]:
             say("        phases: {}".format("  ".join(
                 "{} {:.1f}s".format(k, v) for k, v in outcome["phases"].items())))
+        if outcome.get("mean_streams") is not None:
+            say("        streams: {:.2f} of {} concurrent on average".format(
+                outcome["mean_streams"], outcome["workers"]))
         if not args.keep:
             try:
                 os.unlink(dest)
@@ -1399,6 +1427,41 @@ def command_sweep(args):
         say("Note this is the speedup against THIS source. A source that is already fast")
         say("single-stream leaves little for parallelism to win; the figure that matters")
         say("for the project is the one against the source that is slow today.")
+
+        # A flat sweep has two readings with opposite consequences, and reporting only
+        # "DOES NOT meet the target" leaves the operator to guess which one applies.
+        # The concurrency figure decides it, so say what it decided.
+        if speedup < 1.5:
+            parallel = [r for r in usable if r.get("mean_streams") is not None]
+            say()
+            say("throughput did not move with the connection count, which has two")
+            say("readings. The streams figure above separates them:")
+            if not parallel:
+                say()
+                say("  No streams figure was reported, so THIS RUN CANNOT TELL YOU WHICH.")
+                say("  Re-run against a downloader that emits k9pdl-streams.")
+            else:
+                achieved = max(r["mean_streams"] for r in parallel)
+                asked = max(r["workers"] or 0 for r in parallel)
+                say()
+                say("  best concurrency achieved: {:.2f} of {} requests at once"
+                    .format(achieved, asked))
+                if achieved >= 0.7 * asked:
+                    say()
+                    say("  The requests WERE concurrent, so the ceiling is on the far")
+                    say("  side of the wire: this source caps aggregate bandwidth, not")
+                    say("  per-connection bandwidth. More connections cannot help it,")
+                    say("  and no amount of tuning here will. That is a finding about")
+                    say("  the source, not a failure of the downloader -- but it does")
+                    say("  mean the >=4x target is unreachable against this source.")
+                else:
+                    say()
+                    say("  The requests were NOT concurrent -- {:.2f} streams on average"
+                        .format(achieved))
+                    say("  against {} workers. The flat throughput is a defect in the"
+                        .format(asked))
+                    say("  download path, not a property of the source. Do not record")
+                    say("  this as a measurement of the source.")
     else:
         say("no connections=1 row, so there is no baseline to compare against")
 

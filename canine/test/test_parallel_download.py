@@ -7,6 +7,7 @@ Preemption-specific behavior lives in test_parallel_download_resume.py.
 """
 
 import hashlib
+import inspect
 import re
 import json
 import os
@@ -699,6 +700,10 @@ class TestEndToEnd:
                                   "--check-md5", payload_md5, "--retries", 40)
         assert proc.returncode == 0, proc.stderr
         assert hashlib.md5(open(dest, "rb").read()).hexdigest() == payload_md5
+        # The drop has to have HAPPENED. It did not for as long as this test existed:
+        # the fake server wrote the whole body in one unthrottled write before checking
+        # drop_after, so this passed on a clean transfer and proved nothing about resume.
+        assert "short read" in proc.stderr, proc.stderr
 
     def test_kill_switch_env_var_forces_the_legacy_path(self, tmp_path, payload):
         """CANINE_DISABLE_PARALLEL_DOWNLOAD is the on-VM rollback with no redeploy."""
@@ -1964,3 +1969,110 @@ class TestTheSingleStreamFallbackFailsLoudly:
         assert rc != pdl.EXIT_OK
         assert not (os.path.exists(dest) and os.path.getsize(dest) > 0), \
             "an error body was written to the destination and treated as the object"
+
+
+class TestConcurrencyIsReported:
+    """
+    The GDC sweep came out flat: 16.6 MiB/s at 1 connection and 16.7 at 16. That has two
+    readings with opposite consequences -- the source caps aggregate bandwidth, so
+    parallelism cannot help and the >=4x target is unreachable against it; or the
+    requests never ran concurrently, and there is a defect here. Nothing in the output
+    distinguished them, so the run could not settle the question it was run to answer.
+
+    `k9pdl-streams` is that number: streaming-seconds summed over chunks, divided by
+    wall time, which is the mean count of requests actually receiving bytes.
+    """
+
+    def parse(self, output):
+        match = re.search(
+            r"k9pdl-streams mean ([\d.]+) of (\d+) workers "
+            r"\((\d+) chunks, ([\d.]+)s wall, ([\d.]+)s streaming", output)
+        assert match, "no k9pdl-streams line in:\n" + output
+        return {"mean": float(match.group(1)), "workers": int(match.group(2)),
+                "chunks": int(match.group(3)), "wall": float(match.group(4)),
+                "streaming": float(match.group(5))}
+
+    def test_a_parallel_run_reports_concurrency_near_the_worker_count(self, tmp_path):
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            # trickle each response, so the reads genuinely overlap in time
+            server.state.throttle_bytes = 64 * 1024
+            server.state.throttle_delay = 0.01
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", 256 * 1024)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        assert got["workers"] == 4
+        # Loose on purpose: this asserts the requests overlapped, not how well. A serial
+        # implementation reports ~1.0, which is what the assertion has to exclude.
+        assert got["mean"] > 2.0, "concurrency reported as {:.2f} of 4".format(got["mean"])
+
+    def test_a_single_chunk_run_reports_one_stream(self, tmp_path):
+        """
+        The figure has to be honest downward too, or "near the worker count" means
+        nothing. One chunk cannot exceed one stream however many workers were asked for.
+        """
+        payload = os.urandom(64 * 1024)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 8, "--min-chunk", 8 * MIB)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        assert got["chunks"] == 1
+        assert got["workers"] == 1, "one pending chunk means one worker"
+        assert got["mean"] <= 1.05, got
+
+    def test_backoff_sleeps_are_not_counted_as_streaming(self, tmp_path):
+        """
+        Counting retry sleeps would inflate the figure with time nothing was being
+        transferred -- and a run that retried a lot would then report high concurrency
+        while achieving nothing, which is the false reassurance this number exists to
+        prevent.
+        """
+        payload = os.urandom(512 * 1024)
+        with Server(payload) as server:
+            # drop_after, not fail_next: fail_next is consumed by probe_range before the
+            # pool starts, so the retry happens outside the accounting and the test
+            # measures nothing -- it passed with wall 0.0s that way. A mid-response drop
+            # forces the short-read handler INSIDE the read loop, which is the path
+            # whose backoff must be excluded.
+            server.state.drop_after = 256 * 1024
+            dest = str(tmp_path / "out.bin")
+            # connections=2 with one chunk: workers is min(connections, pending), so this
+            # is one worker on the parallel path. connections=1 would take the legacy
+            # single-stream fallback, which never enters the pool and reports nothing.
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 2, "--min-chunk", 512 * 1024,
+                                  "--retries", 5)
+        assert proc.returncode == 0, proc.stderr
+        assert "retrying in" in proc.stderr, "the retry path did not run"
+        got = self.parse(proc.stderr)
+        assert got["workers"] == 1, got
+        # the sleeps are real wall time, so streaming must fall well short of it --
+        # backoff is min(2**attempt, 60) * (0.5 + random()), so at least ~1s per retry
+        assert got["streaming"] < got["wall"], got
+        assert got["wall"] - got["streaming"] > 0.9, got
+        assert got["mean"] < 1.0, got
+
+    def test_every_stream_exit_is_accounted(self):
+        """
+        The accounting is called from each exit path of the read loop rather than from a
+        `finally`, so that backoff sleeps stay out. The cost is that a handler added
+        later without a call biases the figure downward -- and a low figure reads as
+        "the requests were not concurrent", i.e. as a defect that is not there. So check
+        the source rather than trusting it.
+        """
+        source = inspect.getsource(pdl.Downloader.download_chunk)
+        body = source.split("stream_started = time.time()", 1)[1]
+        # Exactly this indent: handlers of the read loop itself. A deeper `except`
+        # belongs to the nested stream.close() in the `finally`, which is not an exit
+        # path from the loop and must not be counted as one.
+        handlers = [line for line in body.splitlines()
+                    if re.match(r"^ {12}except\b", line)]
+        assert len(handlers) == 2, handlers
+        calls = body.count("_count_stream_time(stream_started)")
+        # one per handler, plus the success path that falls out of the loop normally
+        assert calls == len(handlers) + 1, (
+            "{} exit paths but {} accounting calls".format(len(handlers) + 1, calls))

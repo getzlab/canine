@@ -160,7 +160,13 @@ def make_handler(state):
             block = state.throttle_bytes or len(body) or 1
             try:
                 while written < limit:
-                    piece = body[written:written + block]
+                    # Capped at `limit`, not just `block`. Without the cap, an unthrottled
+                    # response has block == len(body), so the first write sends the WHOLE
+                    # body and `drop_after` truncates nothing -- the loop just exits with
+                    # everything already on the wire. That silently disarmed
+                    # test_dropped_connection_mid_chunk_is_resumed, which was passing on a
+                    # transfer that never dropped.
+                    piece = body[written:min(written + block, limit)]
                     self.wfile.write(piece)
                     self.wfile.flush()
                     written += len(piece)
