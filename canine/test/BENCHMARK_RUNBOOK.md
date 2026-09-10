@@ -1154,6 +1154,52 @@ signature. Calling `presign` four times in the same second with identical argume
 returns the *same* URL, and arm B would silently become a second copy of arm A — which is
 why the `test "$U0" != "$U1"` line is there rather than assumed.
 
+#### Check that the four streams really are four connections
+
+The experiment assumes four `curl` processes open four sockets. They do — curl's connection
+cache is per-process, so separate invocations cannot reuse each other's connections — but
+this is the assumption the whole result rests on, so watch it rather than trust it. While
+arm A is running, from a second shell:
+
+```bash
+# on the node, during arm A or B
+S3_HOST=${S3_ENDPOINT#https://}
+ss -tn state established "dst $(getent hosts "$S3_HOST" | awk '{print $1}')"
+```
+
+Four rows is what you want. One row means something is multiplexing, and the only thing
+that can is a proxy — so check for one before starting, since an `http_proxy` inherited
+from the environment or a `~/.curlrc` would quietly turn all three arms into the same
+measurement:
+
+```bash
+env | grep -i proxy || echo "no proxy set"
+test -f ~/.curlrc && cat ~/.curlrc || echo "no ~/.curlrc"
+```
+
+HTTP/2 is the other multiplexing mechanism and is *not* a confound here, for the same
+reason: it multiplexes streams within one connection, held by one process. It would matter
+if a single `curl` were given all four ranges at once, which is why the arms use four
+processes instead.
+
+Worth recording the peer addresses too, because a per-backend cap and a per-account cap
+are otherwise indistinguishable:
+
+```bash
+getent hosts "$S3_HOST"      # one address, or several?
+```
+
+If the endpoint round-robins across several backends and throughput *still* does not
+scale, the cap is being applied somewhere shared — an account or object quota rather than
+a per-server limit.
+
+The same question about our own code has an answer: `HttpSource.open_range` calls
+`urllib.request.urlopen`, and urllib sends `Connection: close` on every request — verified
+directly against a server that records what arrived, not inferred from the documentation.
+So each chunk gets its own TCP connection and 16 workers really are 16 connections. That
+is also why there is no connection reuse to lose by using the S3 API path instead; see
+§6.1's note.
+
 Reading it, with C as the single-stream time for 256 MiB:
 
 * **B ≈ C, A ≈ 4×C** — per signed URL. Mint one URL per worker and the ceiling lifts.

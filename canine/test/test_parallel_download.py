@@ -14,6 +14,7 @@ import os
 import stat
 import subprocess
 import sys
+import urllib.request
 
 import pytest
 
@@ -2076,3 +2077,49 @@ class TestConcurrencyIsReported:
         # one per handler, plus the success path that falls out of the loop normally
         assert calls == len(handlers) + 1, (
             "{} exit paths but {} accounting calls".format(len(handlers) + 1, calls))
+
+
+class TestEachChunkGetsItsOwnConnection:
+    """
+    Whether the workers share a TCP connection decides how to read a flat sweep: if 16
+    workers were multiplexed onto one socket, a server-side per-connection cap would look
+    exactly like a per-object cap, and the GDC result would mean something different.
+
+    The claim is that `urllib.request` neither pools nor keeps alive, so each ranged GET
+    gets a fresh connection. That claim is load-bearing in PARALLEL_DOWNLOAD.md and in
+    the runbook, and it was asserted from memory twice before anyone checked it. The
+    fake server records client source ports, so it can be checked instead.
+    """
+
+    def test_urllib_asks_the_server_to_close(self):
+        """The mechanism, in one assertion: no keep-alive is requested."""
+        import http.client
+        sent = []
+        original = http.client.HTTPConnection.putheader
+
+        def spy(self, header, *values):
+            sent.append((header.lower(), values))
+            return original(self, header, *values)
+
+        payload = os.urandom(4096)
+        http.client.HTTPConnection.putheader = spy
+        try:
+            with Server(payload) as server:
+                urllib.request.urlopen(server.url()).read()
+        finally:
+            http.client.HTTPConnection.putheader = original
+        assert ("connection", ("close",)) in sent, sent
+
+    def test_a_multi_chunk_download_uses_a_connection_per_request(self, tmp_path):
+        payload = os.urandom(8 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+            seen = server.state.snapshot()
+        assert proc.returncode == 0, proc.stderr
+        # 8 chunks plus the range probe. Sharing would show far fewer connections than
+        # requests; one connection for all of them is the case that would invalidate
+        # the reading of a flat sweep.
+        assert seen["requests"] >= 8, seen
+        assert seen["connections"] == seen["requests"], seen

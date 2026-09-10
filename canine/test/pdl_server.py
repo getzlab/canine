@@ -53,11 +53,15 @@ class ServerState:
         self.throttle_bytes = None     # write in blocks of this size...
         self.throttle_delay = 0.0      # ...sleeping this long between them
         self.fail_next = 0             # return 500 for the next N requests
+        # Client source ports seen, one entry per accepted connection. Lets a test show
+        # that requests do not share a socket, rather than asserting it from the docs.
+        self.client_ports = set()
 
     def snapshot(self):
         with self.lock:
             return {"sent": self.sent, "requests": self.requests,
-                    "range_requests": self.range_requests}
+                    "range_requests": self.range_requests,
+                    "connections": len(self.client_ports)}
 
 
 def make_handler(state):
@@ -69,6 +73,7 @@ def make_handler(state):
 
         def _count(self, n, ranged):
             with state.lock:
+                state.client_ports.add(self.client_address[1])
                 state.sent += n
                 state.requests += 1
                 if ranged:
