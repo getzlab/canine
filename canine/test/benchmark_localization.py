@@ -1307,29 +1307,53 @@ def command_sweep(args):
         say("mean verify   : {:.1f}s ({:.0f}%)".format(vf, 100*vf/total if total else 0))
         say()
         if total and vf/total > 0.25:
-            say("Verification is {:.0f}% of the wall clock. On the in-place route that is a".format(
-                100*vf/total))
-            say("full re-read of the object, and it is avoidable: chunk boundaries are")
-            say("already snapped to S3 part boundaries, so each part's md5 could be")
-            say("computed as the bytes stream past instead of afterwards.")
-            say("-> worth building. It also means the node's cores are doing real work,")
-            say("   so do not size the instance down on the assumption localization is")
-            say("   pure IO.")
+            say("Verification is {:.0f}% of the wall clock, a full re-read of the object."
+                .format(100*vf/total))
+            if getattr(args, "s3_bucket", None) or getattr(args, "part_length", None):
+                say("For a MULTIPART ETag this is avoidable and already implemented: each")
+                say("part's md5 is computed as the bytes stream past, and verify() logs")
+                say("'etag from N recorded part digests, M re-read'. If M is large here,")
+                say("the digests are not surviving -- investigate rather than accept it.")
+            else:
+                say("This source is verified by a WHOLE-FILE md5, which is inherently")
+                say("sequential over the byte stream and cannot be computed from parts.")
+                say("The read-back is therefore unavoidable for this object; only a")
+                say("multipart ETag source can skip it.")
         else:
             say("Verification is a small share, so hashing during the transfer would buy")
             say("little, and the cores are mostly idle -- a smaller instance type is")
             say("worth investigating (§10).")
 
     heading("verdict")
-    best = max(usable, key=lambda r: r["throughput_bytes_per_s"])
-    say("fastest        : {} connections at {}".format(
-        best["connections"], rate(args.size, best["seconds"])))
-    if baseline:
-        say("speedup        : {}x vs a single stream (§8.5 wants >=4x)".format(
-            best["speedup_vs_single_stream"]))
+
+    # Compare the DOWNLOAD phase, not total wall clock. Total mixes phases: this used to
+    # report 1.3x where the like-for-like figure was 1.9x, because every route times its
+    # own verification into the total while the amount of verification differs by route.
+    def download_seconds(row):
+        return row["phases"].get("download") or row["seconds"]
+
+    comparable = all("download" in r["phases"] for r in usable)
+    basis = "download phase" if comparable else "total wall clock, phases unavailable"
+    best = min(usable, key=download_seconds)
+    base_row = next((r for r in usable if r["connections"] <= 1), None)
+
+    say("fastest        : {} connections at {} ({})".format(
+        best["connections"], rate(args.size, download_seconds(best)), basis))
+    if base_row is not None:
+        speedup = download_seconds(base_row) / download_seconds(best)
+        say("single stream  : {}".format(rate(args.size, download_seconds(base_row))))
+        say("speedup        : {:.2f}x vs a single stream (§8.5 wants >=4x)".format(speedup))
         say("               : {}".format(
-            "MEETS the target" if (best["speedup_vs_single_stream"] or 0) >= 4
-            else "DOES NOT meet the target"))
+            "MEETS the target" if speedup >= 4 else "DOES NOT meet the target"))
+        if not comparable:
+            say("               : basis is total time -- some rows logged no phases, so")
+            say("                 this understates parallel rows that verified inline")
+        say()
+        say("Note this is the speedup against THIS source. A source that is already fast")
+        say("single-stream leaves little for parallelism to win; the figure that matters")
+        say("for the project is the one against the source that is slow today.")
+    else:
+        say("no connections=1 row, so there is no baseline to compare against")
 
     # §8.5 wants memory bounded regardless of object size: the design's claim is that
     # only READ_BLOCK per connection is ever buffered, so RSS should be roughly flat
@@ -1348,8 +1372,21 @@ def command_sweep(args):
     peak_disk = max((r["peak_disk_bytes_per_s"] or 0) for r in usable)
     say()
     say("peak NIC       : {}   (n1-standard-8 cap is ~2 GB/s)".format(rate(peak_nic, 1)))
-    say("peak disk write: {}".format(rate(peak_disk, 1)))
-    if peak_nic and peak_disk:
+
+    # /proc/diskstats only sees block devices, so a tmpfs or overlay destination reports
+    # ~0 disk writes -- which the comparison below would read as "the disk is the limit"
+    # when there is no disk in the path at all.
+    dest_mount = probe_mount(args.dest_dir)
+    dest_backing = backing_kind(dest_mount.get("fstype"))
+    if dest_backing != "block device":
+        say("peak disk write: not applicable -- {} is {}".format(
+            args.dest_dir, dest_backing))
+        say("-> no block device in the path, so this run says nothing about the disk.")
+        say("   It measures the source and the NIC, which is what a tmpfs destination")
+        say("   is for. Compare against the same sweep to the localization disk (§6.2).")
+    else:
+        say("peak disk write: {}".format(rate(peak_disk, 1)))
+    if peak_nic and peak_disk and dest_backing == "block device":
         if peak_disk < peak_nic * 0.8:
             say("-> the DISK looks like the limit, as §2 predicted for LocalizeToDisk.")
             say("   Raising connections further will not help; a larger PD would.")

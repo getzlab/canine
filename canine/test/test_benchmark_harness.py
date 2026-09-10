@@ -694,3 +694,104 @@ class TestHeadersReachTheDownloader:
             bench.source_args(args, "/d/f", 10) +
             ["--dest", "/d/f", "--size", "10", "--connections", "4"])
         assert opts.header == ["Authorization: Bearer tok"]
+
+
+class TestTheVerdictComparesLikeWithLike:
+    """
+    The sweep reported a 1.3x speedup where the like-for-like figure was 1.89x. The
+    connections=1 row takes the legacy curl path, which never calls verify(), so its
+    total was download-only while every parallel row's total included 27.7s of read-back.
+    Comparing totals across routes that verify differently is not a comparison.
+    """
+
+    def sweep(self, tmp_path, monkeypatch, rows, dest_dir=None, s3=False):
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, connections, min_chunk, **kw):
+            spec = rows[connections]
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            return {"connections": connections, "returncode": 0,
+                    "seconds": spec["total"], "killed": False, "peak_rss": 1 << 20,
+                    "phases": spec["phases"], "nic_bytes": 0, "disk_bytes": 0,
+                    "peak_nic_bytes_per_s": 1e8, "peak_disk_bytes_per_s": 1e3,
+                    "stderr_tail": []}
+
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload), bench.Verification("md5", digest)))
+        argv = ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+                "--dest-dir", str(dest_dir or tmp_path),
+                "--connections"] + [str(c) for c in sorted(rows)]
+        if s3:
+            argv += ["--s3-bucket", "b", "--s3-key", "k"]
+        return bench.command_sweep(bench.build_parser().parse_args(argv))
+
+    def test_speedup_uses_the_download_phase(self, tmp_path, monkeypatch, capsys):
+        # mirrors the real run: baseline download-only, parallel row download+verify
+        self.sweep(tmp_path, monkeypatch, {
+            1: {"total": 118.7, "phases": {"download": 118.7}},
+            4: {"total": 91.14, "phases": {"download": 62.9, "verify": 27.7}},
+        })
+        out = capsys.readouterr().out
+        assert "download phase" in out
+        # 118.7 / 62.9 = 1.89, not 91.14-based 1.30
+        assert "1.89x" in out, out
+        assert "1.30x" not in out
+
+    def test_it_says_when_the_basis_is_not_comparable(self, tmp_path, monkeypatch,
+                                                      capsys):
+        self.sweep(tmp_path, monkeypatch, {
+            1: {"total": 100.0, "phases": {}},
+            4: {"total": 50.0, "phases": {"download": 25.0, "verify": 25.0}},
+        })
+        out = capsys.readouterr().out
+        assert "phases unavailable" in out
+        assert "understates" in out
+
+    def test_no_disk_verdict_for_a_memory_destination(self, tmp_path, monkeypatch,
+                                                     capsys):
+        """
+        /proc/diskstats sees only block devices, so a tmpfs destination reports ~0 disk
+        writes -- which the old heuristic read as "the DISK looks like the limit" on a
+        run with no disk in it at all.
+        """
+        monkeypatch.setattr(bench, "probe_mount",
+                            lambda d: {"available": True, "matched": True,
+                                       "fstype": "tmpfs", "device": "tmpfs",
+                                       "mountpoint": str(tmp_path)})
+        self.sweep(tmp_path, monkeypatch, {
+            1: {"total": 10.0, "phases": {"download": 10.0}},
+            4: {"total": 5.0, "phases": {"download": 5.0}},
+        })
+        out = capsys.readouterr().out
+        assert "not applicable" in out
+        assert "DISK looks like the limit" not in out
+        assert "says nothing about the disk" in out
+
+    def test_a_whole_file_md5_is_not_advertised_as_avoidable(self, tmp_path, monkeypatch,
+                                                            capsys):
+        """
+        In-transfer hashing only applies to a multipart ETag. A whole-file md5 is
+        sequential over the byte stream and cannot be assembled from parts, so telling
+        the reader the read-back is avoidable would be wrong.
+        """
+        self.sweep(tmp_path, monkeypatch, {
+            1: {"total": 10.0, "phases": {"download": 5.0, "verify": 5.0}},
+            4: {"total": 10.0, "phases": {"download": 5.0, "verify": 5.0}},
+        })
+        out = capsys.readouterr().out
+        assert "WHOLE-FILE md5" in out
+        assert "unavoidable" in out
+        assert "could be computed" not in out
+
+    def test_a_multipart_source_points_at_the_recorded_digests(self, tmp_path,
+                                                              monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch, {
+            1: {"total": 10.0, "phases": {"download": 5.0, "verify": 5.0}},
+            4: {"total": 10.0, "phases": {"download": 5.0, "verify": 5.0}},
+        }, s3=True)
+        out = capsys.readouterr().out
+        assert "MULTIPART" in out
+        assert "already implemented" in out

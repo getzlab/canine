@@ -2666,6 +2666,10 @@ def single_stream_fallback(options, reason):
     """
     log("falling back to a single stream: {}".format(reason))
     clear_preallocated_working_file(options.dest)
+    # Timed as a "download" phase like every other route, so a benchmark comparing this
+    # baseline against the parallel paths compares the same thing. Without it the
+    # single-stream row is download-only while the others include their verification,
+    # which understated the measured speedup by a third.
     if options.legacy_cmd:
         command = options.legacy_cmd
     else:
@@ -2676,7 +2680,8 @@ def single_stream_fallback(options, reason):
             dest=shlex.quote(options.dest),
             url=shlex.quote(options.url),
         )
-    result = subprocess.run(command, shell=True, executable=SHELL)
+    with phase("download", options.size if (options.size or 0) > 0 else None):
+        result = subprocess.run(command, shell=True, executable=SHELL)
     return result.returncode
 
 
