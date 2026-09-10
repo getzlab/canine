@@ -610,19 +610,40 @@ question the fan-out constraint has since closed — `pd-balanced` and `pd-ssd` 
 read-only attachments and cannot back the published artifact whatever their throughput
 (§10). The only live question is whether the per-gigabyte model describes this path at all.
 
+First make sure nothing is already writing to the disk — see the warning below:
+
+```bash
+# on the node
+sudo docker exec slurm sh -c 'ps -eo pid,etime,args | grep "[d]d if="' \
+  && echo "^ a dd is already running; kill it before measuring" \
+  || echo "clear"
+```
+
 ```bash
 # on the node
 sudo docker exec slurm bash -c '
   set -e
   D=/mnt/rwdisks/'"$DISK"'
+  F=$D/ddtest.$$
+  trap "rm -f $F" EXIT
   echo "=== write"
-  dd if=/dev/zero of=$D/ddtest bs=1M count=8000 \
+  dd if=/dev/zero of=$F bs=1M count=8000 \
      oflag=direct conv=fdatasync status=progress
   sync
   echo "=== read"
-  dd if=$D/ddtest of=/dev/null bs=1M iflag=direct status=progress
-  rm -f $D/ddtest'
+  dd if=$F of=/dev/null bs=1M iflag=direct status=progress'
 ```
+
+> **`docker exec` does not forward Ctrl-C.** Without `-t` the docker *client* exits on
+> SIGINT while the process inside the container keeps running. So interrupting this leaves
+> a `dd` writing to the disk, and the next attempt then measures **two writers sharing the
+> bandwidth** — halving the apparent rate — before the straggler reaches its cleanup and
+> deletes the file the new run just wrote. That failure mode presents as a read error
+> immediately after a successful write, which is confusing enough to be worth naming.
+>
+> Hence `$$` in the filename and the `trap`: each run cleans up only its own file, so a
+> straggler cannot delete a live measurement. Check with the `ps` above before trusting
+> any number, and `sudo docker exec slurm pkill -f "dd if="` to clear one.
 
 `oflag=direct` / `iflag=direct` bypass the page cache, so these are the disk and not RAM.
 8000 MiB is enough to be past any burst behaviour and small enough to finish quickly even
