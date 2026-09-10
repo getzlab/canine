@@ -1344,6 +1344,18 @@ def command_sweep(args):
         if outcome.get("mean_streams") is not None:
             say("        streams: {:.2f} of {} concurrent on average".format(
                 outcome["mean_streams"], outcome["workers"]))
+        # NIC bytes over payload bytes. ~1 means every byte crossed the wire once, which
+        # is the claim that the object was chunked into disjoint ranges rather than
+        # fetched N times over. A server that IGNORES Range returns the whole object to
+        # every request -- the gzip-transcoded GCS case -- and this ratio goes to the
+        # connection count. probe_range is supposed to stop that before any parallel work
+        # starts, but the ratio is the observable, and a cost alarm besides: GCS bills
+        # for the whole object per request.
+        if outcome.get("nic_bytes") and args.size:
+            ratio = outcome["nic_bytes"] / float(args.size)
+            note = "" if ratio < 1.5 else "   <-- DUPLICATE FETCHING"
+            say("        wire   : {:.2f}x payload ({} on the NIC){}".format(
+                ratio, human(outcome["nic_bytes"]), note))
         if not args.keep:
             try:
                 os.unlink(dest)
@@ -1464,6 +1476,18 @@ def command_sweep(args):
                     say("  this as a measurement of the source.")
     else:
         say("no connections=1 row, so there is no baseline to compare against")
+
+    wire = [r["nic_bytes"] / float(args.size) for r in usable
+            if r.get("nic_bytes") and args.size]
+    if wire and max(wire) >= 1.5:
+        heading("DUPLICATE FETCHING")
+        say("At least one setting put {:.2f}x the payload on the NIC. Every byte should".
+            format(max(wire)))
+        say("cross the wire once; a ratio near the connection count means the server")
+        say("ignored Range and returned the whole object to each request. Check the")
+        say("probe output -- and note that GCS bills for the whole object per request,")
+        say("so this is a cost incident and not only a wrong measurement.")
+        say()
 
     # §8.5 wants memory bounded regardless of object size: the design's claim is that
     # only READ_BLOCK per connection is ever buffered, so RSS should be roughly flat

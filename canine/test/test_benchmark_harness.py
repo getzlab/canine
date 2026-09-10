@@ -966,3 +966,61 @@ class TestTheS3BaselineIsBoundedToo:
         with open(os.path.join(os.path.dirname(__file__), os.pardir,
                                "localization", "file_handlers.py")) as handle:
             assert '--range "bytes=$SZ-"' in handle.read()
+
+
+class TestDuplicateFetchingIsVisible:
+    """
+    16 connections each fetching the whole object, rather than a disjoint sixteenth of
+    it, would look like a correct-but-slow run: same wall time, same throughput figure, a
+    valid file at the end. What gives it away is NIC bytes -- 16x the payload instead of
+    1x. `probe_range` is meant to prevent it (a server that ignores Range returns the
+    whole object to every request), but prevention is not observation, and on GCS it is a
+    billing event as well as a wrong number.
+    """
+
+    def sweep(self, tmp_path, monkeypatch, ratios):
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, connections, min_chunk, **kw):
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            return {"connections": connections, "returncode": 0, "seconds": 10.0,
+                    "killed": False, "peak_rss": 1 << 20,
+                    "phases": {"download": 9.0, "verify": 1.0},
+                    "nic_bytes": int(ratios[connections] * len(payload)),
+                    "disk_bytes": len(payload),
+                    "peak_nic_bytes_per_s": 1e8, "peak_disk_bytes_per_s": 1e3,
+                    "mean_streams": None, "workers": None, "stderr_tail": []}
+
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload), bench.Verification("md5", digest)))
+        argv = ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+                "--dest-dir", str(tmp_path),
+                "--connections"] + [str(c) for c in sorted(ratios)]
+        bench.command_sweep(bench.build_parser().parse_args(argv))
+
+    def test_a_one_to_one_ratio_is_not_flagged(self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch, {1: 1.02, 16: 1.03})
+        assert "DUPLICATE FETCHING" not in capsys.readouterr().out
+
+    def test_sixteen_times_the_payload_is_flagged(self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch, {1: 1.02, 16: 16.1})
+        out = capsys.readouterr().out
+        assert "DUPLICATE FETCHING" in out
+        assert "ignored Range" in out
+        assert "bills for the whole object" in out, "the cost consequence must be stated"
+
+    def test_the_ratio_is_shown_per_row(self, tmp_path, monkeypatch, capsys):
+        """Visible on every run, not only when it trips the threshold."""
+        self.sweep(tmp_path, monkeypatch, {1: 1.02, 16: 1.03})
+        assert "x payload" in capsys.readouterr().out
+
+    def test_the_threshold_tolerates_protocol_overhead(self, tmp_path, monkeypatch, capsys):
+        """
+        nic_total counts TLS, framing and any other traffic on the box, so the ratio is
+        never exactly 1. A threshold firing at 1.05 would cry wolf on every real run.
+        """
+        self.sweep(tmp_path, monkeypatch, {1: 1.2, 16: 1.4})
+        assert "DUPLICATE FETCHING" not in capsys.readouterr().out
