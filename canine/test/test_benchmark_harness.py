@@ -352,3 +352,111 @@ class TestRangeProbeHandlesBinaryBodies:
     def test_accept_ranges_is_reported(self, tmp_path, monkeypatch, capsys):
         out = self.probe_with(tmp_path, monkeypatch, b"\x1f\x8b" + os.urandom(4094))
         assert out["accept_ranges"] == "bytes"
+
+
+class TestPartLengthUniformity:
+    """
+    The md5-of-md5s only reproduces the ETag if every non-final part is striden at its
+    true length. S3 does NOT require parts to be equal -- only that non-final ones are
+    >= 5 MiB -- so `head-object --part-number 1` is not by itself the stride.
+
+    Getting it wrong is not a benign miss: verify() raises PermanentError on an ETag
+    mismatch and discards the file, so a byte-perfect 279 GB download would be deleted
+    and the job marked do-not-retry.
+    """
+
+    def fake_aws(self, tmp_path, monkeypatch, size, count, lengths):
+        """`lengths` maps part number -> ContentLength."""
+        script = tmp_path / "aws"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "argv = sys.argv[1:]\n"
+            "LEN = {!r}\n"
+            "if '--part-number' in argv:\n"
+            "    n = int(argv[argv.index('--part-number')+1])\n"
+            "    print(json.dumps({{'ContentLength': LEN[n]}}))\n"
+            "else:\n"
+            "    print(json.dumps({{'ContentLength': {}, 'PartsCount': {},\n"
+            "                      'ETag': '\\\"{}-{}\\\"'}}))\n".format(
+                lengths, size, count, "a" * 32, count))
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", "{}:{}".format(tmp_path, os.environ["PATH"]))
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "FAKE")
+        return bench.build_parser().parse_args(
+            ["probe", "--s3-bucket", "b", "--s3-key", "k"])
+
+    def test_uniform_parts_yield_a_stride(self, tmp_path, monkeypatch):
+        # 4 parts of 10, last of 5 -> 3*10 + 5 = 35
+        args = self.fake_aws(tmp_path, monkeypatch, 35, 4,
+                             {1: 10, 2: 10, 3: 10, 4: 5})
+        meta = bench.s3_object_metadata(args)
+        assert meta["parts_uniform"] is True
+        assert meta["part_length"] == 10
+
+    def test_a_differing_interior_part_is_caught(self, tmp_path, monkeypatch):
+        # parts 10, 20, 5 -> the identity (3-1)*10 + 5 = 25 != 35
+        args = self.fake_aws(tmp_path, monkeypatch, 35, 3, {1: 10, 2: 20, 3: 5})
+        meta = bench.s3_object_metadata(args)
+        assert meta["parts_uniform"] is False
+        assert meta["part_length"] is None, "must not offer a stride it cannot trust"
+
+    def test_a_differing_second_part_is_caught_even_if_the_sum_works(
+            self, tmp_path, monkeypatch):
+        """
+        The case the sum identity alone would miss: 10 + 5 + 15 + 5 = 35 and
+        (4-1)*10 + 5 = 35, so only comparing part 2 to part 1 catches it.
+        """
+        args = self.fake_aws(tmp_path, monkeypatch, 35, 4, {1: 10, 2: 5, 3: 15, 4: 5})
+        meta = bench.s3_object_metadata(args)
+        assert meta["parts_uniform"] is False
+
+    def test_a_last_part_larger_than_the_first_is_caught(self, tmp_path, monkeypatch):
+        args = self.fake_aws(tmp_path, monkeypatch, 25, 2, {1: 10, 2: 15})
+        meta = bench.s3_object_metadata(args)
+        assert meta["parts_uniform"] is False
+
+    def test_two_parts_need_no_second_probe(self, tmp_path, monkeypatch):
+        """With two parts, part 1 IS the stride and the layout is unambiguous."""
+        args = self.fake_aws(tmp_path, monkeypatch, 15, 2, {1: 10, 2: 5})
+        meta = bench.s3_object_metadata(args)
+        assert meta["parts_uniform"] is True and meta["part_length"] == 10
+
+    def test_verification_is_declined_rather_than_wrong(self, tmp_path, monkeypatch):
+        args = self.fake_aws(tmp_path, monkeypatch, 35, 3, {1: 10, 2: 20, 3: 5})
+        args = bench.build_parser().parse_args(
+            ["sweep", "--s3-bucket", "b", "--s3-key", "k", "--dest-dir", "/d"])
+        size, verification = bench.resolve_source(args)
+        assert size == 35
+        assert verification.kind is None
+        assert "not uniform" in verification.label
+
+    def test_an_endpoint_that_rejects_other_part_numbers_still_works(
+            self, tmp_path, monkeypatch):
+        """
+        A guard must not regress a working configuration. HandleAWSURL only ever asks for
+        part 1, so an endpoint could support that and reject the rest; the confirmation
+        then downgrades to unconfirmed and the part-1 stride is used as before.
+        """
+        script = tmp_path / "aws"
+        script.write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, sys\n"
+            "argv = sys.argv[1:]\n"
+            "if '--part-number' in argv:\n"
+            "    n = int(argv[argv.index('--part-number')+1])\n"
+            "    if n != 1:\n"
+            "        sys.stderr.write('InvalidArgument\\n'); sys.exit(255)\n"
+            "    print(json.dumps({'ContentLength': 10}))\n"
+            "else:\n"
+            "    print(json.dumps({'ContentLength': 35, 'PartsCount': 4,\n"
+            "                      'ETag': '\"" + "a" * 32 + "-4\"'}))\n")
+        script.chmod(0o755)
+        monkeypatch.setenv("PATH", "{}:{}".format(tmp_path, os.environ["PATH"]))
+        monkeypatch.setenv("AWS_ACCESS_KEY_ID", "FAKE")
+        args = bench.build_parser().parse_args(
+            ["probe", "--s3-bucket", "b", "--s3-key", "k"])
+        meta = bench.s3_object_metadata(args)
+        assert meta["parts_uniform"] is None, "should be unconfirmed, not failed"
+        assert meta["part_length"] == 10, "must still use the part-1 stride"
+        assert "unconfirmed" in meta["uniformity"]

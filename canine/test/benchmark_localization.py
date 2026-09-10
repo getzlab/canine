@@ -90,6 +90,10 @@ def downloader_path(args=None):
 MIB = 1024 * 1024
 GIB = 1024 * MIB
 
+# Mirrors parallel_download.py's DEFAULT_MIN_CHUNK. Defined once here so the parser
+# default and the chunk-plan arithmetic in probe_s3_endpoint cannot drift apart.
+DEFAULT_MIN_CHUNK = 64 * MIB
+
 # The emitted commands and the legacy fallbacks use [[ ]] and process substitution, which
 # dash rejects -- and /bin/sh in the worker image is dash. Same reason parallel_download.py
 # pins it: shell=True would otherwise pick /bin/sh.
@@ -395,23 +399,24 @@ def probe_s3_endpoint(args):
         except subprocess.SubprocessError as e:
             return subprocess.CompletedProcess(command, 1, "", str(e))
 
-    head = aws("s3api head-object --bucket {} --key {}".format(
-        shlex.quote(args.s3_bucket), shlex.quote(args.s3_key)))
-    if head.returncode != 0:
-        say("head-object FAILED: {}".format(head.stderr.strip().splitlines()[:2]))
+    # The same helper resolve_source uses, rather than a second copy of the head logic.
+    # It performs the `--part-number 1` head that HandleAWSURL does
+    # (file_handlers.py:1189-1205), which is the only way to learn the part length --
+    # head-object reports how MANY parts there are, never how big they are.
+    try:
+        meta = s3_object_metadata(args)
+    except RuntimeError as e:
+        say("head-object FAILED: {}".format(e))
         say("without this nothing else can be measured -- check credentials, the")
         say("endpoint URL, and whether the bucket needs --no-sign-request")
         out["head_object"] = False
         return out
 
-    try:
-        meta = json.loads(head.stdout)
-    except ValueError:
-        meta = {}
     out["head_object"] = True
-    out["size"] = meta.get("ContentLength")
-    out["etag"] = (meta.get("ETag") or "").strip('"')
-    out["parts_count"] = meta.get("PartsCount")
+    out["size"] = meta["size"]
+    out["etag"] = meta["etag"]
+    out["parts_count"] = meta["parts_count"]
+    out["part_length"] = meta["part_length"]
     say("size        : {}".format(human(out["size"]) if out["size"] else "?"))
 
     # what the ETag means decides whether check_hash can work at all
@@ -422,12 +427,32 @@ def probe_s3_endpoint(args):
     elif re.fullmatch(r"[0-9a-f]{32}-\d+", etag or ""):
         out["etag_kind"] = "multipart"
         say("etag        : {}  -- multipart (md5-of-md5s)".format(etag))
-        say("              PartsCount={}, so the downloader snaps chunks to part"
-            .format(out["parts_count"]))
-        say("              boundaries and computes the ETag during the transfer.")
-        if not out["parts_count"]:
-            say("              WARNING: multipart-shaped ETag but no PartsCount, so the")
-            say("              part length is unknown and verification cannot use it.")
+        out["parts_uniform"] = meta.get("parts_uniform")
+        out["uniformity"] = meta.get("uniformity")
+        part = out["part_length"]
+        if meta.get("parts_uniform") is False:
+            say("parts       : {} parts, but NOT uniform -- {}".format(
+                out["parts_count"], meta.get("uniformity")))
+            say("              S3 only requires non-final parts to be >= 5 MiB, so the")
+            say("              stride cannot be inferred. Striding by the wrong value")
+            say("              gives a wrong md5-of-md5s, and verify() would discard a")
+            say("              byte-perfect download as an ETag mismatch. ETag")
+            say("              verification is therefore DISABLED for this object.")
+        if part:
+            # measured from head-object --part-number 1, not size/parts: the final part
+            # is short, so dividing understates the real part length.
+            say("parts       : {} x {} (from --part-number 1; the last is shorter)"
+                .format(out["parts_count"], human(part)))
+            min_chunk = getattr(args, "min_chunk", None) or DEFAULT_MIN_CHUNK
+            chunk = max(part, -(-min_chunk // part) * part)
+            out["implied_chunk"] = chunk
+            out["implied_chunks"] = -(-out["size"] // chunk) if out["size"] else None
+            say("chunk plan  : {} ({} whole parts) -> {} chunks at --min-chunk {}".format(
+                human(chunk), chunk // part, out["implied_chunks"], human(min_chunk)))
+        else:
+            say("              WARNING: multipart ETag but no part length, so chunks")
+            say("              cannot be snapped to part boundaries and the ETag would")
+            say("              have to be verified by a full read-back instead.")
     else:
         out["etag_kind"] = "opaque"
         say("etag        : {!r}  -- NOT an AWS-style md5".format(etag))
@@ -443,7 +468,7 @@ def probe_s3_endpoint(args):
     # as text raises UnicodeDecodeError; and if the store were to IGNORE Range -- exactly
     # what this check exists to detect -- capturing stdout would pull the entire object
     # into memory. With an outfile, stdout is just the JSON metadata, which is text.
-    out["accept_ranges"] = meta.get("AcceptRanges")
+    out["accept_ranges"] = meta.get("accept_ranges")
     probe_size = min(1024, out["size"] or 1024)
     handle, tmp_path = tempfile.mkstemp(prefix=".k9pdl-range-")
     os.close(handle)
@@ -930,9 +955,71 @@ def s3_object_metadata(args):
     out = {"size": meta.get("ContentLength"),
            "etag": (meta.get("ETag") or "").strip('"'),
            "parts_count": meta.get("PartsCount") or 1,
-           "part_length": None}
-    if out["parts_count"] > 1:
-        out["part_length"] = head("--part-number 1").get("ContentLength")
+           # carried through because probe reports it and the refactor that moved this
+           # helper's caller onto it silently dropped the field, which a test caught
+           "accept_ranges": meta.get("AcceptRanges"),
+           "part_length": None,
+           "parts_uniform": None,
+           "uniformity": None}
+    if out["parts_count"] <= 1:
+        return out
+
+    count, size = out["parts_count"], out["size"]
+    first = head("--part-number 1").get("ContentLength")
+    out["part_length"] = first
+
+    def optional_head(*words):
+        """
+        A confirmation HEAD that must not break a path which already works.
+
+        HandleAWSURL only ever asks for part 1, so an endpoint could support that and
+        reject or mishandle other part numbers. Treating such a failure as fatal would
+        regress a working configuration in order to run a check, which is the wrong
+        trade -- so an unavailable confirmation downgrades to "could not verify" and the
+        part-1 stride is used, exactly as before this check existed.
+        """
+        try:
+            return head(*words).get("ContentLength")
+        except (RuntimeError, ValueError):
+            return None
+
+    # S3 does NOT require parts to be equal -- only that non-final parts are >= 5 MiB.
+    # So the length of part 1 is not by itself the stride, and striding a 279 GB file by
+    # the wrong value produces a wrong md5-of-md5s: verify() would then reject a
+    # byte-perfect download as an ETag mismatch and discard it. Two extra HEADs turn that
+    # silent false failure into a detected condition.
+    #
+    # The identity below is the strong part: if every non-final part were `first`, the
+    # total must be (count - 1) * first + last. A differing interior part breaks it unless
+    # another compensates exactly, and checking part 2 as well closes the easy cases.
+    last = optional_head("--part-number {}".format(count))
+    out["last_part_length"] = last
+
+    if first is None or size is None or last is None:
+        out["parts_uniform"] = None
+        out["uniformity"] = "unconfirmed (endpoint did not answer for part {})".format(
+            count)
+        return out
+
+    reasons = []
+    expected = (count - 1) * first + last
+    if expected != size:
+        reasons.append(
+            "(count-1)*first + last = {} but the object is {}".format(expected, size))
+    if last > first:
+        reasons.append("last part {} exceeds part 1 {}".format(last, first))
+    if count >= 3:
+        second = optional_head("--part-number 2")
+        out["second_part_length"] = second
+        if second is not None and second != first:
+            reasons.append("part 2 is {}, part 1 is {}".format(second, first))
+
+    out["parts_uniform"] = not reasons
+    out["uniformity"] = "; ".join(reasons) if reasons else "consistent"
+    if reasons:
+        # The stride is unknown, so the ETag cannot be reproduced from it. Better no
+        # verification than a verification that fails on correct data.
+        out["part_length"] = None
     return out
 
 
@@ -1021,6 +1108,10 @@ def resolve_source(args):
                     verification = Verification(
                         None, reason="multipart, but the ETag {!r} is not AWS-style "
                                      "md5-of-md5s".format(etag))
+            elif meta["parts_count"] > 1 and meta.get("parts_uniform") is False:
+                verification = Verification(
+                    None, reason="parts are not uniform ({}), so the md5-of-md5s stride "
+                                 "is unknown".format(meta.get("uniformity")))
             else:
                 verification = Verification(
                     None, reason="the ETag {!r} is not an md5; this store does not follow "
@@ -1425,7 +1516,7 @@ def build_parser():
         p.add_argument("--dest-dir", default="/mnt/rwdisks",
                        help="where to write; use the localization disk to measure the "
                             "path that matters (default: %(default)s)")
-        p.add_argument("--min-chunk", type=int, default=64 * MIB)
+        p.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK)
         p.add_argument("--downloader", metavar="PATH",
                        help="parallel_download.py to drive; defaults to one beside this "
                             "script, else the repo's ../localization/ copy")
@@ -1434,6 +1525,9 @@ def build_parser():
 
     probe = sub.add_parser("probe", help="free environment report; run this first")
     add_s3(probe)
+    probe.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK,
+                       help="used only to report the chunk plan a multipart object "
+                            "would get (default: %(default)s)")
     probe.add_argument("--json", metavar="PATH", help="also write results as JSON")
 
     sweep = sub.add_parser("sweep", help="connection sweep, speedup, NIC-vs-disk limit")
