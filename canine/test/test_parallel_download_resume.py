@@ -769,3 +769,136 @@ class TestExitCodeContract:
                                   "--retries", 1, "--timeout", 2)
         assert proc.returncode != 0
         assert proc.returncode in (pdl.EXIT_FAIL, pdl.EXIT_REQUEUE)
+
+
+# ---------------------------------------------------------------------------
+# in-transfer part hashing across a real kill
+# ---------------------------------------------------------------------------
+
+def multipart_etag_of(data, part_length):
+    digests = [hashlib.md5(data[i:i + part_length]).digest()
+               for i in range(0, len(data), part_length)]
+    return "{}-{}".format(hashlib.md5(b"".join(digests)).hexdigest(), len(digests))
+
+
+class TestPartDigestsAcrossAKill:
+    """
+    The in-place route hashes each S3 part as its bytes go past, so `verify()` need not
+    re-read the object -- a read-back that measures as long as the download itself on a
+    persistent disk.
+
+    A SIGKILL is the only way to exercise what happens to those digests. Bytes written
+    before the kill are on disk (SIGKILL does not discard dirty pages), but the digests
+    for parts straddling the resume point were never completed, so they must be re-read
+    rather than assumed. Getting that wrong in the trusting direction would verify wrong
+    data; getting it wrong in the other would discard a good download.
+    """
+
+    PART = 64 * 1024
+
+    def test_the_etag_is_correct_after_a_kill_and_resume(self, tmp_path):
+        payload = os.urandom(600 * 1024)          # ~9.4 parts
+        etag = multipart_etag_of(payload, self.PART)
+        dest = str(tmp_path / "obj.bam")
+
+        with Server(payload) as server:
+            # Throttled, or the object finishes over loopback before the kill lands and
+            # the second run just reads the done marker -- which passes while verifying
+            # nothing.
+            server.state.throttle_bytes = 32 * 1024
+            server.state.throttle_delay = 0.01
+            proc = spawn_downloader(
+                server.url(), dest, len(payload),
+                "--connections", "2", "--min-chunk", str(2 * self.PART),
+                "--part-length", str(self.PART), "--check-etag", etag,
+                "--retries", "2")
+            kill_after_bytes(server, proc, 200 * 1024)
+            server.state.throttle_delay = 0.0
+
+            assert os.path.exists(dest), "the killed attempt left nothing behind"
+            assert not os.path.exists(pdl.sidecar_paths(dest)[1]), \
+                "the attempt completed before the kill; the test proves nothing"
+
+            second = run_downloader(
+                server.url(), dest, len(payload),
+                "--connections", "2", "--min-chunk", str(2 * self.PART),
+                "--part-length", str(self.PART), "--check-etag", etag,
+                "--retries", "2")
+
+        assert second.returncode == pdl.EXIT_OK, second.stderr
+        with open(dest, "rb") as fh:
+            assert fh.read() == payload, "resumed file does not match the source"
+
+    def test_the_resumed_run_re_reads_only_what_it_must(self, tmp_path):
+        """
+        The point of per-part fallback: a kill should cost a few part reads, not a full
+        object read. If this ever reports every part re-read, the digests recorded before
+        the kill are being thrown away.
+        """
+        payload = os.urandom(600 * 1024)
+        etag = multipart_etag_of(payload, self.PART)
+        dest = str(tmp_path / "obj.bam")
+        n_parts = (len(payload) + self.PART - 1) // self.PART
+
+        with Server(payload) as server:
+            server.state.throttle_bytes = 32 * 1024
+            server.state.throttle_delay = 0.01
+            proc = spawn_downloader(
+                server.url(), dest, len(payload),
+                "--connections", "2", "--min-chunk", str(2 * self.PART),
+                "--part-length", str(self.PART), "--check-etag", etag,
+                "--retries", "2")
+            kill_after_bytes(server, proc, 300 * 1024)
+            server.state.throttle_delay = 0.0
+            assert not os.path.exists(pdl.sidecar_paths(dest)[1]), \
+                "the attempt completed before the kill; the test proves nothing"
+            second = run_downloader(
+                server.url(), dest, len(payload),
+                "--connections", "2", "--min-chunk", str(2 * self.PART),
+                "--part-length", str(self.PART), "--check-etag", etag,
+                "--retries", "2")
+
+        assert second.returncode == pdl.EXIT_OK, second.stderr
+        line = [l for l in second.stderr.split("\n") if "etag from" in l]
+        assert line, "no etag provenance logged: {}".format(second.stderr[-400:])
+        reread = int(line[-1].split(",")[-1].strip().split()[0])
+        carried = n_parts - reread
+        # A weak `reread < n_parts` would pass on a single carried part, which could
+        # happen by luck. The kill lands after ~half the object, so a working
+        # implementation carries a substantial fraction.
+        assert carried >= n_parts // 4, (
+            "carried only {}/{} part digests across the kill -- re-read {}".format(
+                carried, n_parts, reread))
+
+    def test_a_manifest_from_a_different_plan_is_not_trusted(self, tmp_path):
+        """
+        Part digests are only meaningful for the file the manifest describes. A manifest
+        whose plan_id no longer matches is discarded wholesale on load, which takes its
+        part digests with it -- so a changed object cannot inherit stale digests.
+        """
+        payload = os.urandom(300 * 1024)
+        dest = str(tmp_path / "obj.bam")
+        etag = multipart_etag_of(payload, self.PART)
+        with Server(payload) as server:
+            first = run_downloader(
+                server.url(), dest, len(payload),
+                "--connections", "2", "--min-chunk", str(2 * self.PART),
+                "--part-length", str(self.PART), "--check-etag", etag)
+        assert first.returncode == pdl.EXIT_OK
+
+        manifest_path, marker_path = pdl.sidecar_paths(dest)
+        os.unlink(marker_path)
+        assert not os.path.exists(manifest_path), \
+            "a successful run should have removed its manifest"
+
+        # a different object at the same path: different size, so a different plan
+        other = os.urandom(200 * 1024)
+        other_etag = multipart_etag_of(other, self.PART)
+        with Server(other) as server:
+            again = run_downloader(
+                server.url(), dest, len(other),
+                "--connections", "2", "--min-chunk", str(2 * self.PART),
+                "--part-length", str(self.PART), "--check-etag", other_etag)
+        assert again.returncode == pdl.EXIT_OK, again.stderr
+        with open(dest, "rb") as fh:
+            assert fh.read() == other

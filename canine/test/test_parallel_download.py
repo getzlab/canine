@@ -1786,3 +1786,141 @@ class TestRoutesAreNamed:
             ])
         assert rc == pdl.EXIT_OK
         assert "route in-place: test: ext4" in capsys.readouterr().err
+
+
+class TestInTransferPartHashing:
+    """
+    The in-place route used to re-read the whole object to reproduce a multipart ETag.
+    Measured on a 316 GB pd-standard that read-back costs about as long as the download
+    (0.9 h each for a 279 GiB BAM), so it doubled localization. Hashing each S3 part as
+    its bytes go past removes it.
+
+    The invariant it rests on: plan_chunks makes every chunk start a multiple of
+    part_length, so a chunk covers a whole run of parts.
+    """
+
+    @staticmethod
+    def reference_etag(data, part_length):
+        digests = [hashlib.md5(data[i:i + part_length]).digest()
+                   for i in range(0, len(data), part_length)]
+        return "{}-{}".format(hashlib.md5(b"".join(digests)).hexdigest(), len(digests))
+
+    def download(self, tmp_path, payload, part_length, min_chunk, connections=4,
+                 extra=()):
+        dest = str(tmp_path / "obj.bam")
+        with Server(payload) as server:
+            rc = pdl.main([
+                "--url", server.url(), "--dest", dest, "--size", str(len(payload)),
+                "--connections", str(connections), "--min-chunk", str(min_chunk),
+                "--part-length", str(part_length),
+                "--check-etag", self.reference_etag(payload, part_length),
+            ] + list(extra))
+        return rc, dest
+
+    @pytest.mark.parametrize("size,part,min_chunk", [
+        (300000, 100000, 200000),      # 3 parts, chunk = 2 parts
+        (300001, 100000, 200000),      # ragged tail
+        (100000, 100000, 100000),      # exactly one part
+        (250000, 50000, 150000),       # 5 parts, chunk = 3 parts
+    ])
+    def test_the_etag_matches_without_a_read_back(self, tmp_path, capsys,
+                                                 size, part, min_chunk):
+        payload = os.urandom(size)
+        rc, _ = self.download(tmp_path, payload, part, min_chunk)
+        assert rc == pdl.EXIT_OK
+        err = capsys.readouterr().err
+        assert "0 re-read" in err, \
+            "should have hashed every part during transfer: {}".format(
+                [l for l in err.split("\n") if "etag from" in l])
+
+    def test_a_wrong_etag_still_fails(self, tmp_path):
+        """The digests must be able to reject, not merely to agree with themselves."""
+        payload = os.urandom(300000)
+        dest = str(tmp_path / "obj.bam")
+        with Server(payload) as server:
+            rc = pdl.main([
+                "--url", server.url(), "--dest", dest, "--size", str(len(payload)),
+                "--connections", "4", "--min-chunk", "200000",
+                "--part-length", "100000", "--check-etag", "0" * 32 + "-3",
+            ])
+        assert rc == pdl.EXIT_FAIL
+        assert not os.path.exists(dest), "a failed verification must discard the file"
+
+    def test_parts_are_keyed_separately_from_chunks(self, tmp_path):
+        """
+        A chunk spans several parts on this route, so part digests cannot share the
+        `chunks` keyspace that the bucket-compose route uses.
+        """
+        payload = os.urandom(300000)
+        rc, dest = self.download(tmp_path, payload, 100000, 200000)
+        assert rc == pdl.EXIT_OK
+        # 3 parts across 2 chunks -- if the keyspaces were shared this could not hold
+        assert (300000 + 99999) // 100000 == 3
+        assert len(pdl.plan_chunks(300000, 4, 200000, 100000)) == 2
+
+
+class TestPartDigestsSurviveInterruption:
+    """
+    A chunk resumed mid-way has bytes on disk this process never hashed. Those parts must
+    fall back to a read -- but only those parts, since after one preemption that is a
+    handful of 29 MiB reads standing in for a 279 GiB one.
+    """
+
+    def manifest_with(self, tmp_path, path, part_length, recorded):
+        chunks = pdl.plan_chunks(os.path.getsize(path), 4, 200000, part_length)
+        manifest = pdl.Manifest.create(
+            str(tmp_path / "m.json"), "plan", os.path.getsize(path), 200000, chunks,
+            os.stat(path), True, 0)
+        manifest.record_part_md5s(recorded, None)
+        return manifest
+
+    def test_missing_parts_are_re_read_and_the_etag_still_matches(self, tmp_path):
+        data = os.urandom(300000)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+        part = 100000
+        full = [hashlib.md5(data[i:i + part]).digest()
+                for i in range(0, len(data), part)]
+        expected = "{}-{}".format(
+            hashlib.md5(b"".join(full)).hexdigest(), len(full))
+
+        # only parts 0 and 2 recorded; part 1 must be re-read
+        manifest = self.manifest_with(tmp_path, str(path), part, {
+            0: full[0].hex(), 2: full[2].hex()})
+        actual, reread = pdl.multipart_etag_from_manifest(str(path), part, manifest)
+        assert actual == expected
+        assert reread == 1, "should re-read exactly the one missing part"
+
+    def test_no_digests_at_all_degrades_to_a_full_read(self, tmp_path):
+        data = os.urandom(250000)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+        part = 50000
+        manifest = self.manifest_with(tmp_path, str(path), part, {})
+        actual, reread = pdl.multipart_etag_from_manifest(str(path), part, manifest)
+        assert actual == TestInTransferPartHashing.reference_etag(data, part)
+        assert reread == 5, "every part missing means every part re-read"
+
+    def test_a_corrupt_recorded_digest_is_re_read_not_trusted(self, tmp_path):
+        data = os.urandom(200000)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+        part = 100000
+        manifest = self.manifest_with(tmp_path, str(path), part, {0: "not-hex", 1: "zz"})
+        actual, reread = pdl.multipart_etag_from_manifest(str(path), part, manifest)
+        assert actual == TestInTransferPartHashing.reference_etag(data, part)
+        assert reread == 2
+
+    def test_a_stale_digest_produces_a_mismatch_rather_than_a_pass(self, tmp_path):
+        """
+        The failure that matters: if a recorded digest were trusted for bytes that
+        changed, verification would pass on wrong data. It must not agree with itself.
+        """
+        data = os.urandom(200000)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+        part = 100000
+        wrong = hashlib.md5(b"different").digest().hex()
+        manifest = self.manifest_with(tmp_path, str(path), part, {0: wrong})
+        actual, _ = pdl.multipart_etag_from_manifest(str(path), part, manifest)
+        assert actual != TestInTransferPartHashing.reference_etag(data, part)

@@ -779,6 +779,35 @@ class Manifest:
             record["md5"] = md5_hex
             self.flush(None)
 
+    # ---- S3 part digests, for reproducing a multipart ETag without a read-back -------
+    #
+    # A separate keyspace from `chunks`, deliberately. On the bucket-compose route one
+    # chunk IS one uploaded part, so record_part_digest above can key by chunk index. On
+    # the in-place route a chunk spans several S3 parts (87 MiB of 29 MiB parts, for the
+    # object this was built for), so part digests need their own index. Sharing the
+    # `chunks` dict would conflate two different things that happen to both be called
+    # "part".
+
+    def record_part_md5s(self, digests, data_fd):
+        """
+        Persist finished S3-part digests, committed with the same data-before-metadata
+        discipline as everything else: flush() fsyncs `data_fd` first, so a digest can
+        never be durable while the bytes it describes are not.
+
+        Called at chunk completion rather than per part -- one manifest write per chunk,
+        the cadence that already exists, instead of one per 29 MiB.
+        """
+        if not digests:
+            return
+        with self._lock:
+            parts = self.state.setdefault("part_md5", {})
+            for index, md5_hex in digests.items():
+                parts[str(index)] = md5_hex
+            self.flush(data_fd)
+
+    def part_md5(self, index):
+        return self.state.get("part_md5", {}).get(str(index))
+
     @property
     def tmp_path(self):
         """
@@ -1573,11 +1602,19 @@ class PosixChunkSink:
     # filesystem commits, so there is no un-acknowledged window to bound.
     read_block = READ_BLOCK
 
-    def __init__(self, fd, manifest, chunks, dest):
+    def __init__(self, fd, manifest, chunks, dest, part_length=None, size=None):
         self.fd = fd
         self.manifest = manifest
         self.chunks = chunks
         self.dest = dest
+        # S3 part length, when the caller wants a multipart ETag. Hashing as the bytes
+        # go past removes the full read-back verify() would otherwise perform -- which
+        # measures as long as the download itself on a persistent disk.
+        self.part_length = part_length
+        self.size = size
+        self._parts = {}          # part index -> {"md5": ..., "next": expected offset}
+        self._pending = {}        # chunk index -> {part index: hex} awaiting commit
+        self._parts_lock = threading.Lock()
         self.use_checkpoints = not manifest.state.get("seek_hole", True)
         self.checkpoint_interval = (
             manifest.state.get("checkpoint_interval") or FALLBACK_CHECKPOINT_INTERVAL
@@ -1602,7 +1639,57 @@ class PosixChunkSink:
         self._last_checkpoint[index] = offset
         return offset
 
+    def _part_bounds(self, part_index):
+        start = part_index * self.part_length
+        end = min(start + self.part_length, self.size)
+        return start, end
+
+    def _hash(self, chunk_index, offset, buf):
+        """
+        Fold `buf` into the md5 of each S3 part it covers.
+
+        Chunk starts are always multiples of part_length (plan_chunks guarantees it), and
+        a chunk is a whole number of parts except possibly the last -- so a buffer maps
+        onto a contiguous run of parts with no partial-part bookkeeping at the edges
+        beyond the file's own tail.
+
+        A part is only hashed if this process saw it from its first byte onward,
+        contiguously. After a preemption the resumed chunk starts mid-way, so the parts
+        straddling that point were never seen whole and are simply left unrecorded --
+        verify() re-reads exactly those.
+        """
+        view = memoryview(buf)
+        with self._parts_lock:
+            while view:
+                part_index = offset // self.part_length
+                p_start, p_end = self._part_bounds(part_index)
+                take = min(len(view), p_end - offset)
+
+                tracker = self._parts.get(part_index)
+                if tracker is None:
+                    if offset == p_start:
+                        tracker = self._parts[part_index] = {
+                            "md5": hashlib.md5(), "next": p_start}
+                    else:
+                        self._parts[part_index] = False      # missed its start
+                if tracker:
+                    if tracker["next"] == offset:
+                        tracker["md5"].update(view[:take])
+                        tracker["next"] = offset + take
+                        if tracker["next"] == p_end:
+                            self._pending.setdefault(chunk_index, {})[part_index] = \
+                                tracker["md5"].hexdigest()
+                            del self._parts[part_index]
+                    else:
+                        self._parts[part_index] = False      # no longer contiguous
+
+                view = view[take:]
+                offset += take
+
     def write(self, index, offset, buf):
+        if self.part_length:
+            self._hash(index, offset, buf)
+
         view = memoryview(buf)
         while view:
             written = os.pwrite(self.fd, view, offset)
@@ -1622,6 +1709,13 @@ class PosixChunkSink:
         return None
 
     def chunk_done(self, index):
+        if self.part_length:
+            with self._parts_lock:
+                digests = self._pending.pop(index, None)
+            # record_part_md5s flushes, which fsyncs the data first -- so the digests and
+            # the done marker become durable together, never the digests alone
+            if digests:
+                self.manifest.record_part_md5s(digests, self.fd)
         self.manifest.record_chunk_done(index, self.fd)
 
     def sync(self):
@@ -1993,6 +2087,94 @@ def multipart_etag(path, part_length, block=READ_BUFFER, workers=None):
     return "{}-{}".format(hashlib.md5(b"".join(digests)).hexdigest(), len(digests))
 
 
+def multipart_etag_from_manifest(path, part_length, manifest, block=READ_BUFFER,
+                                 workers=None):
+    """
+    The multipart ETag, using digests recorded during the transfer and reading back only
+    the parts that lack one.
+
+    On the in-place route `verify()` otherwise re-reads the entire object, which on a
+    persistent disk costs about as long as the download did -- so the whole point of
+    hashing during the transfer is that this reads nothing on the happy path.
+
+    Fallback is PER PART, not all-or-nothing. After a single preemption only the parts
+    straddling the resume point are unrecorded, so a handful of 29 MiB reads stands in
+    for a 279 GiB one.
+    """
+    size = os.path.getsize(path)
+    if size == 0:
+        return None, 0
+    n_parts = (size + part_length - 1) // part_length
+
+    digests = [None] * n_parts
+    missing = []
+    for index in range(n_parts):
+        recorded = manifest.part_md5(index) if manifest is not None else None
+        if recorded:
+            try:
+                digests[index] = binascii.unhexlify(recorded)
+            except (binascii.Error, ValueError):
+                missing.append(index)
+        else:
+            missing.append(index)
+
+    if missing:
+        if workers is None:
+            workers = VERIFY_READ_WORKERS
+        _hash_parts_into(path, part_length, size, missing, digests, block, workers)
+
+    if any(d is None for d in digests):
+        raise PermanentError("failed to hash every part of {}".format(path))
+    combined = hashlib.md5(b"".join(digests)).hexdigest()
+    return "{}-{}".format(combined, n_parts), len(missing)
+
+
+def _hash_parts_into(path, part_length, size, indices, digests, block, workers):
+    """Hash the given part indices, filling `digests` in place."""
+    def hash_one(index):
+        start = index * part_length
+        remaining = min(part_length, size - start)
+        digest = hashlib.md5()
+        with open(path, "rb") as fh:
+            fh.seek(start)
+            while remaining:
+                piece = fh.read(min(block, remaining))
+                if not piece:
+                    break
+                digest.update(piece)
+                remaining -= len(piece)
+        if remaining:
+            raise PermanentError(
+                "short read hashing part {} of {}".format(index, path))
+        digests[index] = digest.digest()
+
+    if workers <= 1 or len(indices) == 1:
+        for index in indices:
+            hash_one(index)
+        return
+
+    errors = []
+
+    def run(subset):
+        for index in subset:
+            try:
+                hash_one(index)
+            except Exception as e:                              # noqa: BLE001
+                errors.append(e)
+                return
+
+    threads = []
+    for offset in range(min(workers, len(indices))):
+        subset = indices[offset::workers]
+        thread = threading.Thread(target=run, args=(subset,), daemon=True)
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+    if errors:
+        raise errors[0]
+
+
 def normalize_expected_md5(value):
     """Accept either hex or the base64 form servers put in Content-MD5."""
     value = value.strip().strip('"')
@@ -2039,7 +2221,7 @@ class phase:
         return False
 
 
-def verify(path, options):
+def verify(path, options, manifest=None):
     """
     Verification is an absolute guarantee, not a best-effort optimization: when a hash
     was supplied the file is checked before the done marker is written, and being
@@ -2055,10 +2237,19 @@ def verify(path, options):
     the byte stream.
     """
     if options.check_etag and options.part_length:
-        # A small fixed count, not `connections` -- see VERIFY_READ_WORKERS for the two
-        # measured effects that put the optimum at 2.
-        actual = multipart_etag(path, options.part_length,
-                                workers=VERIFY_READ_WORKERS)
+        if manifest is not None:
+            # Digests recorded as the bytes went past; reads only the parts that lack
+            # one. On the happy path that is none of them.
+            actual, reread = multipart_etag_from_manifest(
+                path, options.part_length, manifest)
+            log("etag from {} recorded part digests, {} re-read".format(
+                (os.path.getsize(path) + options.part_length - 1) //
+                options.part_length - reread, reread))
+        else:
+            # A small fixed count, not `connections` -- see VERIFY_READ_WORKERS for the
+            # two measured effects that put the optimum at 2.
+            actual = multipart_etag(path, options.part_length,
+                                    workers=VERIFY_READ_WORKERS)
         expected = options.check_etag.strip().strip('"')
         if actual != expected:
             raise PermanentError(
@@ -2398,7 +2589,7 @@ def run_staged_route(options, decision, source, size, chunks, chunk_size, plan_i
         try:
             with phase("verify",
                        size if (options.check_md5 or options.check_etag) else None):
-                digest = verify(staged, options)
+                digest = verify(staged, options, manifest)
         except PermanentError as e:
             log("verification failed on the staged copy: {}".format(e))
             discard(staged, manifest)
@@ -2762,7 +2953,7 @@ def run(options):
         # On this route verification is a full re-read of the object, so its share of the
         # wall clock is worth knowing on its own.
         with phase("verify", size if (options.check_md5 or options.check_etag) else None):
-            digest = verify(target, options)
+            digest = verify(target, options, manifest)
     except PermanentError as e:
         log("verification failed: {}".format(e))
         discard(target, manifest)
@@ -2826,7 +3017,10 @@ def download_to_local_file(options, source, size, chunks, chunk_size, plan_id, t
 
         try_lock(fd)
 
-        sink = PosixChunkSink(fd, manifest, chunks, target)
+        sink = PosixChunkSink(fd, manifest, chunks, target,
+                              part_length=options.part_length if options.check_etag
+                              else None,
+                              size=size)
         downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
         try:
             downloader.run()
