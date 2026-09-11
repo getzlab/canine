@@ -638,6 +638,14 @@ sudo docker exec slurm sh -c '
 type pdl >/dev/null 2>&1 || echo "pdl shorthand not defined -- redo §3"
 ```
 
+**Quote anything the container should expand.** `sudo docker exec slurm df -h
+/mnt/rwdisks/*` looks like a container-side check and is not one: the node's shell expands
+the glob first, finds no `/mnt/rwdisks` (it is a container path — §6.1), passes the pattern
+through literally, and `df` errors. A `||` fallback then reports "nothing mounted" about a
+disk that was mounted fine. Node-side expansion is sometimes what you want — `$DISK` above
+is deliberately expanded before `docker exec` — so the rule is to be deliberate: single
+quotes for the container, double or bare for the node.
+
 What to re-run for each result:
 
 | Result | Fix |
