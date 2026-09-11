@@ -1392,3 +1392,87 @@ class TestAnUnverifiedRunSaysNothingAboutHashingCost:
         out = capsys.readouterr().out
         assert "mean download" in out
         assert "Not available" not in out
+
+
+class TestSaturationUsesMeanNotPeakDisk:
+    """
+    "the DISK looks like the limit. Raising connections further will not help" fired on a
+    run whose throughput was still rising at the highest setting tried, in the same table.
+
+    The heuristic compared PEAK disk against peak NIC. Writes land in page cache and the
+    kernel flushes at device speed, so peak disk reaches the device's rate regardless of
+    the actual data rate: the connections=1 row measured 87.65 MiB/s peak disk while
+    moving 15.96 MiB/s, a 5.5x gap. Peak carries no saturation information at all, and
+    every disk-destined run tripped the same conclusion.
+    """
+
+    def sweep(self, tmp_path, monkeypatch, rows, fstype="ext4"):
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, conns, min_chunk, **kw):
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            spec = rows[conns]
+            seconds = len(payload) / float(spec["rate"])
+            return {"connections": conns, "returncode": 0, "seconds": seconds,
+                    "killed": False, "peak_rss": 1 << 20,
+                    "phases": {"download": seconds},
+                    "nic_bytes": len(payload),
+                    # disk_bytes/seconds is the sustained rate; peak is set high to mimic
+                    # page-cache flush bursts
+                    "disk_bytes": int(spec["rate"] * seconds),
+                    "peak_nic_bytes_per_s": 300 * bench.MIB,
+                    "peak_disk_bytes_per_s": 95 * bench.MIB,
+                    "stderr_tail": [], "fell_back": None,
+                    "mean_streams": spec.get("streams"), "workers": conns}
+
+        downloader = tmp_path / "parallel_download.py"
+        downloader.write_bytes(b"# stand-in\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(downloader))
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "probe_mount", lambda d: {"fstype": fstype})
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload), bench.Verification("md5", digest)))
+        bench.command_sweep(bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+             "--dest-dir", str(tmp_path),
+             "--connections"] + [str(c) for c in sorted(rows)]))
+
+    def test_still_climbing_is_not_called_disk_bound(self, tmp_path, monkeypatch, capsys):
+        """The measured shape: 66 MiB/s sustained against a 95 MiB/s device, still rising."""
+        self.sweep(tmp_path, monkeypatch,
+                   {1: {"rate": 16 * bench.MIB},
+                    8: {"rate": 55 * bench.MIB, "streams": 3.4},
+                    16: {"rate": 66 * bench.MIB, "streams": 4.1}})
+        out = capsys.readouterr().out
+        assert "NOT disk-bound yet" in out
+        assert "Raising connections will not help" not in out
+        assert "streams" in out, "it must point at the figure that explains the gap"
+
+    def test_a_genuinely_saturated_disk_is_reported_as_such(self, tmp_path, monkeypatch,
+                                                            capsys):
+        self.sweep(tmp_path, monkeypatch,
+                   {1: {"rate": 16 * bench.MIB},
+                    8: {"rate": 92 * bench.MIB, "streams": 7.5},
+                    16: {"rate": 90 * bench.MIB, "streams": 7.6}})
+        out = capsys.readouterr().out
+        assert "the DISK is the limit" in out
+        assert "NOT disk-bound yet" not in out
+
+    def test_the_mean_rate_is_shown_alongside_the_peak(self, tmp_path, monkeypatch,
+                                                       capsys):
+        self.sweep(tmp_path, monkeypatch,
+                   {1: {"rate": 16 * bench.MIB}, 8: {"rate": 55 * bench.MIB}})
+        out = capsys.readouterr().out
+        assert "peak disk write" in out and "mean disk write" in out
+
+    def test_a_memory_destination_still_says_nothing_about_the_disk(
+            self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch,
+                   {1: {"rate": 16 * bench.MIB}, 8: {"rate": 227 * bench.MIB}},
+                   fstype="tmpfs")
+        out = capsys.readouterr().out
+        assert "says nothing about the disk" in out
+        assert "the DISK is the limit" not in out
+        assert "NOT disk-bound yet" not in out

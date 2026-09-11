@@ -1662,6 +1662,12 @@ def command_sweep(args):
     # the NIC-vs-disk question §2 leaves open
     peak_nic = max((r["peak_nic_bytes_per_s"] or 0) for r in usable)
     peak_disk = max((r["peak_disk_bytes_per_s"] or 0) for r in usable)
+    plateau_rows = [r for r in usable if r["connections"] > 1]
+    # sustained rate at whichever setting went fastest -- the number that decides whether
+    # the device is actually the ceiling
+    fastest_row = max(usable, key=lambda r: r["throughput_bytes_per_s"] or 0)
+    best_disk_mean = ((fastest_row.get("disk_bytes") or 0) / fastest_row["seconds"]
+                      if fastest_row.get("seconds") else 0)
     say()
     say("peak NIC       : {}   (n1-standard-8 cap is ~2 GB/s)".format(rate(peak_nic, 1)))
 
@@ -1678,16 +1684,40 @@ def command_sweep(args):
         say("   is for. Compare against the same sweep to the localization disk (§6.2).")
     else:
         say("peak disk write: {}".format(rate(peak_disk, 1)))
-    if peak_nic and peak_disk and dest_backing == "block device":
-        if peak_disk < peak_nic * 0.8:
-            say("-> the DISK looks like the limit, as §2 predicted for LocalizeToDisk.")
-            say("   Raising connections further will not help; a larger PD would.")
-        elif peak_nic > 1.4 * GIB:
-            say("-> the NIC is close to its cap, so the network is the limit.")
+        # Mean, not peak. Writes land in page cache and the kernel flushes at device
+        # speed, so PEAK disk hits the device's rate at every setting -- measured 87.65
+        # MiB/s peak on the connections=1 row whose actual throughput was 15.96 MiB/s,
+        # a 5.5x gap. Peak therefore carries no information about saturation, and the
+        # heuristic built on it fired on every run that touched a disk.
+        if best_disk_mean:
+            say("mean disk write: {}  (at the fastest setting)".format(
+                rate(best_disk_mean, 1)))
+    if dest_backing == "block device" and best_disk_mean and peak_disk:
+        headroom = 1 - best_disk_mean / float(peak_disk)
+        still_climbing = (len(plateau_rows) >= 2
+                          and max(plateau_rows, key=lambda r: r["throughput_bytes_per_s"]
+                                  )["connections"] == max(r["connections"]
+                                                          for r in plateau_rows))
+        if headroom < 0.15:
+            say("-> the DISK is the limit: sustained writes are within {:.0f}% of the"
+                .format(headroom * 100))
+            say("   device's peak. Raising connections will not help; a larger PD would.")
+        elif still_climbing:
+            say("-> NOT disk-bound yet: sustained writes are {:.0f}% below the device's"
+                .format(headroom * 100))
+            say("   peak AND throughput was still rising at the highest setting tried.")
+            say("   Something other than the disk is holding it back -- check the")
+            say("   `streams:` figures. Per-stream throughput at its source rate with")
+            say("   few streams active means workers are blocked between chunks, not")
+            say("   on the network.")
         else:
-            say("-> neither is saturated; the source may be the limit.")
+            say("-> sustained writes are {:.0f}% below the device's peak, so the disk is"
+                .format(headroom * 100))
+            say("   not saturated; the source or the download path is the limit.")
+    elif peak_nic > 1.4 * GIB:
+        say("-> the NIC is close to its cap, so the network is the limit.")
 
-    plateau = [r for r in usable if r["connections"] > 1]
+    plateau = plateau_rows
     if len(plateau) >= 2:
         top = max(r["throughput_bytes_per_s"] for r in plateau)
         knee = min((r["connections"] for r in plateau
