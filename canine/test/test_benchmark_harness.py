@@ -1440,15 +1440,32 @@ class TestSaturationUsesMeanNotPeakDisk:
              "--connections"] + [str(c) for c in sorted(rows)]))
 
     def test_still_climbing_is_not_called_disk_bound(self, tmp_path, monkeypatch, capsys):
-        """The measured shape: 66 MiB/s sustained against a 95 MiB/s device, still rising."""
+        """Well short of the device and still rising: the disk is not the story."""
         self.sweep(tmp_path, monkeypatch,
                    {1: {"rate": 16 * bench.MIB},
-                    8: {"rate": 55 * bench.MIB, "streams": 3.4},
-                    16: {"rate": 66 * bench.MIB, "streams": 4.1}})
+                    8: {"rate": 30 * bench.MIB, "streams": 1.9},
+                    16: {"rate": 40 * bench.MIB, "streams": 2.5}})
         out = capsys.readouterr().out
         assert "NOT disk-bound yet" in out
         assert "Raising connections will not help" not in out
         assert "streams" in out, "it must point at the figure that explains the gap"
+
+    def test_the_measured_shape_is_called_mostly_disk_bound(self, tmp_path, monkeypatch,
+                                                            capsys):
+        """
+        72.10 MiB/s sustained against a device that demonstrated 87.57 -- 82% of it.
+        "not saturated" was technically true and read as though there were room; the
+        remaining 18% is overlap loss between the write path and the network, which more
+        connections cannot recover because each stream is already at its source rate.
+        """
+        self.sweep(tmp_path, monkeypatch,
+                   {1: {"rate": 16 * bench.MIB},
+                    16: {"rate": 72 * bench.MIB, "streams": 4.6}})
+        out = capsys.readouterr().out
+        assert "MOSTLY disk-bound" in out
+        assert "overlap loss" in out
+        assert "faster destination" in out
+        assert "NOT disk-bound yet" not in out
 
     def test_a_genuinely_saturated_disk_is_reported_as_such(self, tmp_path, monkeypatch,
                                                             capsys):

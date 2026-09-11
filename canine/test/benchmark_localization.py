@@ -1702,6 +1702,20 @@ def command_sweep(args):
             say("-> the DISK is the limit: sustained writes are within {:.0f}% of the"
                 .format(headroom * 100))
             say("   device's peak. Raising connections will not help; a larger PD would.")
+        elif headroom < 0.35:
+            # The band this lands in matters: at 82% of what the device demonstrably
+            # absorbs, "not saturated" is technically true and reads as though there
+            # were plenty of room. There is not -- the remaining gap is overlap loss
+            # between writing and reading, not spare bandwidth, and more connections
+            # cannot recover it because each stream is already at its source rate.
+            say("-> MOSTLY disk-bound: sustained writes are at {:.0f}% of the device's"
+                .format((1 - headroom) * 100))
+            say("   peak, so the remaining {:.0f}% is overlap loss rather than spare"
+                .format(headroom * 100))
+            say("   bandwidth. More connections will not recover it -- check whether")
+            say("   per-stream throughput is already at the source's rate, in which")
+            say("   case the only wins left are a faster destination or better overlap")
+            say("   between the write path and the network.")
         elif still_climbing:
             say("-> NOT disk-bound yet: sustained writes are {:.0f}% below the device's"
                 .format(headroom * 100))
