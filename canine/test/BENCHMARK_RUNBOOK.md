@@ -609,6 +609,64 @@ sudo docker exec slurm bash -c '
   mount -o discard,defaults /dev/disk/by-id/google-'"$DISK"' /mnt/rwdisks/'"$DISK"'
 '
 ```
+### 4.0 Preflight after any disconnect or container restart
+
+Three things live in the container and none survive it. `docker run --rm` means a restart
+comes back with an empty mount namespace, and the failures are all quiet: `/mnt/tmpfs`
+missing sends a 4 GiB write to the container's overlay filesystem, `/mnt/rwdisks/$DISK`
+missing does the same, and `pdl` missing is just "command not found". Node-side `df` cannot
+see any of them (§6.1), so a check from the wrong side reports healthy.
+
+Run this first, every time:
+
+```bash
+# on the node
+sudo docker ps --filter name=slurm --format '{{.Names}} up {{.Status}}' \
+  || echo "CONTAINER GONE -- redo §3"
+
+export DISK=$(ls /dev/disk/by-id/ 2>/dev/null | grep '^google-' \
+              | grep -v 'persistent-disk-0' | sed 's/^google-//' | head -1)
+echo "DISK=${DISK:-<none attached>}"
+
+sudo docker exec slurm sh -c '
+  for m in /mnt/tmpfs /mnt/rwdisks/'"${DISK:-nodisk}"'; do
+    if mountpoint -q "$m"; then df -h "$m" | tail -1
+    else echo "NOT MOUNTED: $m"; fi
+  done
+  ls /tmp/pdl/*.py 2>/dev/null || echo "SCRIPTS MISSING: redo §3s docker cp"
+'
+type pdl >/dev/null 2>&1 || echo "pdl shorthand not defined -- redo §3"
+```
+
+What to re-run for each result:
+
+| Result | Fix |
+|---|---|
+| `CONTAINER GONE` | §3 in full — container, scripts, `pdl` |
+| `NOT MOUNTED: /mnt/tmpfs` | the tmpfs block in §6.1 |
+| `NOT MOUNTED: /mnt/rwdisks/...` | the re-mount below — **not** §4, which would `mkfs` |
+| `SCRIPTS MISSING` | the two `docker cp` lines in §3 |
+| `pdl shorthand not defined` | the function definition in §3 |
+| `DISK=<none attached>` | §4 in full, including `create` and `attach-disk` |
+
+Re-mounting a disk that already has a filesystem — the common case, since the disk outlives
+the container and the instance:
+
+```bash
+sudo docker exec slurm bash -c '
+  set -eu
+  DEV=/dev/disk/by-id/google-'"$DISK"'
+  blkid "$DEV" || { echo "NO FILESYSTEM -- this one does need §4s mkfs"; exit 1; }
+  mkdir -p /mnt/rwdisks/'"$DISK"'
+  mountpoint -q /mnt/rwdisks/'"$DISK"' || mount -o discard,defaults "$DEV" /mnt/rwdisks/'"$DISK"'
+  df -h /mnt/rwdisks/'"$DISK"'
+'
+```
+
+The `blkid` guard is the point. §4's `mkfs` on 316 GB with `lazy_itable_init=0` takes
+minutes and would discard the filesystem whose write rate §4.1 measured — so a
+"just re-run §4" reflex costs both the time and the baseline.
+
 ### 4.1 `dd` the disk you just created — the gate
 
 Ten minutes, no egress, no downloads, **and no additional disks**: measure the localization
