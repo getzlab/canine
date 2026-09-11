@@ -1322,6 +1322,35 @@ whole ≥4× premise for the motivating workload rests on which row this lands i
 
 ### 6.2 The same sweep to the localization disk — where the ceiling bites
 
+**Pick the range so it can falsify the prediction, not confirm it.** The disk is expected
+to plateau near 88.0 MiB/s (§4.1) at about 5.5 connections, given ~16 MiB/s per stream
+from §6.1. The temptation is to sweep 1/4/6/8/12 — enough to show the plateau and stop.
+Don't:
+
+* `dd` measured **one sequential writer**. Concurrent `pwrite`s at 16 offsets are a
+  different workload, and §4.1a found read throughput *falling* with concurrency
+  (86/85/76/62 MiB/s at 1/2/4/8). If writes do the same, 16 is materially worse than 8 —
+  which changes the default and is a result, not noise.
+* §6.1 ran 1/4/8/12/16. Dropping a setting costs the like-for-like comparison against the
+  destination-free numbers, which is the whole point of running the same sweep twice.
+* If the fastest row is also the highest tried, `NO KNEE FOUND` fires and the run is
+  inconclusive — so a narrow range does not even save time.
+
+A row is ~47s at disk speed. There is no cost argument for a narrow range here; include
+6 because it is where the plateau is predicted, and keep 16 because it is where the
+prediction could break.
+
+```bash
+pdl sweep --url "$PRESIGNED_URL" --prefix \
+          --size $((4 * 1024 * 1024 * 1024)) \
+          --dest-dir /mnt/rwdisks/$DISK --connections 1 4 6 8 12 16 \
+          --json /tmp/knee-disk.json
+```
+
+Unlike §6.1, this run *does* say something about the disk: `peak disk` becomes non-zero
+and the saturation heuristic in the verdict applies.
+
+
 Same object, same settings, destination changed:
 
 ```bash
