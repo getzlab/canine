@@ -1493,3 +1493,77 @@ class TestSaturationUsesMeanNotPeakDisk:
         assert "says nothing about the disk" in out
         assert "the DISK is the limit" not in out
         assert "NOT disk-bound yet" not in out
+
+
+class TestNearZeroVerifyIsTheFeatureWorking:
+    """
+    The full-size run reported `verify 0.0s` with `hash ok` against a multipart ETag --
+    #19 working exactly as designed: the digest was assembled from part md5s recorded
+    during the transfer, so the post-hoc read-back of 279 GiB never happened. At the
+    91.6 MiB/s read rate from §4.1 that is ~52 minutes avoided.
+
+    The report then said "Verification is a small share, so hashing during the transfer
+    would buy little" -- reading the feature's success as evidence it was unnecessary.
+    The same sentence would recommend removing the thing that produced the 0.0s.
+    """
+
+    def sweep(self, tmp_path, monkeypatch, verify_seconds, s3=False):
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, conns, min_chunk, **kw):
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            return {"connections": conns, "returncode": 0,
+                    "seconds": 100.0 + verify_seconds, "killed": False,
+                    "peak_rss": 1 << 20,
+                    "phases": {"download": 100.0, "verify": verify_seconds},
+                    "nic_bytes": len(payload), "disk_bytes": len(payload),
+                    "peak_nic_bytes_per_s": 1e8, "peak_disk_bytes_per_s": 1e3,
+                    "stderr_tail": [], "fell_back": None,
+                    "mean_streams": 3.0, "workers": conns,
+                    "bookkeeping_seconds": None, "bookkeeping_calls": None,
+                    "bookkeeping_mean": None, "bookkeeping_pct_workers": None}
+
+        downloader = tmp_path / "parallel_download.py"
+        downloader.write_bytes(b"# stand-in\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(downloader))
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload), bench.Verification("md5", digest)))
+        argv = ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+                "--dest-dir", str(tmp_path), "--connections", "16"]
+        if s3:
+            argv += ["--s3-bucket", "b", "--s3-key", "k"]
+        bench.command_sweep(bench.build_parser().parse_args(argv))
+
+    def test_a_zero_verify_on_a_multipart_source_credits_the_transfer(
+            self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch, 0.0, s3=True)
+        out = capsys.readouterr().out
+        assert "read-back was skipped entirely" in out
+        assert "would buy little" not in out
+        assert "Do NOT read this as" in out, "the misreading must be pre-empted"
+
+    def test_it_points_at_the_line_that_would_disprove_it(
+            self, tmp_path, monkeypatch, capsys):
+        """A large M means the digests are not surviving and the saving is illusory."""
+        self.sweep(tmp_path, monkeypatch, 0.0, s3=True)
+        assert "M re-read" in capsys.readouterr().out
+
+    def test_a_zero_verify_without_a_multipart_source_claims_nothing(
+            self, tmp_path, monkeypatch, capsys):
+        """
+        Whole-file md5 is sequential and cannot be assembled from parts, so a cheap
+        verify there says nothing about in-transfer hashing either way.
+        """
+        self.sweep(tmp_path, monkeypatch, 0.0, s3=False)
+        out = capsys.readouterr().out
+        assert "read-back was skipped entirely" not in out
+        assert "did not use one" in out
+
+    def test_an_expensive_verify_still_recommends_the_fix(
+            self, tmp_path, monkeypatch, capsys):
+        self.sweep(tmp_path, monkeypatch, 60.0, s3=True)
+        out = capsys.readouterr().out
+        assert "avoidable and already implemented" in out

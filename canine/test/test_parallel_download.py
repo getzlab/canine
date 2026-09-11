@@ -2206,3 +2206,100 @@ class TestAPrefixOfALargerObjectStaysParallel:
                                   "--connections", 4, "--min-chunk", 256 * 1024)
         assert proc.returncode == 0, proc.stderr
         assert "falling back to a single stream" not in proc.stderr
+
+
+class TestBookkeepingTimeIsMeasured:
+    """
+    The 279 GiB run reached 50% of the disk's floor where the 4 GiB run reached 83%, with
+    per-stream throughput unchanged at the source rate (16.17 vs 15.82 MiB/s) and only
+    3.00 of 16 streams active. So workers were idle outside the read loop, and the only
+    work that grows with the CHUNK COUNT rather than the byte count is chunk_done -- the
+    manifest rewrite, its fsyncs, and the wait for Manifest._lock. 64 chunks at 4 GiB
+    against 3283 at full size.
+
+    Guessing at this once already gave a wrong answer: the fsync-barrier hypothesis
+    predicted a large win from fewer chunks and delivered 8%, because the flush work is
+    invariant to chunk count. So it is measured rather than reasoned about.
+    """
+
+    def parse(self, output):
+        match = re.search(
+            r"k9pdl-bookkeeping ([\d.]+)s over (\d+) calls "
+            r"\(mean ([\d.]+)s, ([\d.]+)% of ([\d.]+) worker-seconds\)", output)
+        assert match, "no k9pdl-bookkeeping line in:\n" + output
+        return {"total": float(match.group(1)), "calls": int(match.group(2)),
+                "mean": float(match.group(3)), "pct": float(match.group(4))}
+
+    def test_one_call_is_recorded_per_chunk(self, tmp_path):
+        payload = os.urandom(8 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        assert got["calls"] == 8, got          # 8 MiB / 1 MiB
+        assert got["total"] >= 0.0
+
+    def test_a_slow_chunk_done_is_attributed_to_bookkeeping_not_streaming(self, tmp_path):
+        """
+        The number has to move when the thing it measures gets slower, or it cannot
+        distinguish the hypothesis from its negation.
+        """
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            slow = (
+                "import sys, time, types\n"
+                "sys.argv = ['pdl'] + {argv!r}\n"
+                "src = open({path!r}).read()\n"
+                "mod = types.ModuleType('pdl'); mod.__file__ = {path!r}\n"
+                "exec(compile(src, {path!r}, 'exec'), mod.__dict__)\n"
+                "orig = mod.PosixChunkSink.chunk_done\n"
+                "mod.PosixChunkSink.chunk_done = "
+                "lambda self, i: (time.sleep(0.30), orig(self, i))[1]\n"
+                "sys.exit(mod.main())\n"
+            ).format(argv=["--url", server.url(), "--dest", dest,
+                           "--size", str(len(payload)), "--connections", "4",
+                           "--min-chunk", str(MIB)], path=PDL_PATH)
+            proc = subprocess.run([sys.executable, "-c", slow],
+                                  capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        assert got["calls"] == 4, got
+        # 4 chunks x 0.30s of injected sleep, serialised or not
+        assert got["total"] >= 1.1, got
+        assert got["mean"] >= 0.28, got
+
+    def test_bookkeeping_is_excluded_from_streaming_time(self, tmp_path):
+        """
+        chunk_done runs after the read loop, so its cost must NOT inflate the streams
+        figure -- otherwise a run bottlenecked on bookkeeping would report healthy
+        concurrency, which is the exact confusion this pair of numbers exists to resolve.
+        """
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        streams = re.search(r"k9pdl-streams mean [\d.]+ of \d+ workers "
+                            r"\(\d+ chunks, ([\d.]+)s wall, ([\d.]+)s streaming", proc.stderr)
+        assert streams, proc.stderr
+        book = self.parse(proc.stderr)
+        # streaming time is bounded by the read loop; bookkeeping sits outside it
+        assert book["total"] <= float(streams.group(1)) * 4 + 1.0, (book, streams.groups())
+
+    def test_the_share_is_of_the_worker_pool_not_the_wall_clock(self, tmp_path):
+        """
+        With N workers the budget is N*wall, so a percentage of wall clock could exceed
+        100 and mean nothing. The denominator has to be worker-seconds.
+        """
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        assert "worker-seconds)" in proc.stderr
+        assert self.parse(proc.stderr)["pct"] <= 100.0

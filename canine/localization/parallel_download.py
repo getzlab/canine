@@ -1903,6 +1903,15 @@ class Downloader:
         # other number in the output distinguishes them.
         self._stream_seconds = 0.0
         self._stream_lock = threading.Lock()
+        # Wall time summed over every chunk_done -- the manifest rewrite, its fsyncs and
+        # the wait for Manifest._lock. This is the only work that grows with the CHUNK
+        # COUNT rather than the byte count, and the 279 GiB run fell to 50% of the disk
+        # floor where the 4 GiB run reached 83%, with per-stream throughput unchanged at
+        # the source rate both times. That points here, and guessing at it once already
+        # produced a wrong answer (the fsync-barrier hypothesis, which predicted a large
+        # win from fewer chunks and delivered 8%). So measure it.
+        self._bookkeeping_seconds = 0.0
+        self._bookkeeping_calls = 0
 
     def resume_offset(self, index):
         return self.sink.resume_offset(index)
@@ -1912,7 +1921,7 @@ class Downloader:
         offset = self.resume_offset(index)
 
         if offset >= end:
-            self.sink.chunk_done(index)
+            self._chunk_done(index)
             self.progress.add(end - start, resumed=True)
             return
 
@@ -1984,7 +1993,16 @@ class Downloader:
                 except (IOError, OSError):
                     pass
 
-        self.sink.chunk_done(index)
+        self._chunk_done(index)
+
+    def _chunk_done(self, index):
+        started = time.time()
+        try:
+            self.sink.chunk_done(index)
+        finally:
+            with self._stream_lock:
+                self._bookkeeping_seconds += time.time() - started
+                self._bookkeeping_calls += 1
 
     def _log_concurrency(self, workers, chunks, wall):
         """
@@ -2005,9 +2023,19 @@ class Downloader:
             return
         with self._stream_lock:
             streaming = self._stream_seconds
+        with self._stream_lock:
+            book = self._bookkeeping_seconds
+            calls = self._bookkeeping_calls
         log("k9pdl-streams mean {:.2f} of {} workers "
             "({} chunks, {:.1f}s wall, {:.1f}s streaming)".format(
                 streaming / wall, workers, chunks, wall, streaming))
+        # Worker-seconds, not wall: with `workers` threads the available budget is
+        # workers*wall, so this says what share of the pool was doing bookkeeping rather
+        # than moving bytes.
+        log("k9pdl-bookkeeping {:.1f}s over {} calls (mean {:.3f}s, "
+            "{:.1f}% of {} worker-seconds)".format(
+                book, calls, book / calls if calls else 0.0,
+                100.0 * book / (workers * wall) if wall else 0.0, workers * wall))
 
     def _count_stream_time(self, started):
         """

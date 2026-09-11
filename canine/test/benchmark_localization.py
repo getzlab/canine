@@ -988,9 +988,17 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     # per-connection results when every row was the same single curl.
     fell_back = re.search(r"falling back to a single stream: (.*)", stderr)
 
+    # Per-chunk bookkeeping, the only cost that grows with chunk count rather than bytes.
+    book = re.search(r"k9pdl-bookkeeping ([\d.]+)s over (\d+) calls "
+                     r"\(mean ([\d.]+)s, ([\d.]+)% of", stderr)
+
     return {
         "phases": phases,
         "fell_back": fell_back.group(1).strip() if fell_back else None,
+        "bookkeeping_seconds": float(book.group(1)) if book else None,
+        "bookkeeping_calls": int(book.group(2)) if book else None,
+        "bookkeeping_mean": float(book.group(3)) if book else None,
+        "bookkeeping_pct_workers": float(book.group(4)) if book else None,
         "mean_streams": float(streams.group(1)) if streams else None,
         "workers": int(streams.group(2)) if streams else None,
         "connections": connections,
@@ -1451,6 +1459,11 @@ def command_sweep(args):
         if outcome.get("mean_streams") is not None:
             say("        streams: {:.2f} of {} concurrent on average".format(
                 outcome["mean_streams"], outcome["workers"]))
+        if outcome.get("bookkeeping_seconds") is not None:
+            say("        chunk_done: {:.1f}s over {} calls (mean {:.3f}s, {:.0f}% of the"
+                " worker pool)".format(
+                    outcome["bookkeeping_seconds"], outcome["bookkeeping_calls"],
+                    outcome["bookkeeping_mean"], outcome["bookkeeping_pct_workers"]))
         # NIC bytes over payload bytes. ~1 means every byte crossed the wire once, which
         # is the claim that the object was chunked into disjoint ranges rather than
         # fetched N times over. A server that IGNORES Range returns the whole object to
@@ -1516,10 +1529,12 @@ def command_sweep(args):
         say("mean download : {:.1f}s ({:.0f}%)".format(dl, 100*dl/total if total else 0))
         say("mean verify   : {:.1f}s ({:.0f}%)".format(vf, 100*vf/total if total else 0))
         say()
+        is_multipart = bool(getattr(args, "s3_bucket", None)
+                            or getattr(args, "part_length", None))
         if total and vf/total > 0.25:
             say("Verification is {:.0f}% of the wall clock, a full re-read of the object."
                 .format(100*vf/total))
-            if getattr(args, "s3_bucket", None) or getattr(args, "part_length", None):
+            if is_multipart:
                 say("For a MULTIPART ETag this is avoidable and already implemented: each")
                 say("part's md5 is computed as the bytes stream past, and verify() logs")
                 say("'etag from N recorded part digests, M re-read'. If M is large here,")
@@ -1529,10 +1544,30 @@ def command_sweep(args):
                 say("sequential over the byte stream and cannot be computed from parts.")
                 say("The read-back is therefore unavoidable for this object; only a")
                 say("multipart ETag source can skip it.")
+        elif total and vf / total < 0.02 and is_multipart:
+            # A near-zero verify against a multipart ETag is in-transfer hashing WORKING,
+            # not evidence that it was unnecessary. The old wording read #19's success as
+            # an argument against building it: the read-back is absent precisely because
+            # the digests were accumulated as the bytes went past. Measured on the 279 GiB
+            # BAM -- verify 0.0s, hash ok -- where the avoided re-read would have been
+            # ~52 minutes at the read rate from §4.1.
+            say("Verification cost {:.1f}s against a MULTIPART ETag, which means the".format(vf))
+            say("digest was assembled from part md5s recorded during the transfer and")
+            say("the post-hoc read-back was skipped entirely. That is #19 working: a")
+            say("re-read of {} at this device's rate would have been the".format(
+                human(args.size)))
+            say("dominant cost of localizing this object.")
+            say()
+            say("Do NOT read this as 'verification is cheap'. It is cheap here because")
+            say("it was moved into the transfer. Confirm with the downloader's")
+            say("'etag from N recorded part digests, M re-read' line -- a large M means")
+            say("the digests are not surviving and the saving is partly illusory.")
         else:
-            say("Verification is a small share, so hashing during the transfer would buy")
-            say("little, and the cores are mostly idle -- a smaller instance type is")
-            say("worth investigating (§10).")
+            say("Verification is a small share of THIS run, so a smaller instance type")
+            say("may do (§10).")
+            if not is_multipart:
+                say("Note this says nothing about hashing during the transfer: that")
+                say("applies to multipart ETags, and this run did not use one.")
 
     heading("verdict")
 
