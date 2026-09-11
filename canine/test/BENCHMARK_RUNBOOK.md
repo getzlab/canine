@@ -1582,11 +1582,42 @@ not actually pay.
 
 ### 6.5 Resume and page-cache loss
 
+Against the §2 GCS object, if it still exists and you still have its md5:
+
 ```bash
 pdl resume --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
            --dest-dir /mnt/rwdisks/$DISK --connections 8 \
            --json /tmp/resume.json
 ```
+
+Against the **real source**, which is better — same code path, and it is the object whose
+behaviour matters. A prefix carries no digest, so establish one first:
+
+```bash
+# on the node. head-object for the true length, so --object-size is not guessed
+export OBJ_SIZE=$(sudo docker exec slurm aws --endpoint-url "$S3_ENDPOINT" \
+  s3api head-object --bucket "$S3_BUCKET" --key "$S3_KEY" \
+  --query ContentLength --output text)
+export PREFIX=$((4 * 1024 * 1024 * 1024))
+
+# A. one clean fetch, to get a digest to resume against (~1 min + ~45s of md5)
+sudo docker exec slurm python3 /tmp/pdl/parallel_download.py \
+  --url "$PRESIGNED_URL" --object-size "$OBJ_SIZE" \
+  --dest /mnt/rwdisks/$DISK/ref.bin --size "$PREFIX" --connections 16
+export PREFIX_MD5=$(sudo docker exec slurm md5sum /mnt/rwdisks/$DISK/ref.bin | cut -d' ' -f1)
+echo "PREFIX_MD5=$PREFIX_MD5"
+sudo docker exec slurm rm -f /mnt/rwdisks/$DISK/ref.bin
+
+# B. the resume run itself
+pdl resume --url "$PRESIGNED_URL" --prefix \
+           --size "$PREFIX" --md5 "$PREFIX_MD5" \
+           --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+           --json /tmp/resume.json
+```
+
+`--connections 16` rather than §6.5's original 8, to match §6.1/§6.2 so the numbers are
+comparable. An explicit `--md5` overrides the `--prefix` ETag guard, which is the one case
+where verifying a prefix is possible at all.
 
 SIGKILLs the download at 25%, 50% and 75%, then lets it finish. Check:
 
