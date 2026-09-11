@@ -20,7 +20,7 @@ from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
-from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging, localization_bucket_name, get_project_number, _zone_to_region
+from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging, localization_bucket_name, get_project_number, _zone_to_region, gcloud_storage_client
 from hound.client import _getblob_bucket
 import pandas as pd
 import google.cloud.compute_v1, google.api_core.exceptions
@@ -37,6 +37,23 @@ def gcloud_disk_client():
     return DISK_CLIENT
 
 PROJECT = get_default_gcp_project()
+
+## Root under which a worker gcsfuse-mounts a bucket, one subdirectory per
+## bucket. Both bucket-mounted *inputs* and (under local_workdir) the symlinks
+## recording bucket-backed *outputs* are expressed relative to this.
+##
+## NOTE: delocalization.py duplicates this value. It runs standalone on the
+## worker -- it is copied into the staging dir, not imported from the canine
+## package -- so it cannot import this constant. Keep the two in sync.
+BUCKETMOUNT_ROOT = "/mnt/bucketmounts"
+
+## Read-WRITE gcsfuse mount of the results bucket, used as the job workspace under
+## workdir_mode="bucket". Deliberately NOT under BUCKETMOUNT_ROOT: the read-only
+## consumer mounts there use a "mount if not already mounted, no backoff" loop that
+## is only safe because nothing writable shares the tree.
+WORKDIR_MOUNT_ROOT = "/mnt/bucketworkdir"
+
+WORKDIR_MODES = {"shared", "local", "bucket"}
 
 Localization = namedtuple("Localization", ['type', 'path'])
 # types: stream, download, ro_disk, None
@@ -85,6 +102,9 @@ class AbstractLocalizer(abc.ABC):
         bucket_upload_wait_tries: int = 60,
         localization_expiry_days: int = 1,
         bucketmount_heartbeat_seconds: int = 3600,
+        workdir_mode: str = "shared", local_workdir_root: str = "/mnt/local_workdir",
+        save_intermediates: bool = False,
+        results_bucket: typing.Optional[str] = None,
         **kwargs
     ):
         """
@@ -186,6 +206,61 @@ class AbstractLocalizer(abc.ABC):
             )
         self.bucketmount_heartbeat_seconds = bucketmount_heartbeat_seconds
 
+        # Where the job's working directory lives:
+        #
+        #   "shared" -- the NFS-exported staging dir (long-standing behaviour).
+        #   "local"  -- a worker-local directory; declared outputs are uploaded to
+        #               results_bucket at teardown. Keeps every output byte off the
+        #               controller while giving tasks a real POSIX filesystem.
+        #   "bucket" -- results_bucket itself, gcsfuse-mounted read-write. Nothing
+        #               to upload: intermediates and results are objects as they
+        #               are written, so they survive the worker and stay available
+        #               for debugging or a rerun.
+        #
+        # "bucket" is not a safe default. gcsfuse cannot seek-write
+        # (bedGraphToBigWig patches its header via fseek) and turns an in-place
+        # modification into a full object re-download plus re-upload (pyflow, and
+        # so Strelka2/Manta, appends to its state files on every task transition).
+        # Those tasks must stay on "local".
+        if workdir_mode not in WORKDIR_MODES:
+            raise ValueError(
+              "workdir_mode must be one of {}, got {!r}".format(
+                ", ".join(sorted(WORKDIR_MODES)), workdir_mode
+              )
+            )
+        self.workdir_mode = workdir_mode
+        self.local_workdir_root = local_workdir_root
+        self.save_intermediates = save_intermediates
+        self.results_bucket = results_bucket
+        # populated lazily by _existing_result_objects()
+        self._results_object_cache = None
+
+        if self.workdir_mode != "shared" and self.results_bucket is None:
+            # Under "local", outputs would land back on the shared mount via
+            # delocalization.py's same_volume() copy branch -- the exact
+            # controller round-trip this exists to remove. Under "bucket" there
+            # is nothing to mount.
+            raise ValueError(
+              "workdir_mode={!r} requires results_bucket.".format(self.workdir_mode)
+            )
+        if self.workdir_mode != "shared" and self.use_scratch_disk:
+            # Both claim CANINE_JOB_WORKSPACE.
+            raise ValueError(
+              "workdir_mode={!r} and use_scratch_disk are mutually exclusive: both "
+              "redirect CANINE_JOB_WORKSPACE away from the shared mount."
+              .format(self.workdir_mode)
+            )
+        if self.save_intermediates and self.workdir_mode != "local":
+            # Under "bucket" the intermediates are already objects; under "shared"
+            # there is no bucket to move them to. Silently ignoring the flag would
+            # leave someone believing their intermediates were preserved.
+            raise ValueError(
+              "save_intermediates only applies to workdir_mode='local' (got {!r}): "
+              "under 'bucket' the whole workspace is already in the bucket, and "
+              "under 'shared' there is nowhere to save it to."
+              .format(self.workdir_mode)
+            )
+
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
         # jobId : { input : [RODISK URLs] }
@@ -196,6 +271,204 @@ class AbstractLocalizer(abc.ABC):
         local_download_dir = None
         self.local_download_dir = local_download_dir if local_download_dir is not None else '/mnt/canine-local-downloads/{}'.format(self.disk_key)
         self.requester_pays = {}
+
+    def job_workspace_path(self, compute_env, jobId, scratch_disk_prefix = None):
+        """
+        Where the job's working directory lives on the worker. Three cases, in
+        precedence order: a worker-local directory, a per-shard scratch disk, or
+        (the default) a directory inside the shared mount.
+
+        Only the last is visible to the controller, which is the point: under
+        local_workdir the bytes never traverse NFS, and delocalization pushes
+        them straight to the results bucket instead.
+        """
+        if self.workdir_mode == "local":
+            return os.path.join(self.local_workdir_root, jobId, 'workspace')
+        if self.workdir_mode == "bucket":
+            # inside the read-write mount of the results bucket, under this task's
+            # own prefix so concurrent tasks and shards cannot collide
+            return os.path.join(
+              self.workdir_mount_dir(), self.results_prefix(), jobId, 'workspace'
+            )
+        if self.use_scratch_disk:
+            return scratch_disk_prefix
+        return os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace')
+
+    def workdir_mount_dir(self):
+        """Where the results bucket is mounted read-write under workdir_mode='bucket'."""
+        return os.path.join(WORKDIR_MOUNT_ROOT, self.results_bucket or "")
+
+    def workdir_mount_script(self):
+        """
+        Setup-script lines mounting the results bucket read-write as the job
+        workspace. Empty unless workdir_mode == "bucket".
+
+        Mirrors the read-only consumer mount in job_setup_teardown(): chown the
+        mountpoint first, because fusermount3 refuses a mountpoint the invoking
+        user cannot write ("the user doesn't have write-access on the mount
+        point"), and gcsfuse runs unprivileged here so that podman's --uidmap root
+        maps through to the task container.
+
+        No `-o ro`, obviously -- and unlike the consumer mounts this one is
+        deliberately left mounted for the life of the job, which is why it lives
+        under its own root rather than in BUCKETMOUNT_ROOT.
+        """
+        if self.workdir_mode != "bucket":
+            return []
+        md = shlex.quote(self.workdir_mount_dir())
+        return [
+            'if ! mountpoint -q {md}; then'.format(md = md),
+            '  sudo mkdir -p {md}'.format(md = md),
+            '  sudo chown $(id -u):$(id -g) {md}'.format(md = md),
+            # gcsfuse resolves credentials via ADC and does not read CLOUDSDK_CONFIG
+            '  if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${CLOUDSDK_CONFIG}/application_default_credentials.json" ]; then export GOOGLE_APPLICATION_CREDENTIALS=${CLOUDSDK_CONFIG}/application_default_credentials.json; fi',
+            '  timeout -k 60 60 gcsfuse --implicit-dirs {b} {md} || {{ echo "ERROR: read-write workdir bucket mount failed!" >&2; exit 1; }}'.format(
+              b = shlex.quote(self.results_bucket or ""), md = md),
+            'fi',
+            'mountpoint -q {md} || {{ echo "ERROR: workdir bucket mount did not appear!" >&2; exit 1; }}'.format(md = md),
+        ]
+
+    def workdir_unmount_script(self):
+        """
+        Teardown-script lines unmounting the read-write workspace.
+
+        Must run AFTER delocalization, not before: delocalization.py globs the
+        workspace to find declared outputs and reads them to compute checksums,
+        both of which need the mount up. It writes its pointer symlinks to the
+        shared mount, so the controller never depends on the objects being
+        finalized at that moment.
+
+        The unmount still matters: it flushes anything not yet finalized, so by
+        the time a later run's job_avoid lists the bucket, or a downstream task
+        mounts it read-only, every object is really there.
+        """
+        if self.workdir_mode != "bucket":
+            return []
+        md = shlex.quote(self.workdir_mount_dir())
+        return [
+            'if mountpoint -q {md}; then'.format(md = md),
+            # leave the job's own directory, or the unmount will fail with EBUSY
+            '  cd /',
+            '  fusermount -u {md} || {{ echo "ERROR: could not unmount read-write workdir mount" >&2; exit 1; }}'.format(md = md),
+            'fi',
+        ]
+
+    def _existing_result_objects(self):
+        """
+        Names of the objects currently under this task's results prefix, listed
+        once and cached for the life of the localizer.
+
+        One listing per task rather than one existence check per output: an array
+        job can have thousands of outputs, and job avoidance runs before any work
+        starts, so it must not cost thousands of round trips.
+        """
+        if self._results_object_cache is None:
+            client = gcloud_storage_client()
+            self._results_object_cache = {
+              b.name for b in
+              client.list_blobs(self.results_bucket, prefix = self.results_prefix() + "/")
+            }
+        return self._results_object_cache
+
+    def bucket_outputs_present(self, output_dir, jobId):
+        """
+        True if every bucket-backed output recorded for this shard still exists.
+
+        Job avoidance otherwise trusts the shard's manifest, which lives on the
+        shared mount. Under local_workdir the data lives in the results bucket
+        instead, behind a daysSinceCustomTime lifecycle rule, so the two expire
+        independently: a manifest can easily outlive the objects it describes.
+        Skipping such a shard would hand downstream tasks bucketmount:// URLs
+        that resolve to nothing.
+
+        Returns False rather than raising if the bucket cannot be listed --
+        re-running a shard is wasteful, but wrongly skipping one is incorrect.
+        """
+        shard_dir = os.path.join(output_dir, str(jobId))
+        if not os.path.isdir(shard_dir):
+            return False
+
+        try:
+            present = self._existing_result_objects()
+        except Exception as e:
+            canine_logging.warning(
+              "Could not list results bucket {} to validate job avoidance for shard {}; "
+              "will re-run it: {}".format(self.results_bucket, jobId, e)
+            )
+            return False
+
+        link_re = re.compile(r"^{}/([^/]+)/(.+)$".format(re.escape(BUCKETMOUNT_ROOT)))
+        checked = 0
+        for root, _dirs, files in os.walk(shard_dir):
+            for fn in files:
+                path = os.path.join(root, fn)
+                if not os.path.islink(path):
+                    # .canine_job_manifest and the .crc32c sidecars are real
+                    # files and stay on the shared mount
+                    continue
+                m = link_re.match(os.readlink(path))
+                if m is None:
+                    continue
+                checked += 1
+                if m[1] != self.results_bucket:
+                    return False
+                objpath = m[2]
+                # A directory-typed output (e.g. SVelfie's "model_results/") is one
+                # symlink standing for a whole prefix: no object is named exactly
+                # that path, only objects beneath it. Exact membership would report
+                # every such shard as missing and re-run it.
+                if objpath in present:
+                    continue
+                prefix = objpath.rstrip("/") + "/"
+                if not any(name.startswith(prefix) for name in present):
+                    return False
+
+        # no bucket-backed outputs found at all: nothing to vouch for, so do not
+        # claim the shard is complete
+        return checked > 0
+
+    def results_prefix(self):
+        """
+        Object path prefix identifying this task run inside the results bucket.
+
+        The staging directory's basename already encodes the task name, date and
+        the script/docker/input hashes, so re-running an identical task converges
+        on the same prefix (and `gcloud storage cp -n` then makes the upload a
+        no-op) while a changed task gets a fresh one.
+        """
+        return os.path.basename(os.path.normpath(self.staging_dir))
+
+    def tmpdir_exports(self, jobId):
+        """
+        Setup-script lines pointing temp-file-heavy tools at local disk.
+
+        Emitted for both "local" and "bucket" modes, and in BOTH cases TMPDIR is a
+        worker-local path -- never inside the bucket mount. Spill files from
+        `bcftools sort`, GNU `sort`, GATK and Picard are written, seeked and deleted
+        in place, which is the exact access pattern gcsfuse handles worst; routing
+        them through FUSE would be the single largest risk in bucket mode.
+
+        Empty under "shared": there the long-standing behaviour is to leave TMPDIR
+        alone, so tools spill to the container's own /tmp, already local disk.
+
+        All three of TMPDIR/TMP/TEMP plus _JAVA_OPTIONS are set because GATK4 and
+        Picard honour them inconsistently (GATK does not read TMPDIR at all;
+        Picard's --TMP_DIR is ignored in some code paths and falls back to /tmp).
+
+        This cannot help tools whose temp location defaults to sit beside their
+        *output* rather than in $TMPDIR -- `samtools sort -T` and
+        `vcf2maf --tmp-dir` both do, and must be passed explicitly by the task.
+        """
+        if self.workdir_mode == "shared":
+            return []
+        tmpdir = os.path.join(self.local_workdir_root, jobId, 'tmp')
+        return [
+            'export TMPDIR="{}"'.format(tmpdir),
+            'export TMP="$TMPDIR"',
+            'export TEMP="$TMPDIR"',
+            'export _JAVA_OPTIONS="-Djava.io.tmpdir=$TMPDIR ${_JAVA_OPTIONS:-}"',
+            'mkdir -p $TMPDIR',
+        ]
 
     def get_requester_pays(self, path: str) -> bool:
         """
@@ -1542,6 +1815,9 @@ class AbstractLocalizer(abc.ABC):
         #
         # create creation/teardown scripts for scratch disk, if specified
         scratch_disk_already_exists = False
+        # only bound inside the branch below, but job_workspace_path() is called
+        # unconditionally further down and takes it as an argument
+        scratch_disk_prefix = None
         if self.use_scratch_disk:
             scratch_disk_prefix, \
             scratch_disk_creation_script, \
@@ -1732,7 +2008,7 @@ class AbstractLocalizer(abc.ABC):
                     file = dgrp[2]
 
                     bucketmount_key = bkt
-                    mount_dir = "/mnt/bucketmounts/{}".format(bucketmount_key)
+                    mount_dir = "{}/{}".format(BUCKETMOUNT_ROOT, bucketmount_key)
 
                     if bucketmount_key not in canine_bucketmounts:
                         canine_bucketmounts.append(bucketmount_key)
@@ -1984,7 +2260,7 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_VARS={}'.format(':'.join(job_vars)),
                 'export CANINE_JOB_INPUTS="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'inputs')),
                 'export CANINE_JOB_WORKSPACE="{}"'.format(
-                  os.path.join(compute_env['CANINE_JOBS'], jobId, 'workspace') if not self.use_scratch_disk else scratch_disk_prefix
+                  self.job_workspace_path(compute_env, jobId, scratch_disk_prefix)
                 ),
                 'export CANINE_JOB_ROOT="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId)),
                 'export CANINE_JOB_SETUP="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'setup.sh')),
@@ -1992,9 +2268,15 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
                 'export CANINE_DOCKER_ARGS="{docker} $CANINE_DOCKER_ARGS"'.format(docker=' '.join(set(docker_args))),
                 'mkdir -p $CANINE_JOB_INPUTS',
+            ]
+            # the workspace lives inside the read-write bucket mount, so the
+            # mount has to exist before mkdir can create anything in it
+            + self.workdir_mount_script()
+            + [
                 'mkdir -p $CANINE_JOB_WORKSPACE',
                 'chmod 755 $CANINE_JOB_LOCALIZATION'
             ]
+            + self.tmpdir_exports(jobId)
             # all exported job variables
             + exports
         ) + "\n"
@@ -2021,9 +2303,15 @@ class AbstractLocalizer(abc.ABC):
                 'shopt -s expand_aliases #DEBUG_OMIT',
                 'alias gcloud=gcloud_exp_backoff #DEBUG_OMIT',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
+                # Stamp the custom time here rather than reusing the localization
+                # script's: that one is a plain shell variable in localization.sh,
+                # a different process, so it is not in scope here. Without it the
+                # uploads below get an unset custom time and the results bucket's
+                # daysSinceCustomTime rule would treat them as immediately expired.
+                'CANINE_BUCKET_CT=$(date -u +%Y-%m-%dT%H:%M:%SZ)' if self.workdir_mode != "shared" else '',
                 # 'mv ../stderr ../stdout .',
                 # do not run delocalization script if we're in debug mode
-                'if [[ -z $CANINE_DEBUG_MODE ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag}; fi; fi'.format(
+                'if [[ -z $CANINE_DEBUG_MODE ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag} {resultsflags}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag} {resultsflags}; fi; fi'.format(
                     script_path = os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     output_root = compute_env['CANINE_OUTPUT'],
                     shard = jobId,
@@ -2037,7 +2325,24 @@ class AbstractLocalizer(abc.ABC):
                     ),
                     scratchflag = "--scratch" if self.use_scratch_disk else "",
                     finishedflag = "--finished_scratch" if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else "",
+                    # $CANINE_BUCKET_CT is stamped by the localization script; the
+                    # results bucket's lifecycle rule is keyed on
+                    # daysSinceCustomTime, so uploads must carry it or they expire
+                    # from an unset (epoch) custom time.
+                    resultsflags = " ".join([
+                      "--results_bucket {} --results_prefix {} --custom_time \"$CANINE_BUCKET_CT\"".format(
+                        shlex.quote(self.results_bucket), shlex.quote(self.results_prefix())
+                      ),
+                      # under "bucket" the workspace IS the bucket, so the objects
+                      # already exist -- record the pointers, skip the upload
+                      "--workdir_in_bucket" if self.workdir_mode == "bucket" else "",
+                      "--save_intermediates" if self.save_intermediates else "",
+                    ]).strip() if self.workdir_mode != "shared" else "",
                 ),
+
+                # flush and release the read-write workspace mount, after
+                # delocalization has finished reading through it
+                ] + self.workdir_unmount_script() + [
 
                 # remove stream dir
                 'if [[ -n "$CANINE_STREAM_DIR" ]]; then rm -rf $CANINE_STREAM_DIR; fi',

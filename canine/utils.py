@@ -267,6 +267,71 @@ def get_project_number(project: str) -> str:
 ## the cluster runs. 21 hex = 84 bits; collision odds at 1e6 buckets are ~5e-14.
 LOCALIZATION_BUCKET_HASH_LEN = 21
 
+## The results bucket is named wolf-<project_number>-<region>-<namespace>, the
+## same shape as a localization bucket but with a user-chosen namespace in the
+## last component instead of a content hash. It therefore gets the same budget:
+## a fixed 21 characters, computed against the longest region name.
+##
+## Fixed rather than region-dependent on purpose. us-central1 (11 chars) would
+## allow 33, but then a namespace that works there starts failing the first time
+## the same workflow runs in northamerica-northeast1 -- a miserable way to find
+## out about a naming limit. One number, everywhere.
+RESULTS_BUCKET_NAMESPACE_MAX_LEN = 21
+
+## Bucket label distinguishing a results bucket from a per-localization bucket.
+## Both share the wolf-<project_number>-<region>-* name shape, and localization
+## buckets are swept by a lifecycle rule with no prefix filter, so tooling must
+## key off this label rather than the name. Localization buckets use the "wolf"
+## label for their working/success/stale state machine; this is deliberately a
+## different key.
+RESULTS_BUCKET_LABEL = "wolf-kind"
+RESULTS_BUCKET_LABEL_VALUE = "results"
+
+def check_results_bucket_namespace(namespace: str) -> str:
+    """
+    Validate `namespace` as the last component of a results bucket name and
+    return its sanitized form. Raises ValueError if it is too long.
+
+    Split out from results_bucket_name() so callers can fail fast -- wolF calls
+    this in Workflow.__init__, long before a project number or region is known,
+    so that an over-long namespace is rejected before a cluster is provisioned
+    rather than when the first task tries to create the bucket.
+
+    Rejects rather than truncating: two namespaces differing only past the
+    cutoff would otherwise share one bucket and quietly interleave results.
+    """
+    sanitized = _sanitize_bucket_name_component(namespace)
+    if len(sanitized) > RESULTS_BUCKET_NAMESPACE_MAX_LEN:
+        raise ValueError(
+          "namespace {!r} is too long: it sanitizes to {!r} ({} characters), but a "
+          "results bucket name allows at most {}. Choose a shorter namespace."
+          .format(namespace, sanitized, len(sanitized), RESULTS_BUCKET_NAMESPACE_MAX_LEN)
+        )
+    return sanitized
+
+def results_bucket_name(project_number: str, region: str, namespace: str) -> str:
+    """
+    Deterministic name of the bucket holding one namespace's task outputs:
+    wolf-<project_number>-<region>-<namespace>.
+
+    Mirrors localization_bucket_name(): the project number rather than the
+    project ID keeps the name stable across project renames, and the region is
+    part of the name because buckets are regional -- the same namespace run in
+    two regions needs two distinct (globally unique) names.
+    """
+    sanitized = check_results_bucket_namespace(namespace)
+
+    name = "wolf-{}-{}-{}".format(
+      _sanitize_bucket_name_component(str(project_number)),
+      _sanitize_bucket_name_component(region),
+      sanitized,
+    )
+    # A longer future project number or a new, longer region name must fail here
+    # rather than reach GCS as an invalid name.
+    if not re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', name):
+        raise ValueError("Computed an invalid GCS bucket name: {!r}".format(name))
+    return name
+
 def localization_bucket_name(project_number: str, region: str, content_hash: str) -> str:
     """
     Deterministic name of the bucket backing one localization:
@@ -324,6 +389,74 @@ def get_or_create_workflow_bucket(zone: str, project: str, workflow_name: typing
     )
     if not has_lifecycle_rule:
         bucket.add_lifecycle_delete_rule(days_since_custom_time=5)
+        bucket.patch()
+
+    return bucket_name
+
+def get_or_create_results_bucket(
+    zone: str, project: str, namespace: str, expiry_days: typing.Optional[int] = 30
+) -> str:
+    """
+    Get or create the regional bucket holding one namespace's task outputs.
+
+    Unlike the localization buckets, this one is written by workers at job
+    teardown and read back by downstream tasks over a read-only gcsfuse mount,
+    so it is created once per namespace and reused across runs.
+
+    `expiry_days` is keyed on daysSinceCustomTime, not object age, matching the
+    localization buckets: results that are still being read have their
+    customTime refreshed by the bucketmount heartbeat, so an actively-used
+    namespace keeps its history rather than expiring on a fixed clock. Pass 0 or
+    None for results that should never expire.
+
+    Raises on a genuine creation failure (permissions, quota, bad zone).
+    """
+    client = gcloud_storage_client()
+    bucket_name = results_bucket_name(
+      get_project_number(project), _zone_to_region(zone), namespace
+    )
+
+    bucket = client.bucket(bucket_name)
+    if not bucket.exists():
+        try:
+            bucket = client.create_bucket(
+              bucket_name, project=project, location=_zone_to_region(zone)
+            )
+        except google.api_core.exceptions.Conflict:
+            # created concurrently by another run in the same namespace; this is
+            # the expected reuse case, not an error
+            bucket = client.bucket(bucket_name)
+            bucket.reload()
+
+    # Label it so tooling can tell a results bucket from a per-localization
+    # bucket -- they share a name shape, and localization buckets are swept by a
+    # lifecycle rule with no prefix filter.
+    if bucket.labels.get(RESULTS_BUCKET_LABEL) != RESULTS_BUCKET_LABEL_VALUE:
+        bucket.labels = {**bucket.labels, RESULTS_BUCKET_LABEL: RESULTS_BUCKET_LABEL_VALUE}
+        bucket.patch()
+
+    # Reconcile the lifecycle rule on every call, not just at creation. The
+    # bucket outlives any single run, so a later run with a different
+    # expiry_days must actually change the rule -- note get_or_create_workflow_bucket
+    # above only checks whether *some* daysSinceCustomTime rule exists and never
+    # updates it, which is not good enough here.
+    # snapshot once: lifecycle_rules is a property yielding a fresh generator on
+    # each access, so it must not be iterated twice as if it were a list
+    current = list(bucket.lifecycle_rules)
+    desired = [
+      rule for rule in current
+      if not (
+        rule.get("action", {}).get("type") == "Delete"
+        and "daysSinceCustomTime" in rule.get("condition", {})
+      )
+    ]
+    if expiry_days:
+        desired.append({
+          "action": {"type": "Delete"},
+          "condition": {"daysSinceCustomTime": int(expiry_days)},
+        })
+    if current != desired:
+        bucket.lifecycle_rules = desired
         bucket.patch()
 
     return bucket_name

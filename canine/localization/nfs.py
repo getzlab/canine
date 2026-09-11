@@ -7,7 +7,7 @@ import re
 import shlex
 import glob
 import subprocess
-from .base import PathType, Localization
+from .base import PathType, Localization, BUCKETMOUNT_ROOT
 from .local import BatchedLocalizer
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
@@ -183,6 +183,47 @@ class NFSLocalizer(BatchedLocalizer):
 
             return self.finalize_staging_dir(inputs)
 
+    def glob_outputs(self, dirpath: str, pattern: str) -> typing.List[str]:
+        """
+        Match one output's declared pattern inside its outputs directory.
+
+        Plain glob is not sufficient under local_workdir. Outputs there are
+        symlinks into a bucket that is not mounted on the controller, so they are
+        broken by design -- and a *directory*-typed pattern like "model_results/"
+        never matches a broken symlink, because glob's trailing slash requires a
+        real directory. The result was an empty output list and no error at all.
+
+        So when a pattern yields nothing under local_workdir, retry it without the
+        trailing slash and keep whatever is lexically present. Broken symlinks are
+        exactly what we are looking for here.
+        """
+        matches = glob.glob(os.path.join(dirpath, pattern))
+        if matches or self.workdir_mode == "shared":
+            return matches
+
+        retry = glob.glob(os.path.join(dirpath, pattern.rstrip("/")))
+        return [p for p in retry if os.path.lexists(p)]
+
+    def bucketmount_url_from_link(self, path: str) -> str:
+        """
+        Turn an output symlink written by delocalization.py under local_workdir
+        into the bucketmount:// URL naming the same object.
+
+        The link text is the future gcsfuse mount path,
+        /mnt/bucketmounts/<bucket>/<object path>, and is deliberately broken on
+        the controller -- the bucket is only mounted on the worker that consumes
+        it. So this reads the link rather than resolving it.
+        """
+        link = os.readlink(path)
+        m = re.match(r"^{}/([^/]+)/(.+)$".format(re.escape(BUCKETMOUNT_ROOT)), link)
+        if m is None:
+            raise ValueError(
+              "Output {} does not point into {} (link target: {!r}). Expected a "
+              "bucket-mount symlink written by delocalization.py under local_workdir."
+              .format(path, BUCKETMOUNT_ROOT, link)
+            )
+        return "bucketmount://{}/{}".format(m[1], m[2])
+
     def delocalize(self, patterns: typing.Dict[str, str], output_dir: typing.Optional[str] = None) -> typing.Dict[str, typing.Dict[str, str]]:
         """
         Delocalizes output from all jobs.
@@ -205,13 +246,25 @@ class NFSLocalizer(BatchedLocalizer):
                 if os.path.isdir(dirpath):
                     if outputname not in patterns:
                         warnings.warn("Detected output directory {} which was not declared".format(dirpath))
-                    output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
+                    output_files[jobId][outputname] = self.glob_outputs(dirpath, patterns[outputname])
 
                     # if we're using a scratch disk, outputs should be RODISK
                     # objects for downstream tasks to mount. read symlinks to
                     # RODISK URLs
                     if self.use_scratch_disk and outputname not in self.files_to_copy_to_outputs:
                         output_files[jobId][outputname] = ["rodisk://" + re.match(r".*(canine-scratch.*)", os.readlink(x))[1] for x in output_files[jobId][outputname]]
+
+                    # the job ran in a worker-local workdir, so delocalization
+                    # uploaded these outputs to the results bucket and left
+                    # symlinks pointing at the future gcsfuse mount. Read those
+                    # back out as bucketmount:// URLs so downstream tasks take
+                    # the bucket_mount localization branch -- which mounts the
+                    # bucket read-only and symlinks into it, never copying.
+                    elif self.workdir_mode != "shared" and outputname not in self.files_to_copy_to_outputs:
+                        output_files[jobId][outputname] = [
+                          self.bucketmount_url_from_link(x)
+                          for x in output_files[jobId][outputname]
+                        ]
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
         return output_files

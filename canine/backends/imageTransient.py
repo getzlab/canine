@@ -9,7 +9,7 @@ import sys
 from .local import LocalSlurmBackend
 from ..utils import (
     get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, canine_logging,
-    get_or_create_workflow_bucket, get_or_create_rapid_cache
+    get_or_create_workflow_bucket, get_or_create_rapid_cache, get_or_create_results_bucket
 )
 
 import googleapiclient.discovery as gd
@@ -89,6 +89,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         workflow_name: typing.Optional[str] = None,
         rapid_cache: bool = False,
         rapid_cache_ttl: str = "1d",
+        workdir_mode: str = "shared",
+        save_intermediates: bool = False,
+        results_expiry_days: typing.Optional[int] = 30,
         **kwargs
     ):
         #
@@ -149,7 +152,13 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "action_on_stop" : action_on_stop,
             "workflow_name" : workflow_name,
             "rapid_cache" : rapid_cache,
-            "rapid_cache_ttl" : rapid_cache_ttl
+            "rapid_cache_ttl" : rapid_cache_ttl,
+            # run jobs in a worker-local workdir and push their outputs to a
+            # results bucket, rather than working on the shared mount
+            "workdir_mode" : workdir_mode,
+            "save_intermediates" : save_intermediates,
+            "results_expiry_days" : results_expiry_days,
+            "results_bucket" : None,
         }
 
         if self.config['project'] is None:
@@ -176,6 +185,17 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             self.config["storage_bucket"] = get_or_create_workflow_bucket(
                 self.config["compute_zone"], self.config["project"], self.config["workflow_name"]
             )
+
+            # get-or-create the bucket that task *outputs* are pushed to under
+            # local_workdir. Separate from storage_bucket above: that one backs
+            # bucket-mounted inputs and its objects are short-lived cache
+            # entries, whereas these are results with their own retention.
+            if self.config["workdir_mode"] != "shared":
+                self.config["results_bucket"] = get_or_create_results_bucket(
+                    self.config["compute_zone"], self.config["project"],
+                    self.config["workflow_name"],
+                    expiry_days = self.config["results_expiry_days"],
+                )
 
             # Rapid Cache is opt-in per workflow (rapid_cache=True), because it
             # is not free and not always a win: cache storage bills per GiB-hour

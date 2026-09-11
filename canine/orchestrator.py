@@ -756,9 +756,14 @@ class Orchestrator(object):
             #       localizer exit early.
             if transport.exists(localizer.staging_dir):
                 try:
-                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id") 
+                    js_df = pd.DataFrame.from_dict(self.job_spec, orient = "index").rename_axis(index = "_job_id")
                     js_df["failed"] = False
                     js_df["output_ok"] = False
+                    # getattr: not every localizer implementation carries this.
+                    # "local" and "bucket" both put the workspace off the shared
+                    # mount and their outputs in the results bucket, so both need
+                    # the exemption and the object-existence check below.
+                    bucket_backed = getattr(localizer, "workdir_mode", "shared") != "shared"
                     jobs_dir = localizer.environment("local")["CANINE_JOBS"]
                     output_dir = localizer.environment("local")["CANINE_OUTPUT"]
 
@@ -770,7 +775,13 @@ class Orchestrator(object):
                         # if workspace directory is missing, consider shard failed
                         # this is to disable job avoidance for jobs that write to scratch
                         # directories, which do not generate a workspace directory.
-                        if not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
+                        #
+                        # Exempt when bucket-backed: the workspace lives on the worker's
+                        # own disk, so there is never one here, and without this
+                        # exemption every shard would look failed and job avoidance
+                        # would silently never fire. Those shards are instead vouched
+                        # for against the results bucket below.
+                        if not bucket_backed and not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
                             js_df.at[i, "failed"] = True
 
                         # otherwise, make sure all three exit code are OK
@@ -796,6 +807,16 @@ class Orchestrator(object):
 
                         if o_df.set_index("output").loc[:, "pattern"].to_dict() == self.raw_outputs:
                             js_df.at[i, "output_ok"] = True
+
+                        # A matching manifest proves the shard once produced the
+                        # right outputs, not that they still exist. Under
+                        # local_workdir the manifest sits on the shared mount while
+                        # the data sits in the results bucket under a
+                        # daysSinceCustomTime rule, so the two expire independently
+                        # -- confirm the objects are actually still there before
+                        # skipping the shard.
+                        if js_df.at[i, "output_ok"] and bucket_backed:
+                            js_df.at[i, "output_ok"] = localizer.bucket_outputs_present(output_dir, i)
 
                     # shards that both succeeded and have matching outputs can be noop'd
                     # in the job spec

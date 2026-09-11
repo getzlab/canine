@@ -44,13 +44,15 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
         cluster_name,
         *,
         action_on_stop="delete",
-        image_family="gsfuse-local",
+        image_family="fuse-nfs",
         image_project="broad-getzlab-workflows",
         image=None,
         storage_namespace="workspace",
         storage_bucket=None,
         storage_disk=None,
         storage_disk_size="100",
+        rclone_bucket=None,
+        worker_boot_disk_size=None,
         user=None,
         shutdown_on_exit=False,
         **kwargs,
@@ -63,7 +65,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                     "$USER not set in environment. Must explicitly pass user argument"
                 )
 
-        if storage_bucket is not None and storage_disk is not None:
+        if rclone_bucket is not None and storage_disk is not None:
             canine_logging.warning(
                 "You specified both a persistent disk and cloud bucket to store workflow outputs; will only store to bucket!"
             )
@@ -85,7 +87,26 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
             "clust_frac": 1.0,
             "user": user,
             "storage_namespace": storage_namespace,
+            # storage_bucket is the bucket backing bucket-mounted localization
+            # (bucketmount:// URLs). It is get-or-created automatically in
+            # TransientImageSlurmBackend.__enter__, which this class inherits, so
+            # it does not normally need to be passed.
             "storage_bucket": storage_bucket,
+            # rclone_bucket is a *separate*, legacy mechanism: mount a bucket as
+            # the shared workspace via rclone and re-export it over NFS. It used
+            # to share the "storage_bucket" key, which meant enabling bucket
+            # localization also triggered the rclone path -- and rclone is not
+            # installed in the image (Dockerfile step 12 is commented out), so
+            # that combination raised RuntimeError. Kept separate so the two
+            # features are independently selectable.
+            "rclone_bucket": rclone_bucket,
+            # Boot disk size for *worker* nodes, e.g. "200GB". This config dict is
+            # pickled to /mnt/nfs/clust_conf/canine/backend_conf.pickle and read by
+            # slurm_gcp_docker/slurm_resume.py when it creates nodes. None means
+            # size it from the machine type's core count
+            # (slurm_resume.map_partition_disksize). Matters because under
+            # local_workdir the job workdir sits on this disk.
+            "worker_boot_disk_size": worker_boot_disk_size,
             "storage_disk": storage_disk,
             "storage_disk_size": storage_disk_size,
             "storage_uuid": str(uuid.uuid4().hex[0:4]),
@@ -142,7 +163,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
 
         #
         # check if image exists; pull it if not
-        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.3'
+        # keep in sync with slurm_gcp_docker/slurm_gcp_docker/VERSION
+        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.4'
         try:
             image = self.dkr.images.get(image_ref)
         except docker.errors.ImageNotFound:
@@ -268,7 +290,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                 canine_logging.error(e)
 
             #
-            # shutdown nodes that are still running (except NFS)
+            # shutdown nodes that are still running
             allnodes = self.nodes
 
             # if we're aborting before the NFS has even been started, there are no
@@ -277,14 +299,18 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                 # sometimes the Google API will spectacularly fail; in that case, we
                 # just try to shutdown everything in the node list, regardless of whether
                 # it exists.
+                #
+                # NOTE: this used to additionally filter out machine_type == "nfs".
+                # That was vestigial: machine_type is populated from Slurm partition
+                # names (slurm_gcp_docker/provision_server.py:158, `part.partition`),
+                # which are GCE machine types or one of {all, main, nonpreemptible,
+                # gpu} -- never "nfs". In this backend the NFS server is the
+                # controller host itself, not a node, so no row was ever excluded.
                 try:
                     extant_nodes = self.list_instances_all_zones()
-                    self.nodes = allnodes.loc[
-                        allnodes.index.isin(extant_nodes["name"])
-                        & (allnodes["machine_type"] != "nfs")
-                    ]
+                    self.nodes = allnodes.loc[allnodes.index.isin(extant_nodes["name"])]
                 except:
-                    self.nodes = allnodes.loc[allnodes["machine_type"] != "nfs"]
+                    self.nodes = allnodes
 
                 # superclass method will stop/delete/leave these running, depending on how
                 # self.config["action_on_stop"] is set
@@ -358,9 +384,13 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
         )
 
         ## mount bucket via rclone (unstable!)
-        if self.config["storage_bucket"] is not None:
+        ## NOTE: gated on rclone_bucket, not storage_bucket -- see __init__.
+        ## rclone is NOT installed in the image (Dockerfile step 12 is
+        ## commented out), so this path currently raises RuntimeError below if
+        ## enabled.
+        if self.config["rclone_bucket"] is not None:
             canine_logging.info1(
-                f"Saving workflow results to bucket {self.config['storage_bucket']} mounted at /mnt/nfs/{self.config['storage_namespace']} ..."
+                f"Saving workflow results to bucket {self.config['rclone_bucket']} mounted at /mnt/nfs/{self.config['storage_namespace']} ..."
             )
 
             # TODO: check if bucket exists; create it if not
@@ -403,9 +433,9 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                  df -t fuse.rclone {bind_mountpoint} || \
                   mount --bind {mountpoint} {bind_mountpoint}'""".format(
                     bucket_name=(
-                        self.config["storage_bucket"][5:]
-                        if self.config["storage_bucket"].startswith("gs://")
-                        else self.config["storage_bucket"]
+                        self.config["rclone_bucket"][5:]
+                        if self.config["rclone_bucket"].startswith("gs://")
+                        else self.config["rclone_bucket"]
                     ),
                     mountpoint=f'/mnt/rclone/{self.config["storage_namespace"]}',
                     bind_mountpoint=f'/mnt/nfs/{self.config["storage_namespace"]}',
