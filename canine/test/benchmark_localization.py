@@ -959,7 +959,14 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
             sampler.tick()
             if kill_after_bytes is not None and not killed:
                 try:
-                    if os.path.getsize(dest) >= kill_after_bytes:
+                    # ALLOCATED blocks, not apparent size. The downloader creates the
+                    # destination sparse with ftruncate at the full object size, so
+                    # os.path.getsize() reads the final size on the very first tick and
+                    # every kill fired immediately -- the three "kills at 25/50/75%" each
+                    # landed after 132 bytes, which is the range probe, and the resume run
+                    # therefore measured a fresh download rather than a resume. st_blocks
+                    # counts what is really on disk and grows with the transfer.
+                    if os.stat(dest).st_blocks * 512 >= kill_after_bytes:
                         process.send_signal(signal.SIGKILL)
                         killed = True
                 except OSError:
@@ -1799,6 +1806,20 @@ def command_sweep(args):
 # resume
 # --------------------------------------------------------------------------------
 
+def premature(outcome):
+    """
+    Did this attempt get killed before it had done any real work?
+
+    Half the target is the threshold: a kill is inherently approximate -- the monitor
+    polls every 250 ms -- but landing under half means the trigger is not tracking
+    progress at all, which is a defect in the harness rather than a fast download.
+    """
+    target = outcome.get("kill_target")
+    if not target or not outcome.get("killed"):
+        return False
+    return (outcome.get("nic_bytes") or 0) < target * 0.5
+
+
 def command_resume(args):
     """
     Resumability against the real filesystem, which is where it matters: the frontier path
@@ -1828,9 +1849,11 @@ def command_resume(args):
                                verification=verification, kill_after_bytes=kill_at)
         total_nic += outcome["nic_bytes"] or 0
         attempts.append(outcome)
-        say("attempt {}: rc={} {} seconds, killed={}, NIC {}".format(
+        outcome["kill_target"] = kill_at
+        say("attempt {}: rc={} {} seconds, killed={}, NIC {}{}".format(
             attempt, outcome["returncode"], outcome["seconds"], outcome["killed"],
-            human(outcome["nic_bytes"] or 0)))
+            human(outcome["nic_bytes"] or 0),
+            "  <-- KILLED BEFORE IT GOT ANYWHERE" if premature(outcome) else ""))
         if outcome["returncode"] == 0 and not outcome["killed"]:
             break
 
@@ -1840,10 +1863,29 @@ def command_resume(args):
         "no digest to check against" if correct is None
         else ("CORRECT" if correct else "WRONG")))
     say("total received : {} for a {} object".format(human(total_nic), human(args.size)))
+
+    # A kill that lands before its target tests nothing: the next attempt starts from
+    # roughly nothing and the run measures a fresh download, which then reports a
+    # flatteringly low refetch figure. Observed: three kills aimed at 25/50/75% all fired
+    # after 132 bytes -- the range probe -- because the trigger read the apparent size of
+    # a sparse preallocated file. The overhead then came out at 0.8%, which is the
+    # protocol overhead of one clean download and nothing to do with resume.
+    duds = [o for o in attempts if premature(o)]
+    if duds:
+        say()
+        say("NOT A RESUME MEASUREMENT: {} of {} kills landed before reaching even half"
+            .format(len(duds), sum(1 for o in attempts if o["kill_target"])))
+        say("of their target, so the attempts after them started from nothing and the")
+        say("overhead below is a fresh download's protocol overhead, not refetched work.")
+        for o in duds:
+            say("  target {:>10}, transferred {:>10}".format(
+                human(o["kill_target"]), human(o["nic_bytes"] or 0)))
+        say()
     if total_nic and args.size:
         waste = total_nic - args.size
-        say("refetched      : {} ({:.1f}% overhead)".format(
-            human(max(0, waste)), 100.0 * max(0, waste) / args.size))
+        say("refetched      : {} ({:.1f}% overhead){}".format(
+            human(max(0, waste)), 100.0 * max(0, waste) / args.size,
+            "  -- MEANINGLESS, see above" if duds else ""))
         say()
         say("The claim is that only the uncommitted tail is refetched. With {} kills,".format(
             len(attempts) - 1))

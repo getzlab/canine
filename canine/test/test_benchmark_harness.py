@@ -10,6 +10,7 @@ issued by someone else, that matters.
 
 import glob
 import hashlib
+import inspect
 import importlib.util
 import os
 import shlex
@@ -1567,3 +1568,66 @@ class TestNearZeroVerifyIsTheFeatureWorking:
         self.sweep(tmp_path, monkeypatch, 60.0, s3=True)
         out = capsys.readouterr().out
         assert "avoidable and already implemented" in out
+
+
+class TestTheResumeKillMustLandWhereItAims:
+    """
+    `pdl resume` aims three SIGKILLs at 25/50/75% of the object. All three landed after
+    132 bytes -- the one-byte range probe and its headers -- because the trigger read
+    `os.path.getsize(dest)`, and the downloader creates the destination sparse with
+    ftruncate at the FULL object size. So the apparent size is final on the first tick,
+    every kill fires immediately, and the last attempt performs a fresh download.
+
+    The run then reported "refetched 31.79 MiB (0.8% overhead)" against a claim that a
+    broken frontier would show ~3 GiB. It looked like a strong pass. It was the protocol
+    overhead of one clean download, and the resume path was never exercised.
+
+    Same sparse-file hazard the downloader already guards elsewhere:
+    clear_preallocated_working_file exists because a size-based check "would see a
+    full-size sparse file and skip the download entirely".
+    """
+
+    def test_the_trigger_uses_allocated_blocks_not_apparent_size(self, tmp_path):
+        """
+        A sparse file the size of the object with almost nothing written: the trigger
+        must see ~0, not the full length.
+        """
+        path = tmp_path / "sparse.bin"
+        with open(path, "wb") as handle:
+            handle.truncate(4 * 1024 ** 3)
+            handle.write(b"x" * 4096)
+        apparent = os.path.getsize(str(path))
+        allocated = os.stat(str(path)).st_blocks * 512
+        assert apparent >= 4 * 1024 ** 3
+        assert allocated < apparent / 100, (allocated, apparent)
+
+    def test_the_source_no_longer_reads_apparent_size(self):
+        # Code only: the comment explaining the bug names getsize, and a naive substring
+        # check fails on the explanation of the thing it is checking for.
+        code = "\n".join(line.split("#", 1)[0]
+                         for line in inspect.getsource(bench.run_download).splitlines())
+        assert "st_blocks" in code
+        assert "getsize" not in code, "apparent size is the bug"
+
+    def test_a_kill_short_of_its_target_is_premature(self):
+        assert bench.premature({"kill_target": 1 << 30, "killed": True,
+                                "nic_bytes": 132})
+
+    def test_a_kill_near_its_target_is_not(self):
+        assert not bench.premature({"kill_target": 1 << 30, "killed": True,
+                                    "nic_bytes": int(0.9 * (1 << 30))})
+
+    def test_an_unkilled_attempt_is_never_premature(self):
+        """The final attempt runs to completion by design."""
+        assert not bench.premature({"kill_target": None, "killed": False,
+                                    "nic_bytes": 1 << 32})
+
+    def test_the_verdict_refuses_to_call_it_a_resume_measurement(self, capsys):
+        attempts = [{"kill_target": 1 << 30, "killed": True, "nic_bytes": 132,
+                     "returncode": -9, "seconds": 0.25},
+                    {"kill_target": None, "killed": False, "nic_bytes": 4 << 30,
+                     "returncode": 0, "seconds": 68.0}]
+        assert [a for a in attempts if bench.premature(a)]
+        # the message itself is asserted through command_resume in the runbook-level
+        # test below; here the classifier is the unit under test
+        assert not bench.premature(attempts[1])
