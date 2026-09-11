@@ -95,6 +95,9 @@ GIB = 1024 * MIB
 # Mirrors parallel_download.py's DEFAULT_MIN_CHUNK. Defined once here so the parser
 # default and the chunk-plan arithmetic in probe_s3_endpoint cannot drift apart.
 DEFAULT_MIN_CHUNK = 64 * MIB
+# Mirrors MAX_CONNECTIONS in parallel_download.py. Stated here rather than imported: this
+# script is deliberately standalone so it can be copied to a node on its own.
+MAX_CONNECTIONS_HINT = 16
 
 # The emitted commands and the legacy fallbacks use [[ ]] and process substitution, which
 # dash rejects -- and /bin/sh in the worker image is dash. Same reason parallel_download.py
@@ -1488,7 +1491,23 @@ def command_sweep(args):
     # in-transfer hashing is worth building
     # `in`, not `.get()`: a verify of 0.0s is falsy, and a fast verify is precisely the
     # result that argues the node can be sized down. Dropping it would hide that.
-    splits = [r["phases"] for r in usable if "verify" in r["phases"]]
+    # `verified is not None`: a run that verified NOTHING reports verify 0.0s, and
+    # concluding "verification is a small share, so hashing during the transfer would buy
+    # little" from that is a statement about work that never happened. The --prefix runs
+    # against the real source cannot verify at all (a slice cannot match the object's
+    # ETag), so this fired on every one of them.
+    splits = [r["phases"] for r in usable
+              if "verify" in r["phases"] and r.get("verified") is not None]
+    unverified = [r for r in usable if "verify" in r["phases"]
+                  and r.get("verified") is None]
+    if unverified and not splits:
+        heading("download vs verify")
+        say("Not available: {} of {} settings verified nothing, so their verify phase is"
+            .format(len(unverified), len(usable)))
+        say("0.0s because no hashing was done -- not because hashing is cheap. Nothing")
+        say("here says whether hashing during the transfer is worth it; that needs a run")
+        say("with a real digest (§6.3 / §6.4 at full size).")
+        say()
     if splits:
         heading("download vs verify")
         dl = sum(s.get("download", 0) for s in splits) / len(splits)
@@ -1673,9 +1692,27 @@ def command_sweep(args):
         top = max(r["throughput_bytes_per_s"] for r in plateau)
         knee = min((r["connections"] for r in plateau
                     if r["throughput_bytes_per_s"] >= 0.95 * top), default=None)
+        highest = max(r["connections"] for r in plateau)
         say()
-        say("throughput is within 5% of its best from {} connections upward,".format(knee))
-        say("which is the value to set as the default (currently 8).")
+        if knee is not None and knee >= highest:
+            # "within 5% of its best from 16 upward" is arithmetically true when 16 is
+            # both the best and the highest setting tried -- and reading it as a knee is
+            # the opposite of the truth, which is that throughput was still climbing when
+            # the range ran out. Recommending the top of an exhausted range as the default
+            # is how a cap gets mistaken for a plateau.
+            say("NO KNEE FOUND: {} connections was both the fastest and the highest"
+                .format(highest))
+            say("setting tried, so throughput was still climbing when the range ran out.")
+            say("This does not identify a default -- it says the sweep was too narrow.")
+            say("Extend the range (MAX_CONNECTIONS caps the downloader at {}), or pick"
+                .format(MAX_CONNECTIONS_HINT))
+            say("the default from the DESTINATION's ceiling instead: at a write limit of")
+            say("W, the useful connection count is about W / (per-stream throughput),")
+            say("and more than that only buys idle sockets.")
+        else:
+            say("throughput is within 5% of its best from {} connections upward,"
+                .format(knee))
+            say("which is the value to set as the default (currently 8).")
     return {"sweep": results}
 
 

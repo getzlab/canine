@@ -1295,3 +1295,100 @@ class TestThePrefixRunLearnsTheObjectSize:
             pass
         out = capsys.readouterr().out
         assert "UNKNOWN" in out and "fall back to a single stream" in out
+
+
+class TestAnExhaustedRangeIsNotAKnee:
+    """
+    The GDC sweep printed "throughput is within 5% of its best from 16 connections
+    upward, which is the value to set as the default". Arithmetically true and exactly
+    backwards: 16 was both the fastest and the highest setting tried, so throughput was
+    still climbing when the range ran out. Per-stream rate was flat at ~16 MiB/s from 1
+    to 16 connections -- there is no knee in that data at all.
+
+    Recommending the top of an exhausted range as the default is how a test-range cap
+    gets mistaken for a source plateau.
+    """
+
+    def sweep(self, tmp_path, monkeypatch, rates, verified=True):
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, conns, min_chunk, **kw):
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            seconds = len(payload) / float(rates[conns])
+            return {"connections": conns, "returncode": 0, "seconds": seconds,
+                    "killed": False, "peak_rss": 1 << 20,
+                    "phases": {"download": seconds, "verify": 0.0},
+                    "nic_bytes": len(payload), "disk_bytes": len(payload),
+                    "peak_nic_bytes_per_s": 1e8, "peak_disk_bytes_per_s": 1e3,
+                    "stderr_tail": [], "fell_back": None,
+                    "mean_streams": float(conns) * 0.9, "workers": conns}
+
+        downloader = tmp_path / "parallel_download.py"
+        downloader.write_bytes(b"# stand-in\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(downloader))
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(
+            bench, "resolve_source",
+            lambda a: (len(payload),
+                       bench.Verification("md5", digest) if verified
+                       else bench.Verification(None, reason="a prefix has no digest")))
+        bench.command_sweep(bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+             "--dest-dir", str(tmp_path),
+             "--connections"] + [str(c) for c in sorted(rates)]))
+
+    def test_still_climbing_at_the_top_is_reported_as_no_knee(
+            self, tmp_path, monkeypatch, capsys):
+        """The real shape: linear in connections, fastest at the highest setting."""
+        self.sweep(tmp_path, monkeypatch, {1: 16e6, 4: 60e6, 8: 123e6, 12: 164e6, 16: 227e6})
+        out = capsys.readouterr().out
+        assert "NO KNEE FOUND" in out
+        assert "too narrow" in out
+        assert "which is the value to set as the default" not in out
+
+    def test_a_real_plateau_still_names_a_default(self, tmp_path, monkeypatch, capsys):
+        """The guard must not swallow the case the message exists for."""
+        self.sweep(tmp_path, monkeypatch, {1: 16e6, 4: 100e6, 8: 101e6, 16: 99e6})
+        out = capsys.readouterr().out
+        assert "NO KNEE FOUND" not in out
+        assert "within 5% of its best from 4 connections" in out
+
+    def test_the_destination_ceiling_is_offered_instead(self, tmp_path, monkeypatch,
+                                                        capsys):
+        """
+        With no knee, the useful default comes from the destination's write limit, not
+        from the source -- which is the actual situation: pd-standard saturates around 6
+        connections while the source was still scaling at 16.
+        """
+        self.sweep(tmp_path, monkeypatch, {1: 16e6, 8: 123e6, 16: 227e6})
+        assert "DESTINATION" in capsys.readouterr().out
+
+
+class TestAnUnverifiedRunSaysNothingAboutHashingCost:
+    """
+    Every --prefix run reports `verify 0.0s`, because a slice of an object cannot match
+    that object's ETag so there is nothing to check. The sweep read that as "verification
+    is a small share, so hashing during the transfer would buy little" -- a conclusion
+    about work that never happened, and the opposite of what §13.35 built #19 for.
+    """
+
+    def sweep(self, tmp_path, monkeypatch, verified):
+        return TestAnExhaustedRangeIsNotAKnee.sweep(
+            self, tmp_path, monkeypatch, {1: 16e6, 8: 123e6}, verified=verified)
+
+    def test_an_unverified_sweep_declines_the_conclusion(self, tmp_path, monkeypatch,
+                                                         capsys):
+        self.sweep(tmp_path, monkeypatch, verified=False)
+        out = capsys.readouterr().out
+        assert "Not available" in out
+        assert "not because hashing is cheap" in out
+        assert "would buy little" not in out
+
+    def test_a_verified_sweep_still_reports_the_split(self, tmp_path, monkeypatch,
+                                                      capsys):
+        self.sweep(tmp_path, monkeypatch, verified=True)
+        out = capsys.readouterr().out
+        assert "mean download" in out
+        assert "Not available" not in out
