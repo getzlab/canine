@@ -56,6 +56,51 @@ class TestRendersWithoutScratchDisk:
         assert "--results_bucket" not in teardown
 
 
+class TestBucketModeScriptPlacement:
+    """
+    Where the mount lands matters as much as what it does. setup.sh is `source`d
+    by the entrypoint (orchestrator.py), so an `exit` there kills the entrypoint
+    shell before any .*_exit_code file is written and before teardown runs -- the
+    shard dies silently with no requeue. localization.sh is *executed*, and its
+    exit 5 is the established requeue signal.
+    """
+
+    def render(self, tmp_path):
+        staging = tmp_path / "task__abc"
+        staging.mkdir(exist_ok=True)
+        loc = NFSLocalizer(
+          MagicMock(), staging_dir=str(staging),
+          workdir_mode="bucket", results_bucket=BUCKET,
+        )
+        loc.inputs = {"0": {}}
+        return loc.job_setup_teardown("0", PATTERNS, transport=MagicMock())
+
+    def test_mount_is_in_localization_not_setup(self, tmp_path):
+        setup, localization, teardown, _ = self.render(tmp_path)
+        assert "gcsfuse" in localization
+        assert "gcsfuse" not in setup
+
+    def test_setup_does_not_mkdir_a_workspace_that_cannot_exist_yet(self, tmp_path):
+        """The mount is not up while setup.sh runs, so mkdir would fail there."""
+        setup, localization, _, _ = self.render(tmp_path)
+        assert "mkdir -p $CANINE_JOB_WORKSPACE" not in setup
+        assert "mkdir -p $CANINE_JOB_WORKSPACE" in localization
+
+    def test_workspace_var_is_still_exported_by_setup(self, tmp_path):
+        """The path is needed by the entrypoint's `cd` even before the mount."""
+        setup, _, _, _ = self.render(tmp_path)
+        assert 'export CANINE_JOB_WORKSPACE="/mnt/bucketworkdir/' in setup
+
+    def test_unmount_is_in_teardown_after_delocalization(self, tmp_path):
+        _, _, teardown, _ = self.render(tmp_path)
+        assert teardown.index("delocalization.py") < teardown.index("fusermount -u /mnt/bucketworkdir")
+
+    def test_tmpdir_still_local_in_bucket_mode(self, tmp_path):
+        setup, _, _, _ = self.render(tmp_path)
+        assert 'export TMPDIR="/mnt/local_workdir/0/tmp"' in setup
+        assert "/mnt/bucketworkdir" not in setup.split("export TMPDIR=")[1].split("\n")[0]
+
+
 class TestRendersWithLocalWorkdir:
 
     def test_local_workdir_renders(self, tmp_path):

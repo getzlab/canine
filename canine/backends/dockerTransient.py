@@ -501,14 +501,41 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                 canine_logging.error(stderr.read().decode())
                 raise RuntimeError()
 
+        ## no dedicated storage at all (storage_disk_size=0 and no rclone bucket)
+        # The staging tree -- job scripts, input/output symlinks, manifests, crc
+        # sidecars -- still lives at /mnt/nfs/<namespace> under every workdir_mode,
+        # it just no longer needs a disk of its own when the job workspace is on
+        # the worker or in a bucket. Nothing else creates this directory, and the
+        # free-space check below would otherwise raise FileNotFoundError before a
+        # single job runs.
+        else:
+            canine_logging.info1(
+                f"No results disk requested; staging directory /mnt/nfs/{self.config['storage_namespace']} "
+                "will live on the controller's own disk."
+            )
+            subprocess.check_call(
+                f"[ ! -d /mnt/nfs/{self.config['storage_namespace']} ] && "
+                f"mkdir -p /mnt/nfs/{self.config['storage_namespace']} || echo -n",
+                shell=True,
+                executable="/bin/bash",
+            )
+
         ## Check disk usage and warn user if it is small
-        free_space_gb = int(
-            shutil.disk_usage(f"/mnt/nfs/{self.config['storage_namespace']}").free
-            / (1024**3)
-        )
-        if free_space_gb < 300:
+        # Advisory only: a missing or unreadable path must not abort cluster
+        # startup, and the 300GB threshold is meaningless once the bulk data
+        # lives on the worker or in a bucket rather than here.
+        try:
+            free_space_gb = int(
+                shutil.disk_usage(f"/mnt/nfs/{self.config['storage_namespace']}").free
+                / (1024**3)
+            )
+            if free_space_gb < 300:
+                canine_logging.warning(
+                    f"Workflow results disk low on space ({free_space_gb} GB remaining)"
+                )
+        except OSError as e:
             canine_logging.warning(
-                f"Workflow results disk low on space ({free_space_gb} GB remaining)"
+                f"Could not check free space on /mnt/nfs/{self.config['storage_namespace']}: {e}"
             )
 
         # TODO: add warnings if overall disk is small (bad disk IO) or node core

@@ -309,23 +309,57 @@ class AbstractLocalizer(abc.ABC):
         point"), and gcsfuse runs unprivileged here so that podman's --uidmap root
         maps through to the task container.
 
-        No `-o ro`, obviously -- and unlike the consumer mounts this one is
-        deliberately left mounted for the life of the job, which is why it lives
-        under its own root rather than in BUCKETMOUNT_ROOT.
+        No `-o ro`, obviously. The mountpoint is per *bucket*, so every shard on a
+        node shares it and it must outlive any one of them -- hence the busy-lock
+        below, and hence its own root rather than BUCKETMOUNT_ROOT.
+
+        Returns lines for localization.sh, NOT setup.sh. setup.sh is `source`d by
+        the entrypoint, so an `exit` there kills the entrypoint shell before any
+        .*_exit_code file is written and before teardown runs -- the shard dies
+        with no bookkeeping and no requeue. localization.sh is executed, and its
+        exit code 5 is the established "requeue this shard elsewhere" signal.
         """
         if self.workdir_mode != "bucket":
             return []
         md = shlex.quote(self.workdir_mount_dir())
+        lock = shlex.quote(self.workdir_mount_dir().rstrip("/") + ".lock")
         return [
-            'if ! mountpoint -q {md}; then'.format(md = md),
-            '  sudo mkdir -p {md}'.format(md = md),
-            '  sudo chown $(id -u):$(id -g) {md}'.format(md = md),
+            # Serialise mount/unmount across shards on this node. Without it two
+            # shards starting together both see "not mounted", both run gcsfuse,
+            # and the loser dies with "mountPoint is not empty".
+            'sudo mkdir -p {p} && sudo chown $(id -u):$(id -g) {p}'.format(
+              p = shlex.quote(os.path.dirname(self.workdir_mount_dir()))),
+            'touch {lk} 2> /dev/null || :'.format(lk = lock),
+            '(',
+            '  flock -w 300 9 || { echo "ERROR: timed out waiting for workdir mount lock" >&2; exit 5; }',
+            # A shard that finished on this node moments ago may have unmounted
+            # this same path, leaving a stale FUSE endpoint. Every subsequent
+            # operation on it -- stat, mkdir, even flock -- then fails with
+            # ENOTCONN or EACCES rather than ENOENT, so clear it first. Same
+            # hazard the read-only consumer mount handles; more likely here,
+            # because this mountpoint is torn down at every job teardown.
+            '  if ! stat {md} > /dev/null 2>&1 && mount | grep -qF " {md_raw} "; then'.format(
+              md = md, md_raw = self.workdir_mount_dir()),
+            '    fusermount -uz {md} 2> /dev/null || sudo umount -l {md} 2> /dev/null || :'.format(md = md),
+            '  fi',
+            '  if ! mountpoint -q {md}; then'.format(md = md),
+            '    sudo mkdir -p {md}'.format(md = md),
+            '    sudo chown $(id -u):$(id -g) {md}'.format(md = md),
             # gcsfuse resolves credentials via ADC and does not read CLOUDSDK_CONFIG
-            '  if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${CLOUDSDK_CONFIG}/application_default_credentials.json" ]; then export GOOGLE_APPLICATION_CREDENTIALS=${CLOUDSDK_CONFIG}/application_default_credentials.json; fi',
-            '  timeout -k 60 60 gcsfuse --implicit-dirs {b} {md} || {{ echo "ERROR: read-write workdir bucket mount failed!" >&2; exit 1; }}'.format(
+            '    if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${CLOUDSDK_CONFIG}/application_default_credentials.json" ]; then export GOOGLE_APPLICATION_CREDENTIALS=${CLOUDSDK_CONFIG}/application_default_credentials.json; fi',
+            # exit 5, not 1: a mount failure is transient (stale endpoint, races,
+            # quota) and the shard should be requeued rather than failed.
+            '    timeout -k 60 60 gcsfuse --implicit-dirs {b} {md} || {{ echo "ERROR: read-write workdir bucket mount failed; requeueing" >&2; exit 5; }}'.format(
               b = shlex.quote(self.results_bucket or ""), md = md),
-            'fi',
-            'mountpoint -q {md} || {{ echo "ERROR: workdir bucket mount did not appear!" >&2; exit 1; }}'.format(md = md),
+            '  fi',
+            ') 9< {lk}'.format(lk = lock),
+            'RC=$?; [ $RC -ne 0 ] && exit $RC || :',
+            'mountpoint -q {md} || {{ echo "ERROR: workdir bucket mount did not appear; requeueing" >&2; exit 5; }}'.format(md = md),
+            # Hold a shared busy-lock for the life of this job, released in
+            # teardown. Another shard's teardown takes it exclusively (flock -n)
+            # before unmounting, so it cannot pull the mount out from under us.
+            'flock -os {lk} sleep infinity & echo $! >> ${{CANINE_JOB_INPUTS}}/.workdirmount_lock_pids'.format(lk = lock),
+            'mkdir -p $CANINE_JOB_WORKSPACE',
         ]
 
     def workdir_unmount_script(self):
@@ -341,15 +375,35 @@ class AbstractLocalizer(abc.ABC):
         The unmount still matters: it flushes anything not yet finalized, so by
         the time a later run's job_avoid lists the bucket, or a downstream task
         mounts it read-only, every object is really there.
+
+        The mountpoint is shared by every shard on this node, so release our
+        busy-lock first and only unmount if no other shard still holds one --
+        otherwise a finishing shard yanks the workspace out from under a running
+        one. Mirrors the read-only bucketmount teardown.
         """
         if self.workdir_mode != "bucket":
             return []
         md = shlex.quote(self.workdir_mount_dir())
+        lock = shlex.quote(self.workdir_mount_dir().rstrip("/") + ".lock")
         return [
-            'if mountpoint -q {md}; then'.format(md = md),
-            # leave the job's own directory, or the unmount will fail with EBUSY
-            '  cd /',
-            '  fusermount -u {md} || {{ echo "ERROR: could not unmount read-write workdir mount" >&2; exit 1; }}'.format(md = md),
+            # leave the mount before touching it, or the unmount fails with EBUSY
+            'cd /',
+            # drop this job's share of the busy-lock
+            'if [ -f ${CANINE_JOB_INPUTS}/.workdirmount_lock_pids ]; then',
+            '  while read -r p; do kill $p 2> /dev/null || :; done < ${CANINE_JOB_INPUTS}/.workdirmount_lock_pids',
+            # kill() only *sends* the signal -- the holder has not released the
+            # flock yet when it returns. Testing flock -n immediately makes the
+            # job see its own lock and skip its own unmount, every time.
+            '  while read -r p; do for _ in $(seq 50); do kill -0 $p 2> /dev/null || break; sleep 0.1; done; done < ${CANINE_JOB_INPUTS}/.workdirmount_lock_pids',
+            '  rm -f ${CANINE_JOB_INPUTS}/.workdirmount_lock_pids',
+            'fi',
+            # flock -n succeeds only if no other shard holds a share. Failure to
+            # unmount is not fatal: the objects are already flushed by close(),
+            # and the next job on this node reuses or recovers the mount.
+            'if flock -n {lk} true 2> /dev/null && mountpoint -q {md}; then'.format(lk = lock, md = md),
+            '  fusermount -u {md} || echo "WARNING: could not unmount read-write workdir mount" >&2'.format(md = md),
+            'else',
+            '  echo "INFO: leaving workdir mount in place (still in use by another shard)" >&2',
             'fi',
         ]
 
@@ -2268,12 +2322,11 @@ class AbstractLocalizer(abc.ABC):
                 'export CANINE_JOB_TEARDOWN="{}"'.format(os.path.join(compute_env['CANINE_JOBS'], jobId, 'teardown.sh')),
                 'export CANINE_DOCKER_ARGS="{docker} $CANINE_DOCKER_ARGS"'.format(docker=' '.join(set(docker_args))),
                 'mkdir -p $CANINE_JOB_INPUTS',
-            ]
-            # the workspace lives inside the read-write bucket mount, so the
-            # mount has to exist before mkdir can create anything in it
-            + self.workdir_mount_script()
-            + [
-                'mkdir -p $CANINE_JOB_WORKSPACE',
+                # NOTE: under workdir_mode="bucket" the workspace lives inside a
+                # gcsfuse mount that does not exist yet, so it is created by
+                # workdir_mount_script() in localization.sh rather than here.
+                # This script is sourced, so a failure here cannot be requeued.
+                'mkdir -p $CANINE_JOB_WORKSPACE' if self.workdir_mode != "bucket" else '',
                 'chmod 755 $CANINE_JOB_LOCALIZATION'
             ]
             + self.tmpdir_exports(jobId)
@@ -2288,7 +2341,14 @@ class AbstractLocalizer(abc.ABC):
             "set -e",
             "shopt -s expand_aliases #DEBUG_OMIT",
             "alias gcloud=gcloud_exp_backoff #DEBUG_OMIT"
-          ] + localization_tasks +
+          ]
+          # Mount the read-write workspace first: inputs are symlinked into
+          # $CANINE_JOB_INPUTS (on the shared mount, already present), but the
+          # job's cwd must exist before anything else runs. This script is
+          # *executed*, so its exit 5 requeues the shard -- setup.sh is sourced
+          # and could not.
+          + self.workdir_mount_script()
+          + localization_tasks +
           ( # skip running task script if finished scratch disk already exists via special localizer exit code
             ["exit 15 #DEBUG_OMIT"] if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else []
           )

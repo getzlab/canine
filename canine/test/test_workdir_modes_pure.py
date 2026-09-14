@@ -105,6 +105,101 @@ class TestBucketModeWorkspace:
         assert "cd /" in script
         assert script.index("cd /") < script.index("fusermount -u")
 
+    def test_mount_is_serialised_by_a_lock(self, tmp_path):
+        """
+        The mountpoint is per BUCKET, so every shard on a node shares it. Without
+        a lock two shards starting together both see "not mounted", both run
+        gcsfuse, and the loser dies with "mountPoint is not empty".
+        """
+        script = "\n".join(
+          make(workdir_mode="bucket", results_bucket=BUCKET,
+               staging_dir=str(tmp_path)).workdir_mount_script()
+        )
+        assert "flock" in script
+        assert script.index("flock") < script.index("gcsfuse")
+
+    def test_mount_clears_a_stale_fuse_endpoint(self, tmp_path):
+        """
+        A shard that finished on this node moments ago may have unmounted this
+        same path. Operations on the stale endpoint fail with ENOTCONN/EACCES,
+        not ENOENT, so mkdir and gcsfuse both fail unless it is cleared first.
+        This mountpoint is torn down at every job teardown, so it is more exposed
+        to this than the read-only consumer mounts.
+        """
+        script = "\n".join(
+          make(workdir_mode="bucket", results_bucket=BUCKET,
+               staging_dir=str(tmp_path)).workdir_mount_script()
+        )
+        assert "fusermount -uz" in script or "umount -l" in script
+        assert script.index("fusermount -uz") < script.index("gcsfuse")
+
+    def test_mount_failure_requeues_rather_than_kills_the_shard(self, tmp_path):
+        """
+        exit 5 is canine's "requeue this shard elsewhere" signal. exit 1 would
+        just fail it. Mount failures (stale endpoint, races, quota) are transient.
+        """
+        lines = make(workdir_mode="bucket", results_bucket=BUCKET,
+                     staging_dir=str(tmp_path)).workdir_mount_script()
+        gcsfuse = next(l for l in lines if "timeout" in l and "gcsfuse" in l)
+        assert "exit 5" in gcsfuse and "exit 1" not in gcsfuse
+
+    def test_mount_holds_a_busy_lock_for_the_job(self, tmp_path):
+        """Another shard's teardown must not unmount this job's workspace."""
+        script = "\n".join(
+          make(workdir_mode="bucket", results_bucket=BUCKET,
+               staging_dir=str(tmp_path)).workdir_mount_script()
+        )
+        assert "flock -os" in script
+        assert ".workdirmount_lock_pids" in script
+
+    def test_unmount_releases_the_lock_then_checks_for_other_holders(self, tmp_path):
+        script = "\n".join(
+          make(workdir_mode="bucket", results_bucket=BUCKET,
+               staging_dir=str(tmp_path)).workdir_unmount_script()
+        )
+        assert ".workdirmount_lock_pids" in script
+        assert "flock -n" in script
+        # release our share before testing whether anyone else holds one
+        assert script.index(".workdirmount_lock_pids") < script.index("flock -n")
+
+    def test_unmount_waits_for_the_lock_holder_to_actually_die(self, tmp_path):
+        """
+        Regression, seen live: kill() only *sends* the signal, so testing flock -n
+        immediately afterwards makes a job see its own still-held lock and skip its
+        own unmount -- every single time, even with no other shard on the node.
+        The symptom was 'leaving workdir mount in place (still in use by another
+        shard)' on a single-shard task.
+        """
+        script = "\n".join(
+          make(workdir_mode="bucket", results_bucket=BUCKET,
+               staging_dir=str(tmp_path)).workdir_unmount_script()
+        )
+        assert "kill -0" in script
+        assert script.index("kill -0") < script.index("flock -n")
+
+    def test_unmount_failure_is_not_fatal(self, tmp_path):
+        """
+        Objects are already flushed by close(); a busy mountpoint must not fail an
+        otherwise-successful shard, which is what `exit 1` here used to do.
+        """
+        script = "\n".join(
+          make(workdir_mode="bucket", results_bucket=BUCKET,
+               staging_dir=str(tmp_path)).workdir_unmount_script()
+        )
+        assert "WARNING" in script
+        assert "exit 1" not in script
+
+    def test_mount_creates_the_workspace(self, tmp_path):
+        """
+        setup.sh cannot mkdir it -- the mount does not exist yet at that point --
+        so the mount script owns creating it.
+        """
+        script = "\n".join(
+          make(workdir_mode="bucket", results_bucket=BUCKET,
+               staging_dir=str(tmp_path)).workdir_mount_script()
+        )
+        assert "mkdir -p $CANINE_JOB_WORKSPACE" in script
+
     @pytest.mark.parametrize("mode", ["shared", "local"])
     def test_no_mount_scripts_outside_bucket_mode(self, mode, tmp_path):
         kwargs = {"results_bucket": BUCKET} if mode != "shared" else {}
