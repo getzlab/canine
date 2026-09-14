@@ -1484,10 +1484,18 @@ def command_sweep(args):
             say("        wire   : {:.2f}x payload ({} on the NIC){}".format(
                 ratio, human(outcome["nic_bytes"]), note))
         if not args.keep:
-            try:
-                os.unlink(dest)
-            except OSError:
-                pass
+            # The sidecars go with it. Unlinking only the payload leaves
+            # `.bench.N.bin.k9pdl.done` behind, and a completion marker with no file is
+            # the state that made a later run exit 0 after 108 bytes. The pre-run sweep
+            # above cleans the row it is about to use, so those orphans only ever
+            # surfaced for connection counts nobody re-ran -- which is worse, not
+            # better: the trap was invisible and dated from a different session.
+            for leftover in [dest, dest + ".k9pdl.gz"] + glob.glob(os.path.join(
+                    args.dest_dir, ".bench.{}.bin.k9pdl.*".format(connections))):
+                try:
+                    os.unlink(leftover)
+                except OSError:
+                    pass
 
     # Only a run that finished AND verified is a measurement -- see the `ok` assignment
     # in the loop above for the failure this guards against.

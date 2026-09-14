@@ -1606,7 +1606,10 @@ sudo docker exec slurm python3 /tmp/pdl/parallel_download.py \
   --dest /mnt/rwdisks/$DISK/ref.bin --size "$PREFIX" --connections 16
 export PREFIX_MD5=$(sudo docker exec slurm md5sum /mnt/rwdisks/$DISK/ref.bin | cut -d' ' -f1)
 echo "PREFIX_MD5=$PREFIX_MD5"
-sudo docker exec slurm rm -f /mnt/rwdisks/$DISK/ref.bin
+# the sidecar too: a .k9pdl.done marker outliving its file is the state that makes a
+# later run exit 0 without downloading anything
+sudo docker exec slurm sh -c 'rm -f /mnt/rwdisks/'"$DISK"'/ref.bin \
+                                    /mnt/rwdisks/'"$DISK"'/.ref.bin.k9pdl.*'
 
 # B. the resume run itself
 pdl resume --url "$PRESIGNED_URL" --prefix \

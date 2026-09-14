@@ -1631,3 +1631,57 @@ class TestTheResumeKillMustLandWhereItAims:
         # the message itself is asserted through command_resume in the runbook-level
         # test below; here the classifier is the unit under test
         assert not bench.premature(attempts[1])
+
+
+class TestTheSweepLeavesNoOrphanedMarkers:
+    """
+    After each row the sweep unlinked `bench.N.bin` but not `.bench.N.bin.k9pdl.done`.
+    Six orphaned markers were found on the bench disk, dating from earlier sessions --
+    and a completion marker with no file is exactly the state that made a later run exit
+    0 after 108 bytes, report `final hash WRONG` and then traceback.
+
+    The pre-run sweep cleans the row it is about to use, so the orphans only ever
+    surfaced for connection counts nobody re-ran. That is worse than an obvious failure:
+    the trap was invisible and survived across sessions.
+    """
+
+    def test_a_completed_row_removes_its_sidecars(self, tmp_path, monkeypatch):
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, conns, min_chunk, **kw):
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            # the downloader's sidecars, named as sidecar_paths() would
+            directory, base = os.path.split(dest)
+            for suffix in ("done", "json"):
+                with open(os.path.join(directory,
+                                       ".{}.k9pdl.{}".format(base, suffix)), "w") as fh:
+                    fh.write("{}")
+            return {"connections": conns, "returncode": 0, "seconds": 1.0,
+                    "killed": False, "peak_rss": 1 << 20,
+                    "phases": {"download": 1.0}, "nic_bytes": len(payload),
+                    "disk_bytes": len(payload), "peak_nic_bytes_per_s": 1e8,
+                    "peak_disk_bytes_per_s": 1e3, "stderr_tail": [], "fell_back": None,
+                    "mean_streams": 3.0, "workers": conns,
+                    "bookkeeping_seconds": None, "bookkeeping_calls": None,
+                    "bookkeeping_mean": None, "bookkeeping_pct_workers": None}
+
+        downloader = tmp_path / "parallel_download.py"
+        downloader.write_bytes(b"# stand-in\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(downloader))
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload), bench.Verification("md5", digest)))
+        bench.command_sweep(bench.build_parser().parse_args(
+            ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+             "--dest-dir", str(tmp_path), "--connections", "4", "16"]))
+
+        left = sorted(os.path.basename(f) for f in glob.glob(str(tmp_path / "*bench*"))
+                      + glob.glob(str(tmp_path / ".*bench*")))
+        assert left == [], "orphans left behind: {}".format(left)
+
+    def test_keep_still_keeps_everything(self, tmp_path, monkeypatch):
+        """--keep exists so a run can be inspected afterwards; it must not be broken."""
+        source = inspect.getsource(bench.command_sweep)
+        assert "if not args.keep:" in source
