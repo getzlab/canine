@@ -1611,22 +1611,44 @@ class TestTheResumeKillMustLandWhereItAims:
 
     def test_a_kill_short_of_its_target_is_premature(self):
         assert bench.premature({"kill_target": 1 << 30, "killed": True,
-                                "nic_bytes": 132})
+                                "killed_at_bytes": 4096, "nic_bytes": 132})
 
     def test_a_kill_near_its_target_is_not(self):
         assert not bench.premature({"kill_target": 1 << 30, "killed": True,
+                                    "killed_at_bytes": int(0.9 * (1 << 30)),
                                     "nic_bytes": int(0.9 * (1 << 30))})
 
     def test_an_unkilled_attempt_is_never_premature(self):
         """The final attempt runs to completion by design."""
         assert not bench.premature({"kill_target": None, "killed": False,
-                                    "nic_bytes": 1 << 32})
+                                    "killed_at_bytes": None, "nic_bytes": 1 << 32})
+
+    def test_a_resumed_attempt_is_judged_on_file_progress_not_its_own_transfer(self):
+        """
+        The measured run: three kills at 25/50/75% of 4 GiB, and EVERY attempt
+        transferred ~1.01 GiB because the file already held the earlier attempts' work.
+        Comparing a per-attempt increment against a cumulative threshold flagged
+        attempt 3 (target 3 GiB, own transfer 1.01 GiB) as premature -- a false alarm on
+        the best resume result we have.
+        """
+        third = {"kill_target": 3 * (1 << 30), "killed": True,
+                 "killed_at_bytes": 3 * (1 << 30) + (1 << 20),
+                 "nic_bytes": 1 << 30}
+        assert not bench.premature(third), "a correct resume must not be flagged"
+
+    def test_an_unreadable_kill_point_counts_as_premature(self):
+        """
+        If the monitor never read a size, the trigger was not tracking anything -- which
+        is the defect this exists to catch, so it must not fail open.
+        """
+        assert bench.premature({"kill_target": 1 << 30, "killed": True,
+                                "killed_at_bytes": None, "nic_bytes": 1 << 30})
 
     def test_the_verdict_refuses_to_call_it_a_resume_measurement(self, capsys):
         attempts = [{"kill_target": 1 << 30, "killed": True, "nic_bytes": 132,
-                     "returncode": -9, "seconds": 0.25},
+                     "killed_at_bytes": 4096, "returncode": -9, "seconds": 0.25},
                     {"kill_target": None, "killed": False, "nic_bytes": 4 << 30,
-                     "returncode": 0, "seconds": 68.0}]
+                     "killed_at_bytes": None, "returncode": 0, "seconds": 68.0}]
         assert [a for a in attempts if bench.premature(a)]
         # the message itself is asserted through command_resume in the runbook-level
         # test below; here the classifier is the unit under test

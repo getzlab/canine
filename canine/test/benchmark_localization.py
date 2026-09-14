@@ -947,6 +947,7 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.PIPE)
         killed = False
+        killed_at = None
         rss = 0
         while True:
             # RSS is read before poll(), so the last sample is taken while the process is
@@ -966,9 +967,11 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
                     # landed after 132 bytes, which is the range probe, and the resume run
                     # therefore measured a fresh download rather than a resume. st_blocks
                     # counts what is really on disk and grows with the transfer.
-                    if os.stat(dest).st_blocks * 512 >= kill_after_bytes:
+                    allocated = os.stat(dest).st_blocks * 512
+                    if allocated >= kill_after_bytes:
                         process.send_signal(signal.SIGKILL)
                         killed = True
+                        killed_at = allocated
                 except OSError:
                     pass
             time.sleep(0.25)
@@ -1012,6 +1015,13 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
         "returncode": process.returncode,
         "seconds": round(sampler.seconds, 2),
         "killed": killed,
+        # File progress when the kill fired, which is what the threshold is expressed
+        # in. NOT the attempt's own transferred bytes: on a resume the file already
+        # holds the earlier attempts' work, so a later attempt reaches a higher
+        # absolute threshold having moved far fewer bytes itself. Comparing the two
+        # flagged a perfectly good run as premature -- every attempt moved ~1.01 GiB,
+        # which is precisely what correct resume looks like.
+        "killed_at_bytes": killed_at,
         "peak_rss": rss or None,
         "nic_bytes": sampler.nic_total,
         "disk_bytes": sampler.disk_total,
@@ -1825,7 +1835,13 @@ def premature(outcome):
     target = outcome.get("kill_target")
     if not target or not outcome.get("killed"):
         return False
-    return (outcome.get("nic_bytes") or 0) < target * 0.5
+    # Against file progress at kill time, in the same units as the threshold. If the
+    # monitor never managed to read a size, treat that as premature: it means the
+    # trigger was not tracking anything.
+    reached = outcome.get("killed_at_bytes")
+    if reached is None:
+        return True
+    return reached < target * 0.5
 
 
 def command_resume(args):
@@ -1894,8 +1910,10 @@ def command_resume(args):
         say("of their target, so the attempts after them started from nothing and the")
         say("overhead below is a fresh download's protocol overhead, not refetched work.")
         for o in duds:
-            say("  target {:>10}, transferred {:>10}".format(
-                human(o["kill_target"]), human(o["nic_bytes"] or 0)))
+            say("  target {:>10}, file reached {:>10}".format(
+                human(o["kill_target"]),
+                "unknown" if o.get("killed_at_bytes") is None
+                else human(o["killed_at_bytes"])))
         say()
     elif kills == 0:
         # Zero kills is not a clean run, it is no experiment at all -- and the old
