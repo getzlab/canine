@@ -2303,3 +2303,79 @@ class TestBookkeepingTimeIsMeasured:
         assert proc.returncode == 0, proc.stderr
         assert "worker-seconds)" in proc.stderr
         assert self.parse(proc.stderr)["pct"] <= 100.0
+
+
+class TestADoneMarkerWithoutItsFileIsNotCompletion:
+    """
+    `run()` short-circuited on the .k9pdl.done marker after checking only the recorded
+    SIZE, never that the destination existed. The marker is a hidden sidecar, so
+    anything that removes the payload without sweeping dotfiles leaves it behind
+    claiming a file that is gone -- a partial cleanup, an `rm` to free space, a disk
+    restored from a snapshot taken mid-write.
+
+    Observed on the bench node: a stale marker made the downloader return EXIT_OK in
+    0.25s having transferred only the 108-byte range probe, and localization reported
+    success with no destination at all. Downstream that is a missing-input failure at
+    best and a stale file at worst.
+
+    The stage-publish route has always checked existence and size
+    (`os.path.exists(staged) and os.path.getsize(staged) == size`); the primary route
+    was the outlier.
+    """
+
+    def marker_for(self, dest):
+        directory, base = os.path.dirname(dest), os.path.basename(dest)
+        return os.path.join(directory, ".{}.k9pdl.done".format(base))
+
+    def test_a_complete_download_writes_a_marker_that_short_circuits(self, tmp_path):
+        """The behaviour being preserved: a real marker still avoids re-downloading."""
+        payload = os.urandom(2 * MIB)
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            first = run_downloader(server.url(), dest, len(payload),
+                                   "--connections", 4, "--min-chunk", MIB)
+            assert first.returncode == 0, first.stderr
+            assert os.path.exists(self.marker_for(dest))
+            before = server.state.snapshot()["sent"]
+            second = run_downloader(server.url(), dest, len(payload),
+                                    "--connections", 4, "--min-chunk", MIB)
+        assert second.returncode == 0, second.stderr
+        assert "already complete" in second.stderr
+        assert server.state.snapshot()["sent"] == before, "it re-fetched despite the marker"
+
+    def test_a_marker_whose_file_is_gone_does_not_claim_completion(self, tmp_path):
+        payload = os.urandom(2 * MIB)
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            first = run_downloader(server.url(), dest, len(payload),
+                                   "--connections", 4, "--min-chunk", MIB)
+            assert first.returncode == 0, first.stderr
+            os.unlink(dest)                     # payload gone, hidden marker survives
+            assert os.path.exists(self.marker_for(dest))
+            second = run_downloader(server.url(), dest, len(payload),
+                                    "--connections", 4, "--min-chunk", MIB,
+                                    "--check-md5", hashlib.md5(payload).hexdigest())
+        assert second.returncode == 0, second.stderr
+        assert "already complete" not in second.stderr
+        assert "ignoring the marker" in second.stderr, second.stderr
+        assert os.path.exists(dest), "it should have re-downloaded"
+        with open(dest, "rb") as handle:
+            assert handle.read() == payload
+
+    def test_a_marker_whose_file_is_the_wrong_size_is_ignored(self, tmp_path):
+        """Truncated or replaced, not merely absent."""
+        payload = os.urandom(2 * MIB)
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            first = run_downloader(server.url(), dest, len(payload),
+                                   "--connections", 4, "--min-chunk", MIB)
+            assert first.returncode == 0, first.stderr
+            with open(dest, "r+b") as handle:
+                handle.truncate(len(payload) // 2)
+            second = run_downloader(server.url(), dest, len(payload),
+                                    "--connections", 4, "--min-chunk", MIB,
+                                    "--check-md5", hashlib.md5(payload).hexdigest())
+        assert second.returncode == 0, second.stderr
+        assert "ignoring the marker" in second.stderr, second.stderr
+        with open(dest, "rb") as handle:
+            assert handle.read() == payload

@@ -1835,7 +1835,14 @@ def command_resume(args):
         "yes -- frontier recovery" if seek["supported"] else "no -- checkpoint fallback"))
 
     dest = os.path.join(args.dest_dir, "bench.resume.bin")
-    for stale in glob.glob(os.path.join(args.dest_dir, "*bench.resume.bin*")):
+    # Two patterns, because glob's leading `*` does NOT match a leading dot -- so
+    # "*bench.resume.bin*" removed the payload and left `.bench.resume.bin.k9pdl.done`
+    # behind. The next run then saw a completion marker for a file that no longer
+    # existed, exited 0 after 108 bytes, and reported `final hash WRONG` plus a
+    # traceback from the punch-hole section. command_sweep had this right already.
+    stale_patterns = [os.path.join(args.dest_dir, "*bench.resume.bin*"),
+                      os.path.join(args.dest_dir, ".bench.resume.bin*")]
+    for stale in sorted(set(sum((glob.glob(pat) for pat in stale_patterns), []))):
         os.unlink(stale)
 
     attempts = []
@@ -1871,6 +1878,7 @@ def command_resume(args):
     # a sparse preallocated file. The overhead then came out at 0.8%, which is the
     # protocol overhead of one clean download and nothing to do with resume.
     duds = [o for o in attempts if premature(o)]
+    kills = sum(1 for o in attempts if o.get("killed"))
     if duds:
         say()
         say("NOT A RESUME MEASUREMENT: {} of {} kills landed before reaching even half"
@@ -1881,11 +1889,26 @@ def command_resume(args):
             say("  target {:>10}, transferred {:>10}".format(
                 human(o["kill_target"]), human(o["nic_bytes"] or 0)))
         say()
+    elif kills == 0:
+        # Zero kills is not a clean run, it is no experiment at all -- and the old
+        # wording rendered as "With 0 kills, a per-attempt loss of a whole chunk would
+        # show up as roughly 0.00 B of overhead", comparing nothing against nothing and
+        # reading as a pass. Observed when a stale done-marker made attempt 1 exit 0
+        # after 108 bytes.
+        say()
+        say("NOT A RESUME MEASUREMENT: nothing was killed, so no resume happened.")
+        if attempts and (attempts[0].get("nic_bytes") or 0) < args.size * 0.5:
+            say("Attempt 1 exited {} having transferred {}, far short of the object --"
+                .format(attempts[0].get("returncode"), human(attempts[0].get("nic_bytes") or 0)))
+            say("the usual cause is a stale .k9pdl.done marker left beside the")
+            say("destination, which short-circuits the download. Check for hidden")
+            say("sidecars in the destination directory.")
+        say()
     if total_nic and args.size:
         waste = total_nic - args.size
         say("refetched      : {} ({:.1f}% overhead){}".format(
             human(max(0, waste)), 100.0 * max(0, waste) / args.size,
-            "  -- MEANINGLESS, see above" if duds else ""))
+            "  -- MEANINGLESS, see above" if (duds or kills == 0) else ""))
         say()
         say("The claim is that only the uncommitted tail is refetched. With {} kills,".format(
             len(attempts) - 1))
@@ -1898,6 +1921,18 @@ def command_resume(args):
         say("This is the case SIGKILL cannot produce -- bytes the process wrote are gone")
         say("because the VM vanished before they were committed. Skipped on the dev")
         say("machine for lack of FALLOC_FL_PUNCH_HOLE, so it runs here for the first time.")
+        # Guarded, because this section presumes the attempts above produced a file. When
+        # they did not -- a stale done-marker short-circuiting attempt 1 -- os.open raised
+        # FileNotFoundError and the run ended in a traceback, which buries the actual
+        # failure (already printed above) under an unrelated one.
+        if not os.path.exists(dest):
+            say()
+            say("SKIPPED: {} does not exist, so the attempts above produced no file to"
+                .format(os.path.basename(dest)))
+            say("punch holes in. Fix that failure first -- this section cannot run.")
+            return {"resume": attempts, "verified": correct,
+                    "verification": verification.label,
+                    "punch_hole": "skipped -- no destination file"}
         fd = os.open(dest, os.O_RDWR)
         try:
             punch_hole(fd, args.size // 3, min(64 * MIB, args.size // 4))

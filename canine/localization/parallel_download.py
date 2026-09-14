@@ -2970,8 +2970,29 @@ def run(options):
     if not options.no_resume:
         marker = read_done_marker(marker_path)
         if marker and marker.get("size") == options.size:
-            log("already complete per {}".format(os.path.basename(marker_path)))
-            return EXIT_OK
+            # The marker alone is not enough: it is a hidden sidecar, so anything that
+            # removes the payload without sweeping dotfiles -- a partial cleanup, a
+            # `rm` to free space, a disk restored from a snapshot taken mid-write --
+            # leaves it behind claiming a file that is gone. Observed: a stale marker
+            # made this return EXIT_OK in 0.25s having transferred only the range
+            # probe, and localization reported success with no destination at all.
+            #
+            # Checking the apparent size is sound HERE, unlike anywhere progress is
+            # inferred: at completion the file is its full length, and the marker's
+            # whole purpose is to certify that a full-length file is real rather than
+            # sparse. So this only ever catches absence or replacement. The
+            # stage-publish route has always done exactly this (see
+            # `os.path.exists(staged) and os.path.getsize(staged) == size`); the
+            # primary route was the outlier.
+            try:
+                present = os.path.getsize(dest) == options.size
+            except OSError:
+                present = False
+            if present:
+                log("already complete per {}".format(os.path.basename(marker_path)))
+                return EXIT_OK
+            log("{} claims completion but {} is missing or the wrong size; "
+                "ignoring the marker".format(os.path.basename(marker_path), dest))
 
     size = options.size
     if size is None or size < 0:
