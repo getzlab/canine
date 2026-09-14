@@ -1015,12 +1015,22 @@ def try_lock(fd):
 # completion marker
 # --------------------------------------------------------------------------------
 
-def write_done_marker(path, size, plan_id, digest):
+def write_done_marker(path, size, plan_id, digest, route=ROUTE_POSIX):
+    """
+    `route` is recorded because the marker is checked before the route is chosen.
+
+    Only the routes that leave a local file can have that file's presence verified;
+    bucket-compose leaves none, so demanding one there turns a valid short-circuit into
+    a full re-upload. An absent field in an older marker is read as ROUTE_POSIX, which
+    is the safe direction: a mis-applied presence check costs a redundant transfer,
+    while a skipped one reports success for a file that is not there.
+    """
     payload = {
         "schema_version": SCHEMA_VERSION,
         "size": size,
         "plan_id": plan_id,
         "hash": digest,
+        "route": route,
     }
     fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
@@ -2515,7 +2525,7 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     for name in part_names:
         client.delete_object(bucket, name)
 
-    write_done_marker(marker_path, size, plan_id, digest)
+    write_done_marker(marker_path, size, plan_id, digest, route=ROUTE_BUCKET)
     manifest.unlink()
     log("complete: {} bytes composed from {} parts{}".format(
         size, len(part_names), " (verified)" if digest else ""))
@@ -2984,11 +2994,14 @@ def run(options):
             # stage-publish route has always done exactly this (see
             # `os.path.exists(staged) and os.path.getsize(staged) == size`); the
             # primary route was the outlier.
+            # bucket-compose leaves no local file, so there is nothing to check and
+            # demanding one would turn a valid short-circuit into a full re-upload.
+            expects_file = marker.get("route", ROUTE_POSIX) != ROUTE_BUCKET
             try:
                 present = os.path.getsize(dest) == options.size
             except OSError:
                 present = False
-            if present:
+            if present or not expects_file:
                 log("already complete per {}".format(os.path.basename(marker_path)))
                 return EXIT_OK
             log("{} claims completion but {} is missing or the wrong size; "

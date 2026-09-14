@@ -10,6 +10,7 @@ the fake service models that at the real 256 KiB granularity.
 
 import hashlib
 import json
+import inspect
 import os
 
 import pytest
@@ -826,3 +827,37 @@ class TestAnUnreadableManifestIsNotFatal:
                 "--connections", "4", "--min-chunk", str(MIB), "--retries", "2",
             ])
         assert rc != pdl.EXIT_FAIL
+
+
+class TestTheMarkerRecordsWhichRouteWroteIt:
+    """
+    The marker is read before the route is chosen, so it has to say whether a local file
+    should exist. Adding a presence check to the short-circuit without this broke the
+    bucket route: it leaves no local file, so the check failed, the marker was ignored
+    and the whole object was re-uploaded -- the regression showed up as exactly 2x the
+    bytes.
+
+    An absent `route` in an older marker is read as ROUTE_POSIX deliberately. A
+    mis-applied presence check costs a redundant transfer; a skipped one reports success
+    for a file that is not there.
+    """
+
+    def test_the_bucket_route_tags_its_marker(self, tmp_path):
+        payload = json.loads(json.dumps({}))  # keep the import used consistently
+        assert pdl.ROUTE_BUCKET == "bucket-compose"
+        path = str(tmp_path / ".obj.k9pdl.done")
+        pdl.write_done_marker(path, 1024, "plan", None, route=pdl.ROUTE_BUCKET)
+        assert pdl.read_done_marker(path)["route"] == pdl.ROUTE_BUCKET
+
+    def test_the_default_route_is_the_one_that_expects_a_file(self, tmp_path):
+        path = str(tmp_path / ".obj.k9pdl.done")
+        pdl.write_done_marker(path, 1024, "plan", None)
+        assert pdl.read_done_marker(path)["route"] == pdl.ROUTE_POSIX
+
+    def test_an_old_marker_without_a_route_is_treated_as_posix(self):
+        """
+        The safe direction: a pre-existing marker gets the presence check, so a missing
+        file causes a re-download rather than a false success.
+        """
+        source = inspect.getsource(pdl.run)
+        assert 'marker.get("route", ROUTE_POSIX)' in source, source[:0] or "default changed"
