@@ -119,6 +119,26 @@ Resume, on a second attempt:
 resuming: 47/71 chunks already complete
 ```
 
+Concurrency and bookkeeping, at the end of the download phase:
+
+```
+k9pdl-streams mean 14.82 of 16 workers (3283 chunks, 5748.2s wall, 85189.4s streaming)
+k9pdl-bookkeeping 2.1s over 3283 calls (mean 0.001s, 0.0% of 91971.2 worker-seconds)
+k9pdl-commit 94.7s over 212 batches (3283 chunks, mean batch 15.5, 1.6% of 5748.2s wall)
+```
+
+* **streams** — how many requests were really receiving bytes at once. `mean` near 1 with
+  many chunks left means the requests were not concurrent, which is a defect, not a slow
+  source.
+* **bookkeeping** — the share of the *worker pool* spent on the worker side of chunk
+  completion. This should be near zero. It was 70% before the manifest commit moved to its
+  own thread, and that alone held the full-size run to half the disk's floor.
+* **commit** — the manifest writer, which runs *off* the worker pool, so its share is of
+  the wall clock. **`mean batch` is the number to look at.** At 1.0 the writer is being
+  drained as fast as it is filled, nothing was amortised, and the commits are still
+  effectively per-chunk — a state that looks identical to a healthy run if you only read
+  the throughput.
+
 Completion:
 
 ```

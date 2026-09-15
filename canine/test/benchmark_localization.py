@@ -1002,6 +1002,13 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     book = re.search(r"k9pdl-bookkeeping ([\d.]+)s over (\d+) calls "
                      r"\(mean ([\d.]+)s, ([\d.]+)% of", stderr)
 
+    # The deferred commit. `mean batch` is the number that says whether the deferral did
+    # anything: at 1.0 the writer is drained as fast as it is filled, nothing was
+    # amortised, and the commits are still effectively per-chunk -- which is
+    # indistinguishable from the fix working if you look only at throughput.
+    commit = re.search(r"k9pdl-commit ([\d.]+)s over (\d+) batches "
+                       r"\((\d+) chunks, mean batch ([\d.]+), ([\d.]+)% of", stderr)
+
     return {
         "phases": phases,
         "fell_back": fell_back.group(1).strip() if fell_back else None,
@@ -1009,6 +1016,11 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
         "bookkeeping_calls": int(book.group(2)) if book else None,
         "bookkeeping_mean": float(book.group(3)) if book else None,
         "bookkeeping_pct_workers": float(book.group(4)) if book else None,
+        "commit_seconds": float(commit.group(1)) if commit else None,
+        "commit_batches": int(commit.group(2)) if commit else None,
+        "commit_chunks": int(commit.group(3)) if commit else None,
+        "commit_mean_batch": float(commit.group(4)) if commit else None,
+        "commit_pct_wall": float(commit.group(5)) if commit else None,
         "mean_streams": float(streams.group(1)) if streams else None,
         "workers": int(streams.group(2)) if streams else None,
         "connections": connections,
@@ -1477,10 +1489,21 @@ def command_sweep(args):
             say("        streams: {:.2f} of {} concurrent on average".format(
                 outcome["mean_streams"], outcome["workers"]))
         if outcome.get("bookkeeping_seconds") is not None:
-            say("        chunk_done: {:.1f}s over {} calls (mean {:.3f}s, {:.0f}% of the"
+            say("        chunk_ready: {:.1f}s over {} calls (mean {:.3f}s, {:.0f}% of the"
                 " worker pool)".format(
                     outcome["bookkeeping_seconds"], outcome["bookkeeping_calls"],
                     outcome["bookkeeping_mean"], outcome["bookkeeping_pct_workers"]))
+        if outcome.get("commit_seconds") is not None:
+            # A mean batch at 1.0 means the commits were never amortised. Named rather
+            # than left to be inferred from the throughput, because a run where the
+            # deferral achieved nothing looks exactly like one where it was not needed.
+            note = "" if outcome["commit_mean_batch"] > 1.05 else \
+                "   <-- NOT BATCHED: every commit was one chunk"
+            say("        commit : {:.1f}s over {} batches ({} chunks, mean batch {:.1f},"
+                " {:.0f}% of wall, off the worker pool){}".format(
+                    outcome["commit_seconds"], outcome["commit_batches"],
+                    outcome["commit_chunks"], outcome["commit_mean_batch"],
+                    outcome["commit_pct_wall"], note))
         # NIC bytes over payload bytes. ~1 means every byte crossed the wire once, which
         # is the claim that the object was chunked into disjoint ranges rather than
         # fetched N times over. A server that IGNORES Range returns the whole object to

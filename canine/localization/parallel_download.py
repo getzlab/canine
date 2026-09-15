@@ -27,6 +27,16 @@ Consequently there is no progress counter to go stale, no periodic checkpointing
 no fsync in the hot path -- and a re-run refetches only the filesystem's uncommitted
 tail rather than a whole checkpoint interval.
 
+The manifest kept alongside the file is bookkeeping, not the source of truth, but its
+`done` markers still obey the same rule the frontier does: a chunk may only be recorded
+complete after an fsync that covers that chunk's bytes. Enforcing that per chunk cost
+three fsyncs and a rename each, serialised, and consumed 70% of the worker pool on a
+3283-chunk transfer. So the commits are batched onto a single writer thread: workers hand
+off and go back to reading, and the writer snapshots whatever has piled up, fsyncs once,
+and records exactly that snapshot. A chunk that finishes *during* that fsync is not
+covered by it, is not in the snapshot, and waits for the next round. The guarantee is
+unchanged; only the number of commits is, and it no longer scales with the chunk count.
+
 Two details that are easy to get wrong and are handled explicitly:
 
   * SEEK_HOLE is block-granular. Writing a partial block allocates the whole block, so
@@ -747,6 +757,38 @@ class Manifest:
             record["done"] = True
             if digest is not None:
                 record["md5"] = digest
+            self.flush(data_fd)
+
+    def record_chunks_done(self, indices, data_fd, chunk_digests=None, part_md5s=None):
+        """
+        Commit a BATCH of completed chunks with a single data fsync and a single manifest
+        write.
+
+        Same guarantee as record_chunk_done, amortised: flush() fsyncs `data_fd` before it
+        writes anything, so every byte of every chunk named here is durable before any of
+        their done markers are. The batch may only contain chunks whose writes had already
+        finished when the batch was assembled -- a chunk that completes DURING this fsync
+        is not covered by it and must wait for the next one.
+
+        This exists because the per-chunk version costs three fsyncs and a rename each, all
+        under _lock, and that is the only work that grows with the chunk count rather than
+        the byte count: 683 of 982 worker-seconds on the 3283-chunk run, against 64 chunks
+        at 4 GiB. Batching does not make an individual commit cheaper; it makes the number
+        of commits independent of the number of chunks.
+        """
+        if not indices and not part_md5s:
+            return
+        with self._lock:
+            chunks = self.state.setdefault("chunks", {})
+            for index in indices:
+                record = chunks.setdefault(str(index), {})
+                record["done"] = True
+                if chunk_digests and chunk_digests.get(index) is not None:
+                    record["md5"] = chunk_digests[index]
+            if part_md5s:
+                parts = self.state.setdefault("part_md5", {})
+                for index, md5_hex in part_md5s.items():
+                    parts[str(index)] = md5_hex
             self.flush(data_fd)
 
     def record_checkpoint(self, index, offset, data_fd):
@@ -1614,6 +1656,20 @@ class Progress:
                 pct, self.done, self.total, self.transferred))
 
 
+class _AlreadyDone:
+    """
+    Sentinel returned by a sink's chunk_ready when the chunk is already recorded complete
+    and there is nothing to commit. A distinct object rather than None because None is a
+    legitimate commit payload -- "no digest for this chunk" -- and conflating the two would
+    silently drop done markers.
+    """
+    def __repr__(self):
+        return "<already done>"
+
+
+CHUNK_ALREADY_DONE = _AlreadyDone()
+
+
 class PosixChunkSink:
     """
     Writes chunks in place into the sparse destination file (the in-place route).
@@ -1734,15 +1790,38 @@ class PosixChunkSink:
         # local file: pwrite either wrote the bytes or raised.
         return None
 
-    def chunk_done(self, index):
+    def chunk_ready(self, index):
+        """
+        Worker-thread half of completion: hand over whatever this chunk has to commit.
+
+        Runs on the worker that finished the chunk, so the part digests are detached from
+        _pending at the moment the chunk's last byte was written -- which is what makes it
+        safe for a later, batched fsync to cover them. Does no I/O and cannot raise.
+        """
         if self.part_length:
             with self._parts_lock:
-                digests = self._pending.pop(index, None)
-            # record_part_md5s flushes, which fsyncs the data first -- so the digests and
-            # the done marker become durable together, never the digests alone
+                return self._pending.pop(index, None) or {}
+        return {}
+
+    def commit(self, batch):
+        """
+        Writer-thread half: one fsync of the data, one manifest write, for the whole batch.
+
+        The part digests and the done markers go into the SAME manifest write, which is
+        strictly stronger than the old per-chunk pair of writes -- a digest could never be
+        durable while its done marker was not, and now neither can be durable without the
+        other.
+        """
+        part_md5s = {}
+        for _, digests in batch:
             if digests:
-                self.manifest.record_part_md5s(digests, self.fd)
-        self.manifest.record_chunk_done(index, self.fd)
+                part_md5s.update(digests)
+        self.manifest.record_chunks_done(
+            [index for index, _ in batch], self.fd, part_md5s=part_md5s)
+
+    def chunk_done(self, index):
+        """Synchronous completion: chunk_ready + commit for one chunk."""
+        self.commit([(index, self.chunk_ready(index))])
 
     def sync(self):
         os.fsync(self.fd)
@@ -1873,12 +1952,17 @@ class BucketChunkSink:
             return None
         return tracker["md5"].hexdigest()
 
-    def chunk_done(self, index):
+    def chunk_ready(self, index):
         # Only GCS can say a part is finished. If the session never returned a
         # completion, the part is not durable and must not be recorded done -- it would
         # be composed as a missing object.
+        #
+        # This check MUST stay on the worker thread. It is the one completion check that
+        # can fail, and raising here is what puts the chunk back through the retry loop;
+        # raising it on the writer thread instead would strand the worker believing it had
+        # succeeded.
         if self.manifest.is_complete(index):
-            return
+            return CHUNK_ALREADY_DONE
         with self._lock:
             completed = index in self._completed
         if not completed:
@@ -1886,10 +1970,18 @@ class BucketChunkSink:
                 "part {} sent all its bytes but the upload session did not "
                 "complete".format(index)
             )
-        digest = self.part_digest(index)
-        if digest:
-            self.manifest.record_part_digest(index, digest)
-        self.manifest.record_chunk_done(index, None)
+        return self.part_digest(index)
+
+    def commit(self, batch):
+        digests = {index: digest for index, digest in batch if digest}
+        self.manifest.record_chunks_done(
+            [index for index, _ in batch], None, chunk_digests=digests)
+
+    def chunk_done(self, index):
+        state = self.chunk_ready(index)
+        if state is CHUNK_ALREADY_DONE:
+            return
+        self.commit([(index, state)])
 
     def sync(self):
         return None
@@ -1922,6 +2014,102 @@ class Downloader:
         # win from fewer chunks and delivered 8%). So measure it.
         self._bookkeeping_seconds = 0.0
         self._bookkeeping_calls = 0
+        # Writer-thread accounting. `_commit_batches` is the number that says whether the
+        # deferral actually did anything: if the mean batch size is ~1 the writer is being
+        # drained as fast as it is filled and nothing was amortised, which looks identical
+        # in a throughput figure to the fix working.
+        self._commit_seconds = 0.0
+        self._commit_batches = 0
+        self._commit_chunks = 0
+        self._writer = None
+        self._writer_queue = []
+        self._writer_cv = threading.Condition()
+        self._writer_stop = False
+        self._writer_error = None
+
+    # ---- deferred manifest commits -------------------------------------------------
+    #
+    # A chunk's done marker may only be written after an fsync that covers that chunk's
+    # bytes. Doing that per chunk costs three fsyncs and a rename each, serialised on
+    # Manifest._lock, and consumed 70% of the worker pool on the 3283-chunk run. The work
+    # is not removed -- the same guarantee still requires the same fsync -- it is made
+    # independent of the chunk count by committing whatever has piled up in one round.
+    #
+    # The ordering rule the batching rests on: the queue is SNAPSHOTTED before the fsync
+    # starts, so every chunk in the snapshot finished writing before the fsync began and is
+    # therefore covered by it. A chunk enqueued while that fsync is in flight is NOT
+    # covered, is not in the snapshot, and waits for the next round.
+
+    def _start_writer(self):
+        with self._writer_cv:
+            self._writer_stop = False
+            self._writer_error = None
+            self._writer_queue = []
+            self._writer = threading.Thread(
+                target=self._writer_loop, name="k9pdl-manifest", daemon=True)
+        self._writer.start()
+
+    def _writer_loop(self):
+        while True:
+            with self._writer_cv:
+                while not self._writer_queue and not self._writer_stop:
+                    self._writer_cv.wait()
+                if not self._writer_queue:
+                    return                      # stopped and drained
+                batch = self._writer_queue
+                self._writer_queue = []
+            started = time.time()
+            try:
+                self.sink.commit(batch)
+            except BaseException as e:
+                # Never retried here and never re-queued. A failed commit costs those
+                # chunks being re-fetched on the next attempt, which is the same price the
+                # manifest already pays for any lost update; what it must not do is leave
+                # the workers waiting on a thread that is gone.
+                with self._writer_cv:
+                    self._writer_error = e
+                    self._writer_cv.notify_all()
+                return
+            finally:
+                elapsed = time.time() - started
+                with self._writer_cv:
+                    self._commit_seconds += elapsed
+                    self._commit_batches += 1
+                    self._commit_chunks += len(batch)
+
+    def _enqueue_done(self, index, state):
+        with self._writer_cv:
+            if self._writer is None:
+                # no writer running (a direct call outside run()); commit inline
+                self.sink.commit([(index, state)])
+                return
+            self._writer_queue.append((index, state))
+            self._writer_cv.notify_all()
+
+    def _stop_writer(self):
+        """
+        Drain and join the writer, returning whatever killed it.
+
+        A plain join, with no timeout: the only unbounded wait inside the loop is the
+        commit itself, which is exactly as blocking as it was when a worker ran it, and
+        abandoning a live writer would leave it rewriting the manifest behind verify()'s
+        back. The thread is a daemon so a genuinely wedged process still dies.
+        """
+        with self._writer_cv:
+            writer, self._writer = self._writer, None
+            if writer is None:
+                return None
+            self._writer_stop = True
+            self._writer_cv.notify_all()
+        writer.join()
+        with self._writer_cv:
+            error, self._writer_error = self._writer_error, None
+            stranded = len(self._writer_queue)
+            self._writer_queue = []
+        if error is not None:
+            log("the manifest writer failed ({}); {} completed chunk(s) were not "
+                "recorded and may be re-fetched".format(error, stranded))
+        return error
 
     def resume_offset(self, index):
         return self.sink.resume_offset(index)
@@ -2006,13 +2194,20 @@ class Downloader:
         self._chunk_done(index)
 
     def _chunk_done(self, index):
+        """
+        Worker-thread completion. Validates on this thread (so a failure still reaches the
+        retry loop) and hands the durable part off to the writer.
+        """
         started = time.time()
         try:
-            self.sink.chunk_done(index)
+            state = self.sink.chunk_ready(index)
         finally:
             with self._stream_lock:
                 self._bookkeeping_seconds += time.time() - started
                 self._bookkeeping_calls += 1
+        if state is CHUNK_ALREADY_DONE:
+            return
+        self._enqueue_done(index, state)
 
     def _log_concurrency(self, workers, chunks, wall):
         """
@@ -2036,6 +2231,10 @@ class Downloader:
         with self._stream_lock:
             book = self._bookkeeping_seconds
             calls = self._bookkeeping_calls
+        with self._writer_cv:
+            commit = self._commit_seconds
+            batches = self._commit_batches
+            committed = self._commit_chunks
         log("k9pdl-streams mean {:.2f} of {} workers "
             "({} chunks, {:.1f}s wall, {:.1f}s streaming)".format(
                 streaming / wall, workers, chunks, wall, streaming))
@@ -2046,6 +2245,15 @@ class Downloader:
             "{:.1f}% of {} worker-seconds)".format(
                 book, calls, book / calls if calls else 0.0,
                 100.0 * book / (workers * wall) if wall else 0.0, workers * wall))
+        # The writer's own cost, which is OFF the worker pool and so is reported against
+        # the wall clock instead. `mean batch` is the point of the whole mechanism: at 1.0
+        # nothing was amortised and the commits are still per-chunk, which a throughput
+        # number alone cannot distinguish from the fix working.
+        log("k9pdl-commit {:.1f}s over {} batches ({} chunks, mean batch {:.1f}, "
+            "{:.1f}% of {:.1f}s wall)".format(
+                commit, batches, committed,
+                (float(committed) / batches) if batches else 0.0,
+                100.0 * commit / wall if wall else 0.0, wall))
 
     def _count_stream_time(self, started):
         """
@@ -2096,14 +2304,24 @@ class Downloader:
             return
         workers = max(1, min(self.options.connections, len(pending), MAX_CONNECTIONS))
         wall_started = time.time()
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(self.download_chunk, i) for i in pending]
-            errors = []
-            for future in futures:
-                try:
-                    future.result()
-                except Exception as e:  # re-raised below, once every worker has settled
-                    errors.append(e)
+        errors = []
+        self._start_writer()
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futures = [pool.submit(self.download_chunk, i) for i in pending]
+                for future in futures:
+                    try:
+                        future.result()
+                    except Exception as e:  # re-raised below, once every worker has settled
+                        errors.append(e)
+        finally:
+            # Joined before anything reads the manifest or the file -- verify(), finalize()
+            # and the done marker all run after run() returns, and every one of them would
+            # be racing a live writer otherwise. In `finally` so a worker blowing up still
+            # cannot leave the thread running.
+            writer_error = self._stop_writer()
+        if writer_error is not None:
+            errors.append(writer_error)
         self._log_concurrency(workers, len(pending), time.time() - wall_started)
         if errors:
             for error in errors:

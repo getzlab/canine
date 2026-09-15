@@ -2230,6 +2230,15 @@ class TestBookkeepingTimeIsMeasured:
         return {"total": float(match.group(1)), "calls": int(match.group(2)),
                 "mean": float(match.group(3)), "pct": float(match.group(4))}
 
+    def parse_commit(self, output):
+        match = re.search(
+            r"k9pdl-commit ([\d.]+)s over (\d+) batches "
+            r"\((\d+) chunks, mean batch ([\d.]+), ([\d.]+)% of ([\d.]+)s wall\)", output)
+        assert match, "no k9pdl-commit line in:\n" + output
+        return {"total": float(match.group(1)), "batches": int(match.group(2)),
+                "chunks": int(match.group(3)), "mean_batch": float(match.group(4)),
+                "pct": float(match.group(5))}
+
     def test_one_call_is_recorded_per_chunk(self, tmp_path):
         payload = os.urandom(8 * MIB)
         with Server(payload) as server:
@@ -2241,10 +2250,15 @@ class TestBookkeepingTimeIsMeasured:
         assert got["calls"] == 8, got          # 8 MiB / 1 MiB
         assert got["total"] >= 0.0
 
-    def test_a_slow_chunk_done_is_attributed_to_bookkeeping_not_streaming(self, tmp_path):
+    def test_a_slow_chunk_ready_is_attributed_to_bookkeeping_not_streaming(self, tmp_path):
         """
         The number has to move when the thing it measures gets slower, or it cannot
         distinguish the hypothesis from its negation.
+
+        The subject is chunk_ready rather than chunk_done since the commit moved to the
+        writer thread: k9pdl-bookkeeping is now specifically the WORKER-side cost of
+        completion, which is the number whose share of the pool the fix is meant to drive
+        to zero. The writer's own cost has its own line, exercised below.
         """
         payload = os.urandom(4 * MIB)
         with Server(payload) as server:
@@ -2255,8 +2269,8 @@ class TestBookkeepingTimeIsMeasured:
                 "src = open({path!r}).read()\n"
                 "mod = types.ModuleType('pdl'); mod.__file__ = {path!r}\n"
                 "exec(compile(src, {path!r}, 'exec'), mod.__dict__)\n"
-                "orig = mod.PosixChunkSink.chunk_done\n"
-                "mod.PosixChunkSink.chunk_done = "
+                "orig = mod.PosixChunkSink.chunk_ready\n"
+                "mod.PosixChunkSink.chunk_ready = "
                 "lambda self, i: (time.sleep(0.30), orig(self, i))[1]\n"
                 "sys.exit(mod.main())\n"
             ).format(argv=["--url", server.url(), "--dest", dest,
@@ -2270,6 +2284,38 @@ class TestBookkeepingTimeIsMeasured:
         # 4 chunks x 0.30s of injected sleep, serialised or not
         assert got["total"] >= 1.1, got
         assert got["mean"] >= 0.28, got
+
+    def test_the_commit_cost_is_reported_separately_from_the_workers(self, tmp_path):
+        """
+        Moving the fsync off the workers is only a fix if the cost lands somewhere it can
+        still be seen. A slow commit must show up on k9pdl-commit and must NOT show up on
+        k9pdl-bookkeeping -- if it leaked back into the worker figure the two numbers would
+        be measuring the same thing again and the fix could not be evaluated.
+        """
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            slow = (
+                "import sys, time, types\n"
+                "sys.argv = ['pdl'] + {argv!r}\n"
+                "src = open({path!r}).read()\n"
+                "mod = types.ModuleType('pdl'); mod.__file__ = {path!r}\n"
+                "exec(compile(src, {path!r}, 'exec'), mod.__dict__)\n"
+                "orig = mod.PosixChunkSink.commit\n"
+                "mod.PosixChunkSink.commit = "
+                "lambda self, b: (time.sleep(0.30), orig(self, b))[1]\n"
+                "sys.exit(mod.main())\n"
+            ).format(argv=["--url", server.url(), "--dest", dest,
+                           "--size", str(len(payload)), "--connections", "4",
+                           "--min-chunk", str(MIB)], path=PDL_PATH)
+            proc = subprocess.run([sys.executable, "-c", slow],
+                                  capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        commit = self.parse_commit(proc.stderr)
+        assert commit["batches"] >= 1, commit
+        assert commit["total"] >= 0.28, commit
+        # the workers never touched it
+        assert self.parse(proc.stderr)["total"] < 0.25, proc.stderr
 
     def test_bookkeeping_is_excluded_from_streaming_time(self, tmp_path):
         """
