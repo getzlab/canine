@@ -1633,6 +1633,106 @@ SIGKILLs the download at 25%, 50% and 75%, then lets it finish. Check:
 * the **punch-hole** section, which is Linux-only and skipped locally. It simulates bytes
   the process wrote being gone because the VM vanished — the case SIGKILL cannot produce.
 
+### 6.5a Re-measure after the deferred manifest writer
+
+The full-size run reached 48.50 MiB/s against a 97.59 MiB/s disk floor — 3.04×, under the
+≥4× target — with `chunk_done` consuming **683 of 982 worker-seconds (70%)**. Per-chunk
+completion cost three fsyncs and a rename each, serialised on `Manifest._lock`, and it is
+the only cost that scales with the *chunk count* rather than the byte count: 3283 chunks
+at full size against 64 at 4 GiB.
+
+Commits are now batched onto a single writer thread. This section re-runs §6.2, §6.5 and
+§6.3 against it, in that order — cheapest falsification first.
+
+**Update the scripts before anything else.** Both files changed, and a stale
+`parallel_download.py` in the container would measure the old code while the report
+claimed otherwise:
+
+```bash
+# from your workstation, in the canine repo
+gcloud compute scp --project $PROJECT --zone $ZONE \
+  canine/test/benchmark_localization.py \
+  canine/localization/parallel_download.py \
+  $NODE:/tmp/
+
+# on the node
+sudo docker exec slurm mkdir -p /tmp/pdl
+sudo docker cp /tmp/benchmark_localization.py slurm:/tmp/pdl/
+sudo docker cp /tmp/parallel_download.py      slurm:/tmp/pdl/
+
+# the copies must match the workstation's, or you are measuring the old code
+sudo docker exec slurm md5sum /tmp/pdl/benchmark_localization.py \
+                              /tmp/pdl/parallel_download.py
+md5sum /tmp/benchmark_localization.py /tmp/parallel_download.py
+```
+
+Then §4.0's preflight, then the sweep. Same object, same range, same destination as §6.2,
+so the rows are directly comparable:
+
+```bash
+pdl sweep --url "$PRESIGNED_URL" --prefix \
+          --size $((4 * 1024 * 1024 * 1024)) \
+          --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+          --json /tmp/knee-disk-after.json
+```
+
+**Read the two bookkeeping lines before the throughput.** The report now prints:
+
+```
+chunk_ready: 0.4s over 64 calls (mean 0.006s, 0% of the worker pool)
+commit : 12.1s over 9 batches (64 chunks, mean batch 7.1, 3% of wall, off the worker pool)
+```
+
+* `chunk_ready` is the worker-side remainder. It should be **near zero** — that is the 70%
+  collapsing, and it is the claim under test.
+* `commit` runs off the worker pool, so its share is of the wall clock. **`mean batch` is
+  the number that says the mechanism ran.** At 1.0 the writer is drained as fast as it is
+  filled, nothing was amortised, and the commits are still per-chunk; the report tags that
+  `NOT BATCHED` rather than leaving it to be inferred from a throughput figure, which
+  cannot distinguish it from the fix working.
+
+Expect throughput near the §4.1 `dd` floor (~97 MiB/s) rather than 72 MiB/s.
+
+Then the resume run, unchanged from §6.5 — **the before-picture is already recorded**:
+three kills, four attempts of ~1.01 GiB each, 4.03 GiB total for a 4.00 GiB object,
+refetched 32.98 MiB (0.8%), hash CORRECT, SEEK_HOLE frontier recovery, punch-hole 111.80
+MiB refetched with the hash still CORRECT.
+
+```bash
+pdl resume --url "$PRESIGNED_URL" --prefix \
+           --size "$PREFIX" --md5 "$PREFIX_MD5" \
+           --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+           --json /tmp/resume-after.json
+```
+
+**What to expect, and the one thing that would be a real finding.** Batching widens the
+window between an fsync and its commit from one chunk to one round, so a preemption can
+now lose a batch's worth of *markers* — never bytes. On ext4 the frontier recovers those
+from the file's own extents at no cost, so **refetched should still be ~0.8%**. If it has
+risen materially, the frontier is not recognising physically-complete chunks whose markers
+were lost, which is the case `TestResumeWithMissingDoneMarkers` covers locally and the
+only regression this change can plausibly cause. Check `frontier` and not `checkpoint
+fallback` in the output before drawing any conclusion from the number.
+
+Finally the full-size run, the number the target is judged against:
+
+```bash
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+          --json /tmp/direct-300g-realbam-after.json
+```
+
+~98 minutes before; ~49 expected. Three things to record:
+
+* `mean batch` here, not just in the sweep — 3283 chunks is where batching matters, and a
+  batch size that is healthy at 64 chunks says nothing about 3283.
+* `verify 0.0s` must **persist**. The in-transfer part digests are recorded in the same
+  manifest write as the done markers now; if verify has become non-zero, the digests are
+  not surviving and a 279 GiB read-back is back. The `etag from N recorded part digests,
+  M re-read` line says which.
+* hash ok against `2872df08…-9849`, the same multipart ETag the pre-fix run matched.
+
 ### 6.6 the bucket-compose route against real GCS
 
 The bucket-compose route has never touched real infrastructure — not the auth path, not
