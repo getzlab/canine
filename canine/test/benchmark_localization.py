@@ -1324,6 +1324,58 @@ class Verification:
         return "NOT VERIFIED -- {}".format(self.reason or "no digest available")
 
 
+def announce_verification(verification, dest, out=None, interval=HEARTBEAT_INTERVAL):
+    """
+    Run the benchmark's own verification, saying so first and ticking while it works.
+
+    This is a full single-threaded re-read of the destination in Python, deliberately
+    independent of the downloader's verdict (see file_multipart_etag). On a 279 GiB object
+    against a ~90 MiB/s device that is the better part of an hour -- comparable to the
+    download it is checking -- and until now it printed nothing at all.
+
+    It also sits OUTSIDE run_download, so the drain thread's heartbeat has already stopped:
+    the child has exited, no more progress lines exist, and the display freezes on the last
+    percentage the download happened to emit. That is how a completed 279 GiB transfer came
+    to look like a run "stuck at 96%" -- 96% was simply the last thing ever printed, and
+    everything after it was this function, silent.
+
+    The reported throughput is unaffected either way; run_download's Sampler has already
+    closed. This is purely about the operator being able to tell work from a wedge.
+    """
+    out = out or sys.stderr
+    if verification.kind is None:
+        return None
+
+    size = os.path.getsize(dest)
+    out.write("        verifying {} against the {} -- a full re-read, "
+              "expect minutes\n".format(human(size), verification.label.split()[0]))
+    out.flush()
+
+    done = threading.Event()
+
+    def tick():
+        started = time.time()
+        while not done.wait(interval):
+            out.write("        ... still verifying ({} elapsed)\n".format(
+                human_seconds(time.time() - started)))
+            out.flush()
+
+    beat = threading.Thread(target=tick, daemon=True)
+    beat.start()
+    try:
+        return verification.check(dest)
+    finally:
+        done.set()
+
+
+def human_seconds(seconds):
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return "{}h{:02d}m".format(hours, minutes)
+    return "{}m{:02d}s".format(minutes, seconds)
+
+
 def parsed_headers(args):
     out = {}
     for item in getattr(args, "header", None) or []:
@@ -1545,7 +1597,7 @@ def command_sweep(args):
                                connections, args.min_chunk,
                                verification=verification)
         if outcome["returncode"] == 0 and os.path.exists(dest):
-            outcome["verified"] = verification.check(dest)
+            outcome["verified"] = announce_verification(verification, dest)
         else:
             outcome["verified"] = False
 

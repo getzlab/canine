@@ -1949,3 +1949,94 @@ class TestAStallSaysWhyItStalled:
         assert not any("retrying" in line for line in echoed), (
             "the old single-clock progress-only filter echoed a retry line, so the "
             "defect being guarded against cannot be reproduced and the guard is vacuous")
+
+
+class TestVerificationSaysItIsWorking:
+    """
+    THIRD INSTRUMENTATION DEFECT IN THIS CHAIN, and the one that actually bit.
+
+    The benchmark verifies the destination itself, independently of the downloader, by
+    re-reading the whole file in Python. On a 279 GiB object against a ~90 MiB/s device
+    that is the better part of an hour -- comparable to the download it is checking.
+
+    It printed nothing. Worse, it runs OUTSIDE run_download, so the drain thread's
+    heartbeat has already stopped: the child has exited, no further progress lines exist,
+    and the terminal freezes on whatever percentage the download last emitted. A complete
+    279 GiB transfer therefore presented as a run "stuck at 96%" for 40+ minutes, with a
+    fully-allocated destination and no processes to point at.
+
+    Fixing the pipe deadlock and then the stall-marker filter both made the log more
+    honest and neither touched this, because both only ever looked at the child's stderr.
+    The lesson is that silence has to be designed out per phase, not per stream.
+    """
+
+    class Recorded:
+        kind = "md5"
+        label = "md5 abc"
+
+        def __init__(self, block):
+            self.block = block
+
+        def check(self, path):
+            self.block.wait(5)
+            return True
+
+    def test_it_announces_before_the_long_read(self, tmp_path):
+        dest = tmp_path / "f.bin"
+        dest.write_bytes(b"x" * 4096)
+        out = io.StringIO()
+        verification = self.Recorded(threading.Event())
+        verification.block.set()
+
+        assert bench.announce_verification(verification, str(dest), out=out) is True
+        assert "verifying" in out.getvalue(), out.getvalue()
+        assert "4.00 KiB" in out.getvalue(), out.getvalue()
+
+    def test_it_ticks_while_the_read_is_still_going(self, tmp_path):
+        """
+        The announcement alone is not enough: it scrolls away, and half an hour later the
+        operator is looking at a dead terminal again. The tick is what distinguishes
+        working from wedged at the moment the question is actually asked.
+        """
+        dest = tmp_path / "f.bin"
+        dest.write_bytes(b"x" * 4096)
+        out = io.StringIO()
+        release = threading.Event()
+        verification = self.Recorded(release)
+
+        worker = threading.Thread(
+            target=lambda: bench.announce_verification(
+                verification, str(dest), out=out, interval=0.05), daemon=True)
+        worker.start()
+        time.sleep(0.4)
+        release.set()
+        worker.join(10)
+
+        assert not worker.is_alive()
+        assert "still verifying" in out.getvalue(), out.getvalue()
+
+    def test_the_tick_stops_when_the_read_does(self, tmp_path):
+        """A ticker that outlives its phase is worse than none -- it reports work that
+        finished, which is the same class of lie as reporting none that is ongoing."""
+        dest = tmp_path / "f.bin"
+        dest.write_bytes(b"x" * 4096)
+        out = io.StringIO()
+        verification = self.Recorded(threading.Event())
+        verification.block.set()
+
+        bench.announce_verification(verification, str(dest), out=out, interval=0.05)
+        settled = out.getvalue()
+        time.sleep(0.4)
+        assert out.getvalue() == settled, "the ticker kept printing after check() returned"
+
+    def test_nothing_is_said_when_there_is_nothing_to_verify(self, tmp_path):
+        """A 'verifying...' line for a run that verifies nothing would be the same defect
+        in the opposite direction -- see the 4 GiB sweep, which reported verify 0.0s
+        because no hashing happened, not because hashing is cheap."""
+        dest = tmp_path / "f.bin"
+        dest.write_bytes(b"x" * 16)
+        out = io.StringIO()
+        nothing = bench.Verification(None, reason="no digest")
+
+        assert bench.announce_verification(nothing, str(dest), out=out) is None
+        assert out.getvalue() == "", out.getvalue()
