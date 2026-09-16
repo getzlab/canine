@@ -1742,8 +1742,64 @@ no extents, so `SEEK_HOLE` correctly reports them as holes and the frontier rewi
 before them. The old per-chunk fsync forced allocation every ~87 MiB; it now happens once
 per batch. ~30 MiB lost per kill against a ~2 GiB batch window means the frontier is still
 recovering nearly all of it, and 2.2% remains 34× better than a broken frontier (~3 GiB
-over three kills). If it needs to be lower, cap the unallocated window with a time-bounded
-flush rather than reverting the batching.
+over three kills).
+
+Note that the obvious remedy — a time-bounded flush in the writer — would do nothing. The
+writer never idles during a saturated download; it commits back-to-back, so the window is
+bounded by *commit duration*, not by a gap between commits, and a timer would never fire.
+Shrinking it means **capping batch size**, which trades directly against the batching this
+section exists to measure. Read the next subsection before reaching for it.
+
+#### Resume again at the full-size chunk geometry
+
+**Run this before deciding the 2.2% is acceptable.** Every resume measurement so far has
+used 64 MiB chunks, because that is what a 4 GiB prefix produces at the default
+`--min-chunk`. Production does not: the real object's multipart ETag has 30408704-byte
+parts, so the chunk plan rounds up to `3 × 30408704 = 91226112` bytes (87.0 MiB), which is
+how 278.91 GiB becomes 3283 chunks. Uncommitted in-flight bytes scale with
+`connections × chunk`, so 16 × 87 MiB is 1.4 GiB in flight against 16 × 64 MiB's 1.0 GiB —
+a 1.4× wider exposure that the 4 GiB run never exercised.
+
+This is minutes on the same 4 GiB prefix, and it is the cheap way to find out whether the
+number generalises before spending 279 GiB of egress on the assumption that it does:
+
+```bash
+pdl resume --url "$PRESIGNED_URL" --prefix \
+           --size "$PREFIX" --md5 "$PREFIX_MD5" \
+           --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+           --min-chunk 91226112 \
+           --json /tmp/resume-after-87m.json
+```
+
+**How to read it, and why the percentage is the wrong number.** 2.2% is a ratio from a
+4 GiB object killed three times; the quantity that transfers to production is **loss per
+preemption**, which was ~30 MiB (90.78 MiB over 3 kills) against ~11 MiB before batching.
+On a 279 GiB localization that is 0.010% versus 0.004% — about a quarter of a second at
+78 MiB/s.
+
+* **~30 MiB per kill again** → the residual is the last fraction of a second of dirty
+  pages, independent of chunk size, and background writeback is allocating extents far
+  ahead of the fsync. Nothing to fix; a batch-size cap would buy back a quarter-second per
+  preemption and re-couple commit cost to chunk count, which is the thing the deferred
+  writer removed.
+* **~40 MiB per kill (scaling with 1.4× the chunk)** → the window really is set by
+  in-flight chunk bytes. Still small, but it means the cost grows with chunk size, so
+  revisit if the chunk plan ever gets much coarser.
+* **Hundreds of MiB per kill** → a genuine finding, and the case for bounding the batch
+  explicitly. Check `frontier` and not `checkpoint fallback` first: a silent fallback would
+  produce exactly this and has nothing to do with batching.
+
+One caveat on the report's own arithmetic: the "a per-attempt loss of a whole chunk would
+show up as roughly N" line is computed as `(attempts - 1) × min_chunk × connections`, which
+at this geometry is 4.2 GiB — larger than the 4 GiB object. That comparison degenerates
+here; read the refetched bytes directly and ignore the projected budget.
+
+**Keep this separate from the preemption question it resembles.** SIGKILL does not drop
+page cache, so it cannot produce the case that actually matters on preemptible VMs: the
+machine vanishing with dirty pages unwritten. That is the punch-hole run, it refetched
+111.81 MiB, and it is **unchanged** by batching — roughly 4× the delalloc delta. If the
+goal is reducing what a preemption costs, that is the number to attack, and batch size is
+not the lever.
 
 #### Before the full-size run: re-copy the harness
 
