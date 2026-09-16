@@ -61,6 +61,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -925,6 +926,46 @@ def header_args(args):
     return out
 
 
+HEARTBEAT_INTERVAL = 300
+
+
+def _drain_stderr(stream, sink, echo_every=HEARTBEAT_INTERVAL, out=None):
+    """
+    Read the child's stderr to EOF, keeping every byte and echoing a progress line
+    occasionally.
+
+    Two jobs, both learned the hard way. Reading continuously is what stops the 64 KiB
+    pipe filling and deadlocking a long run (see run_download). Echoing is what makes a
+    long run distinguishable from a hung one: `pdl sweep` printed nothing between the
+    header and the result row, so a 279 GiB run and a wedged downloader looked identical
+    for hours, and the only way to tell them apart was to stat the destination from
+    another shell.
+
+    Only progress lines are echoed, at most one per `echo_every` seconds, so the heartbeat
+    cannot itself become a wall of output. Everything is still captured in full for the
+    parser -- the echo is a view, never a filter.
+    """
+    out = out or sys.stderr
+    last_echo = 0.0
+    for raw in iter(stream.readline, b""):
+        sink.append(raw)
+        if not echo_every:
+            continue
+        now = time.time()
+        if now - last_echo < echo_every:
+            continue
+        line = raw.decode("utf-8", "replace").rstrip()
+        if "% (" not in line:      # the Progress line; anything else is not a heartbeat
+            continue
+        last_echo = now
+        out.write("        ... {}\n".format(line))
+        out.flush()
+    try:
+        stream.close()
+    except (IOError, OSError):
+        pass
+
+
 def run_download(source, dest, size, connections, min_chunk, extra=(), verification=None,
                  kill_after_bytes=None):
     """
@@ -946,6 +987,23 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     with Sampler() as sampler:
         process = subprocess.Popen(command, stdout=subprocess.DEVNULL,
                                    stderr=subprocess.PIPE)
+        # Drain stderr on its own thread, and do it for the whole life of the process.
+        #
+        # This loop used to poll() without reading a byte until the child exited. A pipe
+        # holds 64 KiB; the downloader logs a ~70-byte progress line every
+        # PROGRESS_INTERVAL (5s), so after roughly 900 lines -- about 78 MINUTES -- the
+        # buffer is full, the child blocks in write() forever, and this loop polls a
+        # process that can now never exit. The result is a hang with no output, at a
+        # threshold that sits under the full-size run and comfortably over every other
+        # measurement, which is exactly why it survived: 4 GiB sweeps, resume runs and
+        # probes all finish long before it.
+        #
+        # The symptom is indistinguishable from a slow source or a wedged downloader, and
+        # `--json` never gets written, so an overnight run yields nothing at all.
+        captured = []
+        drain = threading.Thread(target=_drain_stderr,
+                                 args=(process.stderr, captured), daemon=True)
+        drain.start()
         killed = False
         killed_at = None
         rss = 0
@@ -975,7 +1033,11 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
                 except OSError:
                     pass
             time.sleep(0.25)
-        stderr = process.stderr.read().decode("utf-8", "replace")
+        # The child has exited, so the drain thread sees EOF and finishes. Joined with a
+        # timeout rather than forever: a stuck reader must not turn a completed download
+        # into a hang, which is the failure being fixed here.
+        drain.join(30)
+        stderr = b"".join(captured).decode("utf-8", "replace")
 
     # The downloader emits "k9pdl-phase <name> <secs>s[, rate]" per phase. Capturing the
     # split matters because localization is two costs, not one: moving the bytes, then

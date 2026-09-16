@@ -10,11 +10,16 @@ issued by someone else, that matters.
 
 import glob
 import hashlib
+import io
 import inspect
 import importlib.util
 import os
 import shlex
+import subprocess
+import sys
 import tempfile
+import threading
+import time
 
 import pytest
 
@@ -1707,3 +1712,130 @@ class TestTheSweepLeavesNoOrphanedMarkers:
         """--keep exists so a run can be inspected afterwards; it must not be broken."""
         source = inspect.getsource(bench.command_sweep)
         assert "if not args.keep:" in source
+
+
+class TestAChattyDownloadIsNotADeadlock:
+    """
+    PRODUCTION-OF-THE-MEASUREMENT BUG. run_download polled the child without reading a
+    byte of its stderr until it exited:
+
+        process = subprocess.Popen(..., stderr=subprocess.PIPE)
+        while True:
+            if process.poll() is not None: break
+            ...
+        stderr = process.stderr.read()
+
+    A pipe holds 64 KiB. The downloader logs a ~70-byte progress line every
+    PROGRESS_INTERVAL (5s), so after roughly 900 lines -- about 78 MINUTES -- the buffer
+    fills, the child blocks in write() forever, and the loop polls a process that can
+    never exit.
+
+    The threshold is why it survived: every short measurement (4 GiB sweeps, resume runs,
+    probes) finishes long before it, and only the full-size run crosses it. It presents as
+    a silent hang with no row, no --json, and a destination that stops growing -- which is
+    indistinguishable from a wedged source, and cost an overnight 279 GiB run.
+    """
+
+    def chatty(self, tmp_path, lines, width=70):
+        """A stand-in downloader that floods stderr, then writes the destination."""
+        script = tmp_path / "chatty.py"
+        script.write_text(
+            "import sys\n"
+            "args = sys.argv\n"
+            "dest = args[args.index('--dest') + 1]\n"
+            "size = int(args[args.index('--size') + 1])\n"
+            "sys.stderr.write('[k9pdl] k9pdl-phase download 1.0s, 1.0 MB/s\\n')\n"
+            "for i in range({lines}):\n"
+            "    sys.stderr.write(('[k9pdl] {{:.1f}}% ({{}}/{n} bytes)'\n"
+            "                      .format(i / 10.0, i)).ljust({w}) + '\\n')\n"
+            "    sys.stderr.flush()\n"
+            "open(dest, 'wb').write(b'x' * size)\n".format(
+                lines=lines, n=lines, w=width))
+        return str(script)
+
+    def download(self, tmp_path, monkeypatch, lines=3000, deadline=90):
+        """
+        Call run_download with a deadline, because the bug under test is a HANG.
+
+        Every assertion here has to be reachable: run it inline and a regression wedges
+        the whole suite with no failure and no output, which is the same unhelpful
+        silence the fix exists to remove. The thread is a daemon and the child dies of
+        EPIPE once the interpreter drops the read end, so a timeout leaves nothing behind.
+        """
+        monkeypatch.setattr(bench, "DOWNLOADER", self.chatty(tmp_path, lines))
+        outcome = []
+        worker = threading.Thread(
+            target=lambda: outcome.append(bench.run_download(
+                ["--url", "https://h/o"], str(tmp_path / "out.bin"), 64, 4, 1 << 20)),
+            daemon=True)
+        worker.start()
+        worker.join(deadline)
+        assert not worker.is_alive(), (
+            "run_download did not return within {}s: the child is blocked writing to a "
+            "full stderr pipe and poll() will never report an exit".format(deadline))
+        return outcome[0]
+
+    def test_a_child_that_outgrows_the_pipe_still_completes(self, tmp_path, monkeypatch):
+        """~200 KiB of stderr, comfortably past the 64 KiB a pipe holds."""
+        assert self.download(tmp_path, monkeypatch)["returncode"] == 0
+
+    def test_the_whole_of_a_long_stderr_is_captured(self, tmp_path, monkeypatch):
+        """
+        Draining must not become sampling. Every parsed number -- phases, streams,
+        bookkeeping, commit -- comes out of this text, and the phase line is emitted
+        FIRST here precisely so that dropping the head of the stream would lose it.
+        """
+        outcome = self.download(tmp_path, monkeypatch)
+        assert outcome["phases"] == {"download": 1.0}, outcome["phases"]
+
+    def test_the_old_unread_pipe_really_does_deadlock(self, tmp_path):
+        """
+        Mutation check. Reproduce the original loop exactly -- poll to exit, never read --
+        and it must fail to exit, or the test above proves nothing.
+        """
+        process = subprocess.Popen(
+            [sys.executable, self.chatty(tmp_path, 3000),
+             "--dest", str(tmp_path / "m.bin"), "--size", "8"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            deadline = time.time() + 15
+            while time.time() < deadline and process.poll() is None:
+                time.sleep(0.25)
+            assert process.poll() is None, (
+                "the child exited with its stderr unread, so 3000 lines fit in the pipe "
+                "on this platform and the deadlock cannot be reproduced here -- raise "
+                "the line count until it does")
+        finally:
+            process.kill()
+            process.wait()
+
+    def test_a_long_run_emits_a_heartbeat(self):
+        """
+        The other half of the defect: `pdl sweep` printed nothing between the header and
+        the result row, so a slow run and a hung one looked identical for hours. Only
+        progress lines are echoed, so the heartbeat cannot itself become the wall of
+        output it is reading -- and nothing is filtered out of the capture.
+        """
+        read, write = os.pipe()
+        os.write(write, b"[k9pdl] 1.0% (1/100 bytes)\n"
+                        b"[k9pdl] chunk 3: retrying in 1.0s\n"
+                        b"[k9pdl] 2.0% (2/100 bytes)\n")
+        os.close(write)
+        sink, out = [], io.StringIO()
+        bench._drain_stderr(os.fdopen(read, "rb"), sink, echo_every=0.0001, out=out)
+
+        assert len(sink) == 3, sink
+        echoed = out.getvalue()
+        assert "1.0% (1/100 bytes" in echoed, echoed
+        assert "retrying" not in echoed, echoed
+
+    def test_the_heartbeat_is_rate_limited(self):
+        read, write = os.pipe()
+        os.write(write, b"".join(
+            b"[k9pdl] %d.0%% (%d/100 bytes)\n" % (i, i) for i in range(50)))
+        os.close(write)
+        sink, out = [], io.StringIO()
+        bench._drain_stderr(os.fdopen(read, "rb"), sink, echo_every=3600, out=out)
+
+        assert len(sink) == 50
+        assert len(out.getvalue().splitlines()) <= 1, out.getvalue()

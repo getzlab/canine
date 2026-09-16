@@ -1714,6 +1714,69 @@ were lost, which is the case `TestResumeWithMissingDoneMarkers` covers locally a
 only regression this change can plausibly cause. Check `frontier` and not `checkpoint
 fallback` in the output before drawing any conclusion from the number.
 
+#### What the node actually measured
+
+```
+16  52.12s  78.59 MiB/s  peak NIC 266.54  peak disk 87.78  RSS 63.64 MiB
+    chunk_ready: 0.0s over 64 calls (mean 0.000s, 0% of the worker pool)
+    commit : 46.6s over 2 batches (64 chunks, mean batch 32.0, 91% of wall)
+    streams: 5.32 of 16 concurrent on average
+```
+
+The 70% is gone, and `mean batch 32.0` says the mechanism ran rather than being inferred.
+Throughput went 72.06 → 78.59 MiB/s, which is 82% → **90% of the device**.
+
+`commit` at 91% of wall is **not** overhead, and reading it as overhead is the easy
+mistake here: 46.6s for ~4 GiB is 87 MiB/s, which is exactly `peak disk write`. Workers
+write into page cache and the fsync waits for the platter, so that 91% is the disk, not
+bookkeeping. `streams 5.32 of 16` is writeback throttling — it is what disk-bound looks
+like. **At 4 GiB there is nothing left to win**; the 2× projection only ever applied to
+the 3283-chunk full-size run.
+
+Resume went the other way, as predicted but by a different mechanism than the paragraph
+above anticipated: **refetched 90.78 MiB (2.2%)**, up from 32.98 MiB (0.8%), hash still
+CORRECT, still `frontier recovery`, punch-hole 111.81 MiB and CORRECT. Marker loss is not
+the cause — SIGKILL does not drop page cache, so the frontier could have recovered those
+for free. The cause is **ext4 delayed allocation**: pages written but not yet fsynced have
+no extents, so `SEEK_HOLE` correctly reports them as holes and the frontier rewinds to
+before them. The old per-chunk fsync forced allocation every ~87 MiB; it now happens once
+per batch. ~30 MiB lost per kill against a ~2 GiB batch window means the frontier is still
+recovering nearly all of it, and 2.2% remains 34× better than a broken frontier (~3 GiB
+over three kills). If it needs to be lower, cap the unallocated window with a time-bounded
+flush rather than reverting the batching.
+
+#### Before the full-size run: re-copy the harness
+
+`benchmark_localization.py` had a **Popen/PIPE deadlock**. `run_download` polled the child
+without reading a byte of its stderr until it exited. A pipe holds 64 KiB and the
+downloader logs a ~70-byte progress line every 5s, so after ~900 lines — about **78
+minutes** — the child blocks in `write()` forever and the loop polls a process that can
+never exit. The threshold sits under the full-size run and over every other measurement,
+which is why sweeps, resume runs and probes never hit it.
+
+This cost an overnight 279 GiB run: no row, no `--json`, and a destination that had
+reached ~97% and stopped. It is a harness bug, not a downloader bug — the download itself
+was nearly finished. Note honestly that it is **not understood why the earlier ~98-minute
+pre-fix full-size run survived the same harness**; it may have been invoked directly
+rather than through `pdl sweep`.
+
+stderr is now drained on its own thread, and a progress line is echoed at most once every
+five minutes so a multi-hour run is distinguishable from a wedged one. **Re-copy both
+scripts (the block at the top of this section) before the full-size run.**
+
+Also clear the stale destination first. The overnight run left a 279 GiB file behind and
+the disk was at 89% (`273G used, 38G avail` of 310G); without this the re-run hits ENOSPC
+and sits in `_await_space`:
+
+```bash
+sudo docker exec slurm sh -c '
+  rm -f /mnt/rwdisks/'"$DISK"'/bench.16.bin /mnt/rwdisks/'"$DISK"'/.bench.16.bin.k9pdl.*
+  df -h /mnt/rwdisks/'"$DISK"' | tail -1'
+```
+
+Note that `pkill -f benchmark_localization.py` does **not** kill the downloader it spawned
+— that is `python3 .../parallel_download.py` and has to be matched separately.
+
 Finally the full-size run, the number the target is judged against:
 
 ```bash
@@ -1723,7 +1786,8 @@ pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
           --json /tmp/direct-300g-realbam-after.json
 ```
 
-~98 minutes before; ~49 expected. Three things to record:
+~98 minutes before; ~49 expected, though the 4 GiB row above suggests the disk will cap it
+well short of that. Three things to record:
 
 * `mean batch` here, not just in the sweep — 3283 chunks is where batching matters, and a
   batch size that is healthy at 64 chunks says nothing about 3283.
