@@ -48,6 +48,7 @@ import configparser
 import ctypes
 import errno
 import glob
+import concurrent.futures
 import hashlib
 import json
 import os
@@ -1151,28 +1152,65 @@ def file_md5(path, block=8 * MIB):
     return digest.hexdigest()
 
 
-def file_multipart_etag(path, part_length, block=8 * MIB):
+VERIFY_READ_WORKERS = 2
+
+
+def _part_digest(path, index, part_length, block):
+    """One part's md5, read through its own handle so workers do not share a file offset."""
+    part = hashlib.md5()
+    remaining = part_length
+    with open(path, "rb") as fh:
+        fh.seek(index * part_length)
+        while remaining:
+            chunk = fh.read(min(block, remaining))
+            if not chunk:
+                break
+            part.update(chunk)
+            remaining -= len(chunk)
+    return part.digest()
+
+
+def file_multipart_etag(path, part_length, block=8 * MIB, workers=VERIFY_READ_WORKERS):
     """
     AWS's multipart ETag: md5 of the concatenated per-part md5 digests, then `-<n parts>`.
 
     Computed here so the benchmark's verdict is independent of the downloader's own. If we
     simply reported what the downloader concluded, "md5 ok" would mean no more than "it did
-    not notice a problem".
+    not notice a problem". That independence is why this cost cannot be optimised away by
+    reusing the in-transfer part digests, and a multipart ETag cannot be sampled -- it is
+    only checkable by reading every byte.
+
+    WHY TWO WORKERS, AND NOT MORE. On the 316 GB pd-standard this runs against, aggregate
+    read throughput FALLS with concurrency: 86 / 85 / 76 / 62 MiB/s at 1 / 2 / 4 / 8
+    readers (see test_verify_does_not_scale_readers_with_connections, where passing
+    `connections` made a 279 GiB read-back 21 minutes slower). Meanwhile hashing is only
+    about a seventh of read time -- md5 runs ~600-760 MB/s on one core against ~90 MB/s of
+    disk -- so overlapping it perfectly saves at most ~15%. At 4 readers the 12% read loss
+    eats nearly that whole prize; at 8 it costs more than the prize is worth. Two is where
+    the two curves cross, and it is what the downloader uses, so the benchmark matches it.
+
+    Threads, not processes. hashlib releases the GIL, so threads already scale md5 near
+    linearly (753 -> 4987 MB/s over 8), while processes measured strictly slower at every
+    width (536 -> 4208) purely on spawn cost, before any of the IPC or per-process file
+    handles a real implementation would need. Multiprocessing would only win if the GIL
+    were held here, and it is not. Keeping up with 86 MiB/s needs ~0.11 cores of md5, so
+    the CPU was never the constraint in the first place.
+
+    `workers` is exposed so the balance can be re-measured on other hardware; it must not
+    change the answer, only the time taken to reach it.
     """
-    part_digests = []
-    with open(path, "rb") as fh:
-        while True:
-            part = hashlib.md5()
-            remaining = part_length
-            while remaining:
-                chunk = fh.read(min(block, remaining))
-                if not chunk:
-                    break
-                part.update(chunk)
-                remaining -= len(chunk)
-            if remaining == part_length:
-                break                       # read nothing: end of file
-            part_digests.append(part.digest())
+    size = os.path.getsize(path)
+    parts = (size + part_length - 1) // part_length
+
+    if workers and workers > 1 and parts > 1:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            # map, not as_completed: part order is the digest, so it cannot be
+            # reassembled from whatever finishes first.
+            part_digests = list(pool.map(
+                lambda i: _part_digest(path, i, part_length, block), range(parts)))
+    else:
+        part_digests = [_part_digest(path, i, part_length, block) for i in range(parts)]
+
     combined = hashlib.md5(b"".join(part_digests)).hexdigest()
     return "{}-{}".format(combined, len(part_digests))
 
@@ -1307,12 +1345,12 @@ class Verification:
             return ["--check-etag", self.value, "--part-length", str(self.part_length)]
         return []
 
-    def check(self, path):
+    def check(self, path, workers=VERIFY_READ_WORKERS):
         """True, False, or None when there is nothing to check against."""
         if self.kind == "md5":
             return file_md5(path) == self.value
         if self.kind == "etag":
-            return file_multipart_etag(path, self.part_length) == self.value
+            return file_multipart_etag(path, self.part_length, workers=workers) == self.value
         return None
 
     @property
@@ -1324,7 +1362,8 @@ class Verification:
         return "NOT VERIFIED -- {}".format(self.reason or "no digest available")
 
 
-def announce_verification(verification, dest, out=None, interval=HEARTBEAT_INTERVAL):
+def announce_verification(verification, dest, out=None, interval=HEARTBEAT_INTERVAL,
+                          workers=VERIFY_READ_WORKERS):
     """
     Run the benchmark's own verification, saying so first and ticking while it works.
 
@@ -1363,7 +1402,7 @@ def announce_verification(verification, dest, out=None, interval=HEARTBEAT_INTER
     beat = threading.Thread(target=tick, daemon=True)
     beat.start()
     try:
-        return verification.check(dest)
+        return verification.check(dest, workers=workers)
     finally:
         done.set()
 
@@ -1597,7 +1636,9 @@ def command_sweep(args):
                                connections, args.min_chunk,
                                verification=verification)
         if outcome["returncode"] == 0 and os.path.exists(dest):
-            outcome["verified"] = announce_verification(verification, dest)
+            outcome["verified"] = announce_verification(
+                verification, dest, workers=getattr(args, "verify_workers",
+                                                    VERIFY_READ_WORKERS))
         else:
             outcome["verified"] = False
 
@@ -2316,6 +2357,14 @@ def build_parser():
                        help="where to write; use the localization disk to measure the "
                             "path that matters (default: %(default)s)")
         p.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK)
+        p.add_argument("--verify-workers", type=int, default=VERIFY_READ_WORKERS,
+                       help="readers for the benchmark's own ETag re-read "
+                            "(default: %(default)s). More is not better: on a 316 GB "
+                            "pd-standard read throughput falls with concurrency "
+                            "(86/85/76/62 MiB/s at 1/2/4/8) while hashing is only ~1/7 "
+                            "of read time, so the whole prize is ~15%% and 4+ readers "
+                            "spend more than it is worth. Exposed to re-measure that "
+                            "balance on other hardware, not to tune a run")
         p.add_argument("--prefix", action="store_true",
                        help="--size is a PREFIX of a larger object. Ranges the "
                             "single-stream baseline so it fetches the same bytes as the "

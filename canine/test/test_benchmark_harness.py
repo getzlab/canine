@@ -1977,7 +1977,8 @@ class TestVerificationSaysItIsWorking:
         def __init__(self, block):
             self.block = block
 
-        def check(self, path):
+        def check(self, path, workers=None):
+            self.workers = workers
             self.block.wait(5)
             return True
 
@@ -2040,3 +2041,85 @@ class TestVerificationSaysItIsWorking:
 
         assert bench.announce_verification(nothing, str(dest), out=out) is None
         assert out.getvalue() == "", out.getvalue()
+
+
+class TestTheParallelHasherAgreesWithTheSerialOne:
+    """
+    The benchmark's verdict rests entirely on this function. A parallel hasher that
+    produced a *different* ETag would not fail loudly -- it would report every correct
+    download as corrupt, or worse, agree by accident on the sizes exercised in testing and
+    disagree on the one that matters. So equivalence is asserted against an independently
+    written reference, across widths and across sizes that do not divide evenly.
+
+    Parallelism here buys at most ~15% (hashing is a seventh of read time) and the reason
+    for two workers rather than more is measured read degradation on pd-standard -- see
+    file_multipart_etag. None of that is allowed to change the answer.
+    """
+
+    @staticmethod
+    def reference(data, part_length):
+        """Deliberately not the implementation under test."""
+        digests = [hashlib.md5(data[i:i + part_length]).digest()
+                   for i in range(0, len(data), part_length)]
+        return "{}-{}".format(hashlib.md5(b"".join(digests)).hexdigest(), len(digests))
+
+    @pytest.mark.parametrize("workers", [1, 2, 4, 8])
+    @pytest.mark.parametrize("size,part", [
+        (4096, 1024),          # exact multiple
+        (4097, 1024),          # one byte over: a short final part
+        (1023, 1024),          # smaller than one part
+        (1024, 1024),          # exactly one part
+        (40960, 1024),         # more parts than workers
+    ])
+    def test_every_width_gives_the_same_etag(self, tmp_path, workers, size, part):
+        data = os.urandom(size)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+
+        assert bench.file_multipart_etag(
+            str(path), part, block=512, workers=workers) == self.reference(data, part)
+
+    def test_a_short_final_part_is_not_padded(self, tmp_path):
+        """
+        The serial version found the end of the file by reading until a part came back
+        empty. The parallel version has to derive the part count from the size instead,
+        which is where an off-by-one puts a zero-length part on the end and changes both
+        the digest and the count.
+        """
+        data = os.urandom(3000)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+
+        etag = bench.file_multipart_etag(str(path), 1024, block=512, workers=4)
+        assert etag.endswith("-3"), etag
+        assert etag == self.reference(data, 1024)
+
+    def test_an_empty_file_keeps_its_old_answer(self, tmp_path):
+        """Behaviour predates this change; the parallel path must not quietly alter it."""
+        path = tmp_path / "empty.bin"
+        path.write_bytes(b"")
+        assert bench.file_multipart_etag(str(path), 1024, workers=4) == \
+            "{}-0".format(hashlib.md5(b"").hexdigest())
+
+    def test_parts_are_not_reordered_by_completion(self, tmp_path):
+        """
+        Part order IS the digest. Reassembling from whatever finishes first would produce
+        a stable, plausible, wrong answer -- so make the later parts finish first and
+        confirm the result is unchanged.
+        """
+        data = os.urandom(8192)
+        path = tmp_path / "obj.bin"
+        path.write_bytes(data)
+        real = bench._part_digest
+
+        def slow_early(p, index, part_length, block):
+            time.sleep(0.02 * (4 - index) if index < 4 else 0)
+            return real(p, index, part_length, block)
+
+        original = bench._part_digest
+        bench._part_digest = slow_early
+        try:
+            got = bench.file_multipart_etag(str(path), 1024, block=512, workers=8)
+        finally:
+            bench._part_digest = original
+        assert got == self.reference(data, 1024)

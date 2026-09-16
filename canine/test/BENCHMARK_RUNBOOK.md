@@ -950,6 +950,60 @@ how §10's table is computed.
 
 No measurement required here. Skip to §4.2, or straight to §6 if you accept §10's
 conclusion.
+
+### 4.1d Does hashing cost anything on top of reading? — 5 minutes, no egress
+
+The benchmark verifies the destination itself, by re-reading it and recomputing the
+multipart ETag (`file_multipart_etag`). On a 279 GiB object that is the better part of an
+hour — comparable to the download it is checking — so it roughly **doubles the wall time
+of every setting in a sweep**. It cannot be optimised away: reusing the downloader's
+in-transfer digests would mean the verdict was the downloader's own, and a multipart ETag
+cannot be sampled, because it is only checkable by reading every byte.
+
+What *can* be asked is whether any of that hour is CPU. The arithmetic says barely:
+
+* md5 runs **~600–760 MB/s on one core** — about **7×** the disk. Keeping up with 86 MiB/s
+  needs roughly 0.11 of a core.
+* So hashing is ~1/7 of read time, and overlapping it perfectly saves **at most ~15%**.
+  That is the entire prize, at any core count.
+* Against that, §4.1a's read curve **falls** with concurrency — 86 / 85 / 76 / 62 MiB/s at
+  1 / 2 / 4 / 8 readers. At 4 readers the 12% read loss eats nearly the whole prize; at 8
+  it costs more than the prize is worth. Two is where the curves cross, which is why both
+  the downloader and the benchmark use `VERIFY_READ_WORKERS = 2`.
+
+**Threads, not processes.** `hashlib` releases the GIL, so threads already scale md5 near
+linearly (753 → 1464 → 2853 → 4987 MB/s at 1/2/4/8). Processes measured strictly slower at
+every width (536 → 1310 → 2477 → 4208) purely on spawn cost, before any of the IPC or
+per-process file handles a real implementation would need. Multiprocessing only wins when
+the GIL is held, and here it is not.
+
+The one thing the arithmetic cannot settle is whether the 15% is available at all, because
+buffered reads already overlap: the kernel prefetches block N+1 while Python hashes block
+N. If readahead is doing its job, a single thread is already at the device rate and
+threading the hasher wins nothing. Two commands decide it:
+
+```bash
+# on the node, with the disk otherwise IDLE -- any concurrent download invalidates this
+sudo docker exec slurm sh -c '
+  sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+  dd if=/mnt/rwdisks/'"$DISK"'/bench.16.bin of=/dev/null bs=8M count=4000'
+
+sudo docker exec slurm sh -c '
+  sync; echo 3 > /proc/sys/vm/drop_caches 2>/dev/null
+  dd if=/mnt/rwdisks/'"$DISK"'/bench.16.bin bs=8M count=4000 | md5sum'
+```
+
+| result | meaning |
+|---|---|
+| within a few percent | readahead already overlaps the hash. The prize is ~0, `--verify-workers 1` is as good as 2, and nothing needs changing. |
+| `md5sum` ~15% slower | the read and the hash really are serialised. ~8 minutes per 279 GiB verify is available, and 2 workers is the right default. |
+| `md5sum` ≫ 15% slower | something other than md5 is in the way (Python-level copying, a small block size). Worth a look before accepting the verify cost as inherent. |
+
+If you want the answer for the real code path rather than `dd`, sweep `--verify-workers`
+— it exists to re-measure this balance, not to tune a run, and it **must not change the
+ETag**, only the time taken to produce it. That needs a source and a digest, so it belongs
+with §6.5a rather than here; the block is at the end of that section.
+
 ### 4.2 Disk conversion — off the critical path, but here is what it would tell you
 
 **Optional.** The arithmetic bounds the prize below the complexity cost whatever the
@@ -1800,6 +1854,33 @@ machine vanishing with dirty pages unwritten. That is the punch-hole run, it ref
 111.81 MiB, and it is **unchanged** by batching — roughly 4× the delalloc delta. If the
 goal is reducing what a preemption costs, that is the number to attack, and batch size is
 not the lever.
+
+#### §4.1d's hashing question, against the real code path
+
+The benchmark's own ETag re-read roughly doubles the wall time of every setting, and
+§4.1d bounds the prize from threading it at ~15%. This asks the same question of the
+actual implementation rather than `dd`. `$PRESIGNED_URL` and `$PREFIX_MD5` are both
+defined by now, which is why it lives here:
+
+```bash
+for W in 1 2 4; do
+  echo "--- verify-workers $W"
+  pdl sweep --url "$PRESIGNED_URL" --prefix --size "$PREFIX" \
+            --md5 "$PREFIX_MD5" \
+            --dest-dir /mnt/rwdisks/$DISK --connections 16 --verify-workers $W \
+            --json /tmp/vw-$W.json
+done
+```
+
+`--md5` is not optional here. Without a digest the verify phase hashes nothing and every
+row reports 0.0s — the §6.2 trap, where `verify 0.0s` meant "no verification happened",
+not "verification is free". A sweep of `--verify-workers` against no digest would produce
+three identical zeros and look like a clean negative result.
+
+Read the `verify` phase, not the throughput: `--verify-workers` cannot touch the download.
+If all three are within a few percent, readahead was already overlapping the hash and
+`VERIFY_READ_WORKERS` could as well be 1. The hash itself must be identical at every
+width; if it is not, stop — that is a correctness bug in the hasher, not a tuning result.
 
 #### Before the full-size run: re-copy the harness
 
