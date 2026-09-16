@@ -1820,18 +1820,40 @@ stderr is now drained on its own thread, and a progress line is echoed at most o
 five minutes so a multi-hour run is distinguishable from a wedged one. **Re-copy both
 scripts (the block at the top of this section) before the full-size run.**
 
-Also clear the stale destination first. The overnight run left a 279 GiB file behind and
-the disk was at 89% (`273G used, 38G avail` of 310G); without this the re-run hits ENOSPC
-and sits in `_await_space`:
+Also decide what to do with the stale destination first. The overnight run left ~278 GiB
+on disk — `alloc` was 542276216 × 512B blocks against a 299481061742-byte object, so it
+was **~97% complete** when the harness wedged. `pdl sweep` unlinks `bench.<conns>.bin` and
+its `.k9pdl.*` sidecars before each setting, so there is no ENOSPC risk, but there is also
+**no way to resume through `sweep`** — it will throw those bytes away and re-pay the full
+279 GiB of egress.
+
+`parallel_download.py` was not changed by the harness fix, so that file and its sidecar
+manifest are still valid. Finishing the tail directly costs ~2 GiB instead of 279 GiB and
+answers the two questions that do not need a clean timing — does `verify` stay at 0.0s,
+and does the hash match:
 
 ```bash
-sudo docker exec slurm sh -c '
-  rm -f /mnt/rwdisks/'"$DISK"'/bench.16.bin /mnt/rwdisks/'"$DISK"'/.bench.16.bin.k9pdl.*
-  df -h /mnt/rwdisks/'"$DISK"' | tail -1'
+sudo docker exec slurm python3 /tmp/pdl/parallel_download.py \
+  --url "" --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+  --s3-extra-args="--endpoint-url $S3_ENDPOINT" \
+  --dest /mnt/rwdisks/$DISK/bench.16.bin \
+  --size 299481061742 --connections 16 --min-chunk $((64 * 1024 * 1024)) \
+  --check-etag 2872df08129ad09ead7eb25839421345-9849 --part-length 30408704
 ```
 
+That run is **not** a throughput measurement — it starts 97% done. It is a free check that
+the deferred writer's part digests survived a SIGKILL, which is exactly the failure mode
+the full-size run is meant to rule out. Do it before the timed sweep, which will delete
+the file regardless.
+
 Note that `pkill -f benchmark_localization.py` does **not** kill the downloader it spawned
-— that is `python3 .../parallel_download.py` and has to be matched separately.
+— that is `python3 .../parallel_download.py` and has to be matched separately. Check for
+both before starting anything:
+
+```bash
+sudo docker exec slurm sh -c \
+  'ps -eo pid,etime,args | grep -E "[p]arallel_download|[b]enchmark_localization"'
+```
 
 Finally the full-size run, the number the target is judged against:
 
