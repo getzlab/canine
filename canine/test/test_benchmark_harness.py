@@ -1736,6 +1736,14 @@ class TestAChattyDownloadIsNotADeadlock:
     indistinguishable from a wedged source, and cost an overnight 279 GiB run.
     """
 
+    def drain(self, payload, **kw):
+        read, write = os.pipe()
+        os.write(write, payload)
+        os.close(write)
+        sink, out = [], io.StringIO()
+        bench._drain_stderr(os.fdopen(read, "rb"), sink, out=out, **kw)
+        return sink, out.getvalue()
+
     def chatty(self, tmp_path, lines, width=70):
         """A stand-in downloader that floods stderr, then writes the destination."""
         script = tmp_path / "chatty.py"
@@ -1812,30 +1820,132 @@ class TestAChattyDownloadIsNotADeadlock:
     def test_a_long_run_emits_a_heartbeat(self):
         """
         The other half of the defect: `pdl sweep` printed nothing between the header and
-        the result row, so a slow run and a hung one looked identical for hours. Only
-        progress lines are echoed, so the heartbeat cannot itself become the wall of
-        output it is reading -- and nothing is filtered out of the capture.
+        the result row, so a slow run and a hung one looked the same for hours. Progress
+        lines are echoed on a slow clock so the heartbeat cannot become the wall of output
+        it is reading.
         """
-        read, write = os.pipe()
-        os.write(write, b"[k9pdl] 1.0% (1/100 bytes)\n"
-                        b"[k9pdl] chunk 3: retrying in 1.0s\n"
-                        b"[k9pdl] 2.0% (2/100 bytes)\n")
-        os.close(write)
-        sink, out = [], io.StringIO()
-        bench._drain_stderr(os.fdopen(read, "rb"), sink, echo_every=0.0001, out=out)
+        sink, out = self.drain(
+            b"[k9pdl] 1.0% (1/100 bytes, 1 transferred)\n"
+            b"[k9pdl] chunk 3: fetched\n"
+            b"[k9pdl] 2.0% (2/100 bytes, 2 transferred)\n", echo_every=0.0001)
 
-        assert len(sink) == 3, sink
-        echoed = out.getvalue()
-        assert "1.0% (1/100 bytes" in echoed, echoed
-        assert "retrying" not in echoed, echoed
+        assert len(sink) == 3, sink                        # nothing dropped from capture
+        assert "1.0% (1/100 bytes" in out, out
+        assert "chunk 3: fetched" not in out, out          # not a progress line
 
     def test_the_heartbeat_is_rate_limited(self):
-        read, write = os.pipe()
-        os.write(write, b"".join(
-            b"[k9pdl] %d.0%% (%d/100 bytes)\n" % (i, i) for i in range(50)))
-        os.close(write)
-        sink, out = [], io.StringIO()
-        bench._drain_stderr(os.fdopen(read, "rb"), sink, echo_every=3600, out=out)
+        sink, out = self.drain(b"".join(
+            b"[k9pdl] %d.0%% (%d/100 bytes, %d transferred)\n" % (i, i, i)
+            for i in range(50)), echo_every=3600)
 
         assert len(sink) == 50
-        assert len(out.getvalue().splitlines()) <= 1, out.getvalue()
+        assert len(out.splitlines()) <= 1, out
+
+
+class TestAStallSaysWhyItStalled:
+    """
+    SECOND-ORDER INSTRUMENTATION DEFECT, found by the fix for the first one.
+
+    The heartbeat above proved the pipe was being read. It did not say why a run stalled
+    at 96%, because the downloader's two stall messages -- `retrying in Xs` and `ENOSPC,
+    waiting Ns` -- are not progress lines, and progress lines were the only thing echoed.
+    The filter excluded exactly the lines that explain a stall, so the operator was left
+    where they started: stat the file from another shell and guess.
+
+    Worse, the S3 path discards the underlying error (`S3ApiSource.open_range` runs `aws`
+    with stderr=DEVNULL), so a credential expiry or a 403 surfaces only as a retry count.
+    Echoing the retry line is the only in-band signal that anything is wrong at all.
+    """
+
+    def drain(self, payload, **kw):
+        read, write = os.pipe()
+        os.write(write, payload)
+        os.close(write)
+        sink, out = [], io.StringIO()
+        bench._drain_stderr(os.fdopen(read, "rb"), sink, out=out, **kw)
+        return sink, out.getvalue()
+
+    def test_a_retry_is_echoed_without_waiting_for_the_heartbeat(self):
+        """
+        The whole point: a stall must be explained on a clock much shorter than the
+        five-minute heartbeat, or the explanation arrives after the operator has already
+        killed the run.
+        """
+        sink, out = self.drain(
+            b"[k9pdl] chunk 7: HTTP 403 -- retrying in 4.0s (attempt 2/8)\n",
+            echo_every=3600, stall_every=3600)
+
+        assert "retrying in 4.0s" in out, out
+        assert len(sink) == 1
+
+    def test_enospc_is_echoed(self):
+        sink, out = self.drain(
+            b"[k9pdl] chunk 12: ENOSPC, waiting 8s for the disk to grow\n",
+            echo_every=3600, stall_every=3600)
+        assert "ENOSPC" in out, out
+
+    def test_a_retry_storm_reads_as_a_storm(self):
+        """
+        Rate-limited like the heartbeat, or a failing endpoint buries the terminal. But
+        the suppressed count has to travel with it: one echoed retry line looks like one
+        unlucky chunk, which is a completely different diagnosis from a dead credential.
+        """
+        sink, out = self.drain(b"".join(
+            b"[k9pdl] chunk %d: retrying in 1.0s (attempt 2/8)\n" % i
+            for i in range(200)), echo_every=3600, stall_every=3600)
+
+        assert len(sink) == 200
+        assert len(out.splitlines()) == 2, out
+        assert "[+199 more suppressed]" in out, out
+
+    def test_the_suppressed_count_survives_the_stream_ending(self):
+        """
+        The count is carried to the next echo, and at EOF there is no next echo. A storm
+        that ends -- which is what a failing run looks like -- would otherwise report its
+        first line and nothing else, reading as one unlucky chunk.
+        """
+        sink, out = self.drain(
+            b"[k9pdl] chunk 1: retrying in 1.0s (attempt 2/8)\n"
+            b"[k9pdl] chunk 2: retrying in 1.0s (attempt 3/8)\n",
+            echo_every=3600, stall_every=3600)
+
+        assert len(sink) == 2
+        assert "[+1 more suppressed]" in out, out
+
+    def test_stalls_and_progress_keep_separate_clocks(self):
+        """
+        A stall must not be starved by a recent heartbeat, nor vice versa. Sharing one
+        clock would mean a progress line 4 minutes ago silences the retry explaining why
+        there will not be another one.
+        """
+        sink, out = self.drain(
+            b"[k9pdl] 96.0% (96/100 bytes, 96 transferred)\n"
+            b"[k9pdl] chunk 7: retrying in 4.0s (attempt 2/8)\n",
+            echo_every=3600, stall_every=3600)
+
+        assert "96.0%" in out, out
+        assert "retrying in 4.0s" in out, out
+
+    def test_the_guard_fails_if_stalls_go_back_through_the_heartbeat_filter(self):
+        """
+        Mutation check. The defect was a filter that let only progress lines through, so
+        reproduce exactly that -- one clock, `% (` required -- and confirm the retry is
+        lost. Without this the tests above would still pass against a build that echoed
+        everything unconditionally, which is a different bug.
+        """
+        payload = (b"[k9pdl] 96.0% (96/100 bytes, 96 transferred)\n"
+                   b"[k9pdl] chunk 7: retrying in 4.0s (attempt 2/8)\n")
+        echoed = []
+        last = [0.0]
+        for raw in payload.splitlines():
+            line = raw.decode()
+            if time.time() - last[0] < 3600:
+                continue
+            if "% (" not in line:
+                continue
+            last[0] = time.time()
+            echoed.append(line)
+
+        assert not any("retrying" in line for line in echoed), (
+            "the old single-clock progress-only filter echoed a retry line, so the "
+            "defect being guarded against cannot be reproduced and the guard is vacuous")

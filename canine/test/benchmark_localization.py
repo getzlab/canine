@@ -927,39 +927,77 @@ def header_args(args):
 
 
 HEARTBEAT_INTERVAL = 300
+STALL_ECHO_INTERVAL = 30
+
+# Lines that explain why progress has stopped. A stall shows up as the percentage not
+# moving between heartbeats, and at that point the only question worth answering is which
+# of these is happening -- so they are echoed on their own, much shorter, clock.
+#
+# Both of the downloader's stall messages are here. ENOSPC waits in a bounded loop
+# (ENOSPC_MAX_WAIT, 600s) and retries back off exponentially, so neither is a hang, but
+# from outside they are indistinguishable from one without the text.
+STALL_MARKERS = ("retrying in", "ENOSPC", "falling back", "Traceback")
 
 
-def _drain_stderr(stream, sink, echo_every=HEARTBEAT_INTERVAL, out=None):
+def _drain_stderr(stream, sink, echo_every=HEARTBEAT_INTERVAL, out=None,
+                  stall_every=STALL_ECHO_INTERVAL):
     """
-    Read the child's stderr to EOF, keeping every byte and echoing a progress line
-    occasionally.
+    Read the child's stderr to EOF, keeping every byte and echoing enough of it to tell a
+    slow run from a stopped one.
 
-    Two jobs, both learned the hard way. Reading continuously is what stops the 64 KiB
-    pipe filling and deadlocking a long run (see run_download). Echoing is what makes a
-    long run distinguishable from a hung one: `pdl sweep` printed nothing between the
-    header and the result row, so a 279 GiB run and a wedged downloader looked identical
-    for hours, and the only way to tell them apart was to stat the destination from
-    another shell.
+    Three jobs, all learned the hard way. Reading continuously is what stops the 64 KiB
+    pipe filling and deadlocking a long run (see run_download). Echoing a progress line is
+    what makes a long run distinguishable from a hung one: `pdl sweep` printed nothing
+    between the header and the result row, so a 279 GiB run and a wedged downloader looked
+    identical for hours, and the only way to tell them apart was to stat the destination
+    from another shell.
 
-    Only progress lines are echoed, at most one per `echo_every` seconds, so the heartbeat
-    cannot itself become a wall of output. Everything is still captured in full for the
-    parser -- the echo is a view, never a filter.
+    The third exists because the first version of this function had the first two and was
+    still not enough. A run stalled at 96%; the heartbeat proved the pipe was being read,
+    and then said nothing about why the percentage had stopped moving -- because retries
+    and ENOSPC are not progress lines, and progress lines were all it echoed. The two
+    messages that explain a stall were precisely the two it filtered out. So stall markers
+    get their own, shorter clock, with the suppressed count carried along so a retry storm
+    reads as a storm rather than as one unlucky chunk.
+
+    Everything is still captured in full for the parser -- the echo is a view, never a
+    filter.
     """
     out = out or sys.stderr
     last_echo = 0.0
+    last_stall = 0.0
+    suppressed = 0
+
+    def emit(line, extra=""):
+        out.write("        ... {}{}\n".format(line, extra))
+        out.flush()
+
     for raw in iter(stream.readline, b""):
         sink.append(raw)
         if not echo_every:
             continue
         now = time.time()
+        line = raw.decode("utf-8", "replace").rstrip()
+
+        if any(marker in line for marker in STALL_MARKERS):
+            if now - last_stall < stall_every:
+                suppressed += 1
+                continue
+            last_stall = now
+            emit(line, " [+{} more suppressed]".format(suppressed) if suppressed else "")
+            suppressed = 0
+            continue
+
         if now - last_echo < echo_every:
             continue
-        line = raw.decode("utf-8", "replace").rstrip()
         if "% (" not in line:      # the Progress line; anything else is not a heartbeat
             continue
         last_echo = now
-        out.write("        ... {}\n".format(line))
-        out.flush()
+        emit(line)
+    if suppressed:
+        # Flush at EOF, or a storm that ends -- which is what a failing run looks like --
+        # reports only its first line and reads as one unlucky chunk.
+        emit("[+{} more suppressed]".format(suppressed))
     try:
         stream.close()
     except (IOError, OSError):
