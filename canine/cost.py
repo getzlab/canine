@@ -16,6 +16,7 @@ same NFS mount wolF/canine already use. Nothing in this module writes to either.
 import http.client
 import json
 import os
+import re
 import threading
 import time
 
@@ -61,6 +62,34 @@ def load_node_types(path = None):
     return node_types.astype({"cpus": int, "realmemory": float}).set_index("type")[["cpus", "realmemory"]]
 
 
+def canonical_machine_type(machine_type, node_types):
+    """
+    host_LuT.pickle's "machine_type" column is actually a Slurm partition label
+    (see provision_server.py's `partition1`), not a bare GCE machine type:
+    non-preemptible nodes get a "-nonp" suffix, and GPU nodes get a further
+    "-{accelerator_count}-{accelerator_type}" suffix -- either, both, or
+    neither may be present. host_LuT already tracks preemptibility correctly
+    in its own separate "preemptible" column, so this only needs to recover
+    the bare type for a node_types lookup, not re-derive preemptibility from
+    the suffix.
+
+    Matches against node_types' own (small, known) vocabulary of base type
+    strings, rather than blindly splitting on "-", since accelerator_type
+    names (e.g. "nvidia-tesla-t4") themselves contain hyphens and would make a
+    positional split ambiguous.
+
+    Returns `machine_type` unchanged if it's already a bare type, or if no
+    known base type matches -- callers' existing "not in node_types.index"
+    handling covers that case the same as before this normalization existed.
+    """
+    if machine_type in node_types.index:
+        return machine_type
+    for base in node_types.index:
+        if re.fullmatch(re.escape(base) + r"(-nonp)?(-\d+-.+)?", machine_type):
+            return base
+    return machine_type
+
+
 def node_capacity(node_name, host_lut, node_types):
     """
     Returns (vcpus, mem_mb) for a node, or (None, None) if the node isn't in
@@ -69,7 +98,7 @@ def node_capacity(node_name, host_lut, node_types):
     """
     if node_name not in host_lut.index:
         return None, None
-    machine_type = host_lut.loc[node_name, "machine_type"]
+    machine_type = canonical_machine_type(host_lut.loc[node_name, "machine_type"], node_types)
     if machine_type not in node_types.index:
         return None, None
     row = node_types.loc[machine_type]
@@ -451,6 +480,7 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
     threads that can finish concurrently.
     """
     node_types = load_node_types() if node_types is None else node_types
+    machine_type = canonical_machine_type(machine_type, node_types)
     if machine_type not in node_types.index:
         return None
 

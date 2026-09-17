@@ -194,6 +194,52 @@ class TestNodeCapacity:
         host_lut = pd.DataFrame({"machine_type": ["unknown-type"]}, index = pd.Index(["worker1"]))
         assert cost.node_capacity("worker1", host_lut, self.node_types) == (None, None)
 
+    def test_nonpreemptible_partition_label_suffix_is_recognized(self):
+        # provision_server.py stores the Slurm partition label (not the bare GCE
+        # machine type) in host_LuT's "machine_type" column -- non-preemptible
+        # nodes get a "-nonp" suffix appended. Confirmed live on wolf2-east-slw:
+        # every non-preemptible node's capacity lookup silently failed and
+        # contributed $0 to cost estimation before this was handled.
+        host_lut = pd.DataFrame(
+          {"machine_type": ["n1-highcpu-8-nonp"], "preemptible": [False]},
+          index = pd.Index(["worker5101"], name = "idx"),
+        )
+        assert cost.node_capacity("worker5101", host_lut, self.node_types) == (8, 7000.0)
+
+    def test_nonpreemptible_gpu_partition_label_suffix_is_recognized(self):
+        # non-preemptible GPU nodes get both suffixes: "-nonp-{count}-{accel_type}".
+        # accelerator_type names (e.g. "nvidia-tesla-t4") themselves contain
+        # hyphens, so this specifically exercises that the match isn't done by
+        # blindly splitting on "-".
+        host_lut = pd.DataFrame(
+          {"machine_type": ["n1-highcpu-8-nonp-1-nvidia-tesla-t4"], "preemptible": [False]},
+          index = pd.Index(["worker9001"], name = "idx"),
+        )
+        assert cost.node_capacity("worker9001", host_lut, self.node_types) == (8, 7000.0)
+
+
+class TestCanonicalMachineType:
+    def setup_method(self):
+        self.node_types = pd.DataFrame(
+          {"cpus": [8], "realmemory": [7000.0]},
+          index = pd.Index(["n1-highcpu-8"], name = "type"),
+        )
+
+    def test_bare_type_returned_unchanged(self):
+        assert cost.canonical_machine_type("n1-highcpu-8", self.node_types) == "n1-highcpu-8"
+
+    def test_nonp_suffix_stripped(self):
+        assert cost.canonical_machine_type("n1-highcpu-8-nonp", self.node_types) == "n1-highcpu-8"
+
+    def test_preemptible_gpu_suffix_stripped_without_nonp(self):
+        assert cost.canonical_machine_type("n1-highcpu-8-1-nvidia-tesla-t4", self.node_types) == "n1-highcpu-8"
+
+    def test_nonpreemptible_gpu_suffix_stripped(self):
+        assert cost.canonical_machine_type("n1-highcpu-8-nonp-1-nvidia-tesla-t4", self.node_types) == "n1-highcpu-8"
+
+    def test_unrecognized_type_returned_unchanged(self):
+        assert cost.canonical_machine_type("totally-unknown-type", self.node_types) == "totally-unknown-type"
+
 
 # ---------------------------------------------------------------------------
 # Catalog API SKU matching (synthetic fixtures -- no live network access)
@@ -296,6 +342,22 @@ class TestGetPrice:
         with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
              patch("canine.cost.get_billing_client") as mock_client:
             result = cost.get_price("n1-highcpu-8", "us-central1-a", False, node_types=self.node_types)
+        assert result == 1.23
+        mock_client.assert_not_called()
+
+    def test_nonp_partition_label_hits_same_cache_entry_as_bare_type(self, tmp_path):
+        # host_LuT.pickle passes the raw partition label (e.g. "n1-highcpu-8-nonp")
+        # as machine_type for non-preemptible nodes -- this must resolve to the
+        # same cached price as the bare type, not miss the cache (or the API)
+        # entirely. Confirmed live: before this normalization, get_price()'s own
+        # "machine_type not in node_types.index" check rejected every
+        # non-preemptible node outright.
+        cache_path = tmp_path / "price_cache.json"
+        key = cost._price_cache_key("n1-highcpu-8", "us-central1-a", False, None, 0)
+        cache_path.write_text(json.dumps({key: 1.23}))
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client") as mock_client:
+            result = cost.get_price("n1-highcpu-8-nonp", "us-central1-a", False, node_types=self.node_types)
         assert result == 1.23
         mock_client.assert_not_called()
 
