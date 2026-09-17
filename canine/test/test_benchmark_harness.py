@@ -14,6 +14,7 @@ import io
 import inspect
 import importlib.util
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -2198,3 +2199,61 @@ class TestThePrefixWorksOnTheS3ApiPathToo:
         args.object_size = 12345
         bench.resolve_source(args)
         assert args.object_size == 12345
+
+
+class TestTheRunbookDoesNotHardcodeADigestItCannotKeepCurrent:
+    """
+    The runbook tells the operator to compare the node's copy of a script against the
+    workstation's, which is self-updating and therefore always right. A literal md5 written
+    into the prose is not: the next commit to either script invalidates it, and the
+    instruction it supports -- "if the digest differs you are running stale code" -- then
+    reports the CORRECT file as stale and sends the operator to re-copy a script that was
+    already current.
+
+    That inverts the check, which is worse than not having one. This is the same shape as
+    the defects §6.5a records: something that reads as verification while telling you the
+    opposite of the truth. I wrote such a literal into §6.5b and removed it; this keeps it
+    from coming back.
+    """
+
+    RUNBOOK = os.path.join(os.path.dirname(__file__), "BENCHMARK_RUNBOOK.md")
+    HEX32 = re.compile(r"\b[0-9a-f]{32}\b")
+
+    def digests_of_tracked_scripts(self):
+        here = os.path.dirname(__file__)
+        paths = [os.path.join(here, "benchmark_localization.py"),
+                 os.path.join(here, os.pardir, "localization", "parallel_download.py")]
+        out = {}
+        for p in paths:
+            with open(p, "rb") as fh:
+                out[hashlib.md5(fh.read()).hexdigest()] = os.path.basename(p)
+        return out
+
+    def test_no_literal_matches_a_script_we_ship(self):
+        """
+        A literal that matches TODAY is the dangerous case: it looks authoritative and
+        will silently stop being true. Literals that never matched anything (object ETags,
+        the --md5 of a test object) are data, not claims about our source, so they are
+        left alone.
+        """
+        with open(self.RUNBOOK) as fh:
+            text = fh.read()
+        current = self.digests_of_tracked_scripts()
+        found = {h: current[h] for h in self.HEX32.findall(text) if h in current}
+        assert not found, (
+            "BENCHMARK_RUNBOOK.md hardcodes the current md5 of {}. It will go stale on the "
+            "next commit and then tell the operator the right file is the wrong one. Refer "
+            "to the workstation/node md5sum comparison instead.".format(
+                ", ".join(sorted(found.values()))))
+
+    def test_the_self_updating_comparison_is_still_there(self):
+        """
+        The other half: it is only safe to ban the literal because a comparison that
+        cannot go stale exists. If someone deletes that, the ban above leaves no check at
+        all and this suite would still be green.
+        """
+        with open(self.RUNBOOK) as fh:
+            text = fh.read()
+        assert text.count("md5sum /tmp/pdl/benchmark_localization.py") >= 2, (
+            "the node-vs-workstation md5sum comparison is what replaces a hardcoded "
+            "digest; without it there is no staleness check anywhere")

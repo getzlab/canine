@@ -1956,6 +1956,79 @@ well short of that. Three things to record:
   M re-read` line says which.
 * hash ok against `2872df08…-9849`, the same multipart ETag the pre-fix run matched.
 
+### 6.5b HTTP vs the S3 API, at prefix size
+
+This is the one measurement that decides whether the project meets its target, and after
+the `--prefix` fix it costs about four minutes.
+
+The full-size run above reached **49.04 MiB/s** with 15.47 of 16 streams busy — **3.17
+MiB/s per stream**. The 4 GiB presigned run reached 78.59 MiB/s with 5.32 streams busy —
+**14.77 MiB/s per stream**, 4.6× better. Two explanations fit the same numbers:
+
+* **the transport.** `S3ApiSource` shells out to `aws s3api get-object` per chunk, with no
+  connection pooling — every chunk pays TCP and TLS setup. `HttpSource` holds its
+  connections open.
+* **the object, or the size.** The presigned run fetched the first 4 GiB; the S3 run
+  fetched all 279 GiB. A prefix sits in whatever the store caches; the tail does not.
+
+Per-stream throughput cannot separate those, because the two runs differed in *both*
+transport and extent. The A/B below holds the object, the extent and the destination fixed
+and changes only the transport, which is the only way to attribute the 4.6×.
+
+Both rows fetch the same 4 GiB prefix, so `--md5 "$PREFIX_MD5"` from §6.5 verifies both.
+Without a digest, `verify` reports 0.0s because it hashed nothing — the §6.2 trap.
+
+```bash
+# S3 API path -- the one the full-size run measured
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --prefix --size "$PREFIX" --md5 "$PREFIX_MD5" \
+          --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+          --json /tmp/ab-s3api.json
+
+# presigned HTTP path, same bytes of the same object
+pdl sweep --url "$PRESIGNED_URL" \
+          --prefix --size "$PREFIX" --md5 "$PREFIX_MD5" \
+          --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+          --json /tmp/ab-http.json
+```
+
+**Check the `streams` line on the S3 row before reading anything else.** `--prefix` was
+silently ignored on the S3 path until the fix above: `probe_range` compared the object's
+full 279 GiB against `--size`, decided Range was not honoured, and ran a single stream
+while the header still said 16. If the S3 row reports ~1.0 of 16 concurrent, the node is
+running a stale harness — re-copy both scripts with §6.5a's block and confirm the node's
+md5s match the workstation's, then start over. Every other number on that row would look
+like a healthy transfer, because it is one; only `streams` gives it away.
+
+What the result means:
+
+* **HTTP much faster at the same extent** — the transport is the cause, and the fix is
+  connection reuse in `S3ApiSource` (or routing S3 through presigned URLs). The target is
+  reachable: 78.59 MiB/s is already ~3.7× the 21 MB/s baseline.
+* **both around 49 MiB/s** — the transport is exonerated and the earlier 78.59 was a
+  caching artifact of the prefix. The ceiling is the store, and no client-side change
+  reaches 4×. Say so plainly rather than tuning against it.
+* **both around 79 MiB/s** — the extent is what matters, not the transport, and the
+  full-size number is bounded by something that only appears deep into the object. Neither
+  A/B row would show it; that needs the full-size presigned run in §6.4.
+
+Egress is free on this object, so the full-size presigned run is also affordable if the
+prefix A/B comes out ambiguous. Use §6.4's combined form — passing both `--url` and the
+S3 coordinates keeps ETag verification while transferring over HTTP:
+
+```bash
+pdl sweep --url "$PRESIGNED_URL" \
+          --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+          --json /tmp/direct-300g-http.json
+```
+
+Mint the URL with `--expires-in 43200`: at 49 MiB/s the run is ~98 minutes, and a URL that
+expires mid-transfer surfaces only as a retry count, because `S3ApiSource` sends its
+child's stderr to `DEVNULL`.
+
 ### 6.6 the bucket-compose route against real GCS
 
 The bucket-compose route has never touched real infrastructure — not the auth path, not
