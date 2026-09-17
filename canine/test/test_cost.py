@@ -300,6 +300,62 @@ class TestMatchComputeEnginePrice:
         skus = [make_sku("N1 Predefined Instance Core running in Americas", "us-central1")]
         assert cost.match_compute_engine_price(skus, "n1-highcpu-8", "us-central1", preemptible=False) is None
 
+    def test_n2_family_does_not_match_n2d_skus(self):
+        # "N2" is a literal substring of "N2D" -- confirm the word-boundary match
+        # doesn't let an n2-* lookup pick up N2D's (differently-priced) SKUs.
+        skus = [
+          make_sku("N2D Predefined Instance Core running in Americas", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N2D Predefined Instance Ram running in Americas", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N2 Predefined Instance Core running in Americas", "us-central1", tiered_rate_usd=0.033174),
+          make_sku("N2 Predefined Instance Ram running in Americas", "us-central1", tiered_rate_usd=0.004446),
+        ]
+        result = cost.match_compute_engine_price(skus, "n2-standard-8", "us-central1", preemptible=False)
+        assert result == pytest.approx((0.033174, 0.004446))
+
+    def test_matches_on_demand_n4_with_no_predefined_wording(self):
+        # Confirmed via a live Cloud Billing Catalog API pull: N4's fixed-shape
+        # SKUs are described as plain "N4 Instance Core"/"N4 Instance Ram", with
+        # no "Predefined" anywhere -- unlike N1/N2/N2D/E2.
+        skus = [
+          make_sku("N4 Instance Core running in Netherlands", "us-central1", tiered_rate_usd=0.0387),
+          make_sku("N4 Instance Ram running in Netherlands", "us-central1", tiered_rate_usd=0.0052),
+        ]
+        result = cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=False)
+        assert result == pytest.approx((0.0387, 0.0052))
+
+    def test_matches_preemptible_n4(self):
+        skus = [
+          make_sku("Spot Preemptible N4 Instance Core running in Frankfurt", "us-central1", tiered_rate_usd=0.0116),
+          make_sku("Spot Preemptible N4 Instance Ram running in Frankfurt", "us-central1", tiered_rate_usd=0.0016),
+          make_sku("N4 Instance Core running in Frankfurt", "us-central1", tiered_rate_usd=0.0387),
+        ]
+        result = cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=True)
+        assert result == pytest.approx((0.0116, 0.0016))
+
+    def test_n4_excludes_custom_shape_skus(self):
+        skus = [
+          make_sku("N4 Custom Instance Core running in Virginia", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4 Custom Instance Ram running in Virginia", "us-central1", tiered_rate_usd=0.999),
+        ]
+        assert cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=False) is None
+
+    def test_n4_excludes_sole_tenancy_skus(self):
+        skus = [
+          make_sku("N4 Sole Tenancy Instance Core running in Santiago", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4 Sole Tenancy Instance Ram running in Santiago", "us-central1", tiered_rate_usd=0.999),
+        ]
+        assert cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=False) is None
+
+    def test_n4_family_does_not_match_n4a_or_n4d_skus(self):
+        # "N4" is a literal substring of both "N4A" and "N4D".
+        skus = [
+          make_sku("N4A Instance Core running in London", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4A Instance Ram running in London", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4D Instance Core running in Zurich", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4D Instance Ram running in Zurich", "us-central1", tiered_rate_usd=0.999),
+        ]
+        assert cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=False) is None
+
 
 class TestMatchAcceleratorPrice:
     def test_matches_gpu_model(self):

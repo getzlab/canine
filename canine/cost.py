@@ -361,7 +361,23 @@ def _machine_family(machine_type):
     return machine_type.split("-", 1)[0]
 
 
-_FAMILY_SKU_WORD = {"n1": "N1", "n2": "N2", "n2d": "N2D", "e2": "E2"}
+# Maps our own machine-type family prefix to (Catalog API SKU family word, whether
+# that family's fixed-shape SKUs say "Predefined Instance" or just "Instance").
+# Confirmed via a live Catalog API pull (2026-09): N1/N2/N2D/E2 SKUs all use
+# "Predefined Instance Core"/"Predefined Instance Ram"; N4 dropped "Predefined"
+# entirely -- zero SKUs across the whole N4 family contain that word anywhere,
+# even for its non-custom shapes ("N4 Instance Core running in ...", not
+# "N4 Predefined Instance Core running in ..."). Families using the plain
+# "Instance" wording need "Custom"/"Sole Tenancy" excluded explicitly in
+# matches() below, since those SKUs also just say "... Instance Core"/"Ram"
+# with nothing else to rule them out the way "Predefined Instance" already does.
+_FAMILY_SKU_INFO = {
+    "n1":  ("N1",  True),
+    "n2":  ("N2",  True),
+    "n2d": ("N2D", True),
+    "e2":  ("E2",  True),
+    "n4":  ("N4",  False),
+}
 
 
 def _fetch_compute_engine_service_name(client):
@@ -415,9 +431,17 @@ def match_compute_engine_price(skus, machine_type, region, preemptible):
     against a real API response during live validation, not trusted from static
     review alone.
     """
-    family_word = _FAMILY_SKU_WORD.get(_machine_family(machine_type))
-    if family_word is None:
+    family_info = _FAMILY_SKU_INFO.get(_machine_family(machine_type))
+    if family_info is None:
         return None  # unrecognized family -- not enough info to match confidently
+    family_word, uses_predefined_wording = family_info
+    # word-boundary, not plain substring: "N2" is a literal substring of "N2D"
+    # (and "N4" of "N4A"/"N4D"), so a bare `family_word in desc` would also
+    # match a *different* family's SKUs whenever one family name prefixes
+    # another's -- \b relies on the SKU word immediately following the family
+    # word always being non-alphanumeric (a space, confirmed above), so it
+    # doesn't match inside "N2D"/"N4A"/"N4D" the way plain substring search would.
+    family_word_re = re.compile(r"\b" + re.escape(family_word) + r"\b")
 
     def matches(sku, resource_word):
         if sku.get("category", {}).get("resourceFamily") != "Compute":
@@ -428,7 +452,14 @@ def match_compute_engine_price(skus, machine_type, region, preemptible):
         is_preemptible_sku = "Preemptible" in desc or "Spot" in desc
         if is_preemptible_sku != bool(preemptible):
             return False
-        return family_word in desc and "Predefined Instance" in desc and resource_word in desc
+        if not family_word_re.search(desc):
+            return False
+        if uses_predefined_wording:
+            if "Predefined Instance" not in desc:
+                return False
+        elif "Instance" not in desc or "Custom" in desc or "Sole Tenancy" in desc:
+            return False
+        return resource_word in desc
 
     cpu_skus = [s for s in skus if matches(s, "Core")]
     ram_skus = [s for s in skus if matches(s, "Ram")]
