@@ -2123,3 +2123,78 @@ class TestTheParallelHasherAgreesWithTheSerialOne:
         finally:
             bench._part_digest = original
         assert got == self.reference(data, 1024)
+
+
+class TestThePrefixWorksOnTheS3ApiPathToo:
+    """
+    The --object-size flag was added because a prefix sweep over --url ran the same single
+    curl on every row while reporting 1/4/8/12/16 connections: probe_range compares the
+    server's Content-Range total against --size, sees the whole object, concludes Range is
+    not honoured and falls back. Nothing else looked wrong -- byte count, wire ratio and
+    throughput were all consistent with a healthy transfer, because it was one.
+
+    The fix was applied to the --url branch only. source_args returned early for
+    --s3-bucket/--s3-key, so --prefix was accepted and silently ignored on the S3 API
+    path, with the identical symptom and the identical invisibility. That made a cheap
+    prefix-sized A/B between HttpSource and S3ApiSource impossible: the S3 side would have
+    been a single stream, and the comparison would have looked like a catastrophic loss
+    for a path that had simply been switched off.
+    """
+
+    def args(self, *extra):
+        return bench.build_parser().parse_args(
+            ["sweep", "--s3-bucket", "b", "--s3-key", "k", "--size", "1024",
+             "--dest-dir", "/d"] + list(extra))
+
+    def test_the_size_is_forwarded_on_the_s3_path(self):
+        args = self.args("--prefix")
+        args.object_size = 299481061742
+        source = bench.source_args(args, "/d/f", 1024)
+        assert "--object-size" in source, source
+        assert source[source.index("--object-size") + 1] == "299481061742"
+
+    def test_nothing_is_forwarded_without_prefix(self):
+        args = self.args()
+        args.object_size = 299481061742
+        assert "--object-size" not in bench.source_args(args, "/d/f", 1024)
+
+    def test_the_s3_baseline_is_still_handed_in(self):
+        """
+        Unlike the URL path there is no URL to synthesize a curl from, so --legacy-cmd is
+        unconditional here. Losing it while rearranging the branch would silently turn the
+        connections=1 row into something other than the legacy baseline.
+        """
+        for args in (self.args(), self.args("--prefix")):
+            args.object_size = 299481061742
+            assert "--legacy-cmd" in bench.source_args(args, "/d/f", 1024)
+
+    def test_head_object_supplies_the_total_without_another_round_trip(self, monkeypatch):
+        """
+        The URL path pays an extra ranged GET for this. head-object has already reported
+        the whole object's length by the time resolve_source needs it, so the S3 path must
+        not repeat the probe -- and must not accidentally use the URL path's.
+        """
+        calls = []
+        monkeypatch.setattr(bench, "s3_object_metadata", lambda a: (
+            calls.append("head") or {"size": 299481061742, "etag": "x", "parts_count": 1,
+                                     "part_length": None}))
+        monkeypatch.setattr(bench, "url_object_size",
+                            lambda a: pytest.fail("the URL probe ran on the S3 path"))
+
+        args = self.args("--prefix", "--md5", "d41d8cd98f00b204e9800998ecf8427e")
+        size, _ = bench.resolve_source(args)
+
+        assert size == 1024                       # the PREFIX, not the object
+        # getattr, not attribute access: the parser never defines object_size, so a
+        # regression here raises AttributeError instead of reporting what was missing.
+        assert getattr(args, "object_size", None) == 299481061742   # for probe_range
+        assert calls == ["head"]
+
+    def test_an_explicit_object_size_is_not_overwritten(self, monkeypatch):
+        monkeypatch.setattr(bench, "s3_object_metadata",
+                            lambda a: {"size": 999, "etag": "x", "parts_count": 1,
+                                       "part_length": None})
+        args = self.args("--prefix", "--md5", "d41d8cd98f00b204e9800998ecf8427e")
+        args.object_size = 12345
+        bench.resolve_source(args)
+        assert args.object_size == 12345

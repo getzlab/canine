@@ -893,7 +893,29 @@ def source_args(args, dest, size):
     # and `probe` has no --url. Mixing direct access with getattr made it crash on one
     # shape while tolerating another.
     url = (getattr(args, "url", None) or "").strip()
+
+    def object_size_args():
+        """
+        The `--object-size` a prefix run needs, for EITHER source shape.
+
+        Shared rather than duplicated because duplicating it is exactly how it broke: the
+        S3 branch returned early with its own --legacy-cmd and never reached the --url
+        branch's --object-size, so --prefix was silently accepted and silently ignored.
+        probe_range then compared the whole object's length against the prefix, declared
+        the server broken, and dropped to a single stream -- so an S3 prefix sweep
+        measured one `aws` process per row while reporting 1/4/8/16 connections. That is
+        the same failure --object-size was added to fix on the URL path, and it looked
+        healthy at every other observable there too.
+        """
+        if not getattr(args, "prefix", False):
+            return []
+        total = getattr(args, "object_size", None)
+        return ["--object-size", str(total)] if total else []
+
     if getattr(args, "s3_bucket", None) and getattr(args, "s3_key", None) and not url:
+        # --legacy-cmd unconditionally here: there is no URL for the downloader to
+        # synthesize a curl from, so the connections=1 baseline has to be handed in.
+        # s3_legacy_command bounds its own range under --prefix.
         return ["--url", "",                      # empty: "presign produced nothing"
                 "--s3-bucket", args.s3_bucket,
                 "--s3-key", args.s3_key,
@@ -901,17 +923,15 @@ def source_args(args, dest, size):
                 # (e.g. "--no-sign-request"), and argparse treats such a token as an
                 # option unless it happens to contain a space.
                 "--s3-extra-args={}".format(s3_extra_args(args)),
-                "--legacy-cmd", s3_legacy_command(args, dest, size)] + header_args(args)
+                "--legacy-cmd", s3_legacy_command(args, dest, size),
+                ] + header_args(args) + object_size_args()
+
     base = ["--url", url] + header_args(args)
     if getattr(args, "prefix", False):
-        # otherwise the connections=1 row fetches the whole object, not `size` bytes
+        # Only under --prefix: otherwise the connections=1 row fetches the whole object
+        # rather than `size` bytes. Without --prefix the downloader synthesizes its own.
         base += ["--legacy-cmd", url_legacy_command(args, dest, size)]
-        # and without this the parallel rows are not parallel at all -- see
-        # url_object_size
-        total = getattr(args, "object_size", None)
-        if total:
-            base += ["--object-size", str(total)]
-    return base
+    return base + object_size_args()
 
 
 def header_args(args):
@@ -1535,6 +1555,12 @@ def resolve_source(args):
         meta = s3_object_metadata(args)
         if size is None:
             size = meta["size"]
+        if getattr(args, "prefix", False) and not getattr(args, "object_size", None):
+            # head-object already told us the whole object's length, so the prefix run
+            # gets --object-size for free -- no extra round trip, and none of the
+            # url_object_size probe's failure modes. Without it probe_range compares the
+            # full length against the prefix and drops every row to a single stream.
+            args.object_size = meta["size"]
         if verification is None and getattr(args, "prefix", False):
             # head-object describes the WHOLE object. Deriving from it under --prefix
             # gives the 279 GiB ETag at 9849 parts, which a 12 GiB prefix (424 parts)
