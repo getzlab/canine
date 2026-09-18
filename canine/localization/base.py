@@ -1930,13 +1930,18 @@ class AbstractLocalizer(abc.ABC):
               # then finds mountpoint -q already true once it gets the lock.
               # This only serializes that brief setup race, not any actual job
               # work -- once mounted, every shard reads from the same mount
-              # fully concurrently for the rest of its run. -w bounds the wait
-              # comfortably past the gcsfuse timeout below, so a shard can't
-              # hang forever behind one that's stuck. No shard ever holds
-              # CANINE_BUCKETMOUNT_MOUNTLOCK past this subshell, so a fresh
-              # shard's exclusive acquisition here only ever contends with
-              # other shards currently IN this same setup race, never with
-              # ones already past it and running their own job.
+              # fully concurrently for the rest of its run. No shard ever
+              # holds CANINE_BUCKETMOUNT_MOUNTLOCK past this subshell, so a
+              # fresh shard's exclusive acquisition here only ever contends
+              # with other shards currently IN this same setup race, never
+              # with ones already past it and running their own job -- and
+              # since the lock is scoped to this subshell's own fd, it's
+              # released automatically the instant the holder exits for any
+              # reason, including a crash or preemption, so there's no
+              # scenario where it's held forever by a dead process. -w is
+              # purely a defensive bound against a holder that's genuinely
+              # still alive but hung; it is NOT there to bound normal
+              # contention, so it errs generous rather than tight.
               #
               # Confirmed live: without this lock, several shards starting
               # together on one node raced to run gcsfuse on the identical
@@ -1945,9 +1950,16 @@ class AbstractLocalizer(abc.ABC):
               # the mount point: read-only file system" for all of them,
               # which has nothing to do with the mountpoint's real permissions
               # or a stale mount; it's what a racing concurrent mount attempt
-              # looks like from the losing side.
+              # looks like from the losing side. Also confirmed live: an
+              # earlier, tighter 90s bound was itself too tight -- one shard
+              # among just 8 contenders on one node still timed out waiting,
+              # even though another shard on the same node mounted the same
+              # bucket in under a second, moments earlier. flock gives no
+              # fairness guarantee among waiters, so real wait times under
+              # ordinary contention can run well past what a single mount's
+              # own duration would suggest.
               "(",
-              'flock -x -w 90 200 || { echo "ERROR: timed out waiting for bucketmount lock" >&2; exit 1; }',
+              'flock -x -w 300 200 || { echo "ERROR: timed out waiting for bucketmount lock" >&2; exit 1; }',
 
               # The mountpoint must be WRITABLE BY THE USER THAT RUNS gcsfuse.
               # fusermount3 refuses otherwise ("the user doesn't have

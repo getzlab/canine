@@ -330,7 +330,7 @@ Order matters, and each step exists because of a specific failure:
    `touch`/`chown`-to-the-same-owner are safe under unsynchronized concurrent execution, so this
    step itself needs no lock (`base.py:1919-1923`).
 
-2. **Acquire the mount-setup lock** (`flock -x -w 90 200 ... ) 200>$CANINE_BUCKETMOUNT_MOUNTLOCK`,
+2. **Acquire the mount-setup lock** (`flock -x -w 300 200 ... ) 200>$CANINE_BUCKETMOUNT_MOUNTLOCK`,
    wrapping steps 3-5 below). Shards of the same scatter job routinely start on the same node in
    the same instant; without serialization, several independently see "not mounted yet" and race
    to run `gcsfuse` on the identical path concurrently. Confirmed live: every racing shard failed,
@@ -342,6 +342,15 @@ Order matters, and each step exists because of a specific failure:
    long as *their* jobs take, not just this brief setup race. No shard holds
    `CANINE_BUCKETMOUNT_MOUNTLOCK` past this subshell, so contention is only ever with other shards
    currently in this same race (`base.py:1949-1950,2006`).
+
+   `-w` is a defensive bound against a holder that's genuinely hung, not a way to cap normal
+   contention — the lock is scoped to the holder's own subshell fd, so it's released automatically
+   the instant that process exits for any reason, including a crash or preemption, meaning there's
+   no scenario where it's stuck held forever. It errs generous (300s) rather than tight: an earlier
+   90s bound was itself confirmed live to be too short — one shard among just 8 contenders on one
+   node still timed out, even though a sibling shard on the same node mounted the same bucket in
+   under a second moments earlier. `flock` gives no fairness guarantee among waiters, so real wait
+   times under ordinary contention can run well past what any single mount's own duration suggests.
 
 3. **Clear a stale FUSE endpoint.** A job that finished on this node moments ago may have
    unmounted this same path. Every subsequent operation on it — `stat`, `mkdir`, even `flock` —
