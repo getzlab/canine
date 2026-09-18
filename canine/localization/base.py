@@ -1178,26 +1178,6 @@ class AbstractLocalizer(abc.ABC):
 
         mount_dir = "/mnt/localize/{}".format(bucket)
 
-        # Objects consumed through this bucket are always read via gcsfuse's
-        # bucket-mount, which serves every read as a ranged GET (fundamental to
-        # how FUSE does random-access reads). GCS's decompressive transcoding
-        # for a Content-Encoding: gzip object only applies to a full,
-        # non-ranged GET -- a ranged request gets the raw compressed bytes
-        # back instead, silently. `cp -r` (both "server_side"'s gs://-to-gs://
-        # rewrite and "copy"'s local-file upload) preserves whatever
-        # Content-Encoding the source already carries, so a source object that
-        # happens to be gzip-encoded (common for plain-text reference files
-        # like a .dict, uploaded that way somewhere upstream of wolF/canine
-        # entirely) silently produces an unreadable gcsfuse-mounted copy here.
-        # Confirmed live: a gzip-encoded reference .dict file's bucket-mounted
-        # symlink read back as raw gzip bytes (magic number 1f 8b) instead of
-        # its actual SAM-format text, which GATK reported as "Failed to load
-        # reference dictionary" with no indication the bytes themselves were
-        # never the problem. `cp`'s own --content-encoding flag sets metadata
-        # for a fresh upload but is not a reliable override for a server-side
-        # rewrite's copied metadata, so this clears it explicitly afterward,
-        # the same pattern already used below for the "mount" kind's
-        # --custom-time follow-up call.
         uploads = []
         for item in upload_plan:
             if item.kind == "server_side":
@@ -1205,17 +1185,69 @@ class AbstractLocalizer(abc.ABC):
                 # *source* may be requester-pays even though our bucket is not.
                 # A directory source is copied into its parent: `cp -r gs://a/d
                 # gs://B/k/d` would otherwise produce gs://B/k/d/d/...
-                dest = os.path.dirname(item.dest) + "/" if getattr(item.fh, "is_dir", False) else item.dest
-                uploads.append(
-                  '    gcloud storage cp -r -n{rp} --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
-                    rp = item.fh.rp_string,
-                    src = shlex.quote(item.fh.path),
-                    dst = shlex.quote(dest),
-                  )
+                is_dir = getattr(item.fh, "is_dir", False)
+                dest = os.path.dirname(item.dest) + "/" if is_dir else item.dest
+                plain_cp = '    gcloud storage cp -r -n{rp} --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
+                  rp = item.fh.rp_string, src = shlex.quote(item.fh.path), dst = shlex.quote(dest),
                 )
-                uploads.append(
-                  '    gcloud storage objects update -r --clear-content-encoding {dst} > /dev/null'.format(dst = shlex.quote(dest))
-                )
+                if is_dir:
+                    # Not handled below: checking/decompressing every object under
+                    # a directory source individually is real work with no known
+                    # need for it yet (every case found live has been a single
+                    # reference file, never a gzip-transport-encoded directory
+                    # tree) -- left as the original plain copy rather than a
+                    # speculative, unvalidated attempt at the recursive case.
+                    uploads.append(plain_cp)
+                else:
+                    # A gs:// source object can carry Content-Encoding: gzip as
+                    # transport metadata -- meaning it's meant to be served
+                    # transparently decompressed, the way a web server gzips an
+                    # HTML response in transit while the browser shows plain
+                    # text. `cp -r`'s server-side rewrite preserves that metadata
+                    # (and the still-compressed bytes) onto the destination
+                    # verbatim, unchanged.
+                    #
+                    # Every reader of this bucket -- gcsfuse's bucket-mount, and
+                    # confirmed live even `gcloud storage cat`/`gsutil cat`
+                    # directly -- gets the raw compressed bytes back rather than
+                    # the promised transparent decompression (GCS's own
+                    # decompressive transcoding does not reliably apply to these
+                    # client libraries' own downloads). A consumer with no
+                    # gzip-awareness of its own -- e.g. GATK opening a plain-text
+                    # reference .dict directly -- has no way to know it needs to
+                    # gunzip anything first. Confirmed live: exactly this,
+                    # reported by GATK as "Failed to load reference dictionary"
+                    # with nothing pointing at Content-Encoding as the cause.
+                    #
+                    # Merely clearing the Content-Encoding metadata afterward
+                    # (tried first, live) does not fix this -- it only removes
+                    # the tag that would have triggered transcoding for a
+                    # request that doesn't disable it, while the object's
+                    # physically stored bytes remain compressed regardless. The
+                    # only reliable fix is to materialize the actual decompressed
+                    # bytes here: download (always raw, per the above), gunzip,
+                    # and upload that as fresh content with no encoding tag at
+                    # all -- so nothing downstream has to guess.
+                    #
+                    # Cost: this trades a free server-side rewrite for a real
+                    # download+reupload through this VM, but only for the rare
+                    # object that actually carries this tag -- every ordinary
+                    # gs:// source (no Content-Encoding) still gets the fast
+                    # path below untouched.
+                    # rp_string on describe/cat too -- the source may be
+                    # requester-pays regardless of which branch is taken.
+                    uploads += [
+                      '    if [ "$(gcloud storage objects describe{rp} {src} --format="value(content_encoding)" 2>/dev/null)" == "gzip" ]; then'.format(
+                        rp = item.fh.rp_string, src = shlex.quote(item.fh.path)),
+                      '      CANINE_DECOMP_TMP=$(mktemp)',
+                      '      gcloud storage cat{rp} {src} | gunzip > "$CANINE_DECOMP_TMP"'.format(
+                        rp = item.fh.rp_string, src = shlex.quote(item.fh.path)),
+                      '      gcloud storage cp -n --custom-time="$CANINE_BUCKET_CT" "$CANINE_DECOMP_TMP" {dst}'.format(dst = shlex.quote(dest)),
+                      '      rm -f "$CANINE_DECOMP_TMP"',
+                      '    else',
+                      plain_cp,
+                      '    fi',
+                    ]
             elif item.kind == "copy":
                 # Already a file on the shared mount -- typically an upstream
                 # task's output. The worker uploads it from where it already
@@ -1229,15 +1261,17 @@ class AbstractLocalizer(abc.ABC):
                 # os.path.ismount says no). A worker that genuinely cannot read
                 # the file gets a precise "No such file or directory" from the
                 # cp below, which beats a heuristic that rejects valid inputs.
+                #
+                # No Content-Encoding concern here unlike "server_side" above:
+                # this uploads fresh bytes from a local/shared-mount file, not a
+                # server-side rewrite of an existing GCS object, so there's no
+                # pre-existing object metadata for `cp` to inherit.
                 dest = os.path.dirname(item.dest) + "/" if os.path.isdir(item.fh.path) else item.dest
                 uploads.append(
                   '    gcloud storage cp -r -n --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
                     src = shlex.quote(item.fh.path),
                     dst = shlex.quote(dest),
                   )
-                )
-                uploads.append(
-                  '    gcloud storage objects update -r --clear-content-encoding {dst} > /dev/null'.format(dst = shlex.quote(dest))
                 )
 
         # Sources with no server-side copy (s3://, drs://, GDC, http) have to be
