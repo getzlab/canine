@@ -1178,6 +1178,26 @@ class AbstractLocalizer(abc.ABC):
 
         mount_dir = "/mnt/localize/{}".format(bucket)
 
+        # Objects consumed through this bucket are always read via gcsfuse's
+        # bucket-mount, which serves every read as a ranged GET (fundamental to
+        # how FUSE does random-access reads). GCS's decompressive transcoding
+        # for a Content-Encoding: gzip object only applies to a full,
+        # non-ranged GET -- a ranged request gets the raw compressed bytes
+        # back instead, silently. `cp -r` (both "server_side"'s gs://-to-gs://
+        # rewrite and "copy"'s local-file upload) preserves whatever
+        # Content-Encoding the source already carries, so a source object that
+        # happens to be gzip-encoded (common for plain-text reference files
+        # like a .dict, uploaded that way somewhere upstream of wolF/canine
+        # entirely) silently produces an unreadable gcsfuse-mounted copy here.
+        # Confirmed live: a gzip-encoded reference .dict file's bucket-mounted
+        # symlink read back as raw gzip bytes (magic number 1f 8b) instead of
+        # its actual SAM-format text, which GATK reported as "Failed to load
+        # reference dictionary" with no indication the bytes themselves were
+        # never the problem. `cp`'s own --content-encoding flag sets metadata
+        # for a fresh upload but is not a reliable override for a server-side
+        # rewrite's copied metadata, so this clears it explicitly afterward,
+        # the same pattern already used below for the "mount" kind's
+        # --custom-time follow-up call.
         uploads = []
         for item in upload_plan:
             if item.kind == "server_side":
@@ -1192,6 +1212,9 @@ class AbstractLocalizer(abc.ABC):
                     src = shlex.quote(item.fh.path),
                     dst = shlex.quote(dest),
                   )
+                )
+                uploads.append(
+                  '    gcloud storage objects update -r --clear-content-encoding {dst} > /dev/null'.format(dst = shlex.quote(dest))
                 )
             elif item.kind == "copy":
                 # Already a file on the shared mount -- typically an upstream
@@ -1212,6 +1235,9 @@ class AbstractLocalizer(abc.ABC):
                     src = shlex.quote(item.fh.path),
                     dst = shlex.quote(dest),
                   )
+                )
+                uploads.append(
+                  '    gcloud storage objects update -r --clear-content-encoding {dst} > /dev/null'.format(dst = shlex.quote(dest))
                 )
 
         # Sources with no server-side copy (s3://, drs://, GDC, http) have to be

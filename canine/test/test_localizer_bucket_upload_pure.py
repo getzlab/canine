@@ -102,6 +102,37 @@ class TestCopyFlags:
         cp = [l for l in script_for([gs_item()]).splitlines() if "storage cp" in l][0]
         assert cp.rstrip().endswith("gs://wolf-1-us-central1-abc/inp/reads.bam")
 
+    def test_server_side_copy_clears_content_encoding_afterward(self):
+        """
+        `cp -r` (a gs://-to-gs:// rewrite) preserves the source object's own
+        Content-Encoding. gcsfuse's bucket-mount always reads via ranged GETs,
+        which bypass GCS's decompressive transcoding for a gzip-encoded object
+        -- confirmed live, a gzip-encoded reference .dict landed here still
+        gzip-encoded and read back as raw compressed bytes through the mount,
+        which GATK reported as "Failed to load reference dictionary" with no
+        hint the actual problem was Content-Encoding, not the file's content.
+        """
+        script = script_for([gs_item()])
+        lines = script.splitlines()
+        cp_idx = next(i for i, l in enumerate(lines) if "storage cp" in l)
+        update_line = lines[cp_idx + 1]
+        assert "storage objects update" in update_line
+        assert "--clear-content-encoding" in update_line
+        assert "gs://wolf-1-us-central1-abc/inp/reads.bam" in update_line
+
+    def test_local_copy_also_clears_content_encoding_afterward(self):
+        fh = MagicMock()
+        fh.path = "/mnt/nfs/workspace/ref.fa"
+        fh.localization_mode = "local"
+        item = UploadItem(fh=fh, dest="gs://b/reference/ref.fa", kind="copy")
+        script = "\n".join(make_localizer().bucket_upload_script([item], "gs://b", "us-central1"))
+        lines = script.splitlines()
+        cp_idx = next(i for i, l in enumerate(lines) if "storage cp" in l)
+        update_line = lines[cp_idx + 1]
+        assert "storage objects update" in update_line
+        assert "--clear-content-encoding" in update_line
+        assert "gs://b/reference/ref.fa" in update_line
+
 
 class TestBucketLifecycle:
 
