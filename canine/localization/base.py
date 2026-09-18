@@ -1893,6 +1893,62 @@ class AbstractLocalizer(abc.ABC):
 
               'echo "INFO: Mounting bucket ${CANINE_BUCKETMOUNT} ..." >&2',
 
+              # The busy-lock lives OUTSIDE the mount, as a plain file beside it.
+              # Locking the mountpoint directory itself (as this used to) puts the
+              # lock inside the very thing it protects: once any job unmounts,
+              # the fd is invalid and flock cannot even open the path, so the
+              # teardown guard silently stops guarding.
+              #
+              # Created (as root, since the parent dir may still be root-owned
+              # from a prior bucket's first mkdir) and handed to the invoking
+              # user here, before any locking, since these two lines are
+              # themselves safe under unsynchronized concurrent execution:
+              # `mkdir -p`/repeated `touch`/`chown`-to-the-same-owner are all
+              # idempotent no-ops when raced by multiple shards on the same
+              # node, so nothing below needs a lock held for them.
+              #
+              # CANINE_BUCKETMOUNT_MOUNTLOCK is a SEPARATE file from
+              # CANINE_BUCKETMOUNT_LOCK (below), not just a differently-named
+              # handle on the same one: CANINE_BUCKETMOUNT_LOCK is held
+              # shared, for a whole job's lifetime, by every shard already
+              # using this mount (`flock -os ... sleep infinity &`, further
+              # down) -- an exclusive lock on that same file would block a
+              # newly-starting shard behind every already-running shard on
+              # this node for as long as THEIR jobs take, not just the brief
+              # mount-setup race this is actually meant to serialize.
+              "sudo mkdir -p $(dirname ${CANINE_BUCKETMOUNT_DIR})",
+              "CANINE_BUCKETMOUNT_LOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).lock",
+              "sudo touch ${CANINE_BUCKETMOUNT_LOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_LOCK}",
+              "CANINE_BUCKETMOUNT_MOUNTLOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).mountlock",
+              "sudo touch ${CANINE_BUCKETMOUNT_MOUNTLOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_MOUNTLOCK}",
+
+              # Multiple shards of the same scatter job routinely start on the
+              # same node in the same instant, and each independently checks
+              # "is this already mounted?" -- everything from here through the
+              # gcsfuse invocation must run under this lock so only one shard
+              # ever actually mounts; every other shard just waits briefly here,
+              # then finds mountpoint -q already true once it gets the lock.
+              # This only serializes that brief setup race, not any actual job
+              # work -- once mounted, every shard reads from the same mount
+              # fully concurrently for the rest of its run. -w bounds the wait
+              # comfortably past the gcsfuse timeout below, so a shard can't
+              # hang forever behind one that's stuck. No shard ever holds
+              # CANINE_BUCKETMOUNT_MOUNTLOCK past this subshell, so a fresh
+              # shard's exclusive acquisition here only ever contends with
+              # other shards currently IN this same setup race, never with
+              # ones already past it and running their own job.
+              #
+              # Confirmed live: without this lock, several shards starting
+              # together on one node raced to run gcsfuse on the identical
+              # path concurrently, and every one of them failed --
+              # fusermount3 reported "the user doesn't have write-access on
+              # the mount point: read-only file system" for all of them,
+              # which has nothing to do with the mountpoint's real permissions
+              # or a stale mount; it's what a racing concurrent mount attempt
+              # looks like from the losing side.
+              "(",
+              'flock -x -w 90 200 || { echo "ERROR: timed out waiting for bucketmount lock" >&2; exit 1; }',
+
               # The mountpoint must be WRITABLE BY THE USER THAT RUNS gcsfuse.
               # fusermount3 refuses otherwise ("the user doesn't have
               # write-access on the mount point: permission denied"), and
@@ -1925,14 +1981,6 @@ class AbstractLocalizer(abc.ABC):
               "fi",
               "sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_DIR}",
 
-              # The busy-lock lives OUTSIDE the mount, as a plain file beside it.
-              # Locking the mountpoint directory itself (as this used to) puts the
-              # lock inside the very thing it protects: once any job unmounts,
-              # the fd is invalid and flock cannot even open the path, so the
-              # teardown guard silently stops guarding.
-              "CANINE_BUCKETMOUNT_LOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).lock",
-              "sudo touch ${CANINE_BUCKETMOUNT_LOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_LOCK}",
-
               # unlike RODISK, mounting has no cross-node attach race to
               # protect against: gcsfuse supports many concurrent read-only
               # mounts of the same bucket/prefix, so we can just mount if
@@ -1948,12 +1996,14 @@ class AbstractLocalizer(abc.ABC):
               # depends on whatever ADC happens to resolve to (metadata-server
               # SA vs. the copied user credentials), which silently works in
               # one project and fails in another. Mirrors the rclone path in
-              # backends/dockerTransient.py.
+              # backends/dockerTransient.py. Scoped to this subshell only --
+              # nothing else in this script reads GOOGLE_APPLICATION_CREDENTIALS.
               'if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${CLOUDSDK_CONFIG}/application_default_credentials.json" ]; then export GOOGLE_APPLICATION_CREDENTIALS=${CLOUDSDK_CONFIG}/application_default_credentials.json; fi',
               "timeout -k 60 60 gcsfuse -o ro --implicit-dirs ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
               "fi",
 
               'mountpoint -q ${CANINE_BUCKETMOUNT_DIR} || { echo "ERROR: Bucket mount did not appear!" >&2; exit 1; }',
+              ") 200>${CANINE_BUCKETMOUNT_MOUNTLOCK} || exit 1",
 
             ] + self.bucketmount_reachability_check() + [
 
