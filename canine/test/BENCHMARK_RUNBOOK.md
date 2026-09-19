@@ -2885,6 +2885,105 @@ How to read it:
 * **decays but to ~60, not ~44** → both, in some proportion. Take the measured sustained
   figure as the new denominator and re-derive the gap; do not keep using 79.5.
 
+#### Measured — confirmed. The disk is the answer, and there is no gap.
+
+```
+stage  0 (  0 GiB in):  93.10 s   92.3 MB/s
+stage  1 (  8 GiB in):  93.31 s   92.1 MB/s
+stage  2 ( 16 GiB in):  93.31 s   92.1 MB/s
+stage  3 ( 24 GiB in):  93.30 s   92.1 MB/s
+stage  4 ( 32 GiB in):  93.30 s   92.1 MB/s
+stage  5 ( 40 GiB in):  93.30 s   92.1 MB/s
+stage  6 ( 48 GiB in):  93.30 s   92.1 MB/s
+stage  7 ( 56 GiB in): 140.55 s   61.1 MB/s   <- the knee
+stage  8 ( 64 GiB in): 186.67 s   46.0 MB/s
+stage  9 ( 72 GiB in): 186.65 s   46.0 MB/s
+stage 10 ( 80 GiB in): 186.63 s   46.0 MB/s
+stage 11 ( 88 GiB in): 194.36 s   44.2 MB/s
+```
+
+Plain `dd`, `O_DIRECT`, single stream, no downloader, no page cache, no Python. **Flat to
+0.2% for seven stages at 92.1 MB/s (87.8 MiB/s), a knee in the eighth, then flat again at
+46.0 MB/s (43.9 MiB/s).** The ratio is `92.1 / 46.0 = 2.002×` — the disk delivers exactly
+double its sustained rate for the first ~56 GiB and then halves.
+
+Now use it to predict the full-size run, with nothing from the run itself as input:
+
+| segment | rate from `dd` | time |
+|---|---|---|
+| first 56 GiB | 87.8 MiB/s | 652.9 s |
+| next 8 GiB (the knee) | 58.3 MiB/s | 140.6 s |
+| remaining 214.9 GiB | 43.9 MiB/s | 5016.6 s |
+| **predicted total** | | **5810.0 s** |
+| **§6.5g measured** | | **5818.3 s** |
+
+**A three-parameter model of the device, fitted only to `dd`, predicts the downloader's
+279 GiB wall clock to 8.3 seconds — 0.14%.** And the settled rates: the downloader holds
+**44.2 MiB/s** where a single sequential `O_DIRECT` `dd` sustains **43.9**. Sixteen
+concurrent workers issuing sparse, out-of-order 1 MiB `pwrite`s, with `fdatasync` and an
+in-transfer md5 on top, are **0.8% faster than `dd`**.
+
+**There is no gap. The investigation is closed.** §6.5c through §6.5g were measuring a
+316 GB `pd-standard`'s burst rate and calling the difference a defect. The downloader is at
+the device's ceiling and has been throughout.
+
+For the record, this also retires the §6.5g conclusion that "the loss is between `pwrite`
+returning and bytes reaching the platter — writeback throttling". It is neither writeback
+nor throttling: the bytes reach the platter at exactly the rate the platter accepts them.
+
+#### What this means for canine, which is the actual point
+
+`canine/localization/base.py:920` sizes the localization disk to the payload plus 5%:
+
+```python
+disk_size = max(10, 1 + int(disk_size / (0.95*10**9)))
+```
+
+For this BAM that computes **316 GB** — the benchmark disk is not a coincidence, it is
+precisely what production would provision. And on `pd-standard`, **that line does not only
+choose capacity, it chooses throughput**, because sustained rate scales with provisioned
+size. Sizing a disk to fit the data exactly therefore guarantees the slowest sustained
+transfer that data can have. The tightest possible disk is the slowest possible disk, and
+nothing in the code says so.
+
+Two levers, in the order worth testing:
+
+1. **A faster disk type.** `scratch_disk_type` and `persistent_disk_type` default to
+   `"standard"` and the docstrings offer only `"standard"` or `"ssd"` — `pd-balanced` is
+   not currently expressible. It is the obvious candidate on price/performance for a disk
+   that lives ~2 hours.
+2. **A larger disk of the same type.** At the observed `46.0 / 316 = 0.1456 MB/s per GB`,
+   reaching 64 MiB/s sustained — the rate that would put §6.3 at the ≥4× target — needs
+   roughly a **460 GB** disk. That is a one-line change to the 5% margin.
+
+**Do not act on either from arithmetic.** A `pd-standard` spec figure was quoted from
+memory in §6.5h and was wrong by 2.4×; the same risk applies to `pd-balanced`'s numbers and
+to assuming the per-GB scaling is linear through 460 GB. Measure it — §6.5j is the same
+25-minute `dd` ladder on a differently-provisioned disk, and it costs cents.
+
+#### §6.5j Which disk should canine provision? — ~30 minutes per candidate
+
+Create each candidate, run the §6.5i ladder on it, record burst rate, knee position and
+sustained rate. Nothing else is needed: §6.5i just demonstrated that those three numbers
+predict a full-size localization to 0.14%, so candidates can be compared without
+downloading 279 GiB again.
+
+```bash
+# on the node -- one candidate; repeat with --type pd-balanced / pd-ssd, and with --size 460
+CAND=canine-cand-bal-316
+gcloud compute disks create "$CAND" --zone "$ZONE" --type pd-balanced --size 316GB
+gcloud compute instances attach-disk pdl-bench --disk "$CAND" --zone "$ZONE"
+# then mkfs + mount it per §4, and run the §6.5i ladder against it
+```
+
+Candidates worth the half hour, cheapest first: `pd-standard` at 460 GB, `pd-balanced` at
+316 GB, `pd-balanced` at 460 GB. Feed the winner's three numbers into §10 — and note that
+whatever wins, the *code* change is to `base.py:920` and to the disk-type vocabulary, not
+to `parallel_download.py`.
+
+Remember to detach and delete each candidate (§9); a forgotten 460 GB disk outlives the
+experiment that needed it.
+
 ### 6.6 the bucket-compose route against real GCS
 
 The bucket-compose route has never touched real infrastructure — not the auth path, not
@@ -3139,12 +3238,14 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Does in-transfer hashing (#19) pay off? | §6.3 | yes, completely — `verify 0.0s` with a real ETag, ~52 min of read-back avoided |
 | HTTP vs the S3 API | §6.5b | 6.9% apart on the download phase; the presigned path wins but the transport is not the bottleneck |
 | Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **the question was malformed.** The 4 GiB rows measure page cache (28 GB RAM), so 90% is an artifact; the full-size run's throughput is **flat to 1.7%** across 85% of its duration, which eliminates fullness and extent growth outright. Source, ENOSPC and logical scatter all separately eliminated |
-| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e, **revisited §6.5h** | **very likely just the disk.** 16 concurrent writers get 83.6 MiB/s and one sequential writer 85.8 — but every such arm is ≤16 GiB, and §6.5h measured this device at **88 MiB/s over 4 GiB against 44 MiB/s over 279 GiB**. The comparison was burst against sustained. §6.5i confirms with `dd` alone |
-| Is single-inode `fsync` contention the 1.70×? | §6.5f | **no — 5% of it.** 206 s one inode against 196 s sixteen inodes. Same ≤16 GiB burst caveat as above |
+| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e → **settled §6.5i** | **just the disk.** Plain `dd`, `O_DIRECT`, single stream: 92.1 MB/s flat for 56 GiB, then 46.0 MB/s flat — exactly 2.002×. Every ≤16 GiB arm measured the burst |
+| Is single-inode `fsync` contention the 1.70×? | §6.5f | **moot — there is no 1.70×.** Same ≤16 GiB burst caveat as above |
 | Did the page cache inflate the short arms? | §6.5h | **no — refuted.** `O_DIRECT` measures 88.2 MiB/s write and 87.5 read; buffered + `fdatasync` measures 77.0. The cache *costs* 13%. The `O_DIRECT` test controlled for a variable neither hypothesis depended on |
+| **Is the downloader leaving anything on the table?** | **§6.5i** | **no.** It settles at **44.2 MiB/s** where single-stream sequential `O_DIRECT` `dd` sustains **43.9** — 16 concurrent sparse out-of-order writers with `fdatasync` and in-transfer md5 are 0.8% *faster* than `dd`. A three-parameter device model fitted only to `dd` predicts the 279 GiB run's wall clock to **0.14%** |
 | Is `read`/`write` serialization in `download_chunk` the gap? | §6.5g | **no — falsified.** The loop is **95% `write`, 5% `read`**, overlap ceiling **1.05×**, so a reader/writer split has nothing to recover: 14.60 of 16 workers sat permanently inside `pwrite`. The kernel's socket receive buffer is already the queue that fix would have added |
-| Then what is the remaining gap? | §6.5g–§6.5i | **probably none — burst versus sustained.** Two tools, both directions, cached and uncached: everything ≤16 GiB lands at 77–88 MiB/s, everything ≥279 GiB lands at 43–45. §6.5c's heartbeat records the transition directly — `103 → 88 → 59 → 44.2` flat for 75 minutes, starting at the `dd` figure and settling at half of it after ~73 GiB. §6.5i reproduces it with `dd` alone to confirm |
-| **pd-standard sustained vs burst at 316 GB** | §6.5h / §6.5i | **~88 MiB/s for the first ~73 GiB, ~44 MiB/s thereafter** (pending §6.5i). Do not size a transfer off a `dd` that finishes in a minute |
+| Then what is the remaining gap? | §6.5g–§6.5i | **none. Closed.** The gap was burst-versus-sustained throughout: §6.5c–§6.5f compared the downloader's sustained rate against the disk's burst rate |
+| **pd-standard burst vs sustained at 316 GB** | §6.5i | **92.1 MB/s (87.8 MiB/s) for the first 56 GiB, knee over the next 8, then 46.0 MB/s (43.9 MiB/s) flat — exactly 2.002×.** Never size a transfer off a `dd` that finishes in a minute |
+| **Where is the remaining time, then?** | §6.5i | **in `base.py:920`**, which sizes the localization disk to payload + 5% — 316 GB for this BAM, exactly the benchmark disk. On `pd-standard` that line sets throughput, not just capacity, so the tightest disk is the slowest disk. §6.5j measures the alternatives |
 | What does the benchmark's own verification cost? | §6.5g | **43–45 MiB/s over 278.91 GiB, ≥1h45m** — and it was reported as `0.0s` until this run, because `phases: verify` is the downloader's and this read-back is the harness's. Now printed as `mean re-read :` |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
@@ -3160,8 +3261,8 @@ And report the **3.07×** alongside it rather than §6.2's 4.92×. The larger fi
 of a 4 GiB prefix and not of the object anyone localizes, and the difference between them
 is the open question in §6.5c.
 
-Do not report the 3.07× as "under target because of a defect in our write path". As of
-§6.5h the evidence is that 49 MiB/s is roughly what this `pd-standard` sustains past its
-first ~73 GiB, in which case 3.07× is the disk's answer rather than ours and the remaining
-prize is a different destination — a §10 question, not a code one. §6.5i is what turns
-"the evidence is" into "measured".
+Do not report the 3.07× as "under target because of a defect in our write path". §6.5i
+measured the device directly: **3.07× is what a 316 GB `pd-standard` gives you**, the
+downloader runs 0.8% faster than `dd` on it, and the ≥4× target is a disk-provisioning
+question (§6.5j, §10) rather than a code one. Report it as *"3.07×, at the destination's
+ceiling"* — the qualifier is what stops the next reader re-opening §6.5c.
