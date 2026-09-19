@@ -12,6 +12,7 @@ import hashlib
 import json
 import inspect
 import os
+import threading
 
 import pytest
 
@@ -1051,3 +1052,192 @@ class TestTheMarkerRecordsWhichRouteWroteIt:
         """
         source = inspect.getsource(pdl.run)
         assert 'marker.get("route", ROUTE_POSIX)' in source, source[:0] or "default changed"
+
+
+# ---------------------------------------------------------------------------
+# two writers on one object (§13.48 step 3)
+# ---------------------------------------------------------------------------
+
+class TestTwoWritersOnOneObject:
+    """
+    Production can put two workers on the same bucket object at the same time, and
+    nothing here has ever tested it.
+
+    `LOCALIZATION.md` §3: a worker that loses the bucket-creation race waits
+    `bucket_upload_wait_tries` x 60s for the winner -- a **one hour** ceiling by default
+    -- then declares the claim `stale` and exits 5. A later worker reads `stale`,
+    concludes the uploader died, and takes over. The measured full-size localization is
+    **1.62 h**, so the winner is still uploading when that happens. For the `server_side`
+    and `copy` upload kinds `-n` makes the overlap harmless; `s3://`/GDC inputs are
+    `kind == "mount"`, which is this route, and here the only thing between two writers
+    and a corrupt object is the shared state in the bucket:
+
+      * one manifest object, `<object>.k9pdl.json`, holding per-chunk completion AND the
+        resumable session URIs;
+      * deterministic part names, `<object>.k9pdl.parts/NNNNN`.
+
+    Identical part content makes last-writer-wins on a part harmless. The manifest is the
+    hazard: it is read-modify-write with no generation precondition, so one writer can
+    drop the other's completion records and -- worse -- hand back a session URI the other
+    writer is actively uploading to.
+
+    A node dying mid-upload produces the same overlap without any timeout involved, so
+    this is worth knowing regardless of what `bucket_upload_wait_tries` is set to.
+
+    The two writers get different local `dest` paths on purpose: in production they are
+    different VMs with no shared filesystem, so only the bucket is common.
+    """
+
+    def _race(self, tmp_path, monkeypatch, gcs, payload, payload_md5, writers=2):
+        force_bucket_route(monkeypatch)
+        results, errors = [], []
+
+        with Server(payload) as source:
+            def worker(index):
+                try:
+                    results.append(pdl.run(options_for(
+                        str(tmp_path / "w{}.bam".format(index)),
+                        source.url(), len(payload),
+                        check_md5=payload_md5, connections=4)))
+                except BaseException as exc:          # noqa: BLE001 - reported, not swallowed
+                    errors.append(exc)
+
+            threads = [threading.Thread(target=worker, args=(i,))
+                       for i in range(writers)]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(180)
+            assert not any(t.is_alive() for t in threads), "a writer hung"
+            sent = source.state.snapshot()["sent"]
+
+        # Without this the whole class could pass while never racing anything: if one
+        # writer short-circuited on a marker, or finished before the other started, the
+        # assertions below would hold trivially. Both writers fetching a full payload is
+        # the evidence that two of them were really in the object at once -- measured at
+        # 2.00 payloads every run.
+        assert sent >= 1.5 * len(payload), (
+            "writers did not overlap: source served {:.2f} payloads, so this measured "
+            "a sequence, not a race".format(sent / len(payload)))
+        assert len(results) == writers, "a writer produced no result"
+
+        return results, errors
+
+    def test_the_object_is_never_silently_wrong(self, tmp_path, monkeypatch, gcs,
+                                                payload, payload_md5):
+        """
+        The one property that must hold however the race resolves. Either writer may
+        fail -- requeue is a correct answer to losing a race -- but a writer that
+        reports EXIT_OK is asserting the object is complete and correct, and any object
+        present at the end must match the source.
+        """
+        results, errors = self._race(tmp_path, monkeypatch, gcs, payload, payload_md5)
+
+        assert not errors, "writer raised: {!r}".format(errors[0])
+        stored = gcs.state.objects.get(OBJECT)
+        if pdl.EXIT_OK in results:
+            assert stored is not None, "a writer returned EXIT_OK but there is no object"
+        if stored is not None:
+            assert hashlib.md5(stored).hexdigest() == payload_md5, (
+                "composed object does not match the source")
+
+    def test_no_part_is_left_at_the_wrong_length(self, tmp_path, monkeypatch, gcs,
+                                                 payload, payload_md5):
+        """
+        Crossed resumable sessions show up here first: two writers appending into one
+        session produce a part longer than its chunk. The pre-compose check is supposed
+        to catch that, but it only runs for a writer that gets that far, so assert it
+        directly against the bucket.
+        """
+        self._race(tmp_path, monkeypatch, gcs, payload, payload_md5)
+
+        prefix = OBJECT + ".k9pdl.parts/"
+        parts = {n: gcs.state.objects[n] for n in gcs.state.object_names()
+                 if n.startswith(prefix)}
+        oversized = {n: len(b) for n, b in parts.items() if len(b) > MIB}
+        assert not oversized, "parts longer than one chunk: {}".format(oversized)
+
+    def test_the_manifest_survives_as_valid_json(self, tmp_path, monkeypatch, gcs,
+                                                 payload, payload_md5):
+        """
+        Two interleaved media uploads of the manifest must not leave a torn document --
+        a half-written manifest is unreadable by the next resume, which turns a
+        recoverable state into a full re-download.
+        """
+        self._race(tmp_path, monkeypatch, gcs, payload, payload_md5)
+
+        body = gcs.state.objects.get(MANIFEST_OBJECT)
+        if body is not None:
+            json.loads(body.decode("utf-8"))
+
+    def test_a_writer_that_loses_the_race_requeues_rather_than_failing(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        """
+        Which writer wins is genuinely nondeterministic -- observed both [0, 0] and
+        [5, 0] across runs, depending on whether the loser reaches its pre-compose
+        check before the winner deletes the parts. Both are correct outcomes, and the
+        object verified in every case.
+
+        What must NOT vary is the *kind* of failure. canine reads these codes: 5 means
+        requeue this shard, 15 means skip it, and **anything else nonzero is
+        do-not-retry**. A loser is not a broken job -- it lost a race to a sibling that
+        succeeded, which is the most retryable situation there is. If this ever returns
+        EXIT_FAIL, a workflow dies where it should have requeued, and the trigger is a
+        timing window nobody will reproduce on demand.
+        """
+        results, _ = self._race(tmp_path, monkeypatch, gcs, payload, payload_md5)
+
+        allowed = {pdl.EXIT_OK, pdl.EXIT_REQUEUE}
+        assert set(results) <= allowed, (
+            "a writer returned a do-not-retry code: {} (allowed {})".format(
+                results, sorted(allowed)))
+        assert pdl.EXIT_OK in results, "nobody completed the object"
+
+    # NOTE: the assertion above cannot be relied on to cover the loser branch. The
+    # common outcome is [0, 0] -- both writers compose, because the loser reaches its
+    # pre-compose check before the winner deletes the parts -- so the requeue path is
+    # only sometimes taken. Making the loser return EXIT_FAIL was mutation-tested here
+    # and SURVIVED six consecutive runs. The deterministic cover is the next test; this
+    # one is kept because it exercises real concurrency, which that one does not.
+
+    def test_parts_vanishing_before_compose_requeues(self, tmp_path, monkeypatch, gcs,
+                                                     payload, payload_md5):
+        """
+        The loser's branch, driven directly instead of hoped for.
+
+        This is what a take-over worker finds when it arrives after the winner has
+        already composed and swept the parts: every upload succeeded, and then the
+        parts are gone. canine reads the exit code -- 5 requeue, 15 skip, **anything
+        else nonzero do-not-retry** -- and losing a race to a sibling that succeeded is
+        the most retryable situation there is. EXIT_FAIL here kills a workflow that
+        should simply have run again, on a timing window nobody can reproduce on demand.
+        """
+        force_bucket_route(monkeypatch)
+        real_get_object = pdl.GcsClient.get_object
+
+        def vanishing(self, bucket, name):
+            if ".k9pdl.parts/" in name:
+                raise pdl.PermanentError(
+                    "404 no such object: {} (another writer composed first)".format(name))
+            return real_get_object(self, bucket, name)
+
+        monkeypatch.setattr(pdl.GcsClient, "get_object", vanishing)
+
+        with Server(payload) as source:
+            rc = pdl.run(options_for(str(tmp_path / "loser.bam"), source.url(),
+                                     len(payload), check_md5=payload_md5))
+
+        assert rc == pdl.EXIT_REQUEUE, (
+            "a writer whose parts were swept must requeue (5), got {}".format(rc))
+
+    def test_exactly_one_object_results_and_the_parts_are_cleaned_up(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        """
+        Two writers must not leave two objects' worth of storage behind. Parts are
+        charged for until deleted, and a 279 GiB localization's parts are another
+        279 GiB -- so a race that leaks them doubles the bill silently.
+        """
+        self._race(tmp_path, monkeypatch, gcs, payload, payload_md5)
+
+        leftover = [n for n in gcs.state.object_names() if ".k9pdl.parts/" in n]
+        assert leftover == [], "{} parts left behind after the race".format(len(leftover))
