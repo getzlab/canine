@@ -1575,6 +1575,14 @@ pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
 Expect roughly `300 GB ÷ (the §6.2 plateau)`. Report it as **"4 h → X h"** against today's
 behaviour, not as the sweep's internal speedup.
 
+**Add `--keep` if you might want to measure the disk afterwards.** The sweep unlinks the
+payload and its sidecars at the end of each row by default — correctly, since an orphaned
+`.k9pdl.done` with no file is what made a later run exit 0 after 108 bytes — so a 3h22m
+full-size run leaves an empty filesystem behind. §6.5h's read arm then has nothing to read,
+and the only way back is another 1h37m of transfer. Deleting it is the right default for a
+sweep of several rows on a 316 GB disk; it is the wrong one for the single-row §6.3 run
+whose artifact is the largest thing you will ever have to measure against.
+
 **Record the download/verify split.** `verify()` reads the whole object back on this
 route, so the wall-clock is download plus a 300 GB re-read. The downloader emits
 `k9pdl-phase download …` and `k9pdl-phase verify …`, and the benchmark parses both into
@@ -2741,8 +2749,7 @@ that is already there, so it costs nothing and destroys nothing:
 
 ```bash
 # on the node -- what is actually on the disk. The sweep writes `bench.<connections>.bin`,
-# NOT the source object's name, and it unlinks that path at the START of each row -- so a
-# later sweep will have removed the 279 GiB file this arm wants to read.
+# NOT the source object's name.
 sudo docker exec slurm sh -c 'ls -laS /mnt/rwdisks/'"$DISK"'/ | head'
 
 # on the node -- read, 4 GiB from 128 GiB into the largest file, cache bypassed
@@ -2752,11 +2759,20 @@ sudo docker exec slurm sh -c '
   dd if="$BIG" of=/dev/null bs=1M count=4096 skip=131072 iflag=direct 2>&1 | tail -1'
 ```
 
-**In practice the disk was empty but `lost+found`** — a sweep run after the §6.5g
-measurement had already unlinked `bench.16.bin`, so there was nothing to read. That is the
-normal state, not a mishap, and it is better: with free space available, write the file
-yourself and read it back, and run the *same* 4 GiB buffered as well. Direct and cached
-then sit side by side on identical bytes with identical tooling, which is the actual
+**In practice the disk was empty but `lost+found`, and the §6.5g run deleted the file
+itself.** Not a later sweep — `command_sweep` unlinks the payload and its sidecars at the
+*end* of each row unless `--keep` is passed (`benchmark_localization.py`, `if not
+args.keep`), and it is right to: an orphaned `.bench.N.bin.k9pdl.done` with no file is the
+state that made a later run exit 0 after 108 bytes. So a 3h22m full-size run leaves nothing
+behind to measure, and the 279 GiB of writes it just performed become unrepeatable without
+paying for them again.
+
+> **Pass `--keep` on any §6.3 run you intend to follow with a destination measurement.**
+> There is no way to recover the file afterwards, and re-creating it costs another 1h37m.
+
+That is the only cost of the omission here, because the free space is better than the file
+was: write 4 GiB yourself, read it back, and run the *same* 4 GiB buffered. Direct and
+cached then sit side by side on identical bytes with identical tooling, which is the actual
 experiment — the ≤16 GiB figures in §6.5d–§6.5f are suspect precisely because nothing ever
 ran both ways on the same work.
 
