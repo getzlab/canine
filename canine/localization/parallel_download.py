@@ -1600,7 +1600,15 @@ def compose_tree(client, bucket, destination, parts, max_sources=GCS_COMPOSE_MAX
 
     Sources may themselves be composite, so 800 parts become 25 intermediates and then
     one object. Intermediates are deleted as soon as they have been consumed.
+
+    `max_sources` below 2 cannot make progress: every group would be a single, every
+    single is carried forward unchanged, and the next level would equal the last. That
+    is an infinite loop issuing no requests, so it presents as a hang rather than an
+    error -- rejected here so the parameter can be exercised safely.
     """
+    if max_sources < 2:
+        raise ValueError(
+            "max_sources must be at least 2 to fold, got {}".format(max_sources))
     level = list(parts)
     generation = 0
     created = []

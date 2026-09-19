@@ -407,6 +407,178 @@ class TestComposeTree:
         assert gcs.state.objects["out"] == expected
 
 
+class TestComposeTreeAtTheDepthTheRealObjectNeeds:
+    """
+    Every test above stops at TWO levels. 100 parts folds 100 -> 4 -> 1, and 70 folds
+    70 -> 3 -> 1; neither ever builds an intermediate out of intermediates, because
+    `generation` never reaches 1.
+
+    The real object does. 279 GiB in 87 MiB chunks is **3283 parts**, which folds
+    3283 -> 103 -> 4 -> 1: three compose levels, and the middle one composes objects
+    that are themselves composites. Everything that can only break there -- a name
+    collision between generations, a carried-forward single that never gets composed,
+    an ordering slip between levels, an intermediate from generation 0 deleted before
+    generation 1 consumes it -- is invisible to the existing tests and would surface
+    an hour into a full-size run, after the upload has already been paid for.
+
+    Three levels begin above `32 * 32 = 1024` sources, so 1025 is the real boundary
+    and none of the counts tested so far come near it.
+    """
+
+    # 279 GiB / 87 MiB, the §6.3 object. Kept as the literal rather than derived, so
+    # that a change to chunk sizing does not silently move this test off the case it
+    # exists for.
+    FULL_SIZE_PARTS = 3283
+
+    def seed(self, gcs, count):
+        """`count` distinct single-component sources; returns (names, expected bytes)."""
+        names, expected = [], b""
+        for index in range(count):
+            name = "p{:05d}".format(index)
+            # Four digits so all 3283 payloads differ -- with a narrower field the
+            # values wrap and a reordering between levels could reassemble to the
+            # same bytes and pass.
+            data = "{:04d}".format(index).encode()
+            gcs.state.objects[name] = data
+            gcs.state.composite[name] = 1
+            names.append(name)
+            expected += data
+        return names, expected
+
+    @staticmethod
+    def generations(gcs, destination):
+        """Which intermediate generations were actually built."""
+        marker = destination + ".k9pdl.compose/"
+        return {
+            int(dest[len(marker):].split("-", 1)[0])
+            for dest, _ in gcs.state.compose_calls if dest.startswith(marker)
+        }
+
+    def test_three_levels_at_the_full_size_part_count(self, gcs, monkeypatch):
+        client = pdl.GcsClient()
+        names, expected = self.seed(gcs, self.FULL_SIZE_PARTS)
+
+        pdl.compose_tree(client, BUCKET, "out", names)
+
+        assert self.generations(gcs, "out") == {0, 1}, (
+            "3283 parts must fold through two intermediate generations before the "
+            "final compose; only {} were built".format(self.generations(gcs, "out")))
+        assert gcs.state.objects["out"] == expected
+
+    def test_no_compose_call_exceeds_the_source_limit_at_depth(self, gcs, monkeypatch):
+        """The limit is per call, so it has to hold on the intermediate levels too."""
+        client = pdl.GcsClient()
+        names, _ = self.seed(gcs, self.FULL_SIZE_PARTS)
+
+        pdl.compose_tree(client, BUCKET, "out", names)
+
+        oversized = [(dest, len(sources)) for dest, sources in gcs.state.compose_calls
+                     if len(sources) > pdl.GCS_COMPOSE_MAX_SOURCES]
+        assert oversized == [], "compose calls over the source limit: {}".format(oversized)
+        assert len(gcs.state.compose_calls) > 32, "expected a tree, not a single level"
+
+    def test_every_part_is_present_exactly_once_at_depth(self, gcs, monkeypatch):
+        """
+        Component count is the invariant that catches a part being dropped or counted
+        twice without depending on the payload bytes. A tree that loses one part of
+        3283 changes the object by four bytes in thirteen kilobytes.
+        """
+        client = pdl.GcsClient()
+        names, _ = self.seed(gcs, self.FULL_SIZE_PARTS)
+
+        pdl.compose_tree(client, BUCKET, "out", names)
+
+        assert gcs.state.composite["out"] == self.FULL_SIZE_PARTS
+
+    def test_intermediates_from_both_generations_are_cleaned_up(self, gcs, monkeypatch):
+        """
+        Cleanup is deferred to the end precisely because generation 1 reads generation
+        0's output. Deleting eagerly would be correct-looking and wrong, and only at
+        three levels is there a generation whose inputs are themselves intermediates.
+        """
+        client = pdl.GcsClient()
+        names, _ = self.seed(gcs, self.FULL_SIZE_PARTS)
+
+        pdl.compose_tree(client, BUCKET, "out", names)
+
+        leftover = [n for n in gcs.state.object_names() if ".k9pdl.compose/" in n]
+        assert leftover == [], "{} intermediates left behind, first: {}".format(
+            len(leftover), leftover[0] if leftover else None)
+
+    @pytest.mark.parametrize("count", [
+        1,      # single source: compose still has to name the destination
+        2,
+        32,     # exactly one call
+        33,     # first fold
+        1024,   # exactly 32 groups of 32 -- still two levels
+        1025,   # one more, and the third level appears
+    ])
+    def test_boundaries_around_the_source_limit(self, gcs, monkeypatch, count):
+        client = pdl.GcsClient()
+        names, expected = self.seed(gcs, count)
+
+        pdl.compose_tree(client, BUCKET, "out", names)
+
+        assert gcs.state.objects["out"] == expected
+        assert gcs.state.composite["out"] == count
+        assert all(len(s) <= pdl.GCS_COMPOSE_MAX_SOURCES
+                   for _, s in gcs.state.compose_calls)
+        assert [n for n in gcs.state.object_names() if ".k9pdl.compose/" in n] == []
+
+    @pytest.mark.parametrize("count,levels", [
+        (32, set()),        # no intermediates at all
+        (33, {0}),
+        (1024, {0}),        # 1024 -> 32 -> final: still one generation
+        (1025, {0, 1}),     # 1025 -> 33 -> 2 -> final
+    ])
+    def test_the_third_level_starts_exactly_above_1024(self, gcs, monkeypatch,
+                                                       count, levels):
+        """
+        Pins where the depth changes. 1024 and 1025 differ by one source and by a
+        whole generation, and that is the boundary the existing tests sit 900 parts
+        below.
+        """
+        client = pdl.GcsClient()
+        names, _ = self.seed(gcs, count)
+
+        pdl.compose_tree(client, BUCKET, "out", names)
+
+        assert self.generations(gcs, "out") == levels
+
+    def test_a_carried_single_survives_being_bubbled_through_levels(self, gcs,
+                                                                    monkeypatch):
+        """
+        A group of one is carried forward uncomposed rather than wrapped in a pointless
+        intermediate. At 1025 sources that carried part is the last one, and it is
+        carried TWICE -- through generation 0 and again through generation 1 -- before
+        reaching the final call. If the bubbling drops it, the object is short by
+        exactly its own length and everything else still lines up.
+        """
+        client = pdl.GcsClient()
+        names, expected = self.seed(gcs, 1025)
+
+        pdl.compose_tree(client, BUCKET, "out", names)
+
+        assert gcs.state.objects["out"].endswith(b"1024")
+        assert gcs.state.objects["out"] == expected
+        assert gcs.state.composite["out"] == 1025
+
+    def test_a_max_sources_that_cannot_make_progress_is_rejected(self, gcs,
+                                                                 monkeypatch):
+        """
+        `max_sources=1` makes every group a single, every single is carried forward
+        unchanged, and the next level is identical to the last -- an infinite loop with
+        no requests in flight, so it presents as a hang rather than a failure. The
+        parameter exists to be varied, and a suite that cannot safely probe it is not
+        testing it.
+        """
+        client = pdl.GcsClient()
+        names, _ = self.seed(gcs, 40)
+
+        with pytest.raises(ValueError):
+            pdl.compose_tree(client, BUCKET, "out", names, max_sources=1)
+
+
 # ---------------------------------------------------------------------------
 # verification (§11: check_hash is absolute)
 # ---------------------------------------------------------------------------
