@@ -2946,45 +2946,101 @@ size. Sizing a disk to fit the data exactly therefore guarantees the slowest sus
 transfer that data can have. The tightest possible disk is the slowest possible disk, and
 nothing in the code says so.
 
-Two levers, in the order worth testing:
+**A faster disk type is not available on this path.** `pd-standard` is the only type that
+can be mounted read-only at scale, and the whole point of the rodisk pattern is that one
+localized disk is attached read-only to many workers. So the type is fixed by the *read*
+path's fan-out requirement, and the *write* path — the 1.62 h this benchmark measures —
+pays for a choice it does not get to make. `pd-balanced` is not merely absent from
+`persistent_disk_type`'s `"standard" | "ssd"` vocabulary; it is unusable here. (The
+constraint does not apply to `scratch_disk_type`, which is per-node and never shared, so
+if scratch ever lands on the critical path that lever is still open.)
 
-1. **A faster disk type.** `scratch_disk_type` and `persistent_disk_type` default to
-   `"standard"` and the docstrings offer only `"standard"` or `"ssd"` — `pd-balanced` is
-   not currently expressible. It is the obvious candidate on price/performance for a disk
-   that lives ~2 hours.
-2. **A larger disk of the same type.** At the observed `46.0 / 316 = 0.1456 MB/s per GB`,
-   reaching 64 MiB/s sustained — the rate that would put §6.3 at the ≥4× target — needs
-   roughly a **460 GB** disk. That is a one-line change to the 5% margin.
+**That leaves size as the only in-family lever.** At the observed
+`46.0 / 316 = 0.1456 MB/s per GB`, reaching 64 MiB/s sustained — the rate that would put
+§6.3 at the ≥4× target — needs roughly a **460 GB** disk, a one-line change to the 5%
+margin. Note the tradeoff before reaching for it: `base.py:920` sizes *every* rodisk, so a
+flat multiplier inflates thousands of small ones to buy throughput that only large
+payloads can use. If it is done at all it should be conditional on the payload being big
+enough for sustained rate to matter, which is a design question rather than a constant.
 
-**Do not act on either from arithmetic.** A `pd-standard` spec figure was quoted from
-memory in §6.5h and was wrong by 2.4×; the same risk applies to `pd-balanced`'s numbers and
-to assuming the per-GB scaling is linear through 460 GB. Measure it — §6.5j is the same
-25-minute `dd` ladder on a differently-provisioned disk, and it costs cents.
+**Do not act on the 460 GB from arithmetic.** A `pd-standard` spec figure was quoted from
+memory in §6.5h and was wrong by 2.4×; the same risk applies to assuming the per-GB scaling
+stays linear out to 460 GB, or that the 2.002× burst multiplier and the 56 GiB knee move
+with provisioned size at all. §6.5j measures it with the same 25-minute ladder.
 
-#### §6.5j Which disk should canine provision? — ~30 minutes per candidate
+#### The strategic answer is probably not a disk at all
 
-Create each candidate, run the §6.5i ladder on it, record burst rate, knee position and
-sustained rate. Nothing else is needed: §6.5i just demonstrated that those three numbers
-predict a full-size localization to 0.14%, so candidates can be compared without
-downloading 279 GiB again.
+There is a concurrent effort — **`origin/fuse-localize`** — that replaces the disk on this
+path entirely. `64e56fd` adds `create_bucket_mount()` as a GCS-backed alternative to
+`create_persistent_disk()` for `LocalizeToDisk` inputs: uploads go straight to a
+deterministic per-workflow regional bucket and are consumed through `gcsfuse`, with a
+content-addressed `_SUCCESS` marker for cross-run dedup. `get_or_create_rapid_cache()`
+provisions a zonal Rapid Cache (formerly Anywhere Cache) over that bucket with
+`--enable-ingest-on-write`, best-effort, so a provisioning failure degrades to normal
+bucket latency rather than failing the workflow.
+
+If that lands, **the 43.9 MiB/s ceiling this entire investigation converged on stops
+applying**, because there is no `pd-standard` in either the write or the read path. Two
+things from §6.5c–§6.5i that carry over regardless:
+
+* **§6.6 becomes the measurement that matters**, not §6.5j. The bucket-compose route has
+  still never touched real infrastructure, and it is now the strategic path rather than a
+  fallback.
+* **Measure the bucket path over ≥96 GiB, not 4.** The single most expensive error in this
+  section was comparing a 4 GiB number to a 279 GiB one; a cached bucket has every reason
+  to show its own burst-then-settle curve (cache fill, then origin rate on a miss), and a
+  quick `gcsfuse` benchmark would reproduce the same mistake in a new medium. Run the
+  §6.5i ladder against the mount.
+
+So: treat §6.5j as the contingency that keeps the current path viable if `fuse-localize`
+slips, and §6.6 as the one that decides where this actually ends up.
+
+#### §6.5j Does a bigger pd-standard go faster? — ~30 minutes per size
+
+Only worth running if the current disk path has to survive. Create each candidate, run the
+§6.5i ladder on it, record **burst rate, knee position and sustained rate**. Nothing else
+is needed: §6.5i demonstrated that those three numbers predict a full-size localization to
+0.14%, so sizes can be compared without downloading 279 GiB again.
+
+All candidates are `pd-standard` — the read-only-at-scale requirement rules out the others
+on this path, so this sweeps size alone.
 
 ```bash
-# on the node -- one candidate; repeat with --type pd-balanced / pd-ssd, and with --size 460
-CAND=canine-cand-bal-316
-gcloud compute disks create "$CAND" --zone "$ZONE" --type pd-balanced --size 316GB
+# on the node -- one candidate; repeat at 460 and 640
+CAND=canine-cand-std-460
+gcloud compute disks create "$CAND" --zone "$ZONE" --type pd-standard --size 460GB
 gcloud compute instances attach-disk pdl-bench --disk "$CAND" --zone "$ZONE"
 # then mkfs + mount it per §4, and run the §6.5i ladder against it
 ```
 
-Candidates worth the half hour, cheapest first: `pd-standard` at 460 GB, `pd-balanced` at
-316 GB, `pd-balanced` at 460 GB. Feed the winner's three numbers into §10 — and note that
-whatever wins, the *code* change is to `base.py:920` and to the disk-type vocabulary, not
-to `parallel_download.py`.
+Three sizes — 316 (already measured), 460, 640 — answer the question the arithmetic cannot:
+whether sustained rate really scales linearly with provisioned GB, and whether the 2.002×
+burst multiplier and the 56 GiB knee scale with it too. If sustained rate is flat across
+all three, the per-GB model is wrong and size is not a lever either, which would leave
+`fuse-localize` as the only route to ≥4×.
 
-Remember to detach and delete each candidate (§9); a forgotten 460 GB disk outlives the
+Note the ladder must run past the knee at *each* size. If the knee scales with the disk,
+a 640 GB candidate may not reach it within 96 GiB — extend the stage count until two
+consecutive stages agree, or the run will report a burst rate as if it were sustained.
+That is the same error this section spent four subsections making.
+
+Remember to detach and delete each candidate (§9); a forgotten 640 GB disk outlives the
 experiment that needed it.
 
 ### 6.6 the bucket-compose route against real GCS
+
+> **§6.5i promoted this section.** It was written as a completeness item for a fallback
+> route. With the disk path measured at a hard 43.9 MiB/s sustained, and `pd-standard`
+> fixed by the read-only-at-scale requirement, this is now the likeliest route to the ≥4×
+> target and the measurement that decides the outcome. It also converges with
+> `origin/fuse-localize`, whose `create_bucket_mount()` makes a GCS mount the *primary*
+> destination for `LocalizeToDisk` inputs rather than an alternative.
+>
+> **Run the §6.5i ladder against the mount before running anything else here.** A Rapid
+> Cache bucket has every reason to show its own burst-then-settle curve — cache fill at
+> zonal SSD rate, then origin rate on a miss — and a 4 GiB `gcsfuse` benchmark would
+> reproduce, in a new medium, the single most expensive error in this document. Two
+> consecutive stages agreeing is the bar.
 
 The bucket-compose route has never touched real infrastructure — not the auth path, not
 resumable sessions, not compose. It needs a bucket mounted in the container so that
@@ -3245,7 +3301,9 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Is `read`/`write` serialization in `download_chunk` the gap? | §6.5g | **no — falsified.** The loop is **95% `write`, 5% `read`**, overlap ceiling **1.05×**, so a reader/writer split has nothing to recover: 14.60 of 16 workers sat permanently inside `pwrite`. The kernel's socket receive buffer is already the queue that fix would have added |
 | Then what is the remaining gap? | §6.5g–§6.5i | **none. Closed.** The gap was burst-versus-sustained throughout: §6.5c–§6.5f compared the downloader's sustained rate against the disk's burst rate |
 | **pd-standard burst vs sustained at 316 GB** | §6.5i | **92.1 MB/s (87.8 MiB/s) for the first 56 GiB, knee over the next 8, then 46.0 MB/s (43.9 MiB/s) flat — exactly 2.002×.** Never size a transfer off a `dd` that finishes in a minute |
-| **Where is the remaining time, then?** | §6.5i | **in `base.py:920`**, which sizes the localization disk to payload + 5% — 316 GB for this BAM, exactly the benchmark disk. On `pd-standard` that line sets throughput, not just capacity, so the tightest disk is the slowest disk. §6.5j measures the alternatives |
+| **Where is the remaining time, then?** | §6.5i | **in `base.py:920`**, which sizes the localization disk to payload + 5% — 316 GB for this BAM, exactly the benchmark disk. On `pd-standard` that line sets throughput, not just capacity, so the tightest disk is the slowest disk |
+| Can a faster disk type fix it? | §6.5i | **no — not on this path.** `pd-standard` is the only type mountable read-only at scale, and the rodisk pattern requires exactly that. The type is fixed by the read path's fan-out; the write path pays for it. Size is the only in-family lever (§6.5j) |
+| So what is the actual route to ≥4×? | §6.5i / §6.6 | **`origin/fuse-localize`**, most likely. `create_bucket_mount()` + Rapid Cache with `--enable-ingest-on-write` removes `pd-standard` from both paths, so this whole ceiling stops applying. That promotes §6.6 from a fallback to the measurement that decides the outcome — and it must be run over ≥96 GiB, not 4 |
 | What does the benchmark's own verification cost? | §6.5g | **43–45 MiB/s over 278.91 GiB, ≥1h45m** — and it was reported as `0.0s` until this run, because `phases: verify` is the downloader's and this read-back is the harness's. Now printed as `mean re-read :` |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
