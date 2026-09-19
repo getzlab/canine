@@ -606,9 +606,34 @@ from 3.0 and absent before it. On an older gcsfuse that mount silently buffers t
 object under `--temp-dir` on the boot disk instead, so a measurement taken there describes
 a different system — and on a 279 GiB input it is an ENOSPC rather than a slow result.
 
-**Treat the version as the authority, not the tag.** There is no tag recorded here on
-purpose: image names drift, and the thing that matters is what is actually in the
-container.
+#### The tag: `gcr.io/broad-getzlab-workflows/slurm_gcp_docker:v0.18.3`
+
+Not Docker Hub. `broadinstitute/slurm_gcp_docker:v<VERSION>` is a **local** tag that
+`build_master_images.py` bakes into the worker VM image; the pullable copy lives in GCR
+(`--project` defaults to `broad-getzlab-workflows`). The Hub path 404s.
+
+The version comes from `slurm_gcp_docker/VERSION` on whichever branch built it:
+
+| branch | `VERSION` | gcsfuse |
+|---|---|---|
+| `wolf-2.0-update` | 0.18.2 | **none** — this is what a pre-fuse bench node runs |
+| **`fuse-localize`** | **0.18.3** | **3.11.2** — canine pins this branch in `pyproject.toml` |
+| `fuse-nfs` | 0.18.4 | 3.11.2 — newer, but a separate effort, not what canine pins |
+
+**Take v0.18.3 unless canine's pin has moved.** Check rather than trust this table, since
+both move independently:
+
+```bash
+# from the canine repo
+grep 'slurm_gcp_docker @' pyproject.toml
+# from a slurm_gcp_docker checkout, on the branch that names
+git show origin/<that branch>:slurm_gcp_docker/VERSION
+```
+
+The Dockerfile ends that stage with `RUN command -v gcsfuse && ... gcsfuse --version`, so
+an image built from a gcsfuse branch cannot exist without it — the tag is trustworthy once
+you have the right branch. Verify in the container anyway: **the version is the authority,
+the tag is only how you ask for it.**
 
 #### Restart on the new image
 
@@ -627,8 +652,11 @@ but the container cannot see it until you re-run §4's mount.
 
 ```bash
 # on the node
-sudo docker stop slurm                      # --rm removes it
-sudo docker pull broadinstitute/slurm_gcp_docker:<tag with gcsfuse 3.x>
+IMAGE=gcr.io/broad-getzlab-workflows/slurm_gcp_docker:v0.18.3
+
+gcloud auth configure-docker gcr.io --quiet   # once per node
+sudo docker stop slurm                        # --rm removes it
+sudo docker pull "$IMAGE"
 
 SHM_SIZE=$(df -BM --output=size /dev/shm | sed 1d | tr -d ' ' | tr 'M' 'm')
 sudo docker run -dti --rm --pid host --network host --privileged \
@@ -636,7 +664,7 @@ sudo docker run -dti --rm --pid host --network host --privileged \
   -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
   -v $HOME/.aws:/root/.aws:ro \
   --shm-size "$SHM_SIZE" \
-  --entrypoint /bin/bash --name slurm broadinstitute/slurm_gcp_docker:<tag>
+  --entrypoint /bin/bash --name slurm "$IMAGE"
 ```
 
 Identical to §3's flags. Keep the two credentials mounts: `gcsfuse` resolves credentials
