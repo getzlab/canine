@@ -2548,11 +2548,11 @@ settles at **44.2 MiB/s: 56% of it.** Every external explanation is now eliminat
 | shared inode + `fsync` | 5% of the 44% gap | 206 s vs 196 s, above | 16 GiB ⚠️ |
 
 **Read the right-hand column before trusting the middle one.** Four of these six
-eliminations were measured over 4–16 GiB on a node with 28 GB of RAM — through the very
-page cache §6.5d proved inflates short runs. §6.5g found two independent full-extent
-measurements of this device that both say ~45 MiB/s, so the ⚠️ rows may be eliminating
-candidates at a scale where the disk was never the constraint in the first place. §6.5h
-re-measures with `O_DIRECT`, which is what makes a 4 GiB arm mean something.
+eliminations were measured over 4–16 GiB, and §6.5h found that this device delivers
+88 MiB/s for its first few minutes and 44 MiB/s thereafter. So the ⚠️ rows are eliminating
+candidates in a regime the full-size run spends 3% of its time in — not because the page
+cache inflated them (§6.5h measured the cache *costing* 13%, refuting that) but because
+they were too short to leave the burst.
 
 **The hypothesis below was tested in §6.5g and is false.** It is kept because the
 reasoning is worth having on record next to its refutation, and because the two loose ends
@@ -2572,8 +2572,8 @@ own ceiling.
 
 Both loose ends were the real signal. A measurement above the model's ceiling and a
 measurement below it, at the same time, means the two are not measuring the same system —
-which is exactly what §6.5g found: the 79.8 is a short-extent, cached figure and the 44.2
-is what the device sustains. **When a model is bracketed by its own data, suspect the
+which is what §6.5g/§6.5h converged on: the 79.8 is a short-extent burst figure and the
+44.2 is what the device sustains. **When a model is bracketed by its own data, suspect the
 data's provenance before refining the model.**
 
 **Further shell tests are exhausted.** The next measurement belongs inside the downloader,
@@ -2713,6 +2713,10 @@ hour-plus measurements say ~45. §6.5d did test fullness and found 1.7% variatio
 "inside our own code" and a 1.7× short-burst-versus-sustained ratio on a `pd-standard` are
 the same number, and nothing measured so far distinguishes them.
 
+§6.5h went on to measure exactly that: **88 MiB/s over 4 GiB, 44 MiB/s over 279 GiB, with
+the page cache demonstrated to be irrelevant to either.** The duration hypothesis is the
+surviving one.
+
 #### §6.5h Is 45 MiB/s the device? — `O_DIRECT`, ~4 minutes, no egress
 
 Do not settle this with another long run; settle it by removing the page cache, which is
@@ -2729,20 +2733,12 @@ gcloud compute disks describe "$DISK" --zone "$ZONE" \
 sudo docker exec slurm sh -c 'lsblk -o NAME,SIZE,ROTA | head'
 ```
 
-**Measured: `316  pd-standard`.** GCP rates `pd-standard` at 0.12 MB/s per provisioned GB
-for both read and write, which puts this disk's sustained ceiling at
-`316 × 0.12 = 37.9 MB/s = 36.2 MiB/s` — **below every figure in this document**, including
-the 43–45 MiB/s full-extent re-read and the downloader's own 49 MiB/s. Confirm the per-GB
-constant against current GCP docs before quoting it; the `dd` arms below measure the disk
-directly and are the authority either way.
-
-If it holds, the §6.5c–§6.5f investigation was chasing a gap that does not exist: 49 MiB/s
-would be the downloader *exceeding* the provisioned rate with the page cache's help, and
-the 79–88 MiB/s figures — more than 2× spec — become the anomaly needing explanation
-rather than the target. Note this also predicts a **hard floor on the whole approach**:
-no amount of parallelism makes a 316 GB `pd-standard` go faster than ~36 MiB/s sustained,
-so §10's "buy a bigger or faster disk" option stops being an optimisation and becomes the
-only remaining lever.
+**Measured: `316  pd-standard`.** A spec-sheet prediction was made here and it was wrong:
+`pd-standard` is rated at 0.12 MB/s per provisioned GB, giving `316 × 0.12 = 36.2 MiB/s`,
+and the `dd` arms below measure **88 MiB/s**. Either the constant does not apply to this
+configuration or there is a per-instance floor; whichever it is, **the device is the
+authority and the spec sheet is not.** Recorded because the prediction shaped the next test
+and nearly shaped the conclusion.
 
 Then read and write the same disk with the cache out of the path. The read arm uses the BAM
 that is already there, so it costs nothing and destroys nothing:
@@ -2790,31 +2786,104 @@ sudo docker exec slurm sh -c '
   rm -f "$D"/ddtest "$D"/ddtest2'
 ```
 
-The third arm decides it. **buffered ≈ 80 against direct ≈ 36–45** proves the cache
-inflation and dissolves the 1.70×; **all three ≈ 80** means the `pd-standard` arithmetic
-above is wrong and the gap is ours after all.
-
 Note the disk is now nearly empty rather than 90% full, so this measures the device rather
 than the device-at-fullness. That is the right control here — §6.5d already found fullness
 worth 1.7% — but it does mean the arms are not directly comparable to the §6.5g re-read,
 which ran against a full one.
 
+#### Measured — the cache was never the mechanism, and duration is
+
+```
+/dev/sdb  310G  28K  310G  1%  /mnt/rwdisks/canine-bench-...
+write, O_DIRECT            4 GiB / 46.4s   92.5 MB/s  =  88.2 MiB/s
+read,  O_DIRECT            4 GiB / 46.8s   91.7 MB/s  =  87.5 MiB/s
+write, buffered+fdatasync  4 GiB / 53.3s   80.7 MB/s  =  77.0 MiB/s
+```
+
+**Buffered is 13% *slower* than direct.** The page cache costs this workload throughput; it
+does not lend any. So the hypothesis this section was built on — that the ≤16 GiB arms in
+§6.5d–§6.5f were inflated by RAM — is **refuted**, and the `⚠️` extent column above is
+wrong about the reason those figures should be treated carefully. They were honest
+measurements of this device. Two further consequences worth stating plainly: the `O_DIRECT`
+test **controlled for the wrong variable**, since neither regime turns out to depend on the
+cache, and the instrument therefore could not have distinguished the two hypotheses
+whatever it returned. Choosing a control that both candidates are indifferent to is a
+distinct failure from measuring nothing at all, and harder to notice.
+
+What survives is the pattern, now with the cache eliminated as an explanation for it:
+
+| operation | tool | direction | extent | duration | rate |
+|---|---|---|---|---|---|
+| `dd oflag=direct` | dd | write | 4 GiB | 46 s | **88.2 MiB/s** |
+| `dd iflag=direct` | dd | read | 4 GiB | 47 s | **87.5 MiB/s** |
+| `dd conv=fdatasync` | dd | write | 4 GiB | 53 s | 77.0 MiB/s |
+| 16 writers, one inode (§6.5f) | sh | write | 16 GiB | 206 s | 79.5 MiB/s |
+| the downloader (§6.5g) | python | write | 279 GiB | 5818 s | **44.2 MiB/s settled** |
+| `file_multipart_etag` re-read (§6.5g) | python | read | 279 GiB | 6300 s | **43–45 MiB/s** |
+
+Two tools, both directions, cached and uncached: **everything short lands at 77–88, and
+everything long lands at 43–45.** The only variable that tracks the split is duration.
+
+And the transition was already recorded, in §6.5c's heartbeat series — read it again now
+that there is something to compare it to:
+
+```
+103.3  87.9  58.9 | 44.4 44.1 ... 44.2 ...   MiB/s   (300 s intervals)
+```
+
+That is not noise settling. It **starts at the `dd` figure**, decays over three intervals —
+about 73 GiB of writes — and then holds flat to 1.7% for 75 minutes at half of it. A device
+that delivers 88 MiB/s for the first minutes and 44 MiB/s thereafter explains every row of
+the table above, in both directions, for both tools, with no appeal to our code at all.
+
+**So §6.5e/§6.5f's "a defect — ours" is very likely wrong, but not because their numbers
+were inflated — because they were too short to leave the burst regime.** The downloader's
+44.2 MiB/s is what this disk sustains; the 79.5 MiB/s it was being judged against is what
+this disk does for its first three minutes. Nothing in §6.5c–§6.5f ran long enough to
+measure the thing the full-size run is limited by.
+
+This is not yet proven. It is one inference from a decay curve measured through the
+downloader, and the confirming test is to reproduce that curve with no downloader in the
+path (§6.5i).
+
+#### §6.5i Reproduce the decay with `dd` alone — ~25 minutes, no egress
+
+Twelve 8 GiB stages, each timed separately, `O_DIRECT` throughout so the cache is out of
+the path in every one. If the rate falls from ~88 toward ~44 somewhere around stage 8–9,
+the burst-then-sustained profile is the device's and the investigation is over.
+
+```bash
+# on the node -- 96 GiB total, one rate per 8 GiB stage
+sudo docker exec slurm sh -c '
+  D=/mnt/rwdisks/'"$DISK"'
+  i=0
+  while [ $i -lt 12 ]; do
+    printf "stage %2d (%3d GiB in): " "$i" "$((i*8))"
+    dd if=/dev/zero of="$D"/burst bs=1M count=8192 seek=$((i*8192)) \
+       oflag=direct conv=notrunc 2>&1 | tail -1
+    i=$((i+1))
+  done
+  rm -f "$D"/burst'
+```
+
+The trend is usually obvious by stage 5. Interrupting is safe but leaves the file behind —
+`sudo docker exec slurm rm -f /mnt/rwdisks/$DISK/burst` afterwards, or the next §6.3 run
+will have 96 GiB less room than it expects.
+
 How to read it:
 
-* **both arms ~36–45 MiB/s** → the device is the answer, and it is at or near its
-  provisioned ceiling. 49.08 MiB/s is the downloader matching or beating its disk, the
-  1.70× was a page-cache artifact of the ≤16 GiB arms, and §6.5c through §6.5f were
-  chasing a gap that does not exist. The prize is then a faster destination, not faster
-  code, and §10's cost decision needs redoing on that basis.
-* **both arms ~80 MiB/s** → the device is fine even without the cache, the gap is real and
-  ours, and the next question is what `pwrite` is doing differently from `dd` — 1 MiB
-  blocks, sparse out-of-order offsets, or the `fdatasync` cadence, in that order.
-* **read ~80, write ~45** → asymmetry, and only the write half of §6.5d–§6.5f's elimination
-  survives. Re-run §6.5f with `oflag=direct` before drawing anything from it.
-
-Whatever it says, **re-run §6.5e and §6.5f with `oflag=direct` before citing their numbers
-again.** They are currently the only evidence that the gap is ours, and they were measured
-through exactly the cache this step removes.
+* **decays ~88 → ~44 and holds** → confirmed, and the whole §6.5c–§6.5g investigation
+  resolves to "the disk is a 316 GB `pd-standard`". 3.07× is the device's answer, the
+  downloader has no write-path defect, and the only remaining lever is the destination —
+  a larger `pd-standard` (throughput scales with provisioned GB), `pd-balanced`/`pd-ssd`,
+  or several disks striped. That is §10, and §10 needs redoing with these numbers.
+* **flat at ~88 for all twelve stages** → the device sustains 88 MiB/s and the decay is
+  something the downloader does over time. Then the gap is real and ours, and the suspects
+  are what `pwrite` does differently from `dd`: 1 MiB blocks against dd's 1 MiB *sequential*
+  ones, sparse out-of-order offsets across 16 workers, and the `fdatasync` cadence — in
+  that order, and all three are cheap to test with the same harness.
+* **decays but to ~60, not ~44** → both, in some proportion. Take the measured sustained
+  figure as the new denominator and re-derive the gap; do not keep using 79.5.
 
 ### 6.6 the bucket-compose route against real GCS
 
@@ -3070,10 +3139,12 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Does in-transfer hashing (#19) pay off? | §6.3 | yes, completely — `verify 0.0s` with a real ETag, ~52 min of read-back avoided |
 | HTTP vs the S3 API | §6.5b | 6.9% apart on the download phase; the presigned path wins but the transport is not the bottleneck |
 | Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **the question was malformed.** The 4 GiB rows measure page cache (28 GB RAM), so 90% is an artifact; the full-size run's throughput is **flat to 1.7%** across 85% of its duration, which eliminates fullness and extent growth outright. Source, ENOSPC and logical scatter all separately eliminated |
-| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e, **revisited §6.5g** | **provisional, and now doubted.** 16 concurrent writers get 83.6 MiB/s, one sequential writer 85.8, so write concurrency costs this disk nothing — but both arms were 16 GiB / ~200 s, i.e. through the same page cache §6.5d showed inflates short runs. Re-measure with `oflag=direct` (§6.5h) before citing the 1.70× again |
-| Is single-inode `fsync` contention the 1.70×? | §6.5f | **no — 5% of it.** 206 s one inode against 196 s sixteen inodes. Same 16 GiB caveat as above |
+| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e, **revisited §6.5h** | **very likely just the disk.** 16 concurrent writers get 83.6 MiB/s and one sequential writer 85.8 — but every such arm is ≤16 GiB, and §6.5h measured this device at **88 MiB/s over 4 GiB against 44 MiB/s over 279 GiB**. The comparison was burst against sustained. §6.5i confirms with `dd` alone |
+| Is single-inode `fsync` contention the 1.70×? | §6.5f | **no — 5% of it.** 206 s one inode against 196 s sixteen inodes. Same ≤16 GiB burst caveat as above |
+| Did the page cache inflate the short arms? | §6.5h | **no — refuted.** `O_DIRECT` measures 88.2 MiB/s write and 87.5 read; buffered + `fdatasync` measures 77.0. The cache *costs* 13%. The `O_DIRECT` test controlled for a variable neither hypothesis depended on |
 | Is `read`/`write` serialization in `download_chunk` the gap? | §6.5g | **no — falsified.** The loop is **95% `write`, 5% `read`**, overlap ceiling **1.05×**, so a reader/writer split has nothing to recover: 14.60 of 16 workers sat permanently inside `pwrite`. The kernel's socket receive buffer is already the queue that fix would have added |
-| Then what is the remaining gap? | §6.5g / §6.5h | **OPEN, and the question has changed.** The benchmark's own re-read — an unreported 1h45m — puts this disk at **43–45 MiB/s over 279 GiB**, against 85 MiB/s recorded for the same operation and within 10% of the downloader's write rate. Every "the disk can do 79–88" figure is ≤16 GiB; both full-extent figures say ~45. §6.5h settles it with `O_DIRECT` in ~4 minutes |
+| Then what is the remaining gap? | §6.5g–§6.5i | **probably none — burst versus sustained.** Two tools, both directions, cached and uncached: everything ≤16 GiB lands at 77–88 MiB/s, everything ≥279 GiB lands at 43–45. §6.5c's heartbeat records the transition directly — `103 → 88 → 59 → 44.2` flat for 75 minutes, starting at the `dd` figure and settling at half of it after ~73 GiB. §6.5i reproduces it with `dd` alone to confirm |
+| **pd-standard sustained vs burst at 316 GB** | §6.5h / §6.5i | **~88 MiB/s for the first ~73 GiB, ~44 MiB/s thereafter** (pending §6.5i). Do not size a transfer off a `dd` that finishes in a minute |
 | What does the benchmark's own verification cost? | §6.5g | **43–45 MiB/s over 278.91 GiB, ≥1h45m** — and it was reported as `0.0s` until this run, because `phases: verify` is the downloader's and this read-back is the harness's. Now printed as `mean re-read :` |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
@@ -3089,8 +3160,8 @@ And report the **3.07×** alongside it rather than §6.2's 4.92×. The larger fi
 of a 4 GiB prefix and not of the object anyone localizes, and the difference between them
 is the open question in §6.5c.
 
-Do not report the 3.07× as "under target because of a defect in our write path" until
-§6.5h has run. As of §6.5g the more likely reading is that 49 MiB/s is roughly what this
-`pd-standard` sustains over 279 GiB, in which case 3.07× is the disk's answer rather than
-ours and the remaining prize is a different destination — which is a §10 question, not a
-code one.
+Do not report the 3.07× as "under target because of a defect in our write path". As of
+§6.5h the evidence is that 49 MiB/s is roughly what this `pd-standard` sustains past its
+first ~73 GiB, in which case 3.07× is the disk's answer rather than ours and the remaining
+prize is a different destination — a §10 question, not a code one. §6.5i is what turns
+"the evidence is" into "measured".
