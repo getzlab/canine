@@ -2537,12 +2537,49 @@ Two loose ends that argue against banking it as the answer: the 4 GiB prefix row
 79.8 MiB/s, which this model cannot produce, and the settled 44.2 is 26% under the model's
 own ceiling.
 
-**Further shell tests are exhausted.** The next measurement belongs inside the downloader:
-split the read loop's accounting into time in `stream.read()` versus time in `sink.write()`
-per worker and emit both, the way `chunk_done` was instrumented in §6.5a and the concurrency
-figure in §6.5c. That distinguishes read-write serialisation from a slow write path from
-anything else in one full-size run, and — as every guard in this runbook exists to insist —
-it measures the mechanism rather than inferring it from a total.
+**Further shell tests are exhausted.** The next measurement belongs inside the downloader,
+and it now exists.
+
+#### §6.5g The read/write split — `k9pdl-io`
+
+`download_chunk` now times `stream.read()` and `sink.write()` separately and emits:
+
+```
+k9pdl-io read 1234.567s write 2345.678s other 12.345s over 285621 blocks
+         (read 34% of loop, overlap ceiling 1.53x)
+```
+
+and the sweep prints it as an `io :` line beside `streams:` and `commit :`. Nothing to
+run but the sweep itself — re-upload both scripts and repeat §6.3.
+
+How to read it:
+
+* **`read %`** is the share of worker-loop time the network held the disk idle for. Both
+  halves run on the same thread in sequence, so a worker is never doing both at once.
+* **`overlap ceiling`** is `(read + write) / max(read, write)` — what a reader/writer split
+  with a queue between them could recover. It is **bounded by 2.0**, at `read == write`,
+  because a queue can only hide the smaller half behind the larger one. It is *not*
+  `1/(1 - read share)`: that form assumes reads become free, is unbounded, and printed
+  infinity the first time a test wrote to a fast local disk.
+* **`other`** is the rest of the loop — the progress accounting. Note the in-transfer md5
+  lives inside `sink.write()` on the in-place route, so #19's cost is counted under
+  `write`, not separately.
+
+Against the full-size numbers (44.2 MiB/s settled, 79.5 available):
+
+* **ceiling ≈ 1.8x or better, with `read %` near 45** → read/write serialisation is the
+  gap, and decoupling the loop recovers most of it. The fix is a bounded queue between a
+  reader pool and a writer pool, and it is worth ~35 minutes per BAM.
+* **ceiling ≈ 1.1x, `write` dominating** → the workers are simply waiting on the disk,
+  and since §6.5f showed the device delivering 79.5 MiB/s under this exact pattern, the
+  loss is between `pwrite` returning and bytes reaching the platter — writeback
+  throttling, which is a `dirty_ratio` question, not a code one.
+* **`other` large** → neither; look at the progress accounting itself.
+
+The instrumentation is four `time.time()` calls per 1 MiB block, accumulated per-chunk
+rather than per-block so the shared lock is taken ~3283 times on a 279 GiB object instead
+of ~285000. A test pins that a 32 MiB local download stays under 30s with it on, because
+an instrument that changes what it measures is worse than none.
 
 Pair it with the destination in isolation, on the disk in its current state:
 
@@ -2812,7 +2849,7 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **the question was malformed.** The 4 GiB rows measure page cache (28 GB RAM), so 90% is an artifact; the full-size run's throughput is **flat to 1.7%** across 85% of its duration, which eliminates fullness and extent growth outright. Source, ENOSPC and logical scatter all separately eliminated |
 | Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e | **a defect — ours.** 16 concurrent writers get 83.6 MiB/s, one sequential writer 85.8; write concurrency costs this disk nothing. The downloader's 49.04 is a 1.70× gap inside our own code |
 | Is single-inode `fsync` contention the 1.70×? | §6.5f | **no — 5% of it.** 206 s one inode against 196 s sixteen inodes. The disk gives 79.5 MiB/s under the downloader's exact pattern; the downloader settles at 44.2 |
-| Then what is the remaining 44%? | §6.5f | **OPEN, and shell tests are exhausted.** Leading hypothesis: `download_chunk` reads then writes in one thread, so network and disk never overlap per worker. Needs `read()` vs `write()` split inside the read loop |
+| Then what is the remaining 44%? | §6.5f / §6.5g | **OPEN, instrument built.** Leading hypothesis: `download_chunk` reads then writes in one thread, so network and disk never overlap per worker. `k9pdl-io` now reports the split and the overlap ceiling; re-run §6.3 to read it |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
 | `/bin/sh` in the container | §3 probe | dash |

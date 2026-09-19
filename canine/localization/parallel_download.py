@@ -2005,6 +2005,21 @@ class Downloader:
         # other number in the output distinguishes them.
         self._stream_seconds = 0.0
         self._stream_lock = threading.Lock()
+        # The read loop decomposed: time inside `stream.read()` against time inside
+        # `sink.write()`. Both run on the worker thread, one after the other, so a
+        # worker is never doing both at once -- which makes `read / (read + write)` the
+        # share of worker time the network holds the disk idle for, and therefore the
+        # headroom a reader/writer split would recover.
+        #
+        # This exists because every EXTERNAL explanation for the full-size run settling
+        # at 56% of the disk has been eliminated by measurement (runbook §6.5c-f: the
+        # source does 240 MiB/s at any depth, write concurrency is free, logical scatter
+        # and disk fullness cost nothing, one shared inode costs 5%). What remains is
+        # inside this loop, and the last two times that was true, guessing produced the
+        # wrong answer.
+        self._read_seconds = 0.0
+        self._write_seconds = 0.0
+        self._io_blocks = 0
         # Wall time summed over every chunk_done -- the manifest rewrite, its fsyncs and
         # the wait for Manifest._lock. This is the only work that grows with the CHUNK
         # COUNT rather than the byte count, and the 279 GiB run fell to 50% of the disk
@@ -2143,15 +2158,25 @@ class Downloader:
             # deliberately -- counting them would inflate the concurrency figure with
             # time nothing was being transferred.
             stream_started = time.time()
+            # Accumulated locally and folded in once per attempt. READ_BLOCK is 1 MiB,
+            # so a 279 GiB object is ~285k iterations; taking the shared lock per block
+            # would put 285k acquisitions through 16 threads to measure something the
+            # lock itself would then distort.
+            io = [0.0, 0.0, 0]
             try:
                 while offset < end:
                     want = min(self.sink.read_block, end - offset)
+                    mark = time.time()
                     buf = stream.read(want)
+                    after_read = time.time()
+                    io[0] += after_read - mark
                     if not buf:
                         raise TransientError(
                             "short read at {} ({} bytes short)".format(offset, end - offset)
                         )
                     durable = self.sink.write(index, offset, buf)
+                    io[1] += time.time() - after_read
+                    io[2] += 1
                     sent_to = offset + len(buf)
                     self.progress.add(len(buf))
                     with self._progress_lock:
@@ -2169,15 +2194,15 @@ class Downloader:
                             "sink persisted to {} of {} sent".format(durable, sent_to)
                         )
                 attempts = 0
-                self._count_stream_time(stream_started)
+                self._count_stream_time(stream_started, io)
             except TransientError as e:
-                self._count_stream_time(stream_started)
+                self._count_stream_time(stream_started, io)
                 attempts += 1
                 if attempts > self.options.retries:
                     raise
                 self._backoff(attempts, "chunk {}: {}".format(index, e))
             except (IOError, OSError) as e:
-                self._count_stream_time(stream_started)
+                self._count_stream_time(stream_started, io)
                 if e.errno == errno.ENOSPC:
                     self._await_space(index)
                     continue
@@ -2231,6 +2256,9 @@ class Downloader:
         with self._stream_lock:
             book = self._bookkeeping_seconds
             calls = self._bookkeeping_calls
+            read_s = self._read_seconds
+            write_s = self._write_seconds
+            blocks = self._io_blocks
         with self._writer_cv:
             commit = self._commit_seconds
             batches = self._commit_batches
@@ -2245,6 +2273,26 @@ class Downloader:
             "{:.1f}% of {} worker-seconds)".format(
                 book, calls, book / calls if calls else 0.0,
                 100.0 * book / (workers * wall) if wall else 0.0, workers * wall))
+        # The read loop split in two. Both halves run on the worker thread in sequence,
+        # so `read` is time the network held the disk idle and `write` is time the disk
+        # held the network idle -- and `read / (read + write)` is the share a
+        # reader/writer split with a queue between them could recover. `other` is
+        # whatever is left of the loop: the progress accounting, and on the in-place
+        # route the in-transfer md5, which lives inside sink.write() and is therefore
+        # counted under `write` rather than separately.
+        io = read_s + write_s
+        # The ceiling is (read + write) / max(read, write), NOT 1/(1 - read share).
+        # Decoupling the two with a queue turns a worker's serial `read then write` into
+        # a pipelined `max(read, write)` -- it can hide the smaller half behind the
+        # larger one and no more. That is bounded by 2.0, at read == write. The
+        # 1/(1 - share) form assumes reads become free, which overstates it without
+        # bound and reported infinity the first time a test wrote to a fast local disk.
+        slower = max(read_s, write_s)
+        log("k9pdl-io read {:.3f}s write {:.3f}s other {:.3f}s over {} blocks "
+            "(read {:.0f}% of loop, overlap ceiling {:.2f}x)".format(
+                read_s, write_s, max(0.0, streaming - io), blocks,
+                100.0 * read_s / io if io else 0.0,
+                (io / slower) if slower > 0 else 1.0))
         # The writer's own cost, which is OFF the worker pool and so is reported against
         # the wall clock instead. `mean batch` is the point of the whole mechanism: at 1.0
         # nothing was amortised and the commits are still per-chunk, which a throughput
@@ -2255,7 +2303,7 @@ class Downloader:
                 (float(committed) / batches) if batches else 0.0,
                 100.0 * commit / wall if wall else 0.0, wall))
 
-    def _count_stream_time(self, started):
+    def _count_stream_time(self, started, io=None):
         """
         Account the time this attempt spent with an open request receiving bytes.
 
@@ -2270,6 +2318,10 @@ class Downloader:
         """
         with self._stream_lock:
             self._stream_seconds += time.time() - started
+            if io is not None:
+                self._read_seconds += io[0]
+                self._write_seconds += io[1]
+                self._io_blocks += io[2]
 
     def _await_space(self, index):
         """

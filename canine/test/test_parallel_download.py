@@ -14,6 +14,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 import urllib.request
 
 import pytest
@@ -2073,7 +2074,7 @@ class TestConcurrencyIsReported:
         handlers = [line for line in body.splitlines()
                     if re.match(r"^ {12}except\b", line)]
         assert len(handlers) == 2, handlers
-        calls = body.count("_count_stream_time(stream_started)")
+        calls = body.count("_count_stream_time(stream_started, io)")
         # one per handler, plus the success path that falls out of the loop normally
         assert calls == len(handlers) + 1, (
             "{} exit paths but {} accounting calls".format(len(handlers) + 1, calls))
@@ -2425,3 +2426,185 @@ class TestADoneMarkerWithoutItsFileIsNotCompletion:
         assert "ignoring the marker" in second.stderr, second.stderr
         with open(dest, "rb") as handle:
             assert handle.read() == payload
+
+
+class TestTheReadLoopIsSplitIntoReadAndWrite:
+    """
+    Every external explanation for the full-size run settling at 56% of the disk has been
+    eliminated by measurement (runbook §6.5c-f): the source does 240 MiB/s at any depth,
+    write concurrency is free on this device, logical scatter and disk fullness cost
+    nothing, and one shared inode costs 5%. What is left is inside `download_chunk`, and
+    the leading hypothesis is that it reads a block and then writes it on the same thread,
+    so the network and the disk never overlap within a worker.
+
+    That is a claim about where time goes, and the last two times this project reasoned
+    about where time goes it was wrong -- the fsync-barrier theory predicted a large win
+    from fewer chunks and delivered 8%. So measure it.
+    """
+
+    def parse(self, output):
+        match = re.search(
+            r"k9pdl-io read ([\d.]+)s write ([\d.]+)s other ([\d.]+)s over (\d+) blocks "
+            r"\(read (\d+)% of loop, overlap ceiling ([\d.]+)x\)", output)
+        assert match, "no k9pdl-io line in:\n" + output
+        return {"read": float(match.group(1)), "write": float(match.group(2)),
+                "other": float(match.group(3)), "blocks": int(match.group(4)),
+                "pct": int(match.group(5)), "ceiling": float(match.group(6))}
+
+    def test_both_halves_are_reported(self, tmp_path):
+        payload = os.urandom(8 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        assert got["blocks"] == 8, got          # 8 MiB at READ_BLOCK = 1 MiB
+        assert got["read"] > 0
+        # write can legitimately round to ~0: eight 1 MiB pwrites to a local disk are
+        # microseconds. The directional tests below are what pin the attribution.
+        assert got["write"] >= 0
+
+    def test_the_split_sums_to_no_more_than_the_loop(self, tmp_path):
+        """
+        read and write are a DECOMPOSITION of the stream time, not an addition to it.
+        If they could exceed it the two numbers would be measuring different clocks and
+        the percentage would be meaningless.
+        """
+        payload = os.urandom(8 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        streams = re.search(r"\(\d+ chunks, [\d.]+s wall, ([\d.]+)s streaming", proc.stderr)
+        assert streams, proc.stderr
+        got = self.parse(proc.stderr)
+        assert got["read"] + got["write"] <= float(streams.group(1)) + 0.01, (
+            got, streams.group(1))
+        assert got["other"] >= 0.0
+
+    def test_a_slow_source_shows_up_as_read_time(self, tmp_path):
+        """
+        Throttle the server and the read half must grow. Without this the two numbers
+        could be transposed and nothing would notice.
+        """
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            server.state.throttle_bytes = 64 * 1024
+            server.state.throttle_delay = 0.02
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 2, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        assert got["read"] > got["write"] * 5, got
+        assert got["pct"] >= 80, got
+
+    def test_a_slow_sink_shows_up_as_write_time(self, tmp_path):
+        """The other direction, so the attribution cannot be backwards."""
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            slow = (
+                "import sys, time, types\n"
+                "sys.argv = ['pdl'] + {argv!r}\n"
+                "src = open({path!r}).read()\n"
+                "mod = types.ModuleType('pdl'); mod.__file__ = {path!r}\n"
+                "exec(compile(src, {path!r}, 'exec'), mod.__dict__)\n"
+                "orig = mod.PosixChunkSink.write\n"
+                "def slow_write(self, i, off, buf):\n"
+                "    time.sleep(0.05)\n"
+                "    return orig(self, i, off, buf)\n"
+                "mod.PosixChunkSink.write = slow_write\n"
+                "sys.exit(mod.main())\n"
+            ).format(argv=["--url", server.url(), "--dest", dest,
+                           "--size", str(len(payload)), "--connections", "2",
+                           "--min-chunk", str(MIB)], path=PDL_PATH)
+            proc = subprocess.run([sys.executable, "-c", slow],
+                                  capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        assert got["write"] > got["read"] * 5, got
+        assert got["pct"] <= 20, got
+
+    def test_the_overlap_ceiling_is_bounded_by_two(self, tmp_path):
+        """
+        The headline number, and its bound is the whole point. Decoupling read from write
+        with a queue turns a worker's serial `read then write` into `max(read, write)` --
+        it hides the smaller half behind the larger one and no more, so the best possible
+        speedup is 2x, at read == write.
+
+        The first version of this used 1/(1 - read share), which assumes reads become
+        free. That is unbounded, and it printed infinity the moment a test wrote to a
+        fast local disk where write rounded to zero.
+        """
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            server.state.throttle_bytes = 64 * 1024
+            server.state.throttle_delay = 0.01
+            dest = str(tmp_path / "out.bin")
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 2, "--min-chunk", MIB)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        io = got["read"] + got["write"]
+        expected = io / max(got["read"], got["write"])
+        assert abs(got["ceiling"] - expected) < 0.05, got
+        assert 1.0 <= got["ceiling"] <= 2.0, got
+
+    def test_the_timing_is_cheap_enough_to_leave_on(self, tmp_path):
+        """
+        Four clock reads per 1 MiB block. If that were measurable it would change the
+        thing it measures, so pin that instrumented throughput stays sane.
+        """
+        payload = os.urandom(32 * MIB)
+        with Server(payload) as server:
+            dest = str(tmp_path / "out.bin")
+            started = time.time()
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", MIB)
+            elapsed = time.time() - started
+        assert proc.returncode == 0, proc.stderr
+        assert self.parse(proc.stderr)["blocks"] == 32
+        assert elapsed < 30, "32 MiB from a local server took {:.1f}s".format(elapsed)
+
+    def test_the_ceiling_is_two_when_the_halves_are_balanced(self, tmp_path):
+        """
+        The case that actually exercises the formula. Every other test here has one half
+        dominating, where (read+write)/max(read,write) collapses to ~1.0 -- and so does
+        the wrong formula, so those tests cannot tell them apart. A mutation replacing
+        max(read, write) with (read + write) survived until this existed.
+
+        Throttle the source and the sink to roughly the same rate: read == write, and
+        the ceiling must be ~2.0 because a queue could hide either half entirely behind
+        the other.
+        """
+        payload = os.urandom(4 * MIB)
+        with Server(payload) as server:
+            server.state.throttle_bytes = 64 * 1024
+            server.state.throttle_delay = 0.01     # ~0.16s per 1 MiB block
+            dest = str(tmp_path / "out.bin")
+            slow = (
+                "import sys, time, types\n"
+                "sys.argv = ['pdl'] + {argv!r}\n"
+                "src = open({path!r}).read()\n"
+                "mod = types.ModuleType('pdl'); mod.__file__ = {path!r}\n"
+                "exec(compile(src, {path!r}, 'exec'), mod.__dict__)\n"
+                "orig = mod.PosixChunkSink.write\n"
+                "def slow_write(self, i, off, buf):\n"
+                "    time.sleep(0.16)\n"           # matched to the throttled read
+                "    return orig(self, i, off, buf)\n"
+                "mod.PosixChunkSink.write = slow_write\n"
+                "sys.exit(mod.main())\n"
+            ).format(argv=["--url", server.url(), "--dest", dest,
+                           "--size", str(len(payload)), "--connections", "2",
+                           "--min-chunk", str(MIB)], path=PDL_PATH)
+            proc = subprocess.run([sys.executable, "-c", slow],
+                                  capture_output=True, text=True, timeout=120)
+        assert proc.returncode == 0, proc.stderr
+        got = self.parse(proc.stderr)
+        balance = min(got["read"], got["write"]) / max(got["read"], got["write"])
+        assert balance > 0.5, "halves not balanced enough to test the formula: {}".format(got)
+        assert got["ceiling"] > 1.5, got
+        assert got["ceiling"] <= 2.0, got

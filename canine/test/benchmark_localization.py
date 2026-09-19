@@ -1123,6 +1123,14 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     book = re.search(r"k9pdl-bookkeeping ([\d.]+)s over (\d+) calls "
                      r"\(mean ([\d.]+)s, ([\d.]+)% of", stderr)
 
+    # The read loop split in two. Both halves are on the worker thread in sequence, so
+    # `read %` is the share of worker time the network holds the disk idle for, and the
+    # ceiling is what decoupling them could recover -- bounded by 2x, since a queue can
+    # only hide the smaller half behind the larger.
+    split = re.search(r"k9pdl-io read ([\d.]+)s write ([\d.]+)s other ([\d.]+)s "
+                      r"over (\d+) blocks \(read (\d+)% of loop, "
+                      r"overlap ceiling ([\d.]+)x\)", stderr)
+
     # The deferred commit. `mean batch` is the number that says whether the deferral did
     # anything: at 1.0 the writer is drained as fast as it is filled, nothing was
     # amortised, and the commits are still effectively per-chunk -- which is
@@ -1137,6 +1145,12 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
         "bookkeeping_calls": int(book.group(2)) if book else None,
         "bookkeeping_mean": float(book.group(3)) if book else None,
         "bookkeeping_pct_workers": float(book.group(4)) if book else None,
+        "read_seconds": float(split.group(1)) if split else None,
+        "write_seconds": float(split.group(2)) if split else None,
+        "loop_other_seconds": float(split.group(3)) if split else None,
+        "io_blocks": int(split.group(4)) if split else None,
+        "read_pct_of_loop": int(split.group(5)) if split else None,
+        "overlap_ceiling": float(split.group(6)) if split else None,
         "commit_seconds": float(commit.group(1)) if commit else None,
         "commit_batches": int(commit.group(2)) if commit else None,
         "commit_chunks": int(commit.group(3)) if commit else None,
@@ -1707,6 +1721,12 @@ def command_sweep(args):
         if outcome.get("mean_streams") is not None:
             say("        streams: {:.2f} of {} concurrent on average".format(
                 outcome["mean_streams"], outcome["workers"]))
+        if outcome.get("read_seconds") is not None:
+            say("        io     : read {:.1f}s / write {:.1f}s / other {:.1f}s "
+                "({}% read, overlap ceiling {:.2f}x)".format(
+                    outcome["read_seconds"], outcome["write_seconds"],
+                    outcome["loop_other_seconds"], outcome["read_pct_of_loop"],
+                    outcome["overlap_ceiling"]))
         if outcome.get("bookkeeping_seconds") is not None:
             say("        chunk_ready: {:.1f}s over {} calls (mean {:.3f}s, {:.0f}% of the"
                 " worker pool)".format(
