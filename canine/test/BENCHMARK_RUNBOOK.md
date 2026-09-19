@@ -2380,9 +2380,19 @@ bytes between successive progress lines:
 32.5  27.6  18.5 | 14.0 13.9 14.1 13.8 13.9 13.9 14.0 13.8 13.8 13.9 14.0 14.0 13.9 14.0 13.9   GB
 ```
 
-**Flat to 1.7% across the last fifteen intervals — the last ~85% of a 97-minute run.**
-Disk fullness and extent-tree depth both grow monotonically; neither can produce a flat
-rate. Both are eliminated, for free, by data collected before either hypothesis existed.
+`HEARTBEAT_INTERVAL` is 300 s and the gate is `now - last_echo < echo_every`, so these are
+time intervals and the deltas are genuine rates:
+
+```
+103.3  87.9  58.9 | 44.4 44.1 44.7 44.0 44.1 44.1 44.5 43.9 43.9 44.2 44.5 44.6 44.2 44.5 44.1   MiB/s
+```
+
+**It decays for three intervals and then holds flat to 1.7% for the remaining fifteen —
+75 minutes.** Correcting an earlier reading of this data as flat throughout: the decay is
+real, and it is the page-cache settling curve. What matters is where it settles and for how
+long. Disk fullness went from roughly 10% to 90% *during the flat stretch*, and extent depth
+grew the whole way; neither can produce 1.7% of variation across 75 minutes. Both are
+eliminated, for free, by data collected before either hypothesis existed.
 
 And the first three intervals are the explanation for everything else: **32.5 + 27.6 GB
 absorbed before writeback caught up, on a node with 28 GB of RAM.** A 4 GiB prefix run
@@ -2491,6 +2501,48 @@ writers are mid-write — the downloader's pattern without any of its code.
 
 Either way this is the last test that needs no code. After it, the answer is in the
 downloader and wants instrumentation, not a shell script.
+
+#### Measured — the inode costs 5%, not 70%
+
+```
+16 writers, ONE file: 206s for 16 GiB  ->  79.5 MiB/s
+```
+
+against 196 s / 83.6 MiB/s for the same sixteen writers across sixteen files. **One shared
+inode costs 5%.** Single-inode `fsync` contention is real and is not the gap: closing it
+entirely would buy 5 points of the 41 that are missing.
+
+So the disk, measured under the downloader's own access pattern — sixteen concurrent
+writers, one inode, `fdatasync` underneath — delivers **79.5 MiB/s**, and the downloader
+settles at **44.2 MiB/s: 56% of it.** Every external explanation is now eliminated:
+
+| candidate | verdict | evidence |
+|---|---|---|
+| the source | eliminated | ~240 MiB/s at any depth, §6.5c |
+| ENOSPC waiting | eliminated | no ENOSPC markers in the drained stderr, §6.5c |
+| logical scatter / extent tree | eliminated | 84 vs 76 MiB/s, 5 physical fragments, §6.5d |
+| disk fullness | eliminated | 1.7% variation across 10%→90% full, §6.5d |
+| write concurrency | eliminated | 83.6 vs 85.8 MiB/s, §6.5e |
+| shared inode + `fsync` | 5% of the 44% gap | 206 s vs 196 s, above |
+
+**The leading hypothesis is now the read loop's structure, and it is a hypothesis.**
+`download_chunk` reads a block and then writes it, in the same thread: `buf =
+stream.read(want)` followed by `self.sink.write(...)`. Network and disk never overlap
+*within* a worker, so each worker's rate is `1/(1/r_net + 1/r_disk)` — the same series
+effect the `VERIFY_READ_WORKERS` comment records for read-then-hash. At the aggregate that
+is `1/(1/240 + 1/79.5) = 59.7 MiB/s`, and the measured 44.2 sits **below even that**, so
+if this is the mechanism something else is stacked on top of it.
+
+Two loose ends that argue against banking it as the answer: the 4 GiB prefix rows reach
+79.8 MiB/s, which this model cannot produce, and the settled 44.2 is 26% under the model's
+own ceiling.
+
+**Further shell tests are exhausted.** The next measurement belongs inside the downloader:
+split the read loop's accounting into time in `stream.read()` versus time in `sink.write()`
+per worker and emit both, the way `chunk_done` was instrumented in §6.5a and the concurrency
+figure in §6.5c. That distinguishes read-write serialisation from a slow write path from
+anything else in one full-size run, and — as every guard in this runbook exists to insist —
+it measures the mechanism rather than inferring it from a total.
 
 Pair it with the destination in isolation, on the disk in its current state:
 
@@ -2759,7 +2811,8 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | HTTP vs the S3 API | §6.5b | 6.9% apart on the download phase; the presigned path wins but the transport is not the bottleneck |
 | Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **the question was malformed.** The 4 GiB rows measure page cache (28 GB RAM), so 90% is an artifact; the full-size run's throughput is **flat to 1.7%** across 85% of its duration, which eliminates fullness and extent growth outright. Source, ENOSPC and logical scatter all separately eliminated |
 | Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e | **a defect — ours.** 16 concurrent writers get 83.6 MiB/s, one sequential writer 85.8; write concurrency costs this disk nothing. The downloader's 49.04 is a 1.70× gap inside our own code |
-| Is single-inode `fsync` contention the 1.70×? | §6.5f | **OPEN** — §6.5e used 16 separate files; the downloader uses one inode with a commit thread `fsync`ing it underneath sixteen writers |
+| Is single-inode `fsync` contention the 1.70×? | §6.5f | **no — 5% of it.** 206 s one inode against 196 s sixteen inodes. The disk gives 79.5 MiB/s under the downloader's exact pattern; the downloader settles at 44.2 |
+| Then what is the remaining 44%? | §6.5f | **OPEN, and shell tests are exhausted.** Leading hypothesis: `download_chunk` reads then writes in one thread, so network and disk never overlap per worker. Needs `read()` vs `write()` split inside the read loop |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
 | `/bin/sh` in the container | §3 probe | dash |
