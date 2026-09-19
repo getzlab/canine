@@ -671,8 +671,8 @@ sudo docker exec slurm bash -c '
 sudo docker exec slurm sh -c '
   gcsfuse --version
   gcsfuse --help 2>&1 | grep -c enable-streaming-writes || echo "NO STREAMING WRITES FLAG"'
-sudo docker exec slurm ls /tmp/pdl                 # scripts back?
-sudo docker exec slurm df -h /mnt/rwdisks/$DISK    # disk remounted?
+sudo docker exec slurm ls /tmp/pdl                  # scripts back?
+sudo docker exec slurm sh -c 'df -h /mnt/rwdisks/*' # disk remounted? (§4)
 ```
 
 A zero from the `grep` means streaming writes are not available and §6.6's `mount`-kind
