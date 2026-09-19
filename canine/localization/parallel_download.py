@@ -1373,6 +1373,39 @@ class GcsClient:
         ("gcloud account", ["gcloud", "auth", "print-access-token"]),
     )
 
+    @staticmethod
+    def adc_file():
+        """
+        The credentials file ADC would actually resolve to, or None.
+
+        Needed because `gcloud auth application-default print-access-token` **succeeds
+        without any ADC file at all**: resolution falls through to the GCE metadata
+        server, and gcloud reports success having handed back a *service account* token.
+        So the command exiting 0 says nothing about which identity you got, and a
+        downloader that logged "using ADC" on the strength of it would be lying about
+        the only thing the log line exists to tell you.
+
+        Observed on a real node: `CLOUDSDK_CONFIG=/user_gcloud_config` while the mounted
+        user credentials sat at `/root/.config/gcloud/`, so gcloud never saw them, the
+        token came back as the compute SA, and the upload 403'd with a service-account
+        name in the message. The token call had "worked".
+
+        Checked in ADC's own precedence order.
+        """
+        explicit = os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+        if explicit and os.path.exists(explicit):
+            return explicit
+        config = os.environ.get("CLOUDSDK_CONFIG")
+        candidates = []
+        if config:
+            candidates.append(os.path.join(config, "application_default_credentials.json"))
+        candidates.append(os.path.expanduser(
+            "~/.config/gcloud/application_default_credentials.json"))
+        for candidate in candidates:
+            if os.path.exists(candidate):
+                return candidate
+        return None
+
     def _fetch_token(self):
         """
         Authenticate as the same identity as everything else on this path: ADC.
@@ -1407,7 +1440,14 @@ class GcsClient:
         authenticate would be worse than authenticating as the SA. It is last because it
         is the answer that is always available, not the one that is usually right.
         """
+        adc = self.adc_file()
         for label, command in self.TOKEN_SOURCES:
+            if label == "ADC" and adc is None:
+                # Skipping rather than trying: the command would succeed via the
+                # metadata server and we would report the wrong identity.
+                log("k9pdl-auth no ADC credentials file found "
+                    "(GOOGLE_APPLICATION_CREDENTIALS, $CLOUDSDK_CONFIG, ~/.config/gcloud)")
+                continue
             try:
                 out = subprocess.run(command, capture_output=True, timeout=60)
             except (OSError, subprocess.SubprocessError):
@@ -1415,7 +1455,8 @@ class GcsClient:
             if out.returncode == 0:
                 token = out.stdout.decode("utf-8").strip()
                 if token:
-                    log("k9pdl-auth using {}".format(label))
+                    log("k9pdl-auth using {}{}".format(
+                        label, " ({})".format(adc) if label == "ADC" else ""))
                     return token, 3600
 
         request = urllib.request.Request(

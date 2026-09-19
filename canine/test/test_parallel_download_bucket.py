@@ -1376,3 +1376,86 @@ class _MetadataWatch:
     def __call__(self, *args, **kwargs):
         self.reached = True
         raise OSError("metadata server unavailable")
+
+
+class TestTheADCLabelIsHonest:
+    """
+    `gcloud auth application-default print-access-token` **succeeds with no ADC file at
+    all** -- resolution falls through to the GCE metadata server and gcloud returns a
+    *service account* token, exit 0. So "the command worked" is not evidence the
+    identity is yours.
+
+    Observed on a real node: `CLOUDSDK_CONFIG=/user_gcloud_config` while the mounted user
+    credentials sat in `/root/.config/gcloud/`. gcloud never saw them, the upload 403'd
+    naming `...-compute@developer.gserviceaccount.com`, and every check run beforehand
+    had passed -- including one written specifically to catch this, which only proved
+    that *a* token could be minted.
+
+    So the ADC branch is skipped unless a credentials file actually exists. The log line
+    is the only way an operator learns which identity wrote their objects; it has to be
+    true.
+    """
+
+    def _runner(self, ok=(), token="tok"):
+        def run(command, **kwargs):
+            joined = " ".join(command)
+            if any(joined.startswith(prefix) for prefix in ok):
+                return subprocess.CompletedProcess(
+                    command, 0, (token + "\n").encode(), b"")
+            return subprocess.CompletedProcess(command, 1, b"", b"denied")
+        return run
+
+    def test_adc_is_skipped_when_no_credentials_file_exists(self, monkeypatch, capsys):
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        monkeypatch.setenv("CLOUDSDK_CONFIG", "/nonexistent-config")
+        monkeypatch.setattr(pdl.os.path, "expanduser", lambda p: "/nonexistent-home")
+        # ADC would "succeed" here, via the metadata server, and be reported as ADC.
+        monkeypatch.setattr(pdl.subprocess, "run",
+                            self._runner(ok=("gcloud auth application-default",
+                                             "gcloud auth print-access-token"),
+                                         token="sa-in-disguise"))
+        watch = _MetadataWatch()
+        monkeypatch.setattr(pdl.urllib.request, "urlopen", watch)
+
+        pdl.GcsClient()._fetch_token()
+        err = capsys.readouterr().err
+
+        assert "no ADC credentials file found" in err
+        assert "using ADC" not in err, (
+            "reported ADC with no credentials file -- the label would be a lie")
+        assert "using gcloud account" in err
+
+    def test_adc_is_used_and_names_the_file_when_one_exists(self, tmp_path,
+                                                            monkeypatch, capsys):
+        creds = tmp_path / "application_default_credentials.json"
+        creds.write_text("{}")
+        monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(creds))
+        monkeypatch.setattr(pdl.subprocess, "run",
+                            self._runner(ok=("gcloud auth application-default",)))
+        monkeypatch.setattr(pdl.urllib.request, "urlopen", _MetadataWatch())
+
+        pdl.GcsClient()._fetch_token()
+
+        err = capsys.readouterr().err
+        assert "using ADC" in err
+        assert str(creds) in err, "name the file, so the identity is checkable"
+
+    def test_cloudsdk_config_is_honoured(self, tmp_path, monkeypatch):
+        """The real node's layout: ADC found via $CLOUDSDK_CONFIG, not the home dir."""
+        config = tmp_path / "user_gcloud_config"
+        config.mkdir()
+        (config / "application_default_credentials.json").write_text("{}")
+        monkeypatch.delenv("GOOGLE_APPLICATION_CREDENTIALS", raising=False)
+        monkeypatch.setenv("CLOUDSDK_CONFIG", str(config))
+
+        assert pdl.GcsClient.adc_file() == str(
+            config / "application_default_credentials.json")
+
+    def test_a_stale_GOOGLE_APPLICATION_CREDENTIALS_path_does_not_count(
+            self, tmp_path, monkeypatch):
+        """Set but pointing at nothing is the same as unset, and must not claim ADC."""
+        monkeypatch.setenv("GOOGLE_APPLICATION_CREDENTIALS", str(tmp_path / "gone.json"))
+        monkeypatch.setenv("CLOUDSDK_CONFIG", str(tmp_path / "also-gone"))
+        monkeypatch.setattr(pdl.os.path, "expanduser", lambda p: "/nonexistent-home")
+
+        assert pdl.GcsClient.adc_file() is None
