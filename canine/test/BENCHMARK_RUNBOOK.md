@@ -2955,18 +2955,31 @@ pays for a choice it does not get to make. `pd-balanced` is not merely absent fr
 constraint does not apply to `scratch_disk_type`, which is per-node and never shared, so
 if scratch ever lands on the critical path that lever is still open.)
 
-**That leaves size as the only in-family lever.** At the observed
-`46.0 / 316 = 0.1456 MB/s per GB`, reaching 64 MiB/s sustained — the rate that would put
-§6.3 at the ≥4× target — needs roughly a **460 GB** disk, a one-line change to the 5%
-margin. Note the tradeoff before reaching for it: `base.py:920` sizes *every* rodisk, so a
-flat multiplier inflates thousands of small ones to buy throughput that only large
-payloads can use. If it is done at all it should be conditional on the payload being big
-enough for sustained rate to matter, which is a design question rather than a constant.
+**That leaves size as the only in-family lever, and it does not pay for itself.**
+`update_localization.md` §13.15/§13.16 recommended oversizing to ~742 GB; §13.46
+re-derived that case with the measured constant and, decisively, with the fact that **the
+localization VM is preemptible**. §13.15 priced saved time at the on-demand $0.38/h. A
+preemptible VM-hour is the cheapest hour in the system and a retained persistent disk-hour
+is among the most expensive, so oversizing spends the expensive one for 24–48 h to shorten
+a job that runs once. At a $0.10/h spot rate, 742 GB needs **12 IO-bound consumers** per
+object to break even at 48 h retention, against the 2.3 the recommendation was accepted on.
 
-**Do not act on the 460 GB from arithmetic.** A `pd-standard` spec figure was quoted from
-memory in §6.5h and was wrong by 2.4×; the same risk applies to assuming the per-GB scaling
-stays linear out to 460 GB, or that the 2.002× burst multiplier and the 56 GiB knee move
-with provisioned size at all. §6.5j measures it with the same 25-minute ladder.
+What a faster download buys on a preemptible VM is **preemption exposure**, not dollars:
+1.62 h → 0.77 h halves the window in which the node can vanish. Real, bounded, and not a
+cost saving — frontier recovery already makes those restarts nearly free (§6.5/§6.5a).
+
+**Everything about other disk sizes is unmeasured.** One size was tested. Nothing here
+shows that sustained rate is linear in provisioned GB (§13.15 took that from GCP's
+documented model, and a single point cannot test it), nor whether the 2.002× burst and the
+56 GiB knee appear at other sizes at all. If the knee travels with provisioned size the
+burst is worth 24% at 742 GB; if it stays at 56 GiB it is worth 10%. Those are different
+decisions. A `pd-standard` spec figure was quoted from memory in §6.5h and was wrong by
+2.4× — do not repeat that with the scaling.
+
+Note the tradeoff before reaching for size at all: `base.py:920` sizes *every* rodisk, so a
+flat multiplier inflates thousands of small ones to buy throughput only large payloads can
+use. §13.15 reaches the same conclusion — it must be a multiplier with a size threshold,
+not a target-throughput formula.
 
 #### The strategic answer is probably not a disk at all
 
@@ -2997,7 +3010,11 @@ slips, and §6.6 as the one that decides where this actually ends up.
 
 #### §6.5j Does a bigger pd-standard go faster? — ~30 minutes per size
 
-Only worth running if the current disk path has to survive. Create each candidate, run the
+**Lower priority than it looks.** §13.46 concluded that oversizing does not pay for itself
+against preemptible VM pricing, so this no longer measures a change anyone is likely to
+make. Run it if the disk path has to survive and somebody wants the preemption-exposure
+argument quantified, or to close out whether the per-GB model holds at all — but §6.6 is
+the measurement that decides the outcome now. Create each candidate, run the
 §6.5i ladder on it, record **burst rate, knee position and sustained rate**. Nothing else
 is needed: §6.5i demonstrated that those three numbers predict a full-size localization to
 0.14%, so sizes can be compared without downloading 279 GiB again.
@@ -3006,18 +3023,22 @@ All candidates are `pd-standard` — the read-only-at-scale requirement rules ou
 on this path, so this sweeps size alone.
 
 ```bash
-# on the node -- one candidate; repeat at 460 and 640
+# on the node -- one candidate; repeat at 460 and 742
 CAND=canine-cand-std-460
 gcloud compute disks create "$CAND" --zone "$ZONE" --type pd-standard --size 460GB
 gcloud compute instances attach-disk pdl-bench --disk "$CAND" --zone "$ZONE"
 # then mkfs + mount it per §4, and run the §6.5i ladder against it
 ```
 
-Three sizes — 316 (already measured), 460, 640 — answer the question the arithmetic cannot:
-whether sustained rate really scales linearly with provisioned GB, and whether the 2.002×
-burst multiplier and the 56 GiB knee scale with it too. If sustained rate is flat across
-all three, the per-GB model is wrong and size is not a lever either, which would leave
-`fuse-localize` as the only route to ≥4×.
+Three sizes — 316 (already measured), 460, 742 — answer the two questions the arithmetic
+cannot. **Does sustained rate really scale linearly with provisioned GB?** §13.15's whole
+cost model assumes so on GCP's documented behaviour, and 316 GB is a single point that
+cannot confirm it. **And does the burst scale?** If the knee travels with size the burst is
+worth 24% at 742 GB; if it stays at 56 GiB, 10%; if it vanishes, nothing. 742 GB is in the
+list because it is §13.15's actual recommendation — measure the disk somebody might buy.
+
+If sustained rate is flat across all three, the per-GB model is wrong, size is not a lever
+either, and `fuse-localize` is the only route to ≥4×.
 
 Note the ladder must run past the knee at *each* size. If the knee scales with the disk,
 a 640 GB candidate may not reach it within 96 GiB — extend the stage count until two
@@ -3302,7 +3323,8 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Then what is the remaining gap? | §6.5g–§6.5i | **none. Closed.** The gap was burst-versus-sustained throughout: §6.5c–§6.5f compared the downloader's sustained rate against the disk's burst rate |
 | **pd-standard burst vs sustained at 316 GB** | §6.5i | **92.1 MB/s (87.8 MiB/s) for the first 56 GiB, knee over the next 8, then 46.0 MB/s (43.9 MiB/s) flat — exactly 2.002×.** Never size a transfer off a `dd` that finishes in a minute |
 | **Where is the remaining time, then?** | §6.5i | **in `base.py:920`**, which sizes the localization disk to payload + 5% — 316 GB for this BAM, exactly the benchmark disk. On `pd-standard` that line sets throughput, not just capacity, so the tightest disk is the slowest disk |
-| Can a faster disk type fix it? | §6.5i | **no — not on this path.** `pd-standard` is the only type mountable read-only at scale, and the rodisk pattern requires exactly that. The type is fixed by the read path's fan-out; the write path pays for it. Size is the only in-family lever (§6.5j) |
+| Can a faster disk type fix it? | §6.5i | **no — not on this path.** `pd-standard` is the only type mountable read-only at scale, and the rodisk pattern requires exactly that. The type is fixed by the read path's fan-out; the write path pays for it |
+| Then can a bigger `pd-standard`? | §13.46 | **it would, and it does not pay.** The localization VM is preemptible, so a faster download saves the cheapest hour in the system while the oversized disk bills the most expensive one for 24–48 h. At $0.10/h spot, 742 GB needs ~12 IO-bound consumers per object to break even. What the speedup actually buys is halved preemption exposure, not dollars |
 | So what is the actual route to ≥4×? | §6.5i / §6.6 | **`origin/fuse-localize`**, most likely. `create_bucket_mount()` + Rapid Cache with `--enable-ingest-on-write` removes `pd-standard` from both paths, so this whole ceiling stops applying. That promotes §6.6 from a fallback to the measurement that decides the outcome — and it must be run over ≥96 GiB, not 4 |
 | What does the benchmark's own verification cost? | §6.5g | **43–45 MiB/s over 278.91 GiB, ≥1h45m** — and it was reported as `0.0s` until this run, because `phases: verify` is the downloader's and this read-back is the harness's. Now printed as `mean re-read :` |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
