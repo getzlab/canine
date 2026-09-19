@@ -1333,6 +1333,24 @@ METADATA_TOKEN_URL = (
 # route.
 GCS_UPLOAD_GRANULARITY = 256 * 1024
 
+# How much the bucket route sends per PUT. Must be a multiple of the granularity above,
+# because GCS rejects a non-final PUT that is not.
+#
+# This was GCS_UPLOAD_GRANULARITY itself, chosen to bound bytes-read-but-not-yet-durable
+# to <256 KiB per in-flight chunk. Measured, that bound costs a factor of five: a
+# resumable PUT costs ~53 ms round-trip regardless of payload, so 256 KiB per request is
+# 4.7 MiB/s per stream and ~72 MiB/s at 16 connections -- and 4.7 MiB/s was observed
+# within 1% from two unrelated sources (a GCS object and the GDC S3 endpoint), which is
+# what identifies the block rather than the network as the cap.
+#
+# The trade was mispriced rather than wrong. At 8 MiB the worst case is 128 MiB of
+# re-read across 16 in-flight chunks -- 0.045% of a 279 GiB object, on a preemption that
+# already costs minutes of restart -- while the per-stream ceiling becomes
+# transfer-bound instead of latency-bound and the aggregate moves above what the source
+# can supply. Paying 5x throughput on every transfer to save 124 MiB on the ones that
+# get preempted is the wrong side of that trade.
+DEFAULT_UPLOAD_BLOCK = 8 * 1024 * 1024
+
 # A single compose call accepts at most this many sources; more are tree-composed.
 GCS_COMPOSE_MAX_SOURCES = 32
 
@@ -1970,14 +1988,20 @@ class BucketChunkSink(PartHashingSink):
 
     needs_local_file = False
 
-    # Deliberately the GCS commit granularity rather than the larger local read block.
-    # Bytes that have been read from the source but not yet acknowledged by GCS are lost
-    # if the attempt dies, so this is what bounds discarded work to <256 KiB per
-    # in-flight part. A bigger block would trade that guarantee for fewer requests.
-    read_block = GCS_UPLOAD_GRANULARITY
+    # Set per instance from --upload-block; see DEFAULT_UPLOAD_BLOCK for why it is not
+    # the commit granularity. Bytes read from the source but not yet acknowledged by GCS
+    # are lost if the attempt dies, so this is what bounds discarded work per in-flight
+    # part -- a real guarantee, just a cheaper one than it used to be.
+    read_block = DEFAULT_UPLOAD_BLOCK
 
     def __init__(self, client, bucket, parts_prefix, manifest, chunks,
-                 part_length=None, size=None):
+                 part_length=None, size=None, upload_block=None):
+        if upload_block:
+            if upload_block % GCS_UPLOAD_GRANULARITY:
+                raise PermanentError(
+                    "--upload-block must be a multiple of {} bytes; GCS rejects a "
+                    "non-final PUT that is not".format(GCS_UPLOAD_GRANULARITY))
+            self.read_block = upload_block
         self.client = client
         self.bucket = bucket
         self.parts_prefix = parts_prefix
@@ -2922,7 +2946,8 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
 
     sink = BucketChunkSink(
         client, bucket, parts_prefix, manifest, chunks,
-        part_length=options.part_length if options.check_etag else None, size=size)
+        part_length=options.part_length if options.check_etag else None, size=size,
+        upload_block=getattr(options, "upload_block", None))
     downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
 
     try:
@@ -3726,6 +3751,13 @@ def build_parser():
                         help="simultaneous ranged GETs (0/1 = single stream)")
     parser.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK,
                         dest="min_chunk", help="smallest chunk worth its own request")
+    parser.add_argument("--upload-block", dest="upload_block", type=int,
+                        default=DEFAULT_UPLOAD_BLOCK,
+                        help="bytes per PUT on the bucket-compose route; must be a "
+                             "multiple of {}. Larger is faster (a PUT costs a "
+                             "round-trip regardless of size) and widens the bound on "
+                             "work discarded by a preemption".format(
+                                 GCS_UPLOAD_GRANULARITY))
     parser.add_argument("--header", action="append", default=[],
                         help="extra request header, 'Name: value' (repeatable)")
     parser.add_argument("--s3-bucket", dest="s3_bucket")

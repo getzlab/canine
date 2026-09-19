@@ -103,7 +103,8 @@ class TestBucketRoute:
         dest = str(tmp_path / "sample.bam")
         with Server(payload) as source:
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
         assert rc == pdl.EXIT_OK
         assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
 
@@ -114,7 +115,8 @@ class TestBucketRoute:
         dest = str(tmp_path / "sample.bam")
         with Server(payload) as source:
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
         assert rc == pdl.EXIT_OK
         assert not os.path.exists(dest)
 
@@ -164,7 +166,8 @@ class TestBucketRoute:
                                 check_md5=payload_md5))
             before = source.state.snapshot()["sent"]
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
             after = source.state.snapshot()["sent"]
         assert rc == pdl.EXIT_OK
         assert after == before
@@ -182,12 +185,20 @@ class TestSessionResumability:
         Let `succeed_uploads` uploads through, then refuse everything, which abandons the
         attempt with several parts genuinely partially persisted -- the state a
         preemption leaves behind. Returns the exit code.
+
+        Pins the upload block to GCS's commit granularity, because that granularity is
+        what this class is about: a part left partially persisted, resumable from the
+        durable offset GCS reports. At the default 8 MiB block a 6 MiB payload is one
+        PUT per chunk, so "fail after N uploads" never fires and every test here would
+        pass while interrupting nothing -- which is exactly what happened when the
+        default moved.
         """
         gcs.state.uploads_seen = 0
         gcs.state.fail_uploads_after = succeed_uploads
         try:
             return pdl.run(options_for(dest, source.url(), len(payload),
                                        check_md5=payload_md5, connections=connections,
+                                       upload_block=pdl.GCS_UPLOAD_GRANULARITY,
                                        retries=0))
         finally:
             gcs.state.fail_uploads_after = None
@@ -286,7 +297,8 @@ class TestSessionResumability:
                     break
 
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
 
         assert rc == pdl.EXIT_OK, "an expired session should not be fatal"
         assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
@@ -893,7 +905,8 @@ class TestPerPartDigestComparison:
         monkeypatch.setattr(pdl, "gcs_object_md5", spy)
         with Server(payload) as source:
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
         assert rc == pdl.EXIT_OK
         assert recorded, "the per-part comparison never ran"
         assert all(v is not None for v in recorded.values()), \
@@ -909,7 +922,8 @@ class TestPerPartDigestComparison:
         monkeypatch.setattr(pdl, "gcs_object_md5", lambda metadata: "0" * 32)
         with Server(payload) as source:
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
         assert rc == pdl.EXIT_FAIL
         assert OBJECT not in gcs.state.objects, "composed despite a part mismatch"
 
@@ -953,7 +967,8 @@ class TestNothingIsWrittenInPlace:
 
         with Server(payload) as source:
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
 
         assert rc == pdl.EXIT_OK
         assert calls == [], "wrote in place on the bucket route: {}".format(calls)
@@ -969,7 +984,8 @@ class TestNothingIsWrittenInPlace:
         dest = str(tmp_path / "sample.bam")
         with Server(payload) as source:
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
         assert rc == pdl.EXIT_OK
         assert not os.path.exists(dest), "created the destination file on the mount"
         leftover = [n for n in os.listdir(str(tmp_path)) if "k9pdl" not in n]
@@ -997,7 +1013,8 @@ class TestAnUnreadableManifestIsNotFatal:
         monkeypatch.setattr(pdl.GcsClient, "read_object", unreadable)
         with Server(payload) as source:
             rc = pdl.run(options_for(dest, source.url(), len(payload),
-                                     check_md5=payload_md5))
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
         assert rc == pdl.EXIT_OK, "an unreadable manifest should not fail the transfer"
         assert gcs.state.objects.get(OBJECT) == payload
 
@@ -1580,7 +1597,8 @@ class TestBucketRouteVerifiesAMultipartETag:
             try:
                 first = pdl.run(options_for(
                     dest, source.url(), len(payload), check_etag=etag,
-                    part_length=self.PART, min_chunk=self.CHUNK, retries=0))
+                    part_length=self.PART, min_chunk=self.CHUNK,
+                    upload_block=pdl.GCS_UPLOAD_GRANULARITY, retries=0))
             finally:
                 gcs.state.fail_uploads_after = None
             assert first != pdl.EXIT_OK, "the run was supposed to be interrupted"
@@ -1590,8 +1608,98 @@ class TestBucketRouteVerifiesAMultipartETag:
 
             rc = pdl.run(options_for(
                 dest, source.url(), len(payload), check_etag=etag,
-                part_length=self.PART, min_chunk=self.CHUNK))
+                part_length=self.PART, min_chunk=self.CHUNK,
+                upload_block=pdl.GCS_UPLOAD_GRANULARITY))
 
         assert rc == pdl.EXIT_OK
         assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == \
             hashlib.md5(payload).hexdigest()
+
+
+class TestTheUploadBlockIsTunableAndBounded:
+    """
+    The bucket route sent one PUT per 256 KiB, which measured at 4.71 and 4.76 MiB/s per
+    stream from two unrelated sources -- the GDC S3 endpoint and a GCS object. Agreeing
+    to within 1% across sources is what identified the block, rather than the network,
+    as the cap: a resumable PUT costs a round-trip whatever it carries, so the rate was
+    simply 256 KiB per 53 ms.
+
+    Raising it trades a real guarantee for throughput, so the guarantee is pinned here
+    rather than left in a comment: what is bounded is bytes read from the source but not
+    yet acknowledged by GCS, per in-flight chunk, and that bound IS the block size.
+    """
+
+    def test_the_default_is_large_enough_to_not_be_latency_bound(self):
+        """
+        At ~53 ms per PUT, 256 KiB gives 4.7 MiB/s per stream and ~72 MiB/s at 16
+        connections -- below the 43.9 MiB/s pd-standard it is supposed to beat by
+        enough to matter. The default has to be well clear of that regime.
+        """
+        assert pdl.DEFAULT_UPLOAD_BLOCK >= 4 * 1024 * 1024
+        assert pdl.DEFAULT_UPLOAD_BLOCK % pdl.GCS_UPLOAD_GRANULARITY == 0
+
+    def test_a_non_multiple_of_the_granularity_is_refused(self, gcs):
+        """
+        GCS rejects a non-final PUT that is not a multiple of 256 KiB. Failing at
+        construction beats failing partway through a 279 GiB transfer.
+        """
+        with pytest.raises(pdl.PermanentError):
+            pdl.BucketChunkSink(pdl.GcsClient(), BUCKET, "p", None, [],
+                                upload_block=pdl.GCS_UPLOAD_GRANULARITY + 1)
+
+    def test_a_bigger_block_issues_proportionally_fewer_puts(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        """
+        The whole change, measured at the service rather than asserted from config: a
+        PUT costs a round-trip whatever it carries, so throughput is request count, and
+        request count is what has to fall.
+
+        Counted by the fake, so this reflects what was actually sent. The first version
+        of this test asserted `uploads_seen > 0`, which is true of every run that
+        uploads anything at all -- it would have passed with the option ignored
+        entirely.
+        """
+        force_bucket_route(monkeypatch)
+
+        def puts_for(block, name):
+            gcs.state.uploads_seen = 0
+            with Server(payload) as source:
+                rc = pdl.run(options_for(
+                    str(tmp_path / name), source.url(), len(payload),
+                    check_md5=payload_md5, upload_block=block, min_chunk=4 * MIB))
+            assert rc == pdl.EXIT_OK, "block {} did not complete".format(block)
+            assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+            return gcs.state.uploads_seen
+
+        small = puts_for(pdl.GCS_UPLOAD_GRANULARITY, "small.bam")   # 256 KiB
+        large = puts_for(4 * MIB, "large.bam")                      # 16x bigger
+
+        assert large < small / 4, (
+            "16x the block should mean far fewer PUTs, got {} vs {}".format(
+                large, small))
+
+    def test_a_larger_block_still_resumes_correctly(self, tmp_path, monkeypatch, gcs,
+                                                    payload, payload_md5):
+        """
+        The guarantee being traded. A preemption discards at most one block per
+        in-flight chunk; whatever the block, the resumed attempt must still converge on
+        the right bytes rather than leaving a gap.
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            gcs.state.uploads_seen = 0
+            gcs.state.fail_uploads_after = 3
+            try:
+                first = pdl.run(options_for(
+                    dest, source.url(), len(payload), check_md5=payload_md5,
+                    upload_block=MIB, retries=0))
+            finally:
+                gcs.state.fail_uploads_after = None
+            assert first != pdl.EXIT_OK
+
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5, upload_block=MIB))
+
+        assert rc == pdl.EXIT_OK
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
