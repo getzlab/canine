@@ -2197,6 +2197,38 @@ Note the second one trades directly against resume: `posix_fallocate` would give
 contiguous extents, but its unwritten extents read back as data, which destroys the
 `SEEK_HOLE` frontier recovery §6.5 measured working. Do not "fix" it before measuring it.
 
+**A third candidate, already eliminated — do not re-derive it.** ENOSPC waiting looks
+exactly like this: the disk finished the run 90% full, and `_await_space` blocks a worker
+for up to 600s at a time, which would present as a stall with no throughput and no error.
+It did not happen. The 5823s run used the drained-stderr harness, which echoes ENOSPC
+markers (§6.5a), and printed none. Ruled out on evidence rather than on argument.
+
+**A fourth, still open and cheap to check while you are in there:** does the frontier scan
+itself scale with the file? `chunk_frontier()` walks extents with `SEEK_HOLE`/`SEEK_DATA`,
+and a scan whose cost grows with the number of extents would compound with the same
+fragmentation the second candidate proposes — the two would be indistinguishable from the
+outside and would need separating by where the time lands, not by the total.
+
+**Corroborating detail for the extent hypothesis:** `commit`'s share of wall clock rises
+with extent — 85%, 91%, 92% across the three 4 GiB runs and **100%** at 279 GiB. The
+commit thread is off the worker pool in all four, so this is not backpressure on the
+workers; it means the single writer thread never once caught up at full size. Whatever is
+slow is slow *in the write path*, not in the workers waiting on it.
+
+**One unexplained constant, noted rather than theorised.** `peak NIC` across five runs
+spanning 4 GiB to 279 GiB: 266.54, 267.98, 268.21, 268.34, 268.66 MiB/s — a **0.80%**
+spread, which is 2.25 Gbit/s. The benchmark annotates that line with "n1-standard-8 cap is
+~2 GB/s", and 268 MiB/s is **eight times below** that. Two readings, and this runbook
+should not pick one without evidence: either the instance's real egress ceiling is nothing
+like the quoted figure, or `Sampler`'s tick quantisation is manufacturing the constant. It
+matters only if some future change lifts the disk out of the way — at 88 MiB/s of disk
+nothing is near it — but a number that steady across a 70× range of object sizes is not
+noise, and should not be quoted as headroom until someone checks which it is.
+
+**A caveat on `filefrag`:** the 279 GiB destination was deleted by the sweep's own
+cleanup, so fragmentation cannot be measured after the fact. It has to be sampled
+*during* a long run, or the run has to be repeated with `--keep`.
+
 This test separates them for about two minutes of free egress, by **removing the disk
 entirely** — sixteen ranged GETs straight to `/dev/null`, at the head and then 250 GiB in:
 
