@@ -499,3 +499,64 @@ class TestNonGsSourcesUseAReadWriteMount:
         ])
         proc = subprocess.run([bash, "-n"], input=script.encode(), capture_output=True)
         assert proc.returncode == 0, proc.stderr.decode()
+
+
+class TestTheUploadWaitCeiling:
+    """
+    `bucket_upload_wait_tries` x 60s is how long a worker waits for a sibling's upload
+    before declaring the claim stale and requeueing. Too short and the timeout stops
+    being an error path: a healthy upload is declared dead and taken over mid-flight,
+    costing a duplicate transfer of the whole object, reported only as a warning.
+
+    **The value cannot be derived from anything measured yet, and an earlier version of
+    this test pretended otherwise.** It anchored on 1.62 h for 300 GB -- which is the
+    *pd-standard download* time from BENCHMARK_RUNBOOK.md 6.3, a different path. The
+    bucket route is a relay: source -> JSON API, with no disk in it anywhere. Sizing a
+    bucket constant off a disk measurement is the same category error the runbook spent
+    6.5c-6.5i unwinding.
+
+    What is actually known about the relay is a floor: the source delivers ~227-240
+    MiB/s at 16 connections with no disk in the path (6.1, 6.5c), so 279 GiB cannot
+    take less than ~0.35 h. The upload side -- GCS ingest from an n1-standard-8 -- is
+    **unmeasured**, so there is no upper bound, and on the floor alone the old 1 h
+    default may well have been adequate.
+
+    So 180 is a provisional choice on risk asymmetry, not a computed one. Too small
+    fails silently and repeatedly; too large only slows recovery from a genuinely dead
+    uploader, which is visible in the logs. #20 step 4 measures the relay and supplies
+    the real number -- until then this test exists to stop the default drifting down
+    without data, not to claim the current value is right.
+    """
+
+    PROVISIONAL_DEFAULT = 180
+
+    @staticmethod
+    def _default():
+        import inspect
+        from canine.localization.base import AbstractLocalizer
+        return inspect.signature(
+            AbstractLocalizer.__init__).parameters["bucket_upload_wait_tries"].default
+
+    def test_the_default_is_not_lowered_without_a_measurement(self):
+        assert self._default() >= self.PROVISIONAL_DEFAULT, (
+            "the wait ceiling was lowered to {} ({:.2f} h). That may well be correct -- "
+            "but the relay's throughput is still unmeasured (#20 step 4), so lower it "
+            "with a number, not a guess.".format(
+                self._default(), self._default() * 60 / 3600.0))
+
+    def test_the_default_clears_the_known_floor_with_room(self):
+        """
+        The one bound that is real: the source cannot deliver 279 GiB faster than
+        ~0.35 h (227-240 MiB/s, no disk in the path), so the relay cannot either.
+        A ceiling near that floor would fire on every large input.
+        """
+        source_floor_hours = 0.35
+        hours = self._default() * 60 / 3600.0
+        assert hours >= 4 * source_floor_hours, (
+            "{:.2f} h leaves under 4x over the {:.2f} h source-side floor, and the "
+            "upload side is unmeasured".format(hours, source_floor_hours)) 
+
+    def test_the_emitted_loop_uses_the_configured_value(self):
+        """The constant is only worth pinning if it reaches the generated script."""
+        assert "-ge 180" in script_for([gs_item()], wait_tries=180)
+        assert "-ge 7" in script_for([gs_item()], wait_tries=7)

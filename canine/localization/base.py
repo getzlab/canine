@@ -101,7 +101,7 @@ class AbstractLocalizer(abc.ABC):
         download_min_chunk = file_handlers.DEFAULT_DOWNLOAD_MIN_CHUNK,
         check_hash = None,
         allow_requester_pays: bool = False,
-        bucket_upload_wait_tries: int = 60,
+        bucket_upload_wait_tries: int = 180,
         localization_expiry_days: int = 1,
         bucketmount_heartbeat_seconds: int = 3600,
         **kwargs
@@ -151,8 +151,37 @@ class AbstractLocalizer(abc.ABC):
         allow_requester_pays: if False (default), downloading from a requester-pays
           GCS bucket raises instead of silently billing self.project
         bucket_upload_wait_tries: how many 60s polls a job waits for a sibling's
-          upload to finish before breaking the claim and requeueing (exit 5).
-          Default 60, i.e. a one hour ceiling.
+          upload to finish before declaring the claim stale and requeueing (exit 5).
+          Default 180 -- a three hour ceiling -- and **provisional**.
+
+          Too short and the timeout stops being an error path: a healthy upload is
+          declared dead and taken over mid-flight on every large input, costing a
+          duplicate transfer of the whole object and reported only as a warning. The
+          outcome is safe -- the object verifies under two concurrent writers and the
+          loser requeues rather than failing (test_parallel_download_bucket.py,
+          TestTwoWritersOnOneObject) -- but it is silent and it repeats.
+
+          This is NOT derived from a measurement, because the relevant one does not
+          exist. The route is a relay -- source to the JSON API, no disk anywhere in
+          it -- so BENCHMARK_RUNBOOK.md §6.3's 1.62 h for 300 GB, which is the
+          pd-standard *download* time, says nothing about it. What is known is a floor:
+          the source delivers ~227-240 MiB/s at 16 connections with no disk in the path
+          (§6.1, §6.5c), so 279 GiB cannot relay in under ~0.35 h. GCS ingest from an
+          n1-standard-8 is unmeasured, so there is no upper bound -- and against that
+          floor alone the previous 1 h default may have been perfectly adequate.
+
+          180 is chosen on risk asymmetry rather than arithmetic: too small fails
+          silently and repeatedly, too large only delays recovery from a genuinely dead
+          uploader, which is visible in the logs. Revisit with the number from §6.6.
+
+          Because raising it is not free. The ceiling is also that recovery time, and
+          on preemptible workers a dead uploader is routine: it leaves `wolf=working`
+          behind, and every sibling -- including the requeued original -- now waits
+          three hours rather than one before anyone takes over. The transfer itself
+          survives (the manifest is in the bucket and the take-over resumes); only the
+          time is lost. A constant cannot fix both problems at once, because what
+          separates "still working" from "died" is a liveness signal on the claim, not
+          a longer wait. See update_localization.md §13.49.
         localization_expiry_days: days since last touch after which a localized
           object is deleted by the bucket's lifecycle rule. Default 1. Content is
           re-fetched automatically if something needs it again, and objects still

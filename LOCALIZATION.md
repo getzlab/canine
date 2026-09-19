@@ -147,9 +147,12 @@ take-over harmless.
   ("A conflicting operation is currently in progress"), which means the create is still in
   flight — not that the bucket is readable. So the worker polls `buckets describe` up to 30
   times at 2s before reading the label; failing that, `exit 5` (`base.py:1289`).
-- **Someone else is uploading.** `sleep 60`, up to `bucket_upload_wait_tries` times (default 60,
-  so a ~1 hour ceiling). On timeout the worker sets `wolf=stale`, releases the claim, and
-  `exit 5` (`base.py:1314`).
+- **Someone else is uploading.** `sleep 60`, up to `bucket_upload_wait_tries` times (default 180,
+  so a ~3 hour ceiling). On timeout the worker sets `wolf=stale`, releases the claim, and
+  `exit 5` (`base.py:1314`). **This ceiling has to exceed the longest localization you expect**,
+  or it fires on healthy uploads and every large input gets taken over mid-flight. How long
+  that is on *this* path is unmeasured — see §5a — and the ceiling is simultaneously the
+  recovery time when an uploader genuinely dies.
 
 **`exit 5` means "requeue this shard on another node"** — canine treats it as retryable rather
 than a workflow failure. Every give-up path here uses it, because every cause is transient or
@@ -238,7 +241,7 @@ Pass from wolF via `LocalizeToBucket(files=..., <kwarg>=...)`, or workflow-wide 
 | `localize_to_persistent_disk` | `False` | Master switch for this whole path. `LocalizeToBucket` sets it `True`. Also forces `common = False` (`base.py:158`). |
 | `localization_expiry_days` | `1` | `daysSinceCustomTime` in the lifecycle rule. Bounds *idle* storage, not the life of a running workflow — live content has its clock refreshed on every localization and by the heartbeat. Raise it if you re-run the same inputs over several days and would rather pay for storage than re-transfer. |
 | `bucketmount_heartbeat_seconds` | `3600` | How often a held mount re-stamps customTime (§7). Must be `< localization_expiry_days * 86400 / 4`, else `ValueError` at construction (`base.py:181`) — for the default 1-day expiry, anything `< 21600`. |
-| `bucket_upload_wait_tries` | `60` | 60-second polls a worker waits for a sibling's upload before declaring the claim stale and requeueing (`exit 5`). Default is a ~1 hour ceiling. |
+| `bucket_upload_wait_tries` | `180` | 60-second polls a worker waits for a sibling's upload before declaring the claim stale and requeueing (`exit 5`) — a ~3 hour ceiling. **Was 60, and 180 is provisional.** Too short and a healthy upload is taken over mid-flight on every large input, costing a silent duplicate transfer. But this path's throughput is *unmeasured*: it is a relay (source → JSON API, no disk), so the 1.62 h pd-standard download figure does not apply. The only real bound is a ~0.35 h floor from the source side, against which 60 may have been fine. Chosen on risk asymmetry; revisit with the measurement. Note it is also the recovery time when an uploader dies — routine on preemptible workers — so a liveness signal on the claim, not a bigger constant, is the actual fix (`update_localization.md` §13.49). |
 | `allow_requester_pays` | `False` | If `False`, reading from a requester-pays source raises instead of silently billing `project`. |
 | `persistent_disk_dry_run` | `False` | Return the `bucketmount://` URLs that *would* be produced without creating or uploading anything. |
 

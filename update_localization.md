@@ -3732,8 +3732,75 @@ re-localize — the same trap as the sweep's missing `--keep` (§6.3).
 2. **Object path, `ls` check, and customTime stamping** — same run.
 3. **Two concurrent writers against one `plan_id`**, and the `bucket_upload_wait_tries`
    timeout that produces it.
-4. **Throughput, uncached bucket, ≥96 GiB** — the number that replaces 43.9 MiB/s.
+4. **Throughput, uncached bucket, ≥96 GiB** — the number that replaces 43.9 MiB/s,
+   and the number that sizes `bucket_upload_wait_tries` (§13.49, a placeholder until then).
 5. **Throughput with a hand-provisioned Rapid Cache on the `wolf-...` bucket**, as a separate
    arm with its storage cost stated.
 
 Steps 1–3 need no large transfer and no cache. Only step 4 needs the bench node back.
+
+### 13.49 `bucket_upload_wait_tries`: raised to 180, and the constant is the wrong instrument
+
+**First, a correction to §13.48.** That section flagged the 1 h upload-wait ceiling as a
+risk *"because the measured localization is 1.62 h"*. That reasoning is wrong. 1.62 h is
+the **pd-standard download** time from §6.3; the bucket route is a relay — source straight
+to the JSON API, with **no disk anywhere in it**. Sizing a bucket-path constant off a
+disk-path measurement is precisely the category error §6.5c–§6.5i spent four subsections
+unwinding, committed again three sections later, in the middle of writing up the lesson.
+
+What is actually known about the relay:
+
+| bound | figure | 279 GiB |
+|---|---|---|
+| source → `/dev/null`, 16 conns (§6.5c) | 240 MiB/s | 0.33 h |
+| source → tmpfs, 16 conns (§6.1) | 227 MiB/s | 0.35 h |
+| GCS ingest from an `n1-standard-8` | **unmeasured** | — |
+| ~~pd-standard sustained (§6.5i)~~ | ~~43.9 MiB/s~~ | *wrong path* |
+
+So there is a **floor of ~0.35 h** and no upper bound. Against the floor alone the old 1 h
+default may have been perfectly adequate, and the "it fires on every large input" claim in
+§13.48 is unsupported. It might; nobody knows.
+
+**Raised to 180 anyway (3 h), on risk asymmetry rather than arithmetic.** The two failure
+directions are not symmetric:
+
+* **Too short** declares a healthy upload dead, hands the object to a take-over worker
+  mid-flight, and costs a duplicate transfer — reported as a warning, on every affected
+  input, indefinitely. Silent and recurring.
+* **Too long** only delays recovery from an uploader that genuinely died. Visible in the
+  logs, bounded, and the transfer itself survives: the manifest is in the bucket and the
+  take-over resumes.
+
+Under an unmeasured distribution, pay the visible cost rather than the silent one. This is
+explicitly a placeholder: **§6.6 step 4 measures the relay and supplies the real number**,
+and lowering it again with data would be a good outcome, not a regression.
+
+**But a constant cannot be right here, whatever value it takes**, because it is doing two
+unrelated jobs at once:
+
+1. *How long can a legitimate upload take?* — a function of object size and relay
+   throughput, so it scales with the workload.
+2. *How long until we conclude the uploader died?* — a function of failure detection, and
+   wanting to be as short as possible. On preemptible workers a dead uploader is routine,
+   not exceptional: it leaves `wolf=working` behind, and every sibling — including its own
+   requeued incarnation — now waits the full ceiling before anyone takes over. Raising the
+   constant for job 1 makes job 2 strictly worse, and 3 h of stall per preemption is a real
+   cost on exactly the machines this runs on.
+
+**The fix is a liveness signal on the claim, not a longer wait.** canine already has the
+pattern: `bucketmount_heartbeat_start()` (`LOCALIZATION.md` §7) re-stamps customTime on a
+timer for precisely this reason — *"self-healing by construction. If the worker dies, the
+loop dies with it."* The same shape applies to the upload claim: the uploader periodically
+re-stamps `wolf=working` (or a companion object carrying a timestamp), and a waiter blocks
+while the stamp is fresh and gives up in **minutes** when it goes stale. That decouples the
+two jobs — unbounded patience for a live uploader, fast recovery from a dead one — and
+removes the need to predict transfer times at all.
+
+Not built here: it changes a subsystem `fuse-localize` owns, and the constant is adequate
+in the meantime. Worth raising with whoever owns that path.
+
+**Recorded because the estimate was wrong in an instructive way.** The number was not
+plucked from nowhere — it was a real measurement, correctly obtained, of a different
+system. That is the failure mode this whole effort keeps producing, and the reason the
+runbook's tables now carry an explicit `extent` column: **a figure is only usable together
+with the conditions it was measured under, and "measured" is not the same as "relevant".**
