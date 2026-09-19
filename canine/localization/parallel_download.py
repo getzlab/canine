@@ -86,7 +86,21 @@ SCHEMA_VERSION = 1
 # (LocalizeToDisk pins cpus-per-task=8 and passes --exclusive). A single TCP stream to
 # S3/GDC realistically gets 50-200 MB/s against a ~2 GB/s egress cap, which is the
 # whole reason for fanning out.
-DEFAULT_CONNECTIONS = 8
+#
+# 16, not 8. The original 8 was one per vCPU, reasoned rather than measured, and the
+# streams are IO-blocked rather than CPU-bound so vCPU count was never the right unit.
+# Measured against the real GDC source (BENCHMARK_RUNBOOK.md §6.1/§6.2): throughput is
+# linear in connections to 16 with no knee against the source -- 16.42 MiB/s at 1
+# connection, 227.18 at 16, a 13.85x gain -- because the limit is per-connection, not
+# per-signature or per-endpoint. 16 is where the *destination* saturates, not the source,
+# so it is a floor on what a faster destination could use rather than a ceiling on the
+# source. It is also MAX_CONNECTIONS, so the default is now the cap.
+#
+# On the LocalizeToDisk path this changes little: §6.5i measured that disk at 43.9 MiB/s
+# sustained, which 8 connections already exceed. The gain is on fast destinations -- NFS,
+# tmpfs, and the bucket route -- where the source, not the disk, is what is being asked
+# for more.
+DEFAULT_CONNECTIONS = 16
 MAX_CONNECTIONS = 16
 DEFAULT_MIN_CHUNK = 64 * 1024 * 1024
 

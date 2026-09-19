@@ -118,8 +118,12 @@ class AbstractLocalizer(abc.ABC):
         parallel_download: download remote URLs with N simultaneous ranged GETs rather
           than a single stream. Default True; set False for the legacy single-stream
           commands, which remain the fallback for anything the chunked path declines.
-        download_connections: how many ranged GETs are in flight per input. Default 8,
-          one per vCPU on the n1-standard-8 that LocalizeToDisk reserves exclusively;
+        download_connections: how many ranged GETs are in flight per input. Default 16,
+          measured against the real source rather than derived from vCPU count -- the
+          streams are IO-blocked, and throughput is linear to 16 with no knee against the
+          source (13.85x over a single stream, BENCHMARK_RUNBOOK.md §6.2). Raising it
+          further requires raising MAX_CONNECTIONS, and would only pay on a destination
+          faster than the pd-standard localization disk, which binds at ~44 MiB/s (§6.5i).
           0 or 1 means the legacy single stream. Note this controls concurrency only --
           the chunk layout deliberately does not depend on it, so a requeued task on a
           differently-configured node still resumes rather than starting over.

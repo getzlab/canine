@@ -52,7 +52,7 @@ Any input whose size is unknown, whose URL is `ftp://`, or which resolves to
 
 | Knob | Where | Default | Effect |
 |---|---|---|---|
-| `download_connections` | `localizer_args` | `8` | ranged GETs in flight per input |
+| `download_connections` | `localizer_args` | `16` | ranged GETs in flight per input |
 | `download_min_chunk` | `localizer_args` | 64 MiB | chunk size |
 | `CANINE_DOWNLOAD_CONNECTIONS` | environment | — | overrides the connection count per node |
 
@@ -80,13 +80,38 @@ safe to vary per node precisely because the chunk layout does *not* depend on it
 
 ### Choosing a connection count
 
-8 is one per vCPU on the `n1-standard-8` that `LocalizeToDisk` requests, but the streams
-are IO-blocked rather than CPU-bound, so 12–16 may do better. `BENCHMARK_RUNBOOK.md` §6.1
-finds the knee empirically; until that has been run against your sources, 8 is a
-conservative default rather than a measured one.
+**The default is 16, and it is measured.** It was 8 — one per vCPU, which was never the
+right unit, since the streams are IO-blocked rather than CPU-bound. Against the real GDC
+source, throughput is linear in connections all the way to 16 with no knee at the source
+at all:
+
+| connections | 1 | 4 | 8 | 12 | 16 |
+|---|---|---|---|---|---|
+| MiB/s | 16.42 | 65.0 | 129.4 | 180.6 | **227.18** |
+
+That is **13.85× over a single stream**, and the limit is per *connection* — not per
+signed URL, not per endpoint. 16 is also `MAX_CONNECTIONS`, so the default is now the cap.
+
+**Raising it above 16 is not the lever you want, and on most inputs neither is lowering
+it.** What binds is almost always the destination:
+
+* **`LocalizeToDisk` (the common case).** The localization disk is a `pd-standard` sized
+  to the payload plus 5%, and `pd-standard` throughput is provisioned per gigabyte. For a
+  300 GB object that is a 316 GB disk sustaining **43.9 MiB/s** — measured with plain `dd`
+  and `O_DIRECT`, with the downloader coming within 0.8% of it. Eight connections already
+  exceed that, so on this path the connection count is not what decides your runtime and
+  tuning it will not move the number. See `BENCHMARK_RUNBOOK.md` §6.5i.
+* **Fast destinations** — NFS, tmpfs, the bucket route — are where 16 earns its keep,
+  because there the source is what you are asking for more.
+
+**Beware short benchmarks when checking any of this.** That disk delivers 92.1 MB/s for
+its first ~56 GiB and 46.0 MB/s thereafter — an exact 2× burst. Any test under ~64 GiB
+reports roughly double the sustained rate, and four sections of the runbook concluded
+there was a defect in this downloader on exactly that mistake. If you measure, measure
+past 96 GiB, and treat two consecutive stages agreeing as the bar.
 
 Lower it if a source throttles per-connection, or to be a quieter neighbour when many
-workers pull from the same endpoint at once.
+workers pull from the same endpoint at once. Those are the two reasons left.
 
 ---
 

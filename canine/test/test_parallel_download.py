@@ -1418,6 +1418,17 @@ class TestDoublyCompressedGzipNames:
             assert not any(n.endswith(".part") for n in remaining), remaining
             assert "d.vcf.gz" in remaining
 
+class TestTheModuleContracts:
+    """
+    Properties of the module boundary rather than of any download: what file_handlers
+    and the downloader must share, what the defaults have to satisfy, and what the
+    downloader is not allowed to import.
+
+    These had accreted onto the end of the doubly-compressed-gzip class, so `pytest -k`
+    reported them under `TestDoublyCompressedGzipNames` and nothing led a reader here
+    from either of the modules they constrain.
+    """
+
     def test_the_magic_table_has_a_single_definition(self):
         """
         The emitted fallback and the downloader must agree about which files are
@@ -1434,6 +1445,34 @@ class TestDoublyCompressedGzipNames:
         from canine.localization import file_handlers as fh
         assert fh.DEFAULT_DOWNLOAD_CONNECTIONS is pdl.DEFAULT_CONNECTIONS
         assert fh.DEFAULT_DOWNLOAD_MIN_CHUNK is pdl.DEFAULT_MIN_CHUNK
+
+    def test_the_default_connection_count_is_usable(self):
+        """
+        Every other test spells the default as `DEFAULT_CONNECTIONS` rather than as a
+        number, which is right for testing the wiring and means nothing constrains the
+        value itself. The default now EQUALS `MAX_CONNECTIONS` (both 16, the measured
+        knee), so lowering the cap without lowering the default would ship a default the
+        downloader clamps -- silently, and passing every existing test.
+        """
+        assert 2 <= pdl.DEFAULT_CONNECTIONS <= pdl.MAX_CONNECTIONS
+
+    def test_the_operator_guide_documents_the_default_the_code_uses(self):
+        """
+        Doc drift, pinned because it already happened. PARALLEL_DOWNLOAD.md advertised a
+        default of 8 and described it as "a conservative default rather than a measured
+        one" long after §6.1 had measured the knee at 16 -- so the guide was telling
+        operators to go tune a number that had already been settled. A wrong default in
+        the guide is worse than an absent one: it is the value people set explicitly to
+        "keep the current behaviour" while changing it.
+        """
+        import re
+        guide = os.path.join(os.path.dirname(PDL_PATH), "PARALLEL_DOWNLOAD.md")
+        with open(guide) as handle:
+            text = handle.read()
+        row = re.search(r"^\|\s*`download_connections`\s*\|[^|]*\|\s*`(\d+)`\s*\|",
+                        text, re.M)
+        assert row, "the tuning table has no download_connections row to check"
+        assert int(row.group(1)) == pdl.DEFAULT_CONNECTIONS
 
     def test_the_downloader_still_imports_no_canine(self):
         """
