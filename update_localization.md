@@ -3634,3 +3634,106 @@ than a disk does: a small test may never miss at all.
 
 Procedure lives in `BENCHMARK_RUNBOOK.md` §6.6, which §6.5i already re-scoped from fallback
 to deciding measurement.
+
+### 13.48 Reconciling §13.47 against `LOCALIZATION.md`: three corrections and a new risk
+
+`fuse-localize` is merged (`parallel-localization-fuse`) and ships `LOCALIZATION.md`, which
+documents the bucket-mounted path end to end. Reading it changes §13.47 in four ways.
+
+#### 1. The hazard it warns about is real, and our gate is what avoids it
+
+`LOCALIZATION.md` §4c: the `mount` upload kind mounts the bucket **read-write** at
+`/mnt/localize/<bucket>` and runs the handler's own `localization_command` straight into it,
+relying on gcsfuse streaming writes (image pins 3.11.2). Those are **append-only from offset
+0**, so — its words — *"a multipart/parallel writer would silently fall back to staging"*,
+buffering the whole object under `--temp-dir` on the 25 GB boot disk. On a 279 GiB BAM that
+is an ENOSPC, arrived at silently.
+
+Our downloader is exactly that multipart/parallel writer, and `s3://`/GDC inputs are exactly
+`kind == "mount"`. So the 279 GiB object is precisely the case that would hit it.
+
+It does not, because `select_route` fires first: `fuse.gcsfuse` is off
+`POSIX_FSTYPE_ALLOWLIST`, `gs_url_for` resolves the bucket from `/proc/mounts`, and the
+result is `ROUTE_BUCKET` — parts uploaded through the JSON API and composed server-side,
+never a byte through the mount. That is §4.7's "gate, don't adapt" doing the job it was
+built for, against a hazard documented independently by another branch.
+
+**But it is now a correctness interaction between two subsystems, not a fallback route, and
+nothing has ever run it against real infrastructure.** It becomes §6.6's first measurement
+and it gates everything after it:
+
+* Does `select_route` actually reach `ROUTE_BUCKET` inside `/mnt/localize/<bucket>`, or does
+  something about that mount's options resolve no `gs://` URL and drop it to `stage-publish`
+  — which stages to the same 25 GB boot disk and ENOSPCs just as surely?
+* Does the composed object land at `<input_name>/<basename>`, where the post-unmount
+  `gcloud storage ls` check expects it? Our route writes it before the unmount, so
+  "the unmount is what finalizes the objects" no longer describes how it got there.
+* Does `gcloud storage objects update --custom-time` then stamp it? An object the
+  lifecycle rule cannot see never expires (`LOCALIZATION.md` §3).
+
+None of this needs a 279 GiB transfer. A small input exercises every one of them.
+
+#### 2. Rapid Cache is off by default, and wired to the wrong bucket
+
+§13.47 was written as "measure a Rapid Cache bucket". Per `LOCALIZATION.md` §5b,
+`rapid_cache` defaults to **`False`**, and its own caveat records that
+`get_or_create_rapid_cache()` is called on `config["storage_bucket"]` — the *workflow*
+bucket `canine-<project>-<workflow_name>` — while localization reads per-localization
+`wolf-<project_number>-<region>-<hash>` buckets that are never passed to it. As wired,
+`rapid_cache=True` caches a bucket this path does not read.
+
+So the measurement has to provision the cache **by hand on the `wolf-...` bucket**, and
+report the uncached bucket as the baseline rather than assuming the cache is in play. Also
+note the cache is **zonal** while the bucket is **regional**: a worker in another zone of the
+same region gets a silent miss, so a multi-zone cluster does not see one number.
+
+#### 3. The cache re-introduces the per-GiB-hour bill the bucket was supposed to remove
+
+§13.46 concluded that oversizing the disk fails because a preemptible VM-hour is cheap and a
+retained provisioned disk-hour is expensive, and that `fuse-localize` helps by removing the
+provisioned disk from the model. Half of that survives. `LOCALIZATION.md` §5b prices Rapid
+Cache at roughly **4× standard storage (~$0.089/GiB-month)** while in-region transfer is
+**$0/GiB** — so for a 279 GiB input the cache is on the order of **$25/month of storage to
+save transfer that is already free**, and it buys read *latency* only.
+
+That is the same trade §13.46 rejected, in a new medium: pay per-GiB-hour to speed something
+up. It is a good trade for an input many shards read and a bad one for read-once work, which
+is what a one-off dbGaP BAM is. **The honest default for §6.6 is therefore the *uncached*
+bucket**, with the cache measured as a separate arm and justified only by a consumer count —
+the same number §13.46 found the disk question turning on.
+
+#### 4. New risk: our own runtime exceeds the sibling-wait ceiling
+
+`bucket_upload_wait_tries` defaults to 60 polls at 60 s — a **one hour** ceiling
+(`LOCALIZATION.md` §3). The measured full-size localization is **1.62 h**.
+
+So a sibling shard waiting on our upload times out *before it can finish*, sets
+`wolf=stale`, and exits 5. A later worker reads `stale`, concludes the previous uploader
+died, and takes over — while the original is still running. For the `server_side` and `copy`
+kinds `-n` makes a double take-over harmless, and the doc says so. For `kind == "mount"`,
+which is ours, the only thing standing between that and two concurrent writers is the
+downloader's own resume state in the bucket, and **two concurrent writers against one
+plan_id has never been tested** — the resume suite kills and restarts one writer, it does
+not run two.
+
+This is not hypothetical and it is not new to the merge: any localization over an hour
+reaches it, which is the entire workload this effort exists for. The mitigation is probably
+one line — `bucket_upload_wait_tries` scaled to the expected transfer time rather than a
+flat 60 — but the failure mode should be measured before the constant is picked, and the
+two-writer case tested regardless, because a node dying mid-upload produces it too.
+
+Also from §5a: `localization_expiry_days` defaults to **1**, so a localized artifact is gone
+the next day. Any follow-up measurement against it must happen the same day or pay to
+re-localize — the same trap as the sweep's missing `--keep` (§6.3).
+
+#### Revised order for §6.6
+
+1. **Route correctness on a real gcsfuse RW mount**, small input, no benchmark. Gates the rest.
+2. **Object path, `ls` check, and customTime stamping** — same run.
+3. **Two concurrent writers against one `plan_id`**, and the `bucket_upload_wait_tries`
+   timeout that produces it.
+4. **Throughput, uncached bucket, ≥96 GiB** — the number that replaces 43.9 MiB/s.
+5. **Throughput with a hand-provisioned Rapid Cache on the `wolf-...` bucket**, as a separate
+   arm with its storage cost stated.
+
+Steps 1–3 need no large transfer and no cache. Only step 4 needs the bench node back.

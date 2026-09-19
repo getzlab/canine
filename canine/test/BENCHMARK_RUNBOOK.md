@@ -3050,18 +3050,44 @@ experiment that needed it.
 
 ### 6.6 the bucket-compose route against real GCS
 
-> **§6.5i promoted this section.** It was written as a completeness item for a fallback
-> route. With the disk path measured at a hard 43.9 MiB/s sustained, and `pd-standard`
-> fixed by the read-only-at-scale requirement, this is now the likeliest route to the ≥4×
-> target and the measurement that decides the outcome. It also converges with
-> `origin/fuse-localize`, whose `create_bucket_mount()` makes a GCS mount the *primary*
-> destination for `LocalizeToDisk` inputs rather than an alternative.
+> **§6.5i promoted this section, and `LOCALIZATION.md` re-scoped it.** It was a
+> completeness item for a fallback route. With the disk measured at a hard 43.9 MiB/s and
+> `pd-standard` fixed by read-only fan-out, the bucket is now the only route to ≥4× — and
+> on the merged `parallel-localization-fuse` branch it is not a fallback at all:
+> `create_bucket_mount()` makes a GCS mount the primary destination.
 >
-> **Run the §6.5i ladder against the mount before running anything else here.** A Rapid
-> Cache bucket has every reason to show its own burst-then-settle curve — cache fill at
-> zonal SSD rate, then origin rate on a miss — and a 4 GiB `gcsfuse` benchmark would
-> reproduce, in a new medium, the single most expensive error in this document. Two
-> consecutive stages agreeing is the bar.
+> **Throughput is no longer the first question here.** `LOCALIZATION.md` §4c mounts the
+> bucket **read-write** for `kind == "mount"` inputs — which is what `s3://` and GDC
+> sources are — and runs the handler's command straight into it, relying on gcsfuse
+> streaming writes. Those are append-only from offset 0, and its own warning is that *"a
+> multipart/parallel writer would silently fall back to staging"*, buffering the object
+> under `--temp-dir` on the 25 GB boot disk. We are that writer. The only reason it is not
+> an ENOSPC on a 279 GiB BAM is that `select_route` gates first: `fuse.gcsfuse` is off the
+> POSIX allowlist, `gs_url_for` resolves the bucket, and the route becomes
+> `bucket-compose`, which never touches the mount.
+>
+> That gate has never run against real infrastructure. **Verify it before measuring
+> anything**, and note it needs no large transfer — a small input exercises the whole
+> interaction. The full order is in `update_localization.md` §13.48; the short version:
+>
+> 1. route correctness on a real RW gcsfuse mount (does it reach `bucket-compose`, or drop
+>    to `stage-publish` and stage onto the same boot disk it was avoiding?)
+> 2. object path, the post-unmount `gcloud storage ls` check, and customTime stamping
+> 3. two concurrent writers on one `plan_id` — reachable in production, because
+>    `bucket_upload_wait_tries` defaults to a 1 h ceiling and our localization takes 1.62 h
+> 4. throughput, **uncached** bucket, ≥96 GiB
+> 5. throughput with a hand-provisioned Rapid Cache, as a separate arm
+>
+> Two corrections to earlier assumptions here. **`gcsfuse` IS in the `fuse-localize`
+> image** (3.11.2), so the blocker noted below is stale on this branch. And **Rapid Cache
+> defaults off and is wired to the wrong bucket** — `get_or_create_rapid_cache()` targets
+> the *workflow* bucket, not the per-localization `wolf-...` bucket this path reads
+> (`LOCALIZATION.md` §5b's own caveat), so step 5 must provision it by hand.
+>
+> **When you do reach step 4, run the §6.5i ladder.** A cached bucket has every reason to
+> show its own burst-then-settle curve, and a small benchmark may never miss the cache at
+> all — reproducing this document's most expensive error in a new medium. Two consecutive
+> stages agreeing is the bar.
 
 The bucket-compose route has never touched real infrastructure — not the auth path, not
 resumable sessions, not compose. It needs a bucket mounted in the container so that
@@ -3098,12 +3124,17 @@ have different bucket permissions.
 
 **`gcsfuse` is not in the image on `wolf-2.0-update`**, and neither is `rclone` — its
 Dockerfile install is commented out, though `conf/rclone.conf` ships. Only `fuse-overlayfs`
-is present, for podman. So this step needs one of:
+is present, for podman. So on *that* image this step needs one of:
 
 * `apt-get install` gcsfuse in the running container (needs Google's gcsfuse apt repo);
-* the `fuse-localize` image, which is where this is being evaluated anyway;
-* recording the bucket-compose route as **unverified**, which is the honest default given
-  that branch is benchmarked separately.
+* the `fuse-localize` image;
+* recording the bucket-compose route as **unverified**.
+
+**On `parallel-localization-fuse` this is resolved: the worker image ships gcsfuse 3.11.2**
+(`LOCALIZATION.md` §4c pins it, because the `mount` upload kind depends on its streaming
+writes). Use that image and skip the three options above. Do check the version — streaming
+writes are default-on from 3.x, and on an older gcsfuse the RW upload mount behaves
+differently enough that nothing measured here would transfer.
 
 ### Why the mount goes inside the container
 
