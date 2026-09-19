@@ -30,6 +30,38 @@ Localization (canine/localization/)
 - `canine/localization/base.py` — core localization logic, **heavy pandas use** — highest pandas migration risk
 - `canine/localization/remote.py` — GCS ↔ cluster transfer logic
 
+## Parallel chunked downloading
+
+`canine/localization/parallel_download.py` replaces the single-`curl` download of remote
+URLs with parallel, resumable, chunked transfers. Read
+`canine/localization/PARALLEL_DOWNLOAD.md` (operator's guide) before changing behaviour,
+and `../update_localization.md` for the design rationale and the measurement log.
+
+**One hard constraint: `parallel_download.py` must not import `canine`.** It is staged
+onto nodes and run by hand as a standalone script, where canine is not installed, and the
+import would also be circular — `file_handlers.py` imports *from it*, not the reverse.
+`TestTheModuleContracts` in `canine/test/test_parallel_download.py` enforces this by AST
+walk, along with the constants the two modules must share.
+
+Three write routes, chosen by `select_route` from the destination's filesystem:
+`in-place` (POSIX), `bucket-compose` (a gcsfuse-mounted bucket — parts uploaded
+individually and composed server-side, never written through the mount), and
+`stage-publish` (the fallback). Progress is recovered from file extents via
+`SEEK_HOLE`, with an 8 MiB checkpoint fallback where that is unsupported.
+
+Exit codes are load-bearing for SLURM: **5** = requeue and resume, **15** = skip this job,
+any other nonzero = do not retry. A network error must never escape as a generic nonzero.
+
+Tests: `test_parallel_download.py`, `test_parallel_download_bucket.py` (against a fake GCS
+in `pdl_gcs.py`), `test_parallel_download_resume.py` (SIGKILL), `test_pdl_command.py`
+(emitted-shell contracts), `test_benchmark_harness.py`. The benchmark itself is
+`canine/test/benchmark_localization.py` with `canine/test/BENCHMARK_RUNBOOK.md`.
+
+**When benchmarking this, measure past 96 GiB.** The `pd-standard` localization disk
+delivers a 2× burst for its first ~56 GiB and half that thereafter, and four sections of
+the runbook concluded there was a defect in the downloader by comparing a short
+measurement against a long one. There was none — it runs within 1% of `dd`.
+
 ## Setup & Dev Installation
 
 ```bash
