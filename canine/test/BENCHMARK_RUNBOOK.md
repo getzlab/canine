@@ -2750,15 +2750,38 @@ sudo docker exec slurm sh -c '
   BIG=$(ls -S /mnt/rwdisks/'"$DISK"'/bench.*.bin 2>/dev/null | head -1)
   echo "reading $BIG"
   dd if="$BIG" of=/dev/null bs=1M count=4096 skip=131072 iflag=direct 2>&1 | tail -1'
-
-# on the node -- write, into whatever free space is left, cache bypassed
-sudo docker exec slurm sh -c '
-  df -h /mnt/rwdisks/'"$DISK"' | tail -1
-  dd if=/dev/zero of=/mnt/rwdisks/'"$DISK"'/ddtest bs=1M count=4096 oflag=direct 2>&1 | tail -1
-  rm -f /mnt/rwdisks/'"$DISK"'/ddtest'
 ```
 
-If the write arm reports free space under ~5 GiB, drop `count` to fit; 2048 is plenty.
+**In practice the disk was empty but `lost+found`** — a sweep run after the §6.5g
+measurement had already unlinked `bench.16.bin`, so there was nothing to read. That is the
+normal state, not a mishap, and it is better: with free space available, write the file
+yourself and read it back, and run the *same* 4 GiB buffered as well. Direct and cached
+then sit side by side on identical bytes with identical tooling, which is the actual
+experiment — the ≤16 GiB figures in §6.5d–§6.5f are suspect precisely because nothing ever
+ran both ways on the same work.
+
+```bash
+# on the node -- all three arms, ~6 minutes at 36 MiB/s (halve `count` to shorten)
+sudo docker exec slurm sh -c '
+  D=/mnt/rwdisks/'"$DISK"'
+  df -h "$D" | tail -1
+  echo "== write, O_DIRECT"
+  dd if=/dev/zero of="$D"/ddtest bs=1M count=4096 oflag=direct 2>&1 | tail -1
+  echo "== read back, O_DIRECT"
+  dd if="$D"/ddtest of=/dev/null bs=1M count=4096 iflag=direct 2>&1 | tail -1
+  echo "== write, buffered + fdatasync -- what 6.5e/6.5f measured"
+  dd if=/dev/zero of="$D"/ddtest2 bs=1M count=4096 conv=fdatasync 2>&1 | tail -1
+  rm -f "$D"/ddtest "$D"/ddtest2'
+```
+
+The third arm decides it. **buffered ≈ 80 against direct ≈ 36–45** proves the cache
+inflation and dissolves the 1.70×; **all three ≈ 80** means the `pd-standard` arithmetic
+above is wrong and the gap is ours after all.
+
+Note the disk is now nearly empty rather than 90% full, so this measures the device rather
+than the device-at-fullness. That is the right control here — §6.5d already found fullness
+worth 1.7% — but it does mean the arms are not directly comparable to the §6.5g re-read,
+which ran against a full one.
 
 How to read it:
 
