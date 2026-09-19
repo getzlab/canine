@@ -35,7 +35,7 @@ Localization (canine/localization/)
 `canine/localization/parallel_download.py` replaces the single-`curl` download of remote
 URLs with parallel, resumable, chunked transfers. Read
 `canine/localization/PARALLEL_DOWNLOAD.md` (operator's guide) before changing behaviour,
-and `../update_localization.md` for the design rationale and the measurement log.
+and `update_localization.md` (repo root) for the design rationale and the measurement log.
 
 **One hard constraint: `parallel_download.py` must not import `canine`.** It is staged
 onto nodes and run by hand as a standalone script, where canine is not installed, and the
