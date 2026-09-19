@@ -51,6 +51,7 @@ import glob
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
 import platform
 import random
@@ -2296,6 +2297,138 @@ def command_resume(args):
 # the bucket-compose route
 # --------------------------------------------------------------------------------
 
+BUCKET_CLAIM_POLL_SECONDS = 60      # the emitted wait loop's sleep
+BUCKET_CREATE_POLL_CEILING = 60     # 30 polls x 2s before the label is readable
+
+
+def command_claim(args):
+    """
+    Size `bucket_upload_wait_tries` from what a legitimate upload actually costs.
+
+    The constant gates the **claim**, not the transfer: a sibling waits
+    `bucket_upload_wait_tries` x 60s between `wolf=working` and `wolf=success`, and on
+    timeout declares a live upload dead and hands the object to a take-over worker --
+    silently, as a warning, costing a duplicate transfer every time. So the number to
+    beat is the whole produce phase for the largest real input SET, not the throughput
+    of one object.
+
+    Three things this deliberately does differently from `routeb`, each because getting
+    it wrong is how the constant was mis-sized in the first place (see
+    update_localization.md 13.49, where a pd-standard DOWNLOAD figure was used to size a
+    relay):
+
+      * **Repeats.** A ceiling is a question about the tail. One run is a point, and the
+        slowest relay is what has to fit, so the recommendation is built from the max.
+      * **Scales to the input set.** The timeout covers every input in one localization.
+        Measuring one object and sizing for a set of twelve under-sizes by 12x.
+      * **Adds the overheads it cannot measure.** Bucket-create polling, label updates
+        and the customTime stamping pass all sit inside the claim and outside the
+        transfer. They are named and added rather than quietly ignored.
+    """
+    size, verification = resolve_source(args)
+    args.size = size
+    heading("sizing bucket_upload_wait_tries")
+    say("gs url  : {}".format(args.gs_url))
+    say("size    : {} per object, {} object(s) per localization".format(
+        human(size), args.inputs_per_localization))
+    say("repeats : {}".format(args.repeat))
+    say()
+
+    dest = os.path.join(args.mount_dir, os.path.basename(args.gs_url))
+    runs = []
+    for attempt in range(args.repeat):
+        for stale in (dest, dest + ".k9pdl.gz"):
+            try:
+                os.unlink(stale)
+            except OSError:
+                pass
+        outcome = run_download(source_args(args, dest, size), dest, size,
+                               args.connections, args.min_chunk,
+                               verification=verification)
+        ok = outcome["returncode"] == 0
+        runs.append({"seconds": outcome["seconds"], "ok": ok,
+                     "returncode": outcome["returncode"]})
+        say("relay {}: {:.1f}s {}".format(
+            attempt + 1, outcome["seconds"], "" if ok else
+            "FAILED rc={}".format(outcome["returncode"])))
+        if not ok:
+            for line in outcome["stderr_tail"]:
+                say("    {}".format(line[:100]))
+
+    good = [r["seconds"] for r in runs if r["ok"]]
+    say()
+    if not good:
+        heading("NO USABLE RESULT")
+        say("Every relay failed, so there is no duration to size a timeout from.")
+        return {"claim": {"runs": runs, "usable": 0}}
+
+    slowest = max(good)
+    per_set = slowest * args.inputs_per_localization
+    overhead = BUCKET_CREATE_POLL_CEILING
+    claim_seconds = per_set + overhead
+    recommended = int(math.ceil(claim_seconds * args.safety / BUCKET_CLAIM_POLL_SECONDS))
+
+    say("slowest relay          : {:.1f}s  (mean {:.1f}s over {} ok run(s))".format(
+        slowest, sum(good) / len(good), len(good)))
+    say("x {} input(s) per set   : {:.1f}s".format(args.inputs_per_localization, per_set))
+    say("+ create/label overhead: {:.1f}s  (bucket-create polling ceiling)".format(overhead))
+    say("= claim duration       : {:.1f}s = {:.2f} h".format(
+        claim_seconds, claim_seconds / 3600.0))
+    say()
+    say("x{:.1f} safety          -> bucket_upload_wait_tries >= {}  ({:.2f} h)".format(
+        args.safety, recommended, recommended * BUCKET_CLAIM_POLL_SECONDS / 3600.0))
+    say()
+
+    for candidate, label in ((60, "60 (the original)"), (180, "180 (current default)")):
+        verdict = "ENOUGH" if candidate >= recommended else "TOO SMALL"
+        say("  {:<22} {:>5.2f} h   {}".format(label,
+            candidate * BUCKET_CLAIM_POLL_SECONDS / 3600.0, verdict))
+    say()
+
+    # Guards. Each of these has a matching way to read the table above as saying
+    # something it does not.
+    if len(good) < 3:
+        say("ONE-SHOT: {} usable run(s). A timeout has to clear the SLOWEST legitimate".format(
+            len(good)))
+        say("upload, and this has barely sampled the distribution. Do not lower the")
+        say("constant on this; --repeat 3 is the minimum worth acting on.")
+        say()
+    elif max(good) / min(good) > 1.5:
+        say("WIDE SPREAD: slowest is {:.1f}x the fastest. The source or GCS ingest is".format(
+            max(good) / min(good)))
+        say("variable, so the tail is wider than {} runs can show. Prefer the larger".format(
+            len(good)))
+        say("candidate, or raise --safety.")
+        say()
+    if size < 96 * GIB:
+        say("SHORT MEASUREMENT: {} per object. §6.5i found this hardware delivers a 2x".format(
+            human(size)))
+        say("burst for its first ~56 GiB, so a small relay reports roughly double the")
+        say("sustained rate -- which UNDER-sizes a timeout. Measure at >=96 GiB before")
+        say("lowering anything.")
+        say()
+    if args.inputs_per_localization == 1:
+        say("SINGLE INPUT: the timeout covers a whole localization, and most real ones")
+        say("carry several inputs. Pass --inputs-per-localization with the largest set")
+        say("you actually localize, or this sizes for the easiest case.")
+        say()
+
+    say("Also outside this measurement, and outside the transfer: the customTime")
+    say("stamping pass scales with object COUNT, and a take-over worker's own retry")
+    say("budget sits on top. The recommendation is a floor, not a target.")
+
+    return {"claim": {
+        "runs": runs,
+        "slowest_seconds": slowest,
+        "claim_seconds": claim_seconds,
+        "inputs_per_localization": args.inputs_per_localization,
+        "safety": args.safety,
+        "recommended_tries": recommended,
+        "sufficient_at_60": recommended <= 60,
+        "sufficient_at_180": recommended <= 180,
+    }}
+
+
 def command_routeb(args):
     """
     the bucket-compose route against real GCS. Never exercised outside a fake, and the auth path in
@@ -2499,6 +2632,21 @@ def build_parser():
                         help="the gcsfuse mount the destination lives on")
     routeb.add_argument("--connections", type=int, default=8)
 
+    claim = sub.add_parser(
+        "claim", help="size bucket_upload_wait_tries from repeated relay timings")
+    add_common(claim)
+    claim.add_argument("--gs-url", required=True, help="gs://bucket/object destination")
+    claim.add_argument("--mount-dir", required=True,
+                       help="the gcsfuse mount the destination lives on")
+    claim.add_argument("--connections", type=int, default=MAX_CONNECTIONS_HINT)
+    claim.add_argument("--repeat", type=int, default=3,
+                       help="relays to time; a ceiling is a tail question, not a mean one")
+    claim.add_argument("--inputs-per-localization", type=int, default=1,
+                       help="objects in the largest real input SET -- the timeout covers "
+                            "the whole localization, not one object")
+    claim.add_argument("--safety", type=float, default=2.0,
+                       help="multiplier applied to the slowest observed relay")
+
     sub.add_parser("preempt", help="print the manual forced-preemption procedure")
     return parser
 
@@ -2520,6 +2668,7 @@ def main(argv=None):
         "sweep": command_sweep,
         "resume": command_resume,
         "routeb": command_routeb,
+        "claim": command_claim,
         "preempt": command_preempt,
     }
     result = handlers[args.command](args)

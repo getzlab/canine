@@ -3157,6 +3157,63 @@ is why the command above does that rather than adding `rshared` to §3.
 
 ---
 
+### 6.7 Size `bucket_upload_wait_tries` — should the timeout go back to 1 hour?
+
+The default was raised 60 → 180 (1 h → 3 h) in `update_localization.md` §13.49, on risk
+asymmetry rather than a measurement, because the relay's throughput was unknown. It is a
+placeholder and lowering it again with data is the good outcome — characterization runs on
+the bucket path report noticeably better speeds than the disk path, which is exactly the
+case for re-measuring rather than leaving a conservative constant in place.
+
+**What has to be measured is the claim, not the transfer.** A sibling waits this long
+between `wolf=working` and `wolf=success`; on timeout it declares a live upload dead and a
+take-over worker re-does it, silently, as a warning. So the number to beat is the whole
+produce phase for the **largest real input set** — not the throughput of one object, which
+is the mistake §13.49 records.
+
+```bash
+# on the node, with the bucket gcsfuse-mounted per §6.6
+pdl claim --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --gs-url gs://$BUCKET/claim-test.bam \
+          --mount-dir /mnt/bucket \
+          --repeat 3 \
+          --inputs-per-localization <objects in your largest localization> \
+          --json /tmp/claim.json
+```
+
+It relays the object `--repeat` times, takes the **slowest** run (a ceiling is a tail
+question — a mean lets the slow half of the distribution time out), multiplies by the input
+count, adds the bucket-create polling ceiling, applies `--safety` (default 2×), and prints
+a verdict against both candidates:
+
+```
+  60 (the original)       1.00 h   ENOUGH
+  180 (current default)   3.00 h   ENOUGH
+```
+
+**Decision rule: return to 60 only if it reads `ENOUGH` with `--repeat 3` or more, at
+≥96 GiB, and with the real input count.** Any of the four guards firing means the answer
+is not yet supported:
+
+| guard | why it blocks the decision |
+|---|---|
+| `ONE-SHOT` | fewer than 3 usable runs; the tail has not been sampled |
+| `WIDE SPREAD` | slowest > 1.5× fastest, so the tail is wider than the runs show |
+| `SHORT MEASUREMENT` | under 96 GiB, where §6.5i's 2× burst inflates the rate and **under-sizes** the ceiling |
+| `SINGLE INPUT` | sized for one object against a timeout that covers a whole localization |
+
+Two costs sit outside what it measures and are named in its output: the customTime
+stamping pass scales with object *count*, and a take-over worker's own retry budget stacks
+on top. The recommendation is a floor.
+
+And keep the other direction in view while reading it. The ceiling is also the recovery
+time when an uploader genuinely dies — routine on preemptible workers — so a *smaller*
+value is actively better as long as it clears the tail. The reason to prefer 60 is not
+tidiness; it is three hours of stall per preemption.
+
+---
+
 ## 7. Forced preemption
 
 Cannot be driven from the VM being preempted, and needs the SLURM requeue path to observe

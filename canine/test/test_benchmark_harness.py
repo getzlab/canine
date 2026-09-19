@@ -2328,3 +2328,109 @@ class TestTheRunbookDoesNotHardcodeADigestItCannotKeepCurrent:
         assert text.count("md5sum /tmp/pdl/benchmark_localization.py") >= 2, (
             "the node-vs-workstation md5sum comparison is what replaces a hardcoded "
             "digest; without it there is no staleness check anywhere")
+
+
+class TestSizingTheUploadWaitCeiling:
+    """
+    `pdl claim` answers one question: is 60 enough, or is 180 needed?
+
+    It exists rather than reusing `routeb`'s single timing because of
+    update_localization.md §13.49 -- the constant was previously sized from a
+    pd-standard *download* figure, which is a different path entirely. The shape of the
+    measurement matters more here than its precision: the timeout gates the whole
+    claim, has to clear the SLOWEST legitimate upload rather than the typical one, and
+    covers every input in a localization rather than one object.
+    """
+
+    def run(self, tmp_path, monkeypatch, capsys, durations, **flags):
+        seq = list(durations)
+
+        def fake_run_download(source, dest, size, conns, min_chunk, **kw):
+            seconds = seq.pop(0)
+            return {"connections": conns, "returncode": 0 if seconds > 0 else 1,
+                    "seconds": abs(seconds), "killed": False, "peak_rss": 1 << 20,
+                    "phases": {}, "nic_bytes": 0, "disk_bytes": 0,
+                    "peak_nic_bytes_per_s": 0, "peak_disk_bytes_per_s": 0,
+                    "stderr_tail": [], "fell_back": None, "mean_streams": None,
+                    "workers": conns, "bookkeeping_seconds": None,
+                    "bookkeeping_calls": None, "bookkeeping_mean": None,
+                    "bookkeeping_pct_workers": None}
+
+        downloader = tmp_path / "parallel_download.py"
+        downloader.write_bytes(b"# stand-in\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(downloader))
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        size = flags.pop("size", 100 * bench.GIB)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (size, bench.Verification("md5", "d" * 32)))
+        argv = ["claim", "--url", "https://h/o", "--size", str(size),
+                "--gs-url", "gs://b/o.bam", "--mount-dir", str(tmp_path),
+                "--repeat", str(len(durations))]
+        for key, value in flags.items():
+            argv += ["--" + key.replace("_", "-"), str(value)]
+        result = bench.command_claim(bench.build_parser().parse_args(argv))
+        return result["claim"], capsys.readouterr().out
+
+    def test_a_fast_relay_says_sixty_is_enough(self, tmp_path, monkeypatch, capsys):
+        """20 minutes, doubled for safety, plus overhead, fits inside an hour."""
+        claim, out = self.run(tmp_path, monkeypatch, capsys, [1200, 1150, 1180])
+        assert claim["sufficient_at_60"] is True
+        assert "60 (the original)" in out and "ENOUGH" in out
+
+    def test_a_slow_relay_says_sixty_is_not(self, tmp_path, monkeypatch, capsys):
+        claim, out = self.run(tmp_path, monkeypatch, capsys, [2400, 2500, 2450])
+        assert claim["sufficient_at_60"] is False
+        assert "TOO SMALL" in out
+
+    def test_the_recommendation_uses_the_slowest_run_not_the_mean(
+            self, tmp_path, monkeypatch, capsys):
+        """
+        The whole point of a ceiling. A mean lets the slow half of the distribution
+        time out, which is the failure being sized against.
+        """
+        fast, _ = self.run(tmp_path, monkeypatch, capsys, [1000, 1000, 1000])
+        slow, _ = self.run(tmp_path, monkeypatch, capsys, [1000, 1000, 3000])
+        assert slow["recommended_tries"] > fast["recommended_tries"]
+        assert slow["slowest_seconds"] == 3000
+
+    def test_it_scales_to_the_input_set(self, tmp_path, monkeypatch, capsys):
+        """
+        The timeout covers a localization, not an object. Sizing from one input and
+        deploying against a twelve-input set under-sizes by roughly 12x.
+        """
+        one, _ = self.run(tmp_path, monkeypatch, capsys, [600, 600, 600])
+        many, _ = self.run(tmp_path, monkeypatch, capsys, [600, 600, 600],
+                           inputs_per_localization=12)
+        assert many["recommended_tries"] > 5 * one["recommended_tries"]
+
+    def test_a_single_run_is_flagged_as_not_a_distribution(
+            self, tmp_path, monkeypatch, capsys):
+        _, out = self.run(tmp_path, monkeypatch, capsys, [1200])
+        assert "ONE-SHOT" in out
+        assert "Do not lower the" in out
+
+    def test_a_wide_spread_is_flagged(self, tmp_path, monkeypatch, capsys):
+        _, out = self.run(tmp_path, monkeypatch, capsys, [600, 900, 1800])
+        assert "WIDE SPREAD" in out
+
+    def test_a_short_measurement_is_flagged(self, tmp_path, monkeypatch, capsys):
+        """
+        §6.5i: this hardware bursts 2x for its first ~56 GiB, so a small relay reports
+        roughly double the sustained rate -- and a timeout sized from it is too small,
+        which is the silent direction.
+        """
+        _, out = self.run(tmp_path, monkeypatch, capsys, [600, 610, 605],
+                          size=4 * bench.GIB)
+        assert "SHORT MEASUREMENT" in out
+        assert "UNDER-sizes" in out
+
+    def test_a_single_input_set_is_flagged(self, tmp_path, monkeypatch, capsys):
+        _, out = self.run(tmp_path, monkeypatch, capsys, [600, 610, 605])
+        assert "SINGLE INPUT" in out
+
+    def test_every_relay_failing_reports_no_result_rather_than_a_number(
+            self, tmp_path, monkeypatch, capsys):
+        """A failed relay has a duration too, and it is not a localization time."""
+        claim, out = self.run(tmp_path, monkeypatch, capsys, [-30, -30, -30])
+        assert "NO USABLE RESULT" in out
+        assert "recommended_tries" not in claim
