@@ -3247,26 +3247,25 @@ back to `gcloud`, so on any GCE node metadata always wins. The line reports that
 on GCE, and can never say `gcloud fallback` there — it is not a diagnostic of which
 credentials are mounted.
 
-**What it does tell you is which identity writes to the destination bucket: the node's
-compute service account, not you.** That is a real divergence to plan for rather than
-detect afterwards. A bucket you created with your own `gcloud` is not necessarily readable
-or writable by that SA, and the failure arrives as a 403 during upload — after the source
-probe has already passed, so it looks like a bucket problem rather than an identity one.
-Grant it up front:
+**What it does tell you is which identity writes to the destination bucket, and it is not
+you.** `GcsClient._fetch_token` tries the metadata server first and falls back to `gcloud`;
+it **never reads ADC** — `grep GOOGLE_APPLICATION_CREDENTIALS parallel_download.py` returns
+nothing. So on a GCE node the downloader always writes as the **compute service account**,
+no matter whose credentials are mounted.
 
-```bash
-# on the node
-SA=$(curl -s -H "Metadata-Flavor: Google" \
-  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email)
-echo "the downloader will write as: $SA"
+Three identities are therefore in play at once on this path, which is what makes a 403 hard
+to read:
 
-gcloud storage buckets add-iam-policy-binding "gs://$FUSE_BUCKET" \
-  --member="serviceAccount:$SA" --role=roles/storage.objectAdmin --project "$PROJECT"
-```
+| who | uses | for |
+|---|---|---|
+| you (ADC) | `gcsfuse` | mounting the bucket |
+| you (ADC) | `gcloud storage` | creating the bucket, `ls`, teardown |
+| **compute SA** | `GcsClient`, metadata token | **writing the parts and composing** |
 
-`objectAdmin` rather than `objectCreator`: the route composes parts and then **deletes**
-them, and a creator-only SA leaves every part behind at full size — 279 GiB of silent
-extra storage on top of the object.
+That the bucket is yours says nothing about the third row. Whether it already works depends
+on the SA's project-level roles — the default compute SA frequently has broad storage
+access, in which case nothing needs granting — so §6.6a probes it rather than assuming
+either way.
 
 **`gcsfuse` is not in the image on `wolf-2.0-update`**, and neither is `rclone` — its
 Dockerfile install is commented out, though `conf/rclone.conf` ships. Only `fuse-overlayfs`
@@ -3376,6 +3375,42 @@ keeps charging until next week. `--lifecycle-file` is a backstop for the same re
 **No Rapid Cache yet.** The uncached bucket is the baseline (§13.48); the cache is step 5
 and has to be provisioned by hand on this bucket, because
 `get_or_create_rapid_cache()` targets the workflow bucket instead.
+
+Then check the identity that will actually write. Not yours: the downloader takes the
+metadata-server token and never reads ADC (§6.6), so it writes as the compute SA whatever
+is mounted. Ask that SA directly, with the same API the downloader uses, rather than
+reasoning about IAM:
+
+```bash
+# on the node
+SA=$(mdget instance/service-accounts/default/email)
+SA_TOKEN=$(mdget instance/service-accounts/default/token \
+           | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
+echo "the downloader writes as: $SA"
+
+curl -s -o /dev/null -w 'write probe: %{http_code}\n' -X POST \
+  -H "Authorization: Bearer $SA_TOKEN" -H "Content-Type: text/plain" --data probe \
+  "https://storage.googleapis.com/upload/storage/v1/b/$FUSE_BUCKET/o?uploadType=media&name=.sa-probe"
+```
+
+**`200` means nothing to do** — the SA already has what it needs, which is the common case
+when the default compute SA carries project-level storage access. Clean up the probe object
+and move on:
+
+```bash
+gcloud storage rm "gs://$FUSE_BUCKET/.sa-probe" 2>/dev/null || :
+```
+
+**`403` means grant it**, and only then:
+
+```bash
+gcloud storage buckets add-iam-policy-binding "gs://$FUSE_BUCKET" \
+  --member="serviceAccount:$SA" --role=roles/storage.objectAdmin --project "$PROJECT"
+```
+
+`objectAdmin`, not `objectCreator`: the route composes parts and then **deletes** them, so
+a creator-only SA would leave every part behind — at full size that is 279 GiB of silent
+extra storage sitting on top of the object, and the run still reports success.
 
 #### 2. Update the container
 
