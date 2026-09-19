@@ -2434,6 +2434,64 @@ total, no network.
   after all, with the periodic full-file `fsync` as the remaining suspect: it is the one
   thing `dd` does not reproduce.
 
+#### Measured — the disk is fine; the loss is ours
+
+```
+16 concurrent writers: 196s for 16 GiB   ->  83.6 MiB/s
+1 sequential writer  : 191s for 16 GiB   ->  85.8 MiB/s
+```
+
+Within 3% of each other and both within 5% of §4.1's `dd`. **Write concurrency costs this
+disk nothing** — the reads-degrade-with-concurrency result in §4.1a does not transfer, and
+the suspicion that pd-standard simply could not take sixteen writers is dead. The device
+delivers ~84 MiB/s under our concurrency and the downloader gets **49.04**, a **1.70×** gap
+that is now unambiguously inside our own code.
+
+**And this test has a gap that names the next suspect.** Sixteen `dd`s write sixteen
+*separate files* — sixteen inodes, sixteen independent locks, sixteen independent
+writeback contexts. The downloader writes sixteen streams into **one** file, with the
+commit thread calling `fsync()` on that same inode underneath them. On ext4 an `fsync`
+takes the inode's lock and forces a journal commit; concurrent `pwrite`s to the same inode
+stall behind it. Nothing in §6.5e reproduces that, and it is consistent with every number
+we have: `commit` occupying 100% of wall at full size, and `streams` reading 15.47 of 16
+"busy" while each delivers only 3.17 MiB/s — workers blocked *inside* `pwrite`, which the
+stream accounting counts as busy (§6.5c).
+
+#### §6.5f One inode or sixteen — the last cheap discriminator
+
+Identical bytes and concurrency to §6.5e, changing only the number of inodes:
+
+```bash
+sudo docker exec slurm sh -c '
+  D=/mnt/rwdisks/'"$DISK"'
+  F=$D/single.bin
+  rm -f $F; truncate -s 16G $F
+  START=$(date +%s); i=0
+  while [ $i -lt 16 ]; do
+    dd if=/dev/zero of=$F bs=1M count=1024 seek=$(( i * 1024 )) \
+       conv=notrunc,nocreat,fdatasync 2>/dev/null &
+    i=$((i + 1))
+  done
+  wait
+  echo "16 writers, ONE file: $(( $(date +%s) - START ))s for 16 GiB"
+  rm -f $F'
+```
+
+Each `dd` carries `fdatasync`, so sixteen flushes land on one inode while fifteen other
+writers are mid-write — the downloader's pattern without any of its code.
+
+* **≈ 196s (84 MiB/s)** → the inode is not the contention point either, and the remaining
+  difference is something only the downloader does: the `SEEK_HOLE` frontier scan per
+  chunk, the in-transfer md5, or the manifest write itself. Instrument `PosixChunkSink.write`
+  the way `chunk_done` was instrumented in §6.5a rather than guessing again.
+* **Materially slower, approaching ~330s (49 MiB/s)** → single-inode `fsync` contention is
+  the whole gap, and the fix is structural: fewer full-file `fsync`s (the commit thread
+  already batches — batch harder), `sync_file_range` on just the committed extents instead
+  of `fsync` on the whole inode, or the stage-publish route's separate files.
+
+Either way this is the last test that needs no code. After it, the answer is in the
+downloader and wants instrumentation, not a shell script.
+
 Pair it with the destination in isolation, on the disk in its current state:
 
 ```bash
@@ -2700,7 +2758,8 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Does in-transfer hashing (#19) pay off? | §6.3 | yes, completely — `verify 0.0s` with a real ETag, ~52 min of read-back avoided |
 | HTTP vs the S3 API | §6.5b | 6.9% apart on the download phase; the presigned path wins but the transport is not the bottleneck |
 | Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **the question was malformed.** The 4 GiB rows measure page cache (28 GB RAM), so 90% is an artifact; the full-size run's throughput is **flat to 1.7%** across 85% of its duration, which eliminates fullness and extent growth outright. Source, ENOSPC and logical scatter all separately eliminated |
-| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e | **OPEN** — §4.1's 92.3 MB/s is one sequential writer; sixteen concurrent scattered writers has never been measured. §4.1a found concurrency hurting *reads* on this disk |
+| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e | **a defect — ours.** 16 concurrent writers get 83.6 MiB/s, one sequential writer 85.8; write concurrency costs this disk nothing. The downloader's 49.04 is a 1.70× gap inside our own code |
+| Is single-inode `fsync` contention the 1.70×? | §6.5f | **OPEN** — §6.5e used 16 separate files; the downloader uses one inode with a commit thread `fsync`ing it underneath sixteen writers |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
 | `/bin/sh` in the container | §3 probe | dash |
