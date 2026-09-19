@@ -459,6 +459,7 @@ sudo docker run -dti --rm --pid host --network host --privileged \
   -v /dev:/dev \
   -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
   -v $HOME/.aws:/root/.aws:ro \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json \
   --shm-size "$SHM_SIZE" \
   --entrypoint /bin/bash --name slurm broadinstitute/slurm_gcp_docker
 ```
@@ -477,6 +478,35 @@ container via `docker exec`, so a copy on the node alone is invisible to them.
 
 Both mounts are `:ro` deliberately — nothing in the benchmark should be able to modify your
 credentials, and a read-only mount makes that structural rather than a matter of care.
+
+**`-e GOOGLE_APPLICATION_CREDENTIALS` is not optional, and its absence is silent.** The
+image sets `CLOUDSDK_CONFIG=/user_gcloud_config`, which is a *different* directory from
+where the mount lands. Without the pointer, gcloud finds a config dir with no
+`application_default_credentials.json` in it, detects GCE, and resolves ADC to the
+**metadata server** — handing back a compute-service-account token and exiting 0. Nothing
+reports a problem until a write fails with
+`...-compute@developer.gserviceaccount.com does not have storage.objects.create access`,
+and diagnostics like "can gcloud mint a token?" pass the whole time, because one was
+minted — just not yours.
+
+This mirrors what `base.py` does in production for exactly this reason: it exports
+`GOOGLE_APPLICATION_CREDENTIALS` from `$CLOUDSDK_CONFIG` before invoking `gcsfuse`,
+because there the credentials really are at `$CLOUDSDK_CONFIG`. On a hand-started
+container they are not, so the pointer has to be explicit.
+
+For a container already running, `docker exec -e` works without a restart:
+
+```bash
+# on the node
+ADC=/root/.config/gcloud/application_default_credentials.json
+pdl() { sudo docker exec -e GOOGLE_APPLICATION_CREDENTIALS=$ADC slurm \
+          python3 /tmp/pdl/benchmark_localization.py "$@"; }
+```
+
+Verify it against a bucket once you have one — §6.6a step 1. Verify with a *write*, not
+with "does a token exist": a `tokeninfo` lookup needs the `userinfo.email` scope to say
+anything, so a blank answer there is not evidence either way, and `gcloud ... print-access-
+token` exiting 0 is exactly the check that passed all the way through this failure.
 
 `probe` reports which credential *source* it resolved — a path and a profile name — and
 never the key itself. Use `--s3-profile NAME` for a non-default profile; if no credentials
@@ -663,6 +693,7 @@ sudo docker run -dti --rm --pid host --network host --privileged \
   -v /dev:/dev \
   -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
   -v $HOME/.aws:/root/.aws:ro \
+  -e GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json \
   --shm-size "$SHM_SIZE" \
   --entrypoint /bin/bash --name slurm "$IMAGE"
 ```
@@ -3371,18 +3402,32 @@ keeps charging until next week. `--lifecycle-file` is a backstop for the same re
 and has to be provisioned by hand on this bucket, because
 `get_or_create_rapid_cache()` targets the workflow bucket instead.
 
-Then confirm the identity. With ADC first, the downloader writes as **you** — the same
-identity that created the bucket and mounts it — so normally there is nothing to do:
+Then confirm the identity — with a **write**, because that is the operation that fails
+and every weaker check passes through the failure. The downloader now prefers ADC, but
+the container's `CLOUDSDK_CONFIG` does not point at the mounted credentials, so
+`GOOGLE_APPLICATION_CREDENTIALS` has to be explicit (§3):
 
 ```bash
-# on the node -- expect your account, not ...-compute@developer.gserviceaccount.com
-sudo docker exec slurm gcloud auth application-default print-access-token >/dev/null \
-  && echo "ADC works in the container" || echo "ADC MISSING -- the run will fall back to the SA"
+# on the node
+ADC=/root/.config/gcloud/application_default_credentials.json
+TOKEN=$(sudo docker exec -e GOOGLE_APPLICATION_CREDENTIALS=$ADC slurm \
+          gcloud auth application-default print-access-token)
+
+curl -s -o /dev/null -w 'write probe: %{http_code}\n' -X POST \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: text/plain" --data probe \
+  "https://storage.googleapis.com/upload/storage/v1/b/$FUSE_BUCKET/o?uploadType=media&name=.adc-probe"
+gcloud storage rm "gs://$FUSE_BUCKET/.adc-probe" 2>/dev/null || :
 ```
 
-If that fails, the container has no usable ADC (§3's `~/.config/gcloud` mount), and the
-downloader falls back to the compute service account — which very likely cannot write a
-bucket you created. Fix the mount rather than the IAM. If you would rather grant the SA:
+**`200` and you are done** — that is your identity, writing to your bucket, through the
+same API the downloader uses. Make sure `pdl()` carries the same `-e` flag (§3) or the
+run will not use it.
+
+**`403`** names the identity in the message. If it is `...-compute@developer.gservice
+account.com`, ADC is still not resolving: check that the file exists at `$ADC` in the
+container and that the `-e` flag is actually on the `docker exec`. Granting that SA
+`objectAdmin` is the fallback, but it makes the run exercise an identity production does
+not use, so treat any number from it as provisional:
 
 ```bash
 SA=$(mdget instance/service-accounts/default/email)
@@ -3412,7 +3457,9 @@ you want §6.3 again, §4's disk mount. The disk itself survives.
 sudo docker exec slurm mkdir -p /tmp/pdl
 sudo docker cp /tmp/benchmark_localization.py slurm:/tmp/pdl/
 sudo docker cp /tmp/parallel_download.py      slurm:/tmp/pdl/
-pdl() { sudo docker exec slurm python3 /tmp/pdl/benchmark_localization.py "$@"; }
+ADC=/root/.config/gcloud/application_default_credentials.json
+pdl() { sudo docker exec -e GOOGLE_APPLICATION_CREDENTIALS=$ADC slurm \
+          python3 /tmp/pdl/benchmark_localization.py "$@"; }
 
 sudo docker exec slurm sh -c 'gcsfuse --version; ls /tmp/pdl'
 ```
