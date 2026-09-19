@@ -106,6 +106,10 @@ MAX_CONNECTIONS_HINT = 16
 # TestTheBenchmarkMirrorsTheDownloadersConstants -- `routeb` and `resume` each carried
 # their own hardcoded 8, which silently kept the pre-16 value when the default moved.
 DEFAULT_CONNECTIONS_HINT = 16
+# Mirrors parallel_download.py's DEFAULT_UPLOAD_BLOCK, pinned equal by the same test.
+# The bucket route buffers one of these per connection, so it -- not READ_BLOCK -- is
+# what sets peak RSS there.
+UPLOAD_BLOCK_HINT = 8 * 1024 * 1024
 
 # The emitted commands and the legacy fallbacks use [[ ]] and process substitution, which
 # dash rejects -- and /bin/sh in the worker image is dash. Same reason parallel_download.py
@@ -2029,10 +2033,25 @@ def command_sweep(args):
     if memory:
         say()
         say("peak RSS       : {} across the sweep".format(human(max(memory))))
-        budget = args.min_chunk  # a generous ceiling: one chunk, not one READ_BLOCK
-        say("               : {} -- the claim is ~1 MiB per connection buffered".format(
-            "bounded as designed" if max(memory) < max(256 * MIB, budget)
-            else "HIGHER than expected; check for accumulation"))
+        # Budget from what is actually in flight. The old fixed 256 MiB ceiling and its
+        # "~1 MiB per connection" claim both predate --upload-block: the bucket route
+        # buffers one block per connection, so at 16 x 8 MiB the working set is
+        # legitimately ~400 MiB and a correct run was reported as "HIGHER than
+        # expected". A guard that cries wolf on the default configuration is worse than
+        # none, because the next reader discounts it.
+        #
+        # x4 rather than x1: measured at 397 MiB for 16 x 8 MiB, i.e. ~3.1x the raw
+        # buffer once the request body and allocator overhead are counted.
+        block = max(getattr(args, "upload_block", None) or UPLOAD_BLOCK_HINT, MIB)
+        conns = max(args.connections) if isinstance(args.connections, list) \
+            else args.connections
+        budget = max(256 * MIB, 4 * conns * block)
+        say("               : {} -- expected under {} for {} connections x {} buffered"
+            .format("bounded as designed" if max(memory) < budget
+                    else "HIGHER than expected; check for accumulation",
+                    human(budget), conns, human(block)))
+        say("               : RSS must not grow with OBJECT size -- measured flat at "
+            "~32 MiB across a 32x range (64 MiB to 2 GiB)")
 
     # the NIC-vs-disk question §2 leaves open
     peak_nic = max((r["peak_nic_bytes_per_s"] or 0) for r in usable)
@@ -2620,6 +2639,10 @@ def build_parser():
 
     sweep = sub.add_parser("sweep", help="connection sweep, speedup, NIC-vs-disk limit")
     add_common(sweep)
+    sweep.add_argument("--upload-block", dest="upload_block", type=int,
+                       default=UPLOAD_BLOCK_HINT,
+                       help="bytes per PUT on the bucket route; sets peak RSS with "
+                            "--connections")
     sweep.add_argument("--connections", type=int, nargs="+",
                        default=[1, 4, 8, 12, 16],
                        help="1 is the single-stream baseline (default: %(default)s)")

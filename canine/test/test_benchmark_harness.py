@@ -2454,13 +2454,21 @@ class TestTheBenchmarkMirrorsTheDownloadersConstants:
         path = os.path.join(os.path.dirname(os.path.abspath(bench.__file__)),
                             "..", "localization", "parallel_download.py")
         with open(os.path.normpath(path)) as handle:
-            match = re.search(r"^{} = (\d+)$".format(name), handle.read(), re.M)
+            source = handle.read()
+        # Constants are written as products (8 * 1024 * 1024), so match the RHS and
+        # evaluate it -- restricted to digits, spaces and `*` so this cannot execute
+        # anything the file happens to contain.
+        match = re.search(r"^{} = ([0-9 *]+)$".format(name), source, re.M)
         assert match, "{} not found in parallel_download.py".format(name)
-        return int(match.group(1))
+        return int(eval(match.group(1), {"__builtins__": {}}, {}))
 
     def test_the_default_connection_hint_matches(self):
         assert bench.DEFAULT_CONNECTIONS_HINT == self._downloader_constant(
             "DEFAULT_CONNECTIONS")
+
+    def test_the_upload_block_hint_matches(self):
+        assert bench.UPLOAD_BLOCK_HINT == self._downloader_constant(
+            "DEFAULT_UPLOAD_BLOCK")
 
     def test_the_max_connection_hint_matches(self):
         assert bench.MAX_CONNECTIONS_HINT == self._downloader_constant(
