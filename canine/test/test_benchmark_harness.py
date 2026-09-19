@@ -1548,9 +1548,25 @@ class TestNearZeroVerifyIsTheFeatureWorking:
             self, tmp_path, monkeypatch, capsys):
         self.sweep(tmp_path, monkeypatch, 0.0, s3=True)
         out = capsys.readouterr().out
-        assert "read-back was skipped entirely" in out
+        assert "THE DOWNLOADER did no post-hoc read-back" in out
         assert "would buy little" not in out
         assert "Do NOT read this as" in out, "the misreading must be pre-empted"
+
+    def test_it_does_not_claim_the_read_back_was_skipped_when_it_ran_one(
+            self, tmp_path, monkeypatch, capsys):
+        """
+        The old wording was an unqualified "the post-hoc read-back was skipped entirely",
+        printed on the 279 GiB run directly beneath twenty-one of the benchmark's own
+        "still verifying" heartbeats. Both halves were defensible in isolation -- the
+        downloader really did skip it, this harness really did not -- and together they
+        made 1h45m of disk reading disappear from a report about disk reading.
+        """
+        self.sweep(tmp_path, monkeypatch, 0.0, s3=True)
+        out = capsys.readouterr().out
+        assert "skipped entirely" not in out
+        assert "mean re-read" in out
+        assert "NOT skipped by this benchmark" in out
+        assert "not the cost of" in out, "it must not read as a production cost either"
 
     def test_it_points_at_the_line_that_would_disprove_it(
             self, tmp_path, monkeypatch, capsys):
@@ -1566,7 +1582,7 @@ class TestNearZeroVerifyIsTheFeatureWorking:
         """
         self.sweep(tmp_path, monkeypatch, 0.0, s3=False)
         out = capsys.readouterr().out
-        assert "read-back was skipped entirely" not in out
+        assert "did no post-hoc read-back" not in out
         assert "did not use one" in out
 
     def test_an_expensive_verify_still_recommends_the_fix(
@@ -1990,7 +2006,9 @@ class TestVerificationSaysItIsWorking:
         verification = self.Recorded(threading.Event())
         verification.block.set()
 
-        assert bench.announce_verification(verification, str(dest), out=out) is True
+        verdict, seconds = bench.announce_verification(verification, str(dest), out=out)
+        assert verdict is True
+        assert seconds is not None
         assert "verifying" in out.getvalue(), out.getvalue()
         assert "4.00 KiB" in out.getvalue(), out.getvalue()
 
@@ -2040,8 +2058,61 @@ class TestVerificationSaysItIsWorking:
         out = io.StringIO()
         nothing = bench.Verification(None, reason="no digest")
 
-        assert bench.announce_verification(nothing, str(dest), out=out) is None
+        verdict, seconds = bench.announce_verification(nothing, str(dest), out=out)
+        assert verdict is None
+        assert seconds == 0.0, "no work done, so no cost to report"
         assert out.getvalue() == "", out.getvalue()
+
+    def test_it_reports_how_long_the_re_read_took(self, tmp_path):
+        """
+        The cost was invisible. On the 279 GiB run this function emitted twenty-one
+        heartbeats -- at least 1h45m -- and then the report said `verify 0.0s`, which was
+        the DOWNLOADER's verify (#19 assembles the ETag in flight) and nothing to do with
+        this read-back. No column, no phase, no total carried it.
+
+        It mattered more than the verdict did. 278.91 GiB in 6300s is 43-45 MiB/s, against
+        85 MiB/s recorded for the same operation in file_multipart_etag's docstring, and
+        within 10% of the downloader's own write rate -- the only hour-scale measurement of
+        the destination in the whole run, sitting in a cost nobody was billing for.
+        """
+        dest = tmp_path / "f.bin"
+        dest.write_bytes(b"x" * 8192)
+        out = io.StringIO()
+        verification = self.Recorded(threading.Event())
+        verification.block.set()
+
+        _, seconds = bench.announce_verification(verification, str(dest), out=out)
+
+        assert seconds > 0.0
+        assert "re-read" in out.getvalue(), out.getvalue()
+        assert "8.00 KiB" in out.getvalue(), out.getvalue()
+        assert "/s" in out.getvalue(), "the rate is the point, not the duration"
+
+    def test_the_reported_rate_reflects_the_time_actually_taken(self, tmp_path):
+        """A rate computed against the wrong clock would be worse than none: it is the
+        number the §6.5h device question now turns on."""
+        dest = tmp_path / "f.bin"
+        dest.write_bytes(b"x" * (4 * 1024 * 1024))
+        out = io.StringIO()
+        release = threading.Event()
+        verification = self.Recorded(release)
+
+        holder = {}
+        worker = threading.Thread(
+            target=lambda: holder.update(
+                zip(("verdict", "seconds"),
+                    bench.announce_verification(verification, str(dest), out=out,
+                                                interval=60))),
+            daemon=True)
+        worker.start()
+        time.sleep(0.5)
+        release.set()
+        worker.join(10)
+
+        assert not worker.is_alive()
+        assert 0.4 < holder["seconds"] < 5.0, holder["seconds"]
+        # 4 MiB over ~0.5s is single-digit MiB/s, not the GiB/s a zero-duration clock gives
+        assert "GiB/s" not in out.getvalue(), out.getvalue()
 
 
 class TestTheParallelHasherAgreesWithTheSerialOne:

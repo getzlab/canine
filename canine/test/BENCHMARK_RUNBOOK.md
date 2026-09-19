@@ -1072,6 +1072,20 @@ here is `md5 = ok` and a non-zero throughput.
 Ordered cheapest-and-most-informative first. §6.1 and §6.2 together answer the design
 questions in about 45 minutes and no source egress; §6.3 is the only full-size run.
 
+**Reporting a run.** Two parts of a sweep's output should not leave the node verbatim. The
+`object :` line names the endpoint, bucket and object path next to a
+`<N bytes of query string redacted>` marker — a presigned URL carries the access key ID in
+`X-Amz-Credential`, so treat the line as credential-adjacent even redacted. And the
+`... [k9pdl] NN.N%` / `... still verifying` heartbeats are dozens of near-identical lines
+carrying nothing the `phases:` and `io :` lines do not. Strip both:
+
+```bash
+grep -v -e '\[k9pdl\]' -e 'still verifying' -e '^object *:' sweep.txt
+```
+
+What remains — the table row, the indented metric lines, and the verdict block — is the
+whole measurement.
+
 ### 6.1 Find the knee in tmpfs — no disk in the path
 
 Do this before any disk-destined download. With the disk removed entirely, this measures
@@ -2516,14 +2530,25 @@ So the disk, measured under the downloader's own access pattern — sixteen conc
 writers, one inode, `fdatasync` underneath — delivers **79.5 MiB/s**, and the downloader
 settles at **44.2 MiB/s: 56% of it.** Every external explanation is now eliminated:
 
-| candidate | verdict | evidence |
-|---|---|---|
-| the source | eliminated | ~240 MiB/s at any depth, §6.5c |
-| ENOSPC waiting | eliminated | no ENOSPC markers in the drained stderr, §6.5c |
-| logical scatter / extent tree | eliminated | 84 vs 76 MiB/s, 5 physical fragments, §6.5d |
-| disk fullness | eliminated | 1.7% variation across 10%→90% full, §6.5d |
-| write concurrency | eliminated | 83.6 vs 85.8 MiB/s, §6.5e |
-| shared inode + `fsync` | 5% of the 44% gap | 206 s vs 196 s, above |
+| candidate | verdict | evidence | extent |
+|---|---|---|---|
+| the source | eliminated | ~240 MiB/s at any depth, §6.5c | 250 GiB deep ✅ |
+| ENOSPC waiting | eliminated | no ENOSPC markers in the drained stderr, §6.5c | full run ✅ |
+| logical scatter / extent tree | eliminated | 84 vs 76 MiB/s, 5 physical fragments, §6.5d | 4 GiB ⚠️ |
+| disk fullness | eliminated | 1.7% variation across 10%→90% full, §6.5d | 4 GiB arms ⚠️ |
+| write concurrency | eliminated | 83.6 vs 85.8 MiB/s, §6.5e | 16 GiB ⚠️ |
+| shared inode + `fsync` | 5% of the 44% gap | 206 s vs 196 s, above | 16 GiB ⚠️ |
+
+**Read the right-hand column before trusting the middle one.** Four of these six
+eliminations were measured over 4–16 GiB on a node with 28 GB of RAM — through the very
+page cache §6.5d proved inflates short runs. §6.5g found two independent full-extent
+measurements of this device that both say ~45 MiB/s, so the ⚠️ rows may be eliminating
+candidates at a scale where the disk was never the constraint in the first place. §6.5h
+re-measures with `O_DIRECT`, which is what makes a 4 GiB arm mean something.
+
+**The hypothesis below was tested in §6.5g and is false.** It is kept because the
+reasoning is worth having on record next to its refutation, and because the two loose ends
+noted at the end of it were the tell.
 
 **The leading hypothesis is now the read loop's structure, and it is a hypothesis.**
 `download_chunk` reads a block and then writes it, in the same thread: `buf =
@@ -2536,6 +2561,12 @@ if this is the mechanism something else is stacked on top of it.
 Two loose ends that argue against banking it as the answer: the 4 GiB prefix rows reach
 79.8 MiB/s, which this model cannot produce, and the settled 44.2 is 26% under the model's
 own ceiling.
+
+Both loose ends were the real signal. A measurement above the model's ceiling and a
+measurement below it, at the same time, means the two are not measuring the same system —
+which is exactly what §6.5g found: the 79.8 is a short-extent, cached figure and the 44.2
+is what the device sustains. **When a model is bracketed by its own data, suspect the
+data's provenance before refining the model.**
 
 **Further shell tests are exhausted.** The next measurement belongs inside the downloader,
 and it now exists.
@@ -2592,6 +2623,137 @@ sudo docker exec slurm sh -c \
 That is sequential, so it is an **upper bound** on what our out-of-order sparse writes can
 achieve — if even `dd` only reaches ~50 MiB/s on the now-90%-full filesystem, the write
 path is exonerated too and the disk simply is what it is.
+
+#### Measured — serialization is not the gap, and 95% of the loop is `pwrite`
+
+```
+16   5818.82   49.08 MiB/s   250.94 MiB/s peak NIC   88.00 MiB/s peak disk   ok
+     phases: download 5818.3s  verify 0.0s
+     streams: 15.40 of 16 concurrent on average
+     io     : read 4651.5s / write 84948.8s / other 4.4s (5% read, overlap ceiling 1.05x)
+     chunk_ready: 8.0s over 3283 calls (0% of the worker pool)
+     commit : 5811.9s over 2 batches (3283 chunks, 100% of wall, off the worker pool)
+     wire   : 1.01x payload (280.56 GiB on the NIC)
+```
+
+**The read/write serialization hypothesis is dead.** The ceiling is **1.05×**, not the
+1.8× that decoupling would have to offer to be worth building. The loop is 95% `pwrite`
+and 5% `read`, so there is essentially nothing for a queue to hide.
+
+The instrument agrees with the stream accounting, which is the first thing to check before
+believing any of it: `(4651.5 + 84948.8 + 4.4) / 5818.3 = 15.40`, and `streams:` — computed
+independently, from per-stream open/close timestamps — also says 15.40. Two separate clocks
+on the same fact. Reading the split as occupancy:
+
+| | worker-seconds | workers busy at any instant |
+|---|---|---|
+| `write` | 84948.8 | **14.60 of 16** |
+| `read` | 4651.5 | 0.80 |
+| `other` | 4.4 | 0.00 |
+
+Fourteen and a half of sixteen workers were permanently inside `pwrite`. Per worker that is
+**3.36 MiB/s** of write, and `3.36 × 14.60 = 49.09 MiB/s`, which closes against the table's
+throughput — the split accounts for the whole transfer, with nothing hiding outside it.
+
+**`read %` understates the network, and that is the interesting part.** Each stream, while
+it was actually inside `stream.read()`, moved 61.4 MiB/s. Sixteen of those would be
+982 MiB/s, four times the 240 MiB/s §6.5c measured against `/dev/null` — so the read timer
+is plainly not measuring wire time. It is measuring how long it takes to drain a socket
+buffer that filled while the worker was blocked on the disk. **The kernel's receive buffer
+is already acting as the reader/writer queue the fix would have added**, which is precisely
+why the ceiling is 1.05× and why the series model in §6.5f over-predicted the loss. The
+ceiling is honest about the *fix's* value; it is not a measurement of the network's cost.
+
+So the loss is downstream of `pwrite` being called, and the remaining question is whether
+`pwrite` is slow because of what we ask of it or because of what the device can do.
+
+#### And the same run reported a 1h45m cost as `0.0s`
+
+`phases: verify 0.0s` is the **downloader's** verify, and it is genuinely 0.0s — #19
+assembled the ETag from part digests recorded in flight. But the benchmark then runs its
+own independent re-read (`announce_verification` → `file_multipart_etag`, deliberately not
+trusting the downloader's verdict), and *that* emitted 21 heartbeats: **at least 1h45m**,
+for 278.91 GiB, which is **43–45 MiB/s**. It appears in no column, no phase, and no total.
+The run then prints "the post-hoc read-back was skipped entirely" directly underneath an
+hour and three quarters of post-hoc read-back.
+
+That is the recurring defect again, in its purest form so far: a reported number that is
+true of the thing it names and wrong about the run it describes. Two fixes, both applied —
+the benchmark's own re-read is now timed and reported as its own `re-read :` line, and the
+#19 narrative no longer claims the read-back was skipped when the benchmark just did one.
+
+**The 43–45 MiB/s is the most important number in the run, and it was nearly thrown away.**
+`file_multipart_etag`'s docstring records this same operation — 279 GiB, 2 readers, this
+class of device — at **85 MiB/s**. It just measured 43–45. And the downloader's write, on
+the same disk at the same moment, settles at 44.2–49. Read and write, our code and plain
+`dd`-grade sequential I/O, all land on ~45 MiB/s.
+
+Which inverts §6.5e/§6.5f's verdict of "a defect — ours". Look at the extent of every
+figure those conclusions rest on:
+
+| figure | extent | duration |
+|---|---|---|
+| 79.5 MiB/s, 16 writers one inode (§6.5f) | 16 GiB | 206 s |
+| 83.6 / 85.8 MiB/s, write concurrency (§6.5e) | 16 GiB | ~200 s |
+| 84 / 76 MiB/s, scatter (§6.5d) | 4 GiB | ~50 s |
+| **43–45 MiB/s, 2-reader re-read (this run)** | **279 GiB** | **6300 s** |
+| **49.08 MiB/s, the downloader (this run)** | **279 GiB** | **5818 s** |
+
+Every "the disk can do 79–88" measurement is ≤16 GiB and ≤3.5 minutes. Both full-extent,
+hour-plus measurements say ~45. §6.5d did test fullness and found 1.7% variation — but with
+4 GiB arms, so it could only have eliminated fullness *at short extent*. A 1.70× gap
+"inside our own code" and a 1.7× short-burst-versus-sustained ratio on a `pd-standard` are
+the same number, and nothing measured so far distinguishes them.
+
+#### §6.5h Is 45 MiB/s the device? — `O_DIRECT`, ~4 minutes, no egress
+
+Do not settle this with another long run; settle it by removing the page cache, which is
+what made the short arms untrustworthy in the first place. `O_DIRECT` makes a 4 GiB test
+tell the truth about a 279 GiB one.
+
+First, what the device actually is — provisioned size sets a `pd-standard`'s sustained
+ceiling, and this disk was created fresh for this session:
+
+```bash
+# on the node
+gcloud compute disks describe "$DISK" --zone "$ZONE" \
+  --format='value(sizeGb,type.basename())'
+sudo docker exec slurm sh -c 'lsblk -o NAME,SIZE,ROTA | head'
+```
+
+Then read and write the same disk with the cache out of the path. The read arm uses the BAM
+that is already there, so it costs nothing and destroys nothing:
+
+```bash
+# on the node -- read, 4 GiB from the middle of the existing object, cache bypassed
+sudo docker exec slurm sh -c '
+  BAM=$(ls /mnt/rwdisks/'"$DISK"'/*.bam | head -1)
+  dd if="$BAM" of=/dev/null bs=1M count=4096 skip=131072 iflag=direct 2>&1 | tail -1'
+
+# on the node -- write, into whatever free space is left, cache bypassed
+sudo docker exec slurm sh -c '
+  df -h /mnt/rwdisks/'"$DISK"' | tail -1
+  dd if=/dev/zero of=/mnt/rwdisks/'"$DISK"'/ddtest bs=1M count=4096 oflag=direct 2>&1 | tail -1
+  rm -f /mnt/rwdisks/'"$DISK"'/ddtest'
+```
+
+If the write arm reports free space under ~5 GiB, drop `count` to fit; 2048 is plenty.
+
+How to read it:
+
+* **both arms ~45 MiB/s** → the device is the answer. 49.08 MiB/s is the downloader
+  *matching* its disk, the 1.70× was a page-cache artifact of the ≤16 GiB arms, and §6.5c
+  through §6.5f were chasing a gap that does not exist. The prize is then a faster
+  destination, not faster code, and §10's cost decision needs redoing on that basis.
+* **both arms ~80 MiB/s** → the device is fine even without the cache, the gap is real and
+  ours, and the next question is what `pwrite` is doing differently from `dd` — 1 MiB
+  blocks, sparse out-of-order offsets, or the `fdatasync` cadence, in that order.
+* **read ~80, write ~45** → asymmetry, and only the write half of §6.5d–§6.5f's elimination
+  survives. Re-run §6.5f with `oflag=direct` before drawing anything from it.
+
+Whatever it says, **re-run §6.5e and §6.5f with `oflag=direct` before citing their numbers
+again.** They are currently the only evidence that the gap is ours, and they were measured
+through exactly the cache this step removes.
 
 ### 6.6 the bucket-compose route against real GCS
 
@@ -2847,9 +3009,11 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Does in-transfer hashing (#19) pay off? | §6.3 | yes, completely — `verify 0.0s` with a real ETag, ~52 min of read-back avoided |
 | HTTP vs the S3 API | §6.5b | 6.9% apart on the download phase; the presigned path wins but the transport is not the bottleneck |
 | Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **the question was malformed.** The 4 GiB rows measure page cache (28 GB RAM), so 90% is an artifact; the full-size run's throughput is **flat to 1.7%** across 85% of its duration, which eliminates fullness and extent growth outright. Source, ENOSPC and logical scatter all separately eliminated |
-| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e | **a defect — ours.** 16 concurrent writers get 83.6 MiB/s, one sequential writer 85.8; write concurrency costs this disk nothing. The downloader's 49.04 is a 1.70× gap inside our own code |
-| Is single-inode `fsync` contention the 1.70×? | §6.5f | **no — 5% of it.** 206 s one inode against 196 s sixteen inodes. The disk gives 79.5 MiB/s under the downloader's exact pattern; the downloader settles at 44.2 |
-| Then what is the remaining 44%? | §6.5f / §6.5g | **OPEN, instrument built.** Leading hypothesis: `download_chunk` reads then writes in one thread, so network and disk never overlap per worker. `k9pdl-io` now reports the split and the overlap ceiling; re-run §6.3 to read it |
+| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e, **revisited §6.5g** | **provisional, and now doubted.** 16 concurrent writers get 83.6 MiB/s, one sequential writer 85.8, so write concurrency costs this disk nothing — but both arms were 16 GiB / ~200 s, i.e. through the same page cache §6.5d showed inflates short runs. Re-measure with `oflag=direct` (§6.5h) before citing the 1.70× again |
+| Is single-inode `fsync` contention the 1.70×? | §6.5f | **no — 5% of it.** 206 s one inode against 196 s sixteen inodes. Same 16 GiB caveat as above |
+| Is `read`/`write` serialization in `download_chunk` the gap? | §6.5g | **no — falsified.** The loop is **95% `write`, 5% `read`**, overlap ceiling **1.05×**, so a reader/writer split has nothing to recover: 14.60 of 16 workers sat permanently inside `pwrite`. The kernel's socket receive buffer is already the queue that fix would have added |
+| Then what is the remaining gap? | §6.5g / §6.5h | **OPEN, and the question has changed.** The benchmark's own re-read — an unreported 1h45m — puts this disk at **43–45 MiB/s over 279 GiB**, against 85 MiB/s recorded for the same operation and within 10% of the downloader's write rate. Every "the disk can do 79–88" figure is ≤16 GiB; both full-extent figures say ~45. §6.5h settles it with `O_DIRECT` in ~4 minutes |
+| What does the benchmark's own verification cost? | §6.5g | **43–45 MiB/s over 278.91 GiB, ≥1h45m** — and it was reported as `0.0s` until this run, because `phases: verify` is the downloader's and this read-back is the harness's. Now printed as `mean re-read :` |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
 | `/bin/sh` in the container | §3 probe | dash |
@@ -2863,3 +3027,9 @@ today's behaviour.
 And report the **3.07×** alongside it rather than §6.2's 4.92×. The larger figure is true
 of a 4 GiB prefix and not of the object anyone localizes, and the difference between them
 is the open question in §6.5c.
+
+Do not report the 3.07× as "under target because of a defect in our write path" until
+§6.5h has run. As of §6.5g the more likely reading is that 49 MiB/s is roughly what this
+`pd-standard` sustains over 279 GiB, in which case 3.07× is the disk's answer rather than
+ours and the remaining prize is a different destination — which is a §10 question, not a
+code one.

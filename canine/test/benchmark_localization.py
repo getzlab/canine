@@ -1401,6 +1401,20 @@ def announce_verification(verification, dest, out=None, interval=HEARTBEAT_INTER
     """
     Run the benchmark's own verification, saying so first and ticking while it works.
 
+    Returns `(verdict, seconds)`. The seconds matter as much as the verdict, and used not to
+    be returned at all: on the 279 GiB run this cost **1h45m**, appeared in no column, no
+    phase and no total, and the report printed "the post-hoc read-back was skipped entirely"
+    directly underneath twenty-one of its own heartbeats. `phases: verify 0.0s` was correct
+    about the DOWNLOADER -- #19 really does assemble the ETag from in-flight part digests --
+    and said nothing about this function, which is a different read-back that did happen.
+
+    Timing it also turned out to be the most useful measurement in that run. 278.91 GiB in
+    at least 6300 s is 43-45 MiB/s, against the 85 MiB/s file_multipart_etag's own docstring
+    records for the same operation on this class of device, and within 10% of what the
+    downloader's writes achieve. Every figure suggesting the disk can do 79-88 MiB/s was
+    measured over <=16 GiB; both full-extent measurements say ~45 (see the runbook, 6.5g).
+    A cost nobody was billing for was the only hour-plus sample of the destination we had.
+
     This is a full single-threaded re-read of the destination in Python, deliberately
     independent of the downloader's verdict (see file_multipart_etag). On a 279 GiB object
     against a ~90 MiB/s device that is the better part of an hour -- comparable to the
@@ -1417,7 +1431,7 @@ def announce_verification(verification, dest, out=None, interval=HEARTBEAT_INTER
     """
     out = out or sys.stderr
     if verification.kind is None:
-        return None
+        return None, 0.0
 
     size = os.path.getsize(dest)
     out.write("        verifying {} against the {} -- a full re-read, "
@@ -1435,10 +1449,16 @@ def announce_verification(verification, dest, out=None, interval=HEARTBEAT_INTER
 
     beat = threading.Thread(target=tick, daemon=True)
     beat.start()
+    started = time.time()
     try:
-        return verification.check(dest, workers=workers)
+        verdict = verification.check(dest, workers=workers)
     finally:
         done.set()
+    elapsed = time.time() - started
+    out.write("        re-read {} in {} ({})\n".format(
+        human(size), human_seconds(elapsed), rate(size, elapsed)))
+    out.flush()
+    return verdict, elapsed
 
 
 def human_seconds(seconds):
@@ -1676,11 +1696,11 @@ def command_sweep(args):
                                connections, args.min_chunk,
                                verification=verification)
         if outcome["returncode"] == 0 and os.path.exists(dest):
-            outcome["verified"] = announce_verification(
+            outcome["verified"], outcome["reread_seconds"] = announce_verification(
                 verification, dest, workers=getattr(args, "verify_workers",
                                                     VERIFY_READ_WORKERS))
         else:
-            outcome["verified"] = False
+            outcome["verified"], outcome["reread_seconds"] = False, None
 
         # A failed or unverified run is NOT a measurement. Computing size/elapsed
         # regardless once produced "48.00 GiB/s" over a 2 GB/s NIC and a verdict of
@@ -1796,8 +1816,9 @@ def command_sweep(args):
     # little" from that is a statement about work that never happened. The --prefix runs
     # against the real source cannot verify at all (a slice cannot match the object's
     # ETag), so this fired on every one of them.
-    splits = [r["phases"] for r in usable
-              if "verify" in r["phases"] and r.get("verified") is not None]
+    split_rows = [r for r in usable
+                  if "verify" in r["phases"] and r.get("verified") is not None]
+    splits = [r["phases"] for r in split_rows]
     unverified = [r for r in usable if "verify" in r["phases"]
                   and r.get("verified") is None]
     if unverified and not splits:
@@ -1815,6 +1836,21 @@ def command_sweep(args):
         total = dl + vf
         say("mean download : {:.1f}s ({:.0f}%)".format(dl, 100*dl/total if total else 0))
         say("mean verify   : {:.1f}s ({:.0f}%)".format(vf, 100*vf/total if total else 0))
+        # The benchmark's OWN re-read, which is not part of the downloader's phases and is
+        # not optional: file_multipart_etag exists so the verdict does not come from the
+        # code under test. Unreported, it made a 1h45m read-back invisible on the 279 GiB
+        # run while the text below announced that the read-back had been skipped.
+        # `is not None`, not truthiness: on a small test object the re-read is a few
+        # microseconds and rounds to 0.0s, which is still a read-back that happened. The
+        # whole defect being fixed here was a real cost reported as zero; re-introducing it
+        # for fast destinations would be the same bug with a smaller blast radius.
+        rereads = [r["reread_seconds"] for r in split_rows
+                   if r.get("reread_seconds") is not None]
+        mean_reread = sum(rereads) / len(rereads) if rereads else None
+        if mean_reread is not None:
+            say("mean re-read  : {:.1f}s  ({}) -- the BENCHMARK's independent check,"
+                .format(mean_reread, rate(args.size, mean_reread)))
+            say("                not the downloader's, and not counted in the split above")
         say()
         is_multipart = bool(getattr(args, "s3_bucket", None)
                             or getattr(args, "part_length", None))
@@ -1840,11 +1876,22 @@ def command_sweep(args):
             # ~52 minutes at the read rate from §4.1.
             say("Verification cost {:.1f}s against a MULTIPART ETag, which means the".format(vf))
             say("digest was assembled from part md5s recorded during the transfer and")
-            say("the post-hoc read-back was skipped entirely. That is #19 working: a")
+            say("THE DOWNLOADER did no post-hoc read-back. That is #19 working: a")
             say("re-read of {} at this device's rate would have been the".format(
                 human(args.size)))
             say("dominant cost of localizing this object.")
             say()
+            if mean_reread is not None:
+                # Do not say "skipped entirely" with the benchmark's own read-back on the
+                # same page. It is a different read-back, it took 1h45m on the 279 GiB run,
+                # and claiming it away is how that hour became invisible.
+                say("It was NOT skipped by this benchmark: the 'mean re-read' line above is")
+                say("{} of independent verification, which happened.".format(
+                    human_seconds(mean_reread)))
+                say("That cost is the harness proving the result, not the cost of")
+                say("localizing the object in production -- but it is also the only")
+                say("hour-scale sample of this destination in the run, so read its rate.")
+                say()
             say("Do NOT read this as 'verification is cheap'. It is cheap here because")
             say("it was moved into the transfer. Confirm with the downloader's")
             say("'etag from N recorded part digests, M re-read' line -- a large M means")
