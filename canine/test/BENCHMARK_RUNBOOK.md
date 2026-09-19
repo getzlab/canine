@@ -2721,14 +2721,35 @@ gcloud compute disks describe "$DISK" --zone "$ZONE" \
 sudo docker exec slurm sh -c 'lsblk -o NAME,SIZE,ROTA | head'
 ```
 
+**Measured: `316  pd-standard`.** GCP rates `pd-standard` at 0.12 MB/s per provisioned GB
+for both read and write, which puts this disk's sustained ceiling at
+`316 × 0.12 = 37.9 MB/s = 36.2 MiB/s` — **below every figure in this document**, including
+the 43–45 MiB/s full-extent re-read and the downloader's own 49 MiB/s. Confirm the per-GB
+constant against current GCP docs before quoting it; the `dd` arms below measure the disk
+directly and are the authority either way.
+
+If it holds, the §6.5c–§6.5f investigation was chasing a gap that does not exist: 49 MiB/s
+would be the downloader *exceeding* the provisioned rate with the page cache's help, and
+the 79–88 MiB/s figures — more than 2× spec — become the anomaly needing explanation
+rather than the target. Note this also predicts a **hard floor on the whole approach**:
+no amount of parallelism makes a 316 GB `pd-standard` go faster than ~36 MiB/s sustained,
+so §10's "buy a bigger or faster disk" option stops being an optimisation and becomes the
+only remaining lever.
+
 Then read and write the same disk with the cache out of the path. The read arm uses the BAM
 that is already there, so it costs nothing and destroys nothing:
 
 ```bash
-# on the node -- read, 4 GiB from the middle of the existing object, cache bypassed
+# on the node -- what is actually on the disk. The sweep writes `bench.<connections>.bin`,
+# NOT the source object's name, and it unlinks that path at the START of each row -- so a
+# later sweep will have removed the 279 GiB file this arm wants to read.
+sudo docker exec slurm sh -c 'ls -laS /mnt/rwdisks/'"$DISK"'/ | head'
+
+# on the node -- read, 4 GiB from 128 GiB into the largest file, cache bypassed
 sudo docker exec slurm sh -c '
-  BAM=$(ls /mnt/rwdisks/'"$DISK"'/*.bam | head -1)
-  dd if="$BAM" of=/dev/null bs=1M count=4096 skip=131072 iflag=direct 2>&1 | tail -1'
+  BIG=$(ls -S /mnt/rwdisks/'"$DISK"'/bench.*.bin 2>/dev/null | head -1)
+  echo "reading $BIG"
+  dd if="$BIG" of=/dev/null bs=1M count=4096 skip=131072 iflag=direct 2>&1 | tail -1'
 
 # on the node -- write, into whatever free space is left, cache bypassed
 sudo docker exec slurm sh -c '
@@ -2741,10 +2762,11 @@ If the write arm reports free space under ~5 GiB, drop `count` to fit; 2048 is p
 
 How to read it:
 
-* **both arms ~45 MiB/s** → the device is the answer. 49.08 MiB/s is the downloader
-  *matching* its disk, the 1.70× was a page-cache artifact of the ≤16 GiB arms, and §6.5c
-  through §6.5f were chasing a gap that does not exist. The prize is then a faster
-  destination, not faster code, and §10's cost decision needs redoing on that basis.
+* **both arms ~36–45 MiB/s** → the device is the answer, and it is at or near its
+  provisioned ceiling. 49.08 MiB/s is the downloader matching or beating its disk, the
+  1.70× was a page-cache artifact of the ≤16 GiB arms, and §6.5c through §6.5f were
+  chasing a gap that does not exist. The prize is then a faster destination, not faster
+  code, and §10's cost decision needs redoing on that basis.
 * **both arms ~80 MiB/s** → the device is fine even without the cache, the gap is real and
   ours, and the next question is what `pwrite` is doing differently from `dd` — 1 MiB
   blocks, sparse out-of-order offsets, or the `fdatasync` cadence, in that order.
