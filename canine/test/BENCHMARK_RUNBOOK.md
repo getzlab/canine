@@ -2273,6 +2273,80 @@ Read it against the 88 MiB/s device ceiling, not against each other:
 The third pass repeats the deep range. If it is much faster than the second, something is
 caching and neither number describes a cold localization.
 
+#### Measured — the source is exonerated
+
+```
+base=0              18s  227 MiB/s
+base=268435456000   17s  240 MiB/s   (~250 GiB in)
+base=268435456000   16s  256 MiB/s   (repeat)
+```
+
+Timing is whole seconds on ~17s, so ±6%: **these are one number, not a trend.** Call it
+~240 MiB/s at any depth.
+
+That is the third branch above, and it settles the question:
+
+* **No cold-range penalty.** Deep is if anything *faster* than the head. A store that
+  served its cached object head quickly and cold interior slowly would show the opposite.
+* **No caching artifact.** If a cache explained the deep number, pass 2 would be slow and
+  pass 3 fast. Passes 2 and 3 both beat pass 1.
+* **The source has 2.6× more headroom than the disk can take** (240 against 88.07 MiB/s)
+  and **4.6× more than the full-size run achieved** (against 49.04).
+* **It agrees with §6.1 by a completely different route.** 227–256 MiB/s to `/dev/null`
+  with `curl` and no canine code at all, against 227–230 MiB/s to tmpfs through the
+  downloader. Two independent measurements of the same ceiling.
+
+**So the ~35 minutes §6.3 leaves unexplained is ours, in the write path.** Of the four
+candidates, the source is now eliminated alongside ENOSPC, and the two that remain are
+both local and both scale with extent: the sparse file's extent tree, and the
+`SEEK_HOLE` frontier scan that walks it.
+
+#### §6.5d Separate extent depth from disk fullness — no network, ~3 minutes
+
+The two survivors are still confounded, because the full-size run changed both at once: it
+wrote a 279 GiB sparse file **and** filled the disk to 90%. `dd` on the disk *now* cannot
+tell them apart — the sweep deleted its 279 GiB destination, so the disk is empty again and
+`dd` would only re-measure §4.1.
+
+Write the same 4 GiB of real data into two sparse files of very different apparent size,
+out of order, and the only variable left is extent depth:
+
+```bash
+sudo docker exec slurm sh -c '
+  D=/mnt/rwdisks/'"$DISK"'
+  for SIZE_GIB in 4 279; do
+    F=$D/extent.$SIZE_GIB.bin
+    rm -f $F; truncate -s ${SIZE_GIB}G $F
+    # 64 x 64 MiB at descending offsets: out of order, spread across the whole extent
+    START=$(date +%s)
+    i=63
+    while [ $i -ge 0 ]; do
+      OFF=$(( i * (SIZE_GIB * 1024 / 64) ))
+      dd if=/dev/zero of=$F bs=1M count=64 seek=$OFF conv=notrunc,nocreat 2>/dev/null
+      i=$((i - 1))
+    done
+    sync
+    echo "apparent ${SIZE_GIB}GiB: $(( $(date +%s) - START ))s for 4 GiB out of order"
+    filefrag $F
+    rm -f $F
+  done'
+```
+
+Both passes write 4 GiB and leave the disk equally empty, so fullness is held constant.
+
+* **279 GiB pass much slower, and `filefrag` reports far more extents** → the extent tree
+  is the cause, and `posix_fallocate` is the lever — at the cost of `SEEK_HOLE` resume
+  (see the caveat above), so the manifest would have to become the primary recovery
+  mechanism rather than the backstop.
+* **Both passes the same** → extent depth is innocent, and what remains is disk fullness
+  or the frontier scan. Fullness is then testable by filling the disk to 90% with a
+  ballast file and repeating §4.1's `dd`; the frontier scan by timing `chunk_frontier()`
+  directly, since it is the only other thing that walks the tree.
+
+Note this measures `dd`'s sequential-per-chunk writes, not the downloader's interleaved
+ones, so it is a **lower bound** on the effect: sixteen workers writing concurrently at
+scattered offsets can only fragment more than one process writing 64 MiB at a time.
+
 Pair it with the destination in isolation, on the disk in its current state:
 
 ```bash
@@ -2538,7 +2612,8 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Resume overhead | §6.5 / §6.5a | 0.8% before the deferred writer, **2.2%** after; a broken frontier would show ~75% |
 | Does in-transfer hashing (#19) pay off? | §6.3 | yes, completely — `verify 0.0s` with a real ETag, ~52 min of read-back avoided |
 | HTTP vs the S3 API | §6.5b | 6.9% apart on the download phase; the presigned path wins but the transport is not the bottleneck |
-| Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c | **OPEN** — source-cold-range vs our own extent growth, not yet separated |
+| Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **narrowed to our write path.** The source does ~240 MiB/s at any depth (§6.5c), 2.6× the disk; ENOSPC ruled out. Extent depth vs disk fullness vs frontier scan still to separate (§6.5d) |
+| Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
 | `/bin/sh` in the container | §3 probe | dash |
 | Resume across a real preemption | §7 | not measured — needs a SLURM cluster, not a single node |
