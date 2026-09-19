@@ -1628,10 +1628,12 @@ def compose_tree(client, bucket, destination, parts, max_sources=GCS_COMPOSE_MAX
         level = next_level
         generation += 1
 
-    result = client.compose(bucket, destination, level) if len(level) > 1 else None
-    if result is None:
-        # a single source: compose still gives the destination the right name
-        result = client.compose(bucket, destination, level)
+    # Unconditional: a single remaining source still needs composing, because that is
+    # what gives the destination its name. This was previously spelled as a `> 1` test
+    # falling through to the same call when the result was None, which read as two
+    # cases but was one -- and a client whose compose returned None would have composed
+    # twice.
+    result = client.compose(bucket, destination, level)
 
     for name in created:
         client.delete_object(bucket, name)

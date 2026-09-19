@@ -563,6 +563,24 @@ class TestComposeTreeAtTheDepthTheRealObjectNeeds:
         assert gcs.state.objects["out"] == expected
         assert gcs.state.composite["out"] == 1025
 
+    @pytest.mark.parametrize("count", [1, 5, 1025, FULL_SIZE_PARTS])
+    def test_the_destination_is_composed_exactly_once(self, gcs, monkeypatch, count):
+        """
+        The final call is unconditional -- a single remaining source still needs
+        composing, since that is what gives the destination its name. It used to be
+        written as a `len(level) > 1` test falling through to the same call when the
+        result came back None, which read as two cases but was one, and would have
+        composed twice for any client whose compose returned None. Pinned at every
+        depth because the fall-through was only reachable on the single-source path.
+        """
+        client = pdl.GcsClient()
+        names, _ = self.seed(gcs, count)
+
+        pdl.compose_tree(client, BUCKET, "out", names)
+
+        final = [sources for dest, sources in gcs.state.compose_calls if dest == "out"]
+        assert len(final) == 1, "destination composed {} times".format(len(final))
+
     def test_a_max_sources_that_cannot_make_progress_is_rejected(self, gcs,
                                                                  monkeypatch):
         """
