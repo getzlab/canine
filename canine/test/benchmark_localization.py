@@ -101,6 +101,11 @@ DEFAULT_MIN_CHUNK = 64 * MIB
 # Mirrors MAX_CONNECTIONS in parallel_download.py. Stated here rather than imported: this
 # script is deliberately standalone so it can be copied to a node on its own.
 MAX_CONNECTIONS_HINT = 16
+# Mirrors parallel_download.py's DEFAULT_CONNECTIONS. Mirrored rather than imported
+# because this script is standalone and stdlib-only, so the two are pinned equal by
+# TestTheBenchmarkMirrorsTheDownloadersConstants -- `routeb` and `resume` each carried
+# their own hardcoded 8, which silently kept the pre-16 value when the default moved.
+DEFAULT_CONNECTIONS_HINT = 16
 
 # The emitted commands and the legacy fallbacks use [[ ]] and process substitution, which
 # dash rejects -- and /bin/sh in the worker image is dash. Same reason parallel_download.py
@@ -2622,7 +2627,7 @@ def build_parser():
 
     resume = sub.add_parser("resume", help="SIGKILL resume, refetch accounting, punch-hole")
     add_common(resume)
-    resume.add_argument("--connections", type=int, default=8)
+    resume.add_argument("--connections", type=int, default=DEFAULT_CONNECTIONS_HINT)
     resume.add_argument("--max-attempts", type=int, default=4)
 
     routeb = sub.add_parser("routeb", help="the bucket-compose route against real GCS")
@@ -2630,7 +2635,7 @@ def build_parser():
     routeb.add_argument("--gs-url", required=True, help="gs://bucket/object destination")
     routeb.add_argument("--mount-dir", required=True,
                         help="the gcsfuse mount the destination lives on")
-    routeb.add_argument("--connections", type=int, default=8)
+    routeb.add_argument("--connections", type=int, default=DEFAULT_CONNECTIONS_HINT)
 
     claim = sub.add_parser(
         "claim", help="size bucket_upload_wait_tries from repeated relay timings")

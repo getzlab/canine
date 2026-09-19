@@ -2434,3 +2434,48 @@ class TestSizingTheUploadWaitCeiling:
         claim, out = self.run(tmp_path, monkeypatch, capsys, [-30, -30, -30])
         assert "NO USABLE RESULT" in out
         assert "recommended_tries" not in claim
+
+
+class TestTheBenchmarkMirrorsTheDownloadersConstants:
+    """
+    The benchmark is standalone and stdlib-only, so it cannot import the downloader and
+    keeps its own copies of two constants. Copies drift: `routeb` and `resume` each
+    hardcoded `default=8`, and when DEFAULT_CONNECTIONS moved 8 -> 16 they silently kept
+    the old value -- a live `routeb` run was found doing 8 while the shipping default
+    was 16, with nothing to indicate the divergence.
+
+    Parsed out of the downloader's source rather than imported, which is the same
+    constraint the benchmark itself works under.
+    """
+
+    @staticmethod
+    def _downloader_constant(name):
+        import re
+        path = os.path.join(os.path.dirname(os.path.abspath(bench.__file__)),
+                            "..", "localization", "parallel_download.py")
+        with open(os.path.normpath(path)) as handle:
+            match = re.search(r"^{} = (\d+)$".format(name), handle.read(), re.M)
+        assert match, "{} not found in parallel_download.py".format(name)
+        return int(match.group(1))
+
+    def test_the_default_connection_hint_matches(self):
+        assert bench.DEFAULT_CONNECTIONS_HINT == self._downloader_constant(
+            "DEFAULT_CONNECTIONS")
+
+    def test_the_max_connection_hint_matches(self):
+        assert bench.MAX_CONNECTIONS_HINT == self._downloader_constant(
+            "MAX_CONNECTIONS")
+
+    def test_no_subcommand_hardcodes_a_connection_default(self):
+        """
+        The actual defect: a literal default that cannot track the constant. Every
+        subcommand must take it from the hint.
+        """
+        import re
+        with open(os.path.abspath(bench.__file__)) as handle:
+            source = handle.read()
+        literals = re.findall(
+            r'add_argument\("--connections"[^)]*default=(\d+)', source)
+        assert literals == [], (
+            "hardcoded --connections defaults: {} -- use DEFAULT_CONNECTIONS_HINT so "
+            "they follow the downloader".format(literals))
