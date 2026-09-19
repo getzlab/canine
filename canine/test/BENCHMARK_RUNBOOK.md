@@ -3088,13 +3088,26 @@ pdl routeb --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
            --json /tmp/routeb.json
 ```
 
-**Read the token source line carefully, because this is where the mock node can diverge
-from production.** A real worker authenticates with user credentials copied from NFS by
-`docker_copy_gcloud_credentials.sh`, so it takes the `gcloud` path. With §3's credentials
-mount in place, `gcloud` should work here too — that is what the mount is for. If it
-reports the **metadata server** instead, the mount is missing or unreadable and you are
-exercising the compute service account rather than the identity production uses, which may
-have different bucket permissions.
+**Read the token source line carefully, but not the way this paragraph used to say.** It
+claimed that reporting the **metadata server** meant the credentials mount was missing.
+That was wrong twice over: the benchmark's own probe tries the metadata server *first*, so
+on any GCE node it always wins and can never report `gcloud fallback` — and until the ADC
+fix below, `GcsClient` did the same, so every bucket write went out as the **compute
+service account** while the rest of the job ran as the copied user credentials.
+
+`GcsClient._fetch_token` now tries **ADC → active gcloud account → metadata server**,
+matching what a real worker gets from `docker_copy_gcloud_credentials.sh`, and logs which
+one it used:
+
+```
+k9pdl-auth using ADC
+```
+
+`using the metadata server (compute service account)` is the real missing-credentials
+symptom — ADC *and* gcloud both failed inside the container, so the writes are not yours
+and may not be permitted on a bucket you created. The benchmark's own `token source :`
+line is separate and still reports metadata first; it tells you that you are on GCE, not
+which identity the downloader will use.
 
 **`gcsfuse` is not in the image on `wolf-2.0-update`**, and neither is `rclone` — its
 Dockerfile install is commented out, though `conf/rclone.conf` ships. Only `fuse-overlayfs`

@@ -1365,35 +1365,75 @@ class GcsClient:
             self._token_expiry = time.monotonic() + max(60, lifetime - 300)
             return self._token
 
+    # Application Default Credentials first, then the active gcloud account, and the
+    # metadata server only as a last resort. Order matters more than any of the
+    # individual entries.
+    TOKEN_SOURCES = (
+        ("ADC", ["gcloud", "auth", "application-default", "print-access-token"]),
+        ("gcloud account", ["gcloud", "auth", "print-access-token"]),
+    )
+
     def _fetch_token(self):
         """
-        Prefer the GCE metadata server (no subprocess, and workers are GCE VMs), then
-        fall back to gcloud, which canine already relies on elsewhere.
+        Authenticate as the same identity as everything else on this path: ADC.
+
+        **This used to prefer the metadata server**, on the reasoning that workers are GCE
+        VMs and it avoids a subprocess. Both premises were true and the conclusion was
+        wrong, because the choice is not about cost -- it silently selects *who you are*.
+        The metadata server always answers on GCE, so it always won, and every bucket
+        write went out as the **compute service account** while the rest of the same job
+        ran as the copied user credentials.
+
+        canine takes explicit pains to prevent exactly that. `base.py`'s bucket-mount
+        block and `dockerTransient.py`'s rclone path both pin
+        `GOOGLE_APPLICATION_CREDENTIALS` to `$CLOUDSDK_CONFIG/application_default_
+        credentials.json` before invoking anything, and the comment there names this
+        failure: *"the authenticating identity depends on whatever ADC happens to resolve
+        to (metadata-server SA vs. the copied user credentials), which silently works in
+        one project and fails in another."* A production worker gets its credentials from
+        `docker_copy_gcloud_credentials.sh`, not from the instance's service account.
+
+        The consequences of getting it wrong are all quiet ones: a 403 on upload that
+        looks like a bucket misconfiguration, or -- worse -- success, with objects written
+        and billed under an identity nobody intended and an audit trail that does not
+        match the workflow.
+
+        So: ADC, then the active gcloud account, then the metadata server. The subprocess
+        the old order was avoiding costs about a second, against a token cached for ~55
+        minutes and a transfer measured in hours.
+
+        The metadata server stays as the final fallback rather than being removed: a
+        worker with no user credentials at all is a real configuration, and failing to
+        authenticate would be worse than authenticating as the SA. It is last because it
+        is the answer that is always available, not the one that is usually right.
         """
+        for label, command in self.TOKEN_SOURCES:
+            try:
+                out = subprocess.run(command, capture_output=True, timeout=60)
+            except (OSError, subprocess.SubprocessError):
+                continue
+            if out.returncode == 0:
+                token = out.stdout.decode("utf-8").strip()
+                if token:
+                    log("k9pdl-auth using {}".format(label))
+                    return token, 3600
+
         request = urllib.request.Request(
             METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"}
         )
         try:
             with urllib.request.urlopen(request, timeout=10) as response:
                 payload = json.loads(response.read().decode("utf-8"))
+            # Named, because it means the writes are NOT the user's. On a node that is
+            # supposed to have credentials this line is the symptom.
+            log("k9pdl-auth using the metadata server (compute service account) -- "
+                "ADC and gcloud both unavailable")
             return payload["access_token"], int(payload.get("expires_in", 3600))
         except Exception:
             pass
 
-        try:
-            out = subprocess.run(
-                ["gcloud", "auth", "print-access-token"],
-                capture_output=True, timeout=60,
-            )
-            if out.returncode == 0:
-                token = out.stdout.decode("utf-8").strip()
-                if token:
-                    return token, 3600
-        except (OSError, subprocess.SubprocessError):
-            pass
-
         raise PermanentError(
-            "could not obtain a GCS access token from the metadata server or gcloud"
+            "could not obtain a GCS access token from ADC, gcloud, or the metadata server"
         )
 
     # -- plumbing -----------------------------------------------------------
