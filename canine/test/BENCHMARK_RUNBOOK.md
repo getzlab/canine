@@ -585,6 +585,101 @@ container actually executed.
 
 ---
 
+### 3a. Switching the container to a gcsfuse-capable image
+
+**Required for §6.6 and §6.7, and for nothing before them.** The `wolf-2.0-update` image
+has no `gcsfuse` and no `rclone` — only `fuse-overlayfs`, for podman — so every bucket
+measurement fails at the mount. Everything in §4–§6.5 runs fine on it; switch when you
+reach the bucket work, not before.
+
+#### Check what you are on
+
+```bash
+# on the node
+sudo docker exec slurm sh -c 'gcsfuse --version 2>/dev/null || echo "NO GCSFUSE"'
+sudo docker inspect --format '{{.Config.Image}} {{.Image}}' slurm
+```
+
+`gcsfuse` must be **3.x or newer**. `LOCALIZATION.md` §4c pins 3.11.2 in the worker image
+because the read-write upload mount depends on **streaming writes**, which are default-on
+from 3.0 and absent before it. On an older gcsfuse that mount silently buffers the whole
+object under `--temp-dir` on the boot disk instead, so a measurement taken there describes
+a different system — and on a 279 GiB input it is an ENOSPC rather than a slow result.
+
+**Treat the version as the authority, not the tag.** There is no tag recorded here on
+purpose: image names drift, and the thing that matters is what is actually in the
+container.
+
+#### Restart on the new image
+
+The container is `--rm` and holds no state, so this is safe — but it is not free, because
+several things live *inside* it:
+
+| Lost on restart | Redo with |
+|---|---|
+| `/mnt/tmpfs` (if you mounted one) | §6.1's `mount -t tmpfs` |
+| `/mnt/rwdisks/$DISK` | §4's mount block — **the disk and its data survive**, only the mount is gone |
+| `/tmp/pdl/*.py` | §3's two `docker cp`s |
+| any `/mnt/localize` or `/mnt/bucketmounts` FUSE mount | §6.6 |
+
+`/mnt/rwdisks` is the one that catches people: the *disk* persists, so nothing is lost,
+but the container cannot see it until you re-run §4's mount.
+
+```bash
+# on the node
+sudo docker stop slurm                      # --rm removes it
+sudo docker pull broadinstitute/slurm_gcp_docker:<tag with gcsfuse 3.x>
+
+SHM_SIZE=$(df -BM --output=size /dev/shm | sed 1d | tr -d ' ' | tr 'M' 'm')
+sudo docker run -dti --rm --pid host --network host --privileged \
+  -v /dev:/dev \
+  -v $HOME/.config/gcloud:/root/.config/gcloud:ro \
+  -v $HOME/.aws:/root/.aws:ro \
+  --shm-size "$SHM_SIZE" \
+  --entrypoint /bin/bash --name slurm broadinstitute/slurm_gcp_docker:<tag>
+```
+
+Identical to §3's flags. Keep the two credentials mounts: `gcsfuse` resolves credentials
+via ADC and does **not** read `CLOUDSDK_CONFIG`, so §6.6 points
+`GOOGLE_APPLICATION_CREDENTIALS` at the mounted file explicitly — without the mount there
+is nothing for it to point at, and the authenticating identity silently becomes the
+metadata server's service account.
+
+#### If no suitable image is published yet
+
+Install into the running container. It does not survive a restart, which is a feature
+while the image is still moving:
+
+```bash
+# on the node
+sudo docker exec slurm bash -c '
+  set -e
+  apt-get update -qq
+  apt-get install -y -qq curl gnupg lsb-release
+  echo "deb https://packages.cloud.google.com/apt gcsfuse-$(lsb_release -c -s) main" \
+    > /etc/apt/sources.list.d/gcsfuse.list
+  curl -fsSL https://packages.cloud.google.com/apt/doc/apt-key.gpg | apt-key add -
+  apt-get update -qq
+  apt-get install -y -qq gcsfuse
+  gcsfuse --version'
+```
+
+#### Then re-verify, before measuring anything
+
+```bash
+# on the node
+sudo docker exec slurm sh -c '
+  gcsfuse --version
+  gcsfuse --help 2>&1 | grep -c enable-streaming-writes || echo "NO STREAMING WRITES FLAG"'
+sudo docker exec slurm ls /tmp/pdl                 # scripts back?
+sudo docker exec slurm df -h /mnt/rwdisks/$DISK    # disk remounted?
+```
+
+A zero from the `grep` means streaming writes are not available and §6.6's `mount`-kind
+path will behave differently from production. Stop there rather than measuring it.
+
+---
+
 ## 4. Create the localization disk, and measure its ceiling first
 
 Mirrors `base.py:1000-1060` — same type, same `mkfs` flags, same mount options.
@@ -3079,7 +3174,10 @@ experiment that needed it.
 > 5. throughput with a hand-provisioned Rapid Cache, as a separate arm
 >
 > Two corrections to earlier assumptions here. **`gcsfuse` IS in the `fuse-localize`
-> image** (3.11.2), so the blocker noted below is stale on this branch. And **Rapid Cache
+> image** (3.11.2), so the blocker noted below is stale on this branch — but the bench
+> node's container is almost certainly still on the old one. **Do §3a first**: switch the
+> container, and check `gcsfuse --version` reports 3.x, because streaming writes are what
+> the `mount` upload kind depends on. And **Rapid Cache
 > defaults off and is wired to the wrong bucket** — `get_or_create_rapid_cache()` targets
 > the *workflow* bucket, not the per-localization `wolf-...` bucket this path reads
 > (`LOCALIZATION.md` §5b's own caveat), so step 5 must provision it by hand.
@@ -3170,6 +3268,9 @@ between `wolf=working` and `wolf=success`; on timeout it declares a live upload 
 take-over worker re-does it, silently, as a warning. So the number to beat is the whole
 produce phase for the **largest real input set** — not the throughput of one object, which
 is the mistake §13.49 records.
+
+Prerequisites: §3a (a gcsfuse-capable container) and §6.6 steps 1–2 passing, since a
+timing from a route that silently fell back to staging measures the wrong thing.
 
 ```bash
 # on the node, with the bucket gcsfuse-mounted per §6.6
@@ -3419,6 +3520,23 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
 | `/bin/sh` in the container | §3 probe | dash |
 | Resume across a real preemption | §7 | not measured — needs a SLURM cluster, not a single node |
+
+**The bucket path (#20). Record results here, not in `LOCALIZATION.md`** — that file is
+`fuse-localize`'s design reference and editing it from this side only creates merge
+friction. This table is the single place measurements land; `update_localization.md` §13
+carries the narrative once a row is filled in.
+
+| Question | Where it comes from | Answer |
+|---|---|---|
+| gcsfuse version actually in the container | §3a | not recorded — must be ≥3.x for streaming writes |
+| Does `select_route` reach `bucket-compose` on a real RW gcsfuse mount? | §6.6 step 1 | **not measured.** The gate that stops us staging 279 GiB onto a 25 GB boot disk |
+| Does the composed object land where the post-unmount `ls` check looks? | §6.6 step 2 | not measured |
+| Is customTime stamped on it? | §6.6 step 2 | not measured — unstamped means invisible to the lifecycle rule, so it never expires |
+| Two writers on one `plan_id` | §6.6 step 3 | **done, in the fake.** Object correct, loser requeues, no leaked parts (`TestTwoWritersOnOneObject`). Unverified against real GCS |
+| Relay throughput, uncached bucket, ≥96 GiB | §6.6 step 4 | not measured — the number that replaces 43.9 MiB/s |
+| Relay throughput with Rapid Cache | §6.6 step 5 | not measured — cache must be provisioned by hand on the `wolf-...` bucket |
+| **Should `bucket_upload_wait_tries` go back to 60?** | §6.7 `pdl claim` | not measured. Currently **180**, a placeholder from risk asymmetry (§13.49); characterization runs suggest it can come down |
+| Largest input count in one real localization | needed as `--inputs-per-localization` | **not known — ask.** It multiplies the answer above directly |
 
 Report the §6.3 number as **"4.97 h → 1.62 h on the real BAM"**, not as the sweep's
 internal speedup. The internal figure is measured against a single stream on the same
