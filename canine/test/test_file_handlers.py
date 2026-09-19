@@ -1,5 +1,5 @@
 import pytest
-from unittest.mock import patch
+from unittest.mock import patch, MagicMock
 from canine.localization.file_handlers import (
     parse_header_block,
     extract_content_checksum,
@@ -10,6 +10,7 @@ from canine.localization.file_handlers import (
     HandleGSURL,
     HandleAWSURL,
     HandleRODISKURL,
+    HandleBucketMountURL,
     HandleDRSURI,
     HandleGCSSignedURL,
     HandleGDCHTTPURL,
@@ -99,6 +100,40 @@ class TestHandleRODISKURLHash:
 
 
 # ---------------------------------------------------------------------------
+# HandleBucketMountURL._get_hash
+# ---------------------------------------------------------------------------
+
+class TestHandleBucketMountURLHash:
+
+    def test_returns_full_url(self):
+        url = "bucketmount://my-bucket/canine-abc123def456/input/myfile.txt"
+        f = HandleBucketMountURL(url)
+        assert f._get_hash() == url
+
+    def test_non_canine_hash_returns_full_url(self):
+        url = "bucketmount://my-bucket/user-custom-prefix/data.bam"
+        f = HandleBucketMountURL(url)
+        assert f._get_hash() == url
+
+    def test_per_localization_bucket_layout_returns_full_url(self):
+        """
+        One-bucket-per-localization layout: the content address is the bucket
+        name itself, and the object path is just <input>/<basename>.
+        """
+        url = "bucketmount://wolf-406002258908-us-central1-abc123def456789012/filename/reads.bam"
+        f = HandleBucketMountURL(url)
+        assert f._get_hash() == url
+
+    def test_invalid_url_no_path_raises(self):
+        with pytest.raises(ValueError):
+            HandleBucketMountURL("bucketmount://my-bucket/canine-abc").  _get_hash()
+
+    def test_invalid_url_completely_malformed_raises(self):
+        with pytest.raises(ValueError):
+            HandleBucketMountURL("not-a-bucketmount-url")._get_hash()
+
+
+# ---------------------------------------------------------------------------
 # get_file_handler — URL routing dispatch
 # ---------------------------------------------------------------------------
 
@@ -155,6 +190,10 @@ class TestGetFileHandler:
     def test_rodisk_url(self):
         h = get_file_handler("rodisk://canine-crc32c-abc/file.txt")
         assert isinstance(h, HandleRODISKURL)
+
+    def test_bucketmount_url(self):
+        h = get_file_handler("bucketmount://my-bucket/canine-abc123/file.txt")
+        assert isinstance(h, HandleBucketMountURL)
 
     def test_generic_https_url(self):
         # HandleOtherURL runs `curl -sIL` in __init__; mock to avoid network
@@ -805,3 +844,116 @@ class TestTranscodedSizeEstimation:
         gs_size_handler([Recording(1000, content_encoding="gzip")]).size
         assert recorded["raw_download"] is True
         assert recorded["start"] == 996 and recorded["end"] == 999
+
+
+# ---------------------------------------------------------------------------
+# HandleGSURL — requester-pays access gate
+# ---------------------------------------------------------------------------
+
+class TestHandleGSURLRequesterPays:
+
+    def test_denied_by_default_raises(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=True):
+            with pytest.raises(ValueError, match="disabled"):
+                HandleGSURL("gs://bucket/file.txt", project="my-project")
+
+    def test_denied_explicitly_raises(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=True):
+            with pytest.raises(ValueError, match="disabled"):
+                HandleGSURL("gs://bucket/file.txt", project="my-project", allow_requester_pays=False)
+
+    def test_allowed_with_project_sets_billing_flag(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=True):
+            h = HandleGSURL("gs://bucket/file.txt", project="my-project", allow_requester_pays=True)
+        assert h.rp_string == " --billing-project=my-project"
+
+    def test_allowed_without_project_raises_no_project(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=True):
+            with pytest.raises(ValueError, match="no user project provided"):
+                HandleGSURL("gs://bucket/file.txt", allow_requester_pays=True)
+
+    def test_non_requester_pays_bucket_unaffected_by_flag(self):
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=False):
+            h = HandleGSURL("gs://bucket/file.txt")
+        assert h.rp_string == ""
+
+
+# ---------------------------------------------------------------------------
+# HandleGSURL.get_requester_pays — describe-vs-ls fallback
+#
+# Regression coverage for a real bug found via live testing against
+# gs://gtex-resources: `gcloud storage buckets describe` requires
+# storage.buckets.get, which many requester-pays buckets don't grant even
+# when object-level read access works fine. get_requester_pays() must fall
+# back to `gcloud storage ls` (object-level) whenever `describe` fails for
+# *any* reason, not just when its error text happens to contain "404".
+# ---------------------------------------------------------------------------
+
+class TestHandleGSURLGetRequesterPaysFallback:
+
+    def _make_handler(self):
+        # construct without running the real get_requester_pays() during __init__
+        with patch.object(HandleGSURL, "get_requester_pays", return_value=False):
+            return HandleGSURL("gs://bucket/file.txt")
+
+    def _fake_run(self, describe_stderr, describe_rc, ls_stderr=b"", ls_rc=0):
+        def run(command, shell=True, capture_output=True):
+            result = MagicMock()
+            if "buckets describe" in command:
+                result.returncode = describe_rc
+                result.stderr = describe_stderr
+                result.stdout = b""
+            else:
+                result.returncode = ls_rc
+                result.stderr = ls_stderr
+                result.stdout = b""
+            return result
+        return run
+
+    def test_permission_denied_on_describe_falls_back_to_ls_and_detects_requester_pays(self):
+        h = self._make_handler()
+        run = self._fake_run(
+            describe_stderr=b"403 ... does not have storage.buckets.get access to the Google Cloud Storage bucket ...",
+            describe_rc=1,
+            ls_stderr=b"HTTPError 400: Bucket is a requester pays bucket but no user project provided.",
+            ls_rc=1,
+        )
+        with patch("canine.localization.file_handlers.gcloud_storage_client", side_effect=Exception("no bucket access")), \
+             patch("canine.localization.file_handlers.subprocess.run", side_effect=run):
+            assert h.get_requester_pays() is True
+
+    def test_permission_denied_on_describe_and_ls_succeeds_non_requester_pays(self):
+        h = self._make_handler()
+        run = self._fake_run(
+            describe_stderr=b"403 ... does not have storage.buckets.get access to the Google Cloud Storage bucket ...",
+            describe_rc=1,
+            ls_stderr=b"",
+            ls_rc=0,
+        )
+        with patch("canine.localization.file_handlers.gcloud_storage_client", side_effect=Exception("no bucket access")), \
+             patch("canine.localization.file_handlers.subprocess.run", side_effect=run):
+            assert h.get_requester_pays() is False
+
+    def test_object_truly_missing_raises(self):
+        h = self._make_handler()
+        run = self._fake_run(
+            describe_stderr=b"404: gs://bucket not found",
+            describe_rc=1,
+            ls_stderr=b"404: gs://bucket/file.txt not found",
+            ls_rc=1,
+        )
+        with patch("canine.localization.file_handlers.gcloud_storage_client", side_effect=Exception("no bucket access")), \
+             patch("canine.localization.file_handlers.subprocess.run", side_effect=run):
+            with pytest.raises(Exception):
+                h.get_requester_pays()
+
+    def test_describe_succeeds_used_directly(self):
+        h = self._make_handler()
+        run = self._fake_run(
+            describe_stderr=b"",
+            describe_rc=0,
+        )
+        with patch("canine.localization.file_handlers.gcloud_storage_client", side_effect=Exception("no bucket access")), \
+             patch("canine.localization.file_handlers.subprocess.run", side_effect=run) as mock_run:
+            assert h.get_requester_pays() is False
+            mock_run.assert_called_once()  # never falls through to ls when describe succeeds

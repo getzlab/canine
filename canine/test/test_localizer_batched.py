@@ -132,6 +132,58 @@ class TestUnit(unittest.TestCase):
                 self.localizer.queued_batch
             )
 
+class TestRequesterPaysGate(unittest.TestCase):
+    """
+    Requester-pays access gate on the download leg of gs_dircp/gs_copy
+    (canine/localization/base.py) -- separate from the HandleGSURL gate
+    (canine/localization/file_handlers.py), which is covered in
+    test_file_handlers.py.
+    """
+
+    @classmethod
+    @with_timeout(10)
+    def setUpClass(cls):
+        cls.localizer = BatchedLocalizer(BACKEND)
+        cls.localizer.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.localizer.__exit__()
+
+    def test_download_denied_by_default_raises(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            dest = os.path.join(tempdir, 'dest')
+            with unittest.mock.patch.object(self.localizer, 'get_requester_pays', return_value=True), \
+                 unittest.mock.patch('canine.localization.base.subprocess.check_call') as mock_check_call:
+                with self.assertRaisesRegex(ValueError, 'disabled'):
+                    self.localizer.gs_dircp('gs://bucket/dir', dest, 'local')
+                mock_check_call.assert_not_called()
+
+    def test_download_allowed_adds_billing_project(self):
+        with tempfile.TemporaryDirectory() as tempdir:
+            dest = os.path.join(tempdir, 'dest')
+            self.localizer.allow_requester_pays = True
+            try:
+                with unittest.mock.patch.object(self.localizer, 'get_requester_pays', return_value=True), \
+                     unittest.mock.patch('canine.localization.base.subprocess.check_call') as mock_check_call:
+                    self.localizer.gs_dircp('gs://bucket/dir', dest, 'local')
+                    mock_check_call.assert_called_once()
+                    self.assertIn('--billing-project', mock_check_call.call_args[0][0])
+            finally:
+                self.localizer.allow_requester_pays = False
+
+    def test_upload_direction_not_gated(self):
+        # the flag only guards downloads (gs:// -> local); an upload (local -> gs://)
+        # to a requester-pays bucket should proceed as it does today
+        with tempfile.TemporaryDirectory() as src:
+            with unittest.mock.patch.object(self.localizer, 'get_requester_pays', return_value=True), \
+                 unittest.mock.patch('canine.localization.base.subprocess.check_call') as mock_check_call, \
+                 unittest.mock.patch('canine.localization.base.subprocess.run'):
+                self.localizer.gs_dircp(src, 'gs://bucket/dir', 'local')
+                mock_check_call.assert_called_once()
+                self.assertIn('--billing-project', mock_check_call.call_args[0][0])
+
+
 class TestIntegration(unittest.TestCase):
     """
     Tests high-level features of the localizer

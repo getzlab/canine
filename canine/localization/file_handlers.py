@@ -6,7 +6,7 @@ import pandas as pd
 import urllib.parse
 
 from google.auth.transport.requests import AuthorizedSession
-from ..utils import sha1_base32, canine_logging
+from ..utils import sha1_base32, canine_logging, gcloud_storage_client
 
 # Imported rather than duplicated. The standalone-script constraint is one-directional:
 # parallel_download.py must not import canine, so it stays runnable by hand on a node
@@ -801,17 +801,6 @@ def hash_set(x):
 
 ## Google Cloud Storage {{{
 
-STORAGE_CLIENT = None
-storage_client_creation_lock = threading.Lock()
-
-def gcloud_storage_client():
-    global STORAGE_CLIENT
-    with storage_client_creation_lock:
-        if STORAGE_CLIENT is None:
-            # this is the expensive operation
-            STORAGE_CLIENT = google.cloud.storage.Client()
-    return STORAGE_CLIENT
-
 class GSFileNotExists(Exception):
     pass
 
@@ -846,7 +835,7 @@ class HandleGSURL(FileType):
             ret = subprocess.run(command, shell = True, capture_output = True)
             text = ret.stderr
 
-            if ret.returncode == 0 or b'404' not in text:
+            if ret.returncode == 0:
                 # Check both stderr (for error messages) and stdout (for success messages)
                 return (
                     b'requester pays bucket but no user project provided' in text
@@ -855,7 +844,9 @@ class HandleGSURL(FileType):
             else:
                 # Try again ls-ing the object itself
                 # sometimes permissions can disallow bucket inspection
-                # but allow object inspection
+                # (e.g. missing storage.buckets.get, as with many third-party
+                # requester-pays buckets) but allow object inspection -- retry
+                # regardless of why the describe call failed, not just on 404
                 command = 'gcloud storage ls gs://{}'.format(path)
                 ret = subprocess.run(command, shell = True, capture_output = True)
                 text = ret.stderr
@@ -876,6 +867,9 @@ class HandleGSURL(FileType):
         # check if this bucket is requester pays
         self.rp_string = ""
         if self.get_requester_pays():
+            if not self.extra_args.get("allow_requester_pays", False):
+                raise ValueError(f"File {self.path} resides in a requester-pays bucket, but access to "
+                                  "requester-pays buckets is disabled (allow_requester_pays=False)")
             if "project" not in self.extra_args:
                 raise ValueError(f"File {self.path} resides in a requester-pays bucket but no user project provided")
             self.rp_string = f' --billing-project={self.extra_args["project"]}'
@@ -1846,6 +1840,35 @@ class HandleRODISKURL(FileType):
 
 # }}}
 
+## Bucket-mounted (RODISK replacement) reads {{{
+
+class HandleBucketMountURL(FileType):
+    localization_mode = "bucket_mount"
+
+    # file size is unknowable without mounting
+
+    # hash is based on the bucketmount URL itself (bucket + content hash),
+    # since actually hashing the contents would entail mounting them --
+    # same reasoning as HandleRODISKURL
+    def _get_hash(self):
+        bmURL = re.match(r"bucketmount://([^/]+)/([^/]+)/(.*)", self.path)
+        if bmURL is None or bmURL[3] == "":
+            raise ValueError("Invalid bucketmount URL specified ({})!".format(self.path))
+
+        # the content address lives in the bucket name ("wolf-<project>-<region>
+        # -<hash>") for a per-localization bucket, or in the first object path
+        # segment ("canine-<hash>") for the legacy shared-bucket layout
+        if not (bmURL[1].startswith("wolf-") or bmURL[2].startswith("canine-")):
+            canine_logging.debug("Bucket-mount input {} cannot be hashed; this job may be inadvertently avoided.".format(self.path))
+
+        # the whole URL (bucket + content hash + file path) serves as the hash
+        return self.path
+
+    # handler will be command to gcsfuse-mount the bucket prefix
+    # (currently implemented in base.py)
+
+# }}}
+
 def get_file_handler(path, url_map = None, **kwargs):
     url_map = {
       r"^gs://" : HandleGSURL,
@@ -1855,6 +1878,7 @@ def get_file_handler(path, url_map = None, **kwargs):
       r"^https://api.awg.gdc.cancer.gov" : HandleGDCHTTPURL,
       r"^https://storage\.(?:googleapis|cloud\.google)\.com/" : HandleGCSSignedURL,
       r"^rodisk://" : HandleRODISKURL,
+      r"^bucketmount://" : HandleBucketMountURL,
       r"^(?:ftp|https|http)://" : HandleOtherURL
     } if url_map is None else url_map
 

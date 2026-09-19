@@ -3,13 +3,18 @@ import os
 import sys
 import select
 import io
+import re
 import warnings
 import logging
+import datetime
+import threading
 from collections import namedtuple
 import functools
 import shlex
 import subprocess
 import google.auth
+import google.api_core.exceptions
+import google.cloud.storage
 import paramiko
 import shutil
 import time
@@ -161,6 +166,7 @@ def make_interactive(channel: paramiko.Channel) -> typing.Tuple[int, typing.Bina
     stderr.seek(0,0)
     return channel.recv_exit_status(), stdout, stderr
 
+@functools.lru_cache()
 def get_default_gcp_zone():
     try:
         response = requests.get(
@@ -180,8 +186,15 @@ def get_default_gcp_zone():
             return response.stdout.strip().decode()
     except subprocess.CalledProcessError:
         pass
-    # gcloud config not happy, just return default
-    return 'us-central1-a'
+    # Both sources are exhausted. Returning a hardcoded zone here silently
+    # places zonal resources (Anywhere Caches, disks) and regional ones
+    # (localization buckets) somewhere the cluster isn't, which costs money and
+    # leaves nothing in the logs to explain it. A wrong zone is worse than none.
+    raise ValueError(
+        "Could not determine a default GCP zone: the GCE metadata server is unreachable "
+        "and `gcloud config get-value compute/zone` is unset. Pass the zone explicitly "
+        "(e.g. compute_zone=... to the backend) or run `gcloud config set compute/zone <zone>`."
+    )
 
 __DEFAULT_GCP_PROJECT__ = None
 
@@ -199,6 +212,173 @@ def get_default_gcp_project():
             stacklevel=1
         )
     return __DEFAULT_GCP_PROJECT__
+
+STORAGE_CLIENT = None
+storage_client_creation_lock = threading.Lock()
+
+def gcloud_storage_client():
+    global STORAGE_CLIENT
+    with storage_client_creation_lock:
+        if STORAGE_CLIENT is None:
+            # this is the expensive operation
+            STORAGE_CLIENT = google.cloud.storage.Client()
+    return STORAGE_CLIENT
+
+def _sanitize_bucket_name_component(s: str) -> str:
+    """
+    Lowercases and replaces any run of characters not valid in a GCS bucket
+    name with a single hyphen, trimming leading/trailing hyphens.
+    """
+    s = re.sub(r'[^a-z0-9-]+', '-', s.lower()).strip('-')
+    return s if s else "default"
+
+def _zone_to_region(zone: str) -> str:
+    """
+    Derives a GCP region from a zone (e.g. "us-central1-a" -> "us-central1").
+    Standard (non-zonal) bucket locations must be a region, not a zone.
+    """
+    return zone.rsplit('-', 1)[0]
+
+@functools.lru_cache(maxsize=None)
+def get_project_number(project: str) -> str:
+    """
+    Numeric ID of `project`. Used in localization bucket names because, unlike
+    the project ID, it is stable across project renames. Cached: this shells out
+    once per project per process.
+    """
+    proc = subprocess.run(
+        ["gcloud", "projects", "describe", project, "--format=value(projectNumber)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    check_call(
+        "gcloud projects describe {}".format(project),
+        proc.returncode, io.BytesIO(proc.stdout), io.BytesIO(proc.stderr)
+    )
+    number = proc.stdout.decode().strip()
+    if not number.isdigit():
+        raise ValueError("Could not resolve a numeric project ID for {!r} (got {!r})".format(project, number))
+    return number
+
+## Longest hash that still fits in a 63-char bucket name for every current GCP
+## region. With a 12-digit project number the budget is
+## 63 - len("wolf-") - len(project_number) - len(region) - 2 separators, which
+## bottoms out at 21 for "northamerica-northeast1" (23 chars, the longest region
+## name). A fixed 21 is used everywhere so names are uniform regardless of where
+## the cluster runs. 21 hex = 84 bits; collision odds at 1e6 buckets are ~5e-14.
+LOCALIZATION_BUCKET_HASH_LEN = 21
+
+def localization_bucket_name(project_number: str, region: str, content_hash: str) -> str:
+    """
+    Deterministic name of the bucket backing one localization:
+    wolf-<project_number>-<region>-<21 chars of content_hash>.
+
+    The region is part of the name because buckets are regional -- one bucket
+    cannot serve two regions, so the same content localized in two regions needs
+    two distinct (globally unique) names. The project number, rather than the
+    project ID, keeps the name stable across project renames.
+
+    `content_hash` is the same hash_set() value used for the old RODISK name, so
+    identical input sets still converge on one bucket.
+    """
+    name = "wolf-{}-{}-{}".format(
+      _sanitize_bucket_name_component(str(project_number)),
+      _sanitize_bucket_name_component(region),
+      content_hash[:LOCALIZATION_BUCKET_HASH_LEN],
+    )
+    # A longer future project number or a new, longer region name must fail here
+    # rather than reach GCS as an invalid name.
+    if not re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', name):
+        raise ValueError("Computed an invalid GCS bucket name: {!r}".format(name))
+    return name
+
+def get_or_create_workflow_bucket(zone: str, project: str, workflow_name: typing.Optional[str] = None) -> str:
+    """
+    Get or create the standard regional bucket backing bucket-mounted
+    (RODISK-replacement) localization for one workflow. The name is
+    deterministic -- canine-<project>-<sanitized workflow_name> -- so
+    repeated or concurrent runs of the same workflow reuse the same
+    bucket rather than creating a new one each time. Also idempotently
+    ensures a "delete 5 days after last touched" lifecycle rule is present
+    (keyed on customTime, not object age -- see BUCKET_FUSE_MIGRATION.md).
+    Raises on a genuine creation failure (permissions, quota, bad zone).
+    """
+    client = gcloud_storage_client()
+    prefix = "canine-{}-".format(project)
+    name_budget = 63 - len(prefix)
+    sanitized = _sanitize_bucket_name_component(workflow_name or "default")[:name_budget]
+    bucket_name = prefix + sanitized
+
+    bucket = client.bucket(bucket_name)
+    if not bucket.exists():
+        try:
+            bucket = client.create_bucket(bucket_name, project=project, location=_zone_to_region(zone))
+        except google.api_core.exceptions.Conflict:
+            # bucket was created concurrently by another run of the same
+            # workflow; this is the expected reuse case, not an error
+            bucket = client.bucket(bucket_name)
+            bucket.reload()
+
+    has_lifecycle_rule = any(
+        rule.get("action", {}).get("type") == "Delete" and "daysSinceCustomTime" in rule.get("condition", {})
+        for rule in bucket.lifecycle_rules
+    )
+    if not has_lifecycle_rule:
+        bucket.add_lifecycle_delete_rule(days_since_custom_time=5)
+        bucket.patch()
+
+    return bucket_name
+
+def get_or_create_rapid_cache(bucket: str, zone: str, ttl: str = "1d", ingest_on_write: bool = True):
+    """
+    Get or create a Rapid Cache (formerly Anywhere Cache) instance for
+    `bucket` in `zone`. Callers should treat failure here as best-effort/
+    non-fatal: Rapid Cache degrades gracefully to normal bucket latency on
+    a miss or absent cache, so a failure to provision it should not fail
+    the workflow the way a bucket-creation failure does.
+
+    Callers opt in explicitly -- this is not free. Cache storage bills per
+    GiB-hour (Rapid Cache Storage Iowa: $0.0001233/GiB-hour, ~$0.089/GiB-month,
+    about 4x standard regional storage), while the data transfer it would save
+    is $0/GiB within North America. So a workload whose bucket and workers share
+    a region pays purely for read latency, which is worth it for an input read by
+    many shards and wasteful for read-once work.
+
+    `ttl` defaults to 1 day to match the localization bucket's own
+    daysSinceCustomTime expiry (AbstractLocalizer.localization_expiry_days). Keep
+    the two aligned: a longer cache TTL means paying to cache objects that have
+    already been deleted -- at 7d against a 1d expiry that was ~7x the cache bill
+    for no benefit. If you raise one, raise the other.
+    """
+    list_proc = subprocess.run(
+        ["gcloud", "storage", "buckets", "anywhere-caches", "list", "gs://{}".format(bucket), "--format=value(zone)"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE
+    )
+    check_call(
+        "gcloud storage buckets anywhere-caches list gs://{}".format(bucket),
+        list_proc.returncode, io.BytesIO(list_proc.stdout), io.BytesIO(list_proc.stderr)
+    )
+    if zone in list_proc.stdout.decode().split():
+        return
+
+    create_cmd = [
+        "gcloud", "storage", "buckets", "anywhere-caches", "create",
+        "gs://{}".format(bucket), zone, "--ttl={}".format(ttl)
+    ]
+    if ingest_on_write:
+        create_cmd.append("--enable-ingest-on-write")
+    create_proc = subprocess.run(create_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    check_call(' '.join(create_cmd), create_proc.returncode, io.BytesIO(create_proc.stdout), io.BytesIO(create_proc.stderr))
+
+def touch_object(bucket: str, path: str):
+    """
+    Bumps an object's customTime metadata to now, so a GCS Object Lifecycle
+    Management rule keyed on daysSinceCustomTime treats this object as
+    freshly touched (its 5-day clock restarts) rather than expiring it
+    based on when it was first uploaded.
+    """
+    blob = gcloud_storage_client().bucket(bucket).blob(path)
+    blob.custom_time = datetime.datetime.now(datetime.timezone.utc)
+    blob.patch()
 
 def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None, stderr: typing.Optional[typing.BinaryIO] = None):
     """
