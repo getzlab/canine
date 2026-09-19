@@ -3247,25 +3247,20 @@ back to `gcloud`, so on any GCE node metadata always wins. The line reports that
 on GCE, and can never say `gcloud fallback` there — it is not a diagnostic of which
 credentials are mounted.
 
-**What it does tell you is which identity writes to the destination bucket, and it is not
-you.** `GcsClient._fetch_token` tries the metadata server first and falls back to `gcloud`;
-it **never reads ADC** — `grep GOOGLE_APPLICATION_CREDENTIALS parallel_download.py` returns
-nothing. So on a GCE node the downloader always writes as the **compute service account**,
-no matter whose credentials are mounted.
+**What it tells you about the *destination* used to matter, and no longer does.**
+`GcsClient._fetch_token` once tried the metadata server first, so every bucket write went
+out as the **compute service account** while the rest of the job ran as the copied user
+credentials. That is now fixed: the order is ADC → active gcloud account → metadata
+server, matching what `base.py` and `dockerTransient.py` already pin for `gcsfuse` and
+`rclone`. The downloader logs which one it used:
 
-Three identities are therefore in play at once on this path, which is what makes a 403 hard
-to read:
+```
+k9pdl-auth using ADC
+```
 
-| who | uses | for |
-|---|---|---|
-| you (ADC) | `gcsfuse` | mounting the bucket |
-| you (ADC) | `gcloud storage` | creating the bucket, `ls`, teardown |
-| **compute SA** | `GcsClient`, metadata token | **writing the parts and composing** |
-
-That the bucket is yours says nothing about the third row. Whether it already works depends
-on the SA's project-level roles — the default compute SA frequently has broad storage
-access, in which case nothing needs granting — so §6.6a probes it rather than assuming
-either way.
+If it instead says `using the metadata server (compute service account)`, ADC and gcloud
+both failed inside the container — that *is* the missing-credentials symptom the old
+paragraph here was reaching for, and now it is reported by the thing that knows.
 
 **`gcsfuse` is not in the image on `wolf-2.0-update`**, and neither is `rclone` — its
 Dockerfile install is commented out, though `conf/rclone.conf` ships. Only `fuse-overlayfs`
@@ -3376,34 +3371,21 @@ keeps charging until next week. `--lifecycle-file` is a backstop for the same re
 and has to be provisioned by hand on this bucket, because
 `get_or_create_rapid_cache()` targets the workflow bucket instead.
 
-Then check the identity that will actually write. Not yours: the downloader takes the
-metadata-server token and never reads ADC (§6.6), so it writes as the compute SA whatever
-is mounted. Ask that SA directly, with the same API the downloader uses, rather than
-reasoning about IAM:
+Then confirm the identity. With ADC first, the downloader writes as **you** — the same
+identity that created the bucket and mounts it — so normally there is nothing to do:
 
 ```bash
-# on the node
+# on the node -- expect your account, not ...-compute@developer.gserviceaccount.com
+sudo docker exec slurm gcloud auth application-default print-access-token >/dev/null \
+  && echo "ADC works in the container" || echo "ADC MISSING -- the run will fall back to the SA"
+```
+
+If that fails, the container has no usable ADC (§3's `~/.config/gcloud` mount), and the
+downloader falls back to the compute service account — which very likely cannot write a
+bucket you created. Fix the mount rather than the IAM. If you would rather grant the SA:
+
+```bash
 SA=$(mdget instance/service-accounts/default/email)
-SA_TOKEN=$(mdget instance/service-accounts/default/token \
-           | python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])')
-echo "the downloader writes as: $SA"
-
-curl -s -o /dev/null -w 'write probe: %{http_code}\n' -X POST \
-  -H "Authorization: Bearer $SA_TOKEN" -H "Content-Type: text/plain" --data probe \
-  "https://storage.googleapis.com/upload/storage/v1/b/$FUSE_BUCKET/o?uploadType=media&name=.sa-probe"
-```
-
-**`200` means nothing to do** — the SA already has what it needs, which is the common case
-when the default compute SA carries project-level storage access. Clean up the probe object
-and move on:
-
-```bash
-gcloud storage rm "gs://$FUSE_BUCKET/.sa-probe" 2>/dev/null || :
-```
-
-**`403` means grant it**, and only then:
-
-```bash
 gcloud storage buckets add-iam-policy-binding "gs://$FUSE_BUCKET" \
   --member="serviceAccount:$SA" --role=roles/storage.objectAdmin --project "$PROJECT"
 ```

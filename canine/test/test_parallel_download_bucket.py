@@ -12,6 +12,7 @@ import hashlib
 import json
 import inspect
 import os
+import subprocess
 import threading
 
 import pytest
@@ -1241,3 +1242,137 @@ class TestTwoWritersOnOneObject:
 
         leftover = [n for n in gcs.state.object_names() if ".k9pdl.parts/" in n]
         assert leftover == [], "{} parts left behind after the race".format(len(leftover))
+
+
+# ---------------------------------------------------------------------------
+# which identity writes
+# ---------------------------------------------------------------------------
+
+class TestTheClientAuthenticatesAsADC:
+    """
+    The credential order decides *who* every bucket write is attributed to, and it had
+    no test at all.
+
+    It used to try the metadata server first, reasoning that workers are GCE VMs and it
+    saves a subprocess. The metadata server always answers on GCE, so it always won, and
+    every write went out as the **compute service account** while the rest of the same
+    job ran as the user credentials `docker_copy_gcloud_credentials.sh` stages.
+
+    canine pins ADC explicitly in two other places for precisely this reason
+    (`base.py`'s bucket-mount block, `dockerTransient.py`'s rclone path), and the comment
+    there names the failure: the identity "silently works in one project and fails in
+    another". Both outcomes are quiet -- a 403 that reads as a bucket problem, or success
+    with an audit trail that does not match the workflow.
+    """
+
+    def _runner(self, ok=(), token="tok"):
+        """Fake subprocess.run where only `ok` command prefixes succeed."""
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append(command)
+            joined = " ".join(command)
+            if any(joined.startswith(prefix) for prefix in ok):
+                return subprocess.CompletedProcess(
+                    command, 0, (token + "\n").encode(), b"")
+            return subprocess.CompletedProcess(command, 1, b"", b"denied")
+
+        return run, calls
+
+    def test_adc_is_preferred_over_everything(self, monkeypatch):
+        run, calls = self._runner(ok=("gcloud auth application-default",), token="adc")
+        watch = _MetadataWatch()
+        monkeypatch.setattr(pdl.subprocess, "run", run)
+        monkeypatch.setattr(pdl.urllib.request, "urlopen", watch)
+
+        token, _ = pdl.GcsClient()._fetch_token()
+
+        assert token == "adc"
+        assert not watch.reached, "the metadata server was consulted anyway"
+        assert calls[0] == ["gcloud", "auth", "application-default",
+                            "print-access-token"]
+
+    def test_the_metadata_server_is_not_consulted_when_adc_works(self, monkeypatch):
+        """
+        The actual regression. On GCE the metadata server always answers, so merely
+        *listing* it first was enough to make it always win.
+        """
+        run, _ = self._runner(ok=("gcloud auth application-default",))
+        watch = _MetadataWatch()
+        monkeypatch.setattr(pdl.subprocess, "run", run)
+        monkeypatch.setattr(pdl.urllib.request, "urlopen", watch)
+
+        pdl.GcsClient()._fetch_token()
+
+        assert not watch.reached, (
+            "ADC succeeded but the metadata server was still consulted -- listing it "
+            "first is all it takes, because on GCE it always answers")
+
+    def test_it_falls_back_to_the_active_gcloud_account(self, monkeypatch):
+        run, calls = self._runner(ok=("gcloud auth print-access-token",), token="acct")
+        watch = _MetadataWatch()
+        monkeypatch.setattr(pdl.subprocess, "run", run)
+        monkeypatch.setattr(pdl.urllib.request, "urlopen", watch)
+
+        token, _ = pdl.GcsClient()._fetch_token()
+
+        assert token == "acct"
+        assert not watch.reached
+        assert calls[0][:4] == ["gcloud", "auth", "application-default",
+                                "print-access-token"], "ADC must still be tried first"
+
+    def test_the_metadata_server_is_the_last_resort_and_says_so(self, monkeypatch,
+                                                                capsys):
+        """
+        Kept rather than removed -- a worker with no user credentials is a real
+        configuration, and failing to authenticate is worse than authenticating as the
+        SA. But it is announced, because it means the writes are not the user's.
+        """
+        run, _ = self._runner(ok=())            # neither gcloud path works
+        monkeypatch.setattr(pdl.subprocess, "run", run)
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"access_token": "sa", "expires_in": 3600}).encode()
+
+        monkeypatch.setattr(pdl.urllib.request, "urlopen",
+                            lambda *a, **k: Response())
+
+        token, _ = pdl.GcsClient()._fetch_token()
+
+        assert token == "sa"
+        assert "compute service account" in capsys.readouterr().err
+
+    def test_no_source_at_all_is_a_permanent_error(self, monkeypatch):
+        run, _ = self._runner(ok=())
+        watch = _MetadataWatch()
+        monkeypatch.setattr(pdl.subprocess, "run", run)
+        monkeypatch.setattr(pdl.urllib.request, "urlopen", watch)
+
+        with pytest.raises(pdl.PermanentError):
+            pdl.GcsClient()._fetch_token()
+        assert watch.reached, "the last resort must at least have been tried"
+
+
+class _MetadataWatch:
+    """
+    Records whether the metadata server was reached, rather than raising.
+
+    Raising does not work here: `_fetch_token`'s metadata branch is wrapped in
+    `except Exception`, which swallows AssertionError along with everything else -- so a
+    sentinel that raises is silently neutralised by the code it is watching. Caught by
+    mutation-testing the original defect back in: four of five tests still passed.
+    """
+
+    def __init__(self):
+        self.reached = False
+
+    def __call__(self, *args, **kwargs):
+        self.reached = True
+        raise OSError("metadata server unavailable")
