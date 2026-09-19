@@ -1282,6 +1282,12 @@ Two consequences worth carrying forward:
   §6.2 — the same sweep to the localization disk — is the measurement that now decides
   the project, and §10's cost model has to be rebuilt around a disk ceiling rather than a
   source ceiling.
+
+  *Both projections here were optimistic, and §6.3 says by how much.* The "54 min
+  disk-bound" figure assumed the disk ceiling would be reached at full size the way it is
+  at 4 GiB. It is not: the measured full-size run is **97 min at 49.04 MiB/s**, 56% of the
+  same device that the 4 GiB prefix drives to 90%. Arithmetic on a 4 GiB row does not
+  extrapolate to 279 GiB, and §6.5c is open on why.
 * **`MAX_CONNECTIONS` is 16 and 16 was still scaling.** That matters only for destinations
   faster than pd-standard; for the primary case the disk saturates first, so raising it is
   not obviously worth the extra sockets. Worth revisiting if a run ever targets tmpfs or a
@@ -1492,6 +1498,37 @@ Note the 12 GB object gets a 316 GB disk here, so the per-GB ceiling is the *300
 that is deliberate. Sizing the disk to the small object would give a ~13 GB disk at
 ~1.6 MB/s and measure a situation that never occurs.
 
+#### Measured
+
+4 GiB prefix of the real BAM, presigned URL, to the 316 GB pd-standard disk. `dd` on this
+disk reads 88.0 MiB/s and every row's `peak disk write` lands at 87.7–96.9 MiB/s:
+
+| conns | throughput | streams | mean disk | vs 1 conn |
+|---|---|---|---|---|
+| 1 | 15.96 MiB/s | — (legacy curl) | — | 1.00× |
+| 4 | 37.61 MiB/s | 2.36 of 4 | — | 2.36× |
+| 6 | 46.61 MiB/s | 2.86 of 6 | — | 2.92× |
+| 8 | 54.90 MiB/s | 3.37 of 8 | — | 3.44× |
+| 12 | 59.48 MiB/s | 3.64 of 12 | — | 3.73× |
+| 16 | 66.49 MiB/s | 4.12 of 16 | — | **4.17×** |
+| 16, after the deferred writer (§6.5a) | **78.59 MiB/s** | 5.32 of 16 | 78.61 MiB/s | **4.92×** |
+
+**Both predictions in the bullets above were wrong, and keeping 16 is what showed it.**
+Concurrency did not hurt writes the way §4.1a found it hurting reads — throughput rose
+monotonically to 16. And the run did *not* plateau: 16 was both the fastest and the highest
+setting tried, so `NO KNEE FOUND` fired and the sweep was formally inconclusive about the
+default. Had the range stopped at 12, "plateau at 59 MiB/s" would have been recorded as a
+result.
+
+The deferred manifest writer then moved this row from 66.49 to 78.59 MiB/s (**+18.2%**) and
+flipped the verdict from `MOSTLY disk-bound` to `the DISK is the limit: sustained writes are
+within 10% of the device's peak`. At 78.61 of 87.78 MiB/s the destination is **90%**
+saturated, so at this extent the answer is settled: the disk is the ceiling, 16 connections
+reach it, and more would only buy idle sockets.
+
+Hold that conclusion to *this extent*. §6.3 runs the same configuration at 279 GiB and gets
+56% of the same device.
+
 ### 6.3 Direct to pd-standard at full size — the primary result
 
 **This is the number everything else is judged against, and it may well be the answer on
@@ -1529,6 +1566,66 @@ Record alongside it the thing that makes this configuration valuable and the alt
 expensive: **time to `finished=yes`**. That label is when the data becomes available to
 every other workflow waiting on it (§6.7), and on this path it lands the moment the
 download completes.
+
+#### Measured — the headline, and the target is missed
+
+The real BAM, whole object, `S3ApiSource`, to the 316 GB pd-standard disk, 16 connections.
+Run twice: once before the deferred manifest writer and once after.
+
+```bash
+# what was actually run. No --size: it is derived from head-object, so probe_range's
+# declared total matches and nothing falls back (see §6.1a). No $KNEE -- that variable
+# was never defined anywhere; 16 is the §6.2 figure.
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --dest-dir /mnt/rwdisks/$DISK --connections 16 \
+          --json /tmp/direct-300g-realbam.json
+```
+
+| | throughput | wall | hash | verify | mean disk | vs today |
+|---|---|---|---|---|---|---|
+| today, single stream | 15.96 MiB/s | 4.97 h | — | — | — | 1.00× |
+| before the writer fix | 48.50 MiB/s | 98.1 min | `ok` | 0.0s | 48.87 MiB/s | 3.04× |
+| **after the writer fix** | **49.04 MiB/s** | **97.1 min** | **`ok`** | **0.0s** | 49.05 MiB/s | **3.07×** |
+| the disk's own ceiling | 88.07 MiB/s | 54.1 min | | | 88.07 MiB/s | 5.52× |
+
+**Report it as 4.97 h → 1.62 h.** That is the number the project exists for, and it is
+real: 278.91 GiB, ETag `2872df08129ad09ead7eb25839421345-9849` verified, on the shipping
+configuration.
+
+**It is also 3.07×, under §8.5's ≥4×.** Say that plainly rather than quoting §6.2's 4.92×,
+which is a 4 GiB figure.
+
+Three things this run settles:
+
+* **Correctness on the real object.** `hash ok` against a 9849-part multipart ETag. Every
+  other measurement in this runbook is throughput; this is the only correctness result
+  that matters, and it is the release gate.
+* **In-transfer hashing (#19) pays for itself completely.** `verify 0.0s` *with* a real
+  digest means the ETag was assembled from part md5s recorded as the bytes went past. The
+  read-back it replaces is 278.91 GiB at the 91.6 MiB/s read rate from §4.1 — **~52
+  minutes**, which would otherwise be over a third of the total. Do not read the 0.0s as
+  "verification is cheap"; it is cheap because it was moved into the transfer.
+* **Memory is bounded by connections, not by object size.** 86.24 MiB peak RSS on a
+  279 GiB object, against 63.64 MiB on 4 GiB at the same connection count.
+
+And one it does not settle, which is now the open question:
+
+**The deferred writer bought +18.2% at 4 GiB and +1.1% here.** 66.49 → 78.59 MiB/s at
+prefix size; 48.50 → 49.04 MiB/s at full size. So the `chunk_done` fsync barrier §6.5a
+diagnosed was real, was fixed, and was *never the full-size bottleneck* — `chunk_ready` is
+now 2.9s over 3283 calls (0% of the worker pool) and `commit` runs 100% of wall entirely
+off the pool, yet the object still arrives at 56% of what the device demonstrably absorbs
+(49.05 against 88.07 MiB/s) where the 4 GiB prefix reaches 90%.
+
+The degradation is a function of **extent**, and §6.5c separates the two candidates that
+remain — a source that is slower for deep cold ranges, versus our own write path degrading
+as the sparse file's extent tree grows. Until that is answered, the honest summary is:
+**4.97 h → 1.62 h, verified correct, 3.07× against a 4× target, with ~35 minutes of
+unexplained headroom against the disk.**
+
+The GCS-composed 300 GB object (`$URL_300G`) was never run: the real BAM is the subject,
+its egress is free, and a same-region GCS object measures a source that is not slow.
 
 ### 6.4 Correctness against the real sources
 
@@ -2029,6 +2126,133 @@ Mint the URL with `--expires-in 43200`: at 49 MiB/s the run is ~98 minutes, and 
 expires mid-transfer surfaces only as a retry count, because `S3ApiSource` sends its
 child's stderr to `DEVNULL`.
 
+#### Measured
+
+Both arms: 4 GiB prefix of the same object, `--md5 $PREFIX_MD5`, same disk, 16 connections,
+minutes apart. `hash ok` on both.
+
+| | download | total | streams | per stream | verify | commit | mean disk |
+|---|---|---|---|---|---|---|---|
+| `S3ApiSource` | 75.29 MiB/s | 62.64 MiB/s | 8.46 of 16 | 8.90 | 10.7s | 46.3s, 3 batches, 85% of wall | 62.66 (71% of peak) |
+| `HttpSource` | **80.47 MiB/s** | **67.59 MiB/s** | 5.17 of 16 | 15.56 | 9.2s | 46.6s, 3 batches, 92% of wall | 67.61 (77% of peak) |
+
+**6.9% apart on the download phase.** Shelling out to `aws s3api` per chunk is measurably
+worse, and the presigned path is the right default for the reasons already in §6.1 — but
+5 MiB/s is not the 4.6× the per-stream figures above predicted, and it is not where the
+target lives. The transport is exonerated; §6.5c takes the question from here.
+
+Note the inversion, because it is the whole lesson: the *slower* arm reports *more* streams
+busy (8.46 against 5.17). `chunk_ready` is 0% of the worker pool in both, so nothing is
+blocked on the commit thread — the extra stream-time is `aws` process startup and TLS
+handshake, which `open_range` pays inside the counted region. A higher `streams` figure is
+not a healthier run.
+
+### 6.5c The transport is not the problem — find what actually is
+
+§6.5b ran and **exonerated the transport**. Same object, same 4 GiB prefix, same
+destination, only the source class differs:
+
+| run | download | streams | per stream |
+|---|---|---|---|
+| S3ApiSource, 4 GiB prefix | 75.29 MiB/s | 8.46 | 8.90 |
+| HttpSource, 4 GiB prefix | 80.47 MiB/s | 5.17 | 15.56 |
+| S3ApiSource, 279 GiB full | 49.04 MiB/s | 15.47 | 3.17 |
+
+**6.9% apart at equal extent.** Shelling out to `aws s3api` per chunk costs something, but
+not the 4.6× the per-stream figures implied. Connection pooling in `S3ApiSource` is worth
+at most those 5 MiB/s, which is not where the target lives.
+
+**Do not use per-stream throughput to compare sources.** It is `aggregate ÷ streams`, and
+both terms move with the *destination*, not the source:
+
+* `streams` counts time a stream is **open**, not time it is **delivering**. Every `aws`
+  process spawn, TLS handshake and — crucially — every moment a worker sits blocked on a
+  full write path counts as busy. So backpressure *inflates* the denominator.
+* When the disk is the binding constraint, the numerator is pinned regardless.
+
+The two prefix rows make the trap explicit: 8.46 × 8.90 and 5.17 × 15.56 are the same
+product from wildly different factors. And the full-size row's 15.47 of 16 is not a sign of
+health — it is the signature of sixteen workers blocked on the write path. That reading is
+what sent this investigation after the transport; it was wrong, and the A/B cost four
+minutes to say so.
+
+**The constant worth explaining is `peak disk write`: 87.78, 88.07, 87.87, 87.94 MiB/s
+across four runs spanning 4 GiB to 279 GiB — a 0.33% spread.** That is a real device
+ceiling, not a coincidence. Every run reaches it; the question is only what fraction of the
+time each sustains it. The prefix runs hold 71–77% of it. The full-size run holds 56%.
+
+So the gap is **extent**, not transport, and two candidates remain. Both are local:
+
+* **The source is slower for deep, cold ranges.** A 4 GiB prefix is the object's head,
+  which is what every client touches and what any cache in front of the store will hold.
+  250 GiB in is cold.
+* **Our write path degrades as the file grows.** The destination is created sparse with
+  `ftruncate` and chunks land **out of order** (see the header notes at the top of
+  `parallel_download.py`). Out-of-order writes into a sparse file build an extent tree
+  whose update cost grows with the number of extents, and the filesystem was at 90% full
+  by the end of the full-size run, where ext4's allocator works hardest. Neither effect is
+  visible in 4 GiB.
+
+Note the second one trades directly against resume: `posix_fallocate` would give
+contiguous extents, but its unwritten extents read back as data, which destroys the
+`SEEK_HOLE` frontier recovery §6.5 measured working. Do not "fix" it before measuring it.
+
+This test separates them for about two minutes of free egress, by **removing the disk
+entirely** — sixteen ranged GETs straight to `/dev/null`, at the head and then 250 GiB in:
+
+```bash
+cat > /tmp/source_ceiling.sh <<'EOS'
+#!/bin/sh
+# Sixteen parallel ranged GETs to /dev/null: the source's rate with no write path at all.
+# 256 MiB x 16 = 4 GiB per pass, so each pass is directly comparable to a 6.5b row.
+U="$1"
+CHUNK=268435456
+for BASE in 0 268435456000 268435456000; do    # head, deep, deep again (cache check)
+  START=$(date +%s)
+  i=0
+  while [ "$i" -lt 16 ]; do
+    OFF=$((BASE + i * CHUNK))
+    curl -sS --fail -r "$OFF-$((OFF + CHUNK - 1))" "$U" -o /dev/null &
+    i=$((i + 1))
+  done
+  wait
+  EL=$(( $(date +%s) - START ))
+  [ "$EL" -eq 0 ] && EL=1
+  echo "base=$BASE  ${EL}s  $((4096 / EL)) MiB/s"
+done
+EOS
+sudo docker cp /tmp/source_ceiling.sh slurm:/tmp/pdl/
+sudo docker exec slurm sh /tmp/pdl/source_ceiling.sh "$PRESIGNED_URL"
+```
+
+Read it against the 88 MiB/s device ceiling, not against each other:
+
+* **Head ≫ 88 MiB/s (say 200+)** — the source has headroom the disk never let us use, and
+  the destination is the whole story. Nothing in the download path is worth tuning; a
+  faster PD (or pd-ssd) is the entire remaining win, which is a provisioning decision
+  rather than a code one.
+* **Head ≈ 80 and deep ≈ 49** — the store is slower for cold ranges and 49 MiB/s is close
+  to the ceiling for this object. The target is not reachable by any client-side change,
+  and that should be reported plainly rather than tuned against.
+* **Head ≈ deep, both well above 88** — the source is uniform and fast, so the degradation
+  is ours: the extent-tree/allocator hypothesis. That is the only branch where a code
+  change helps, and `filefrag -v` on the destination after a long run is the confirmation.
+
+The third pass repeats the deep range. If it is much faster than the second, something is
+caching and neither number describes a cold localization.
+
+Pair it with the destination in isolation, on the disk in its current state:
+
+```bash
+sudo docker exec slurm sh -c \
+  'dd if=/dev/zero of=/mnt/rwdisks/'"$DISK"'/ddtest bs=1M count=8192 conv=fdatasync 2>&1 \
+   | tail -1; rm -f /mnt/rwdisks/'"$DISK"'/ddtest'
+```
+
+That is sequential, so it is an **upper bound** on what our out-of-order sparse writes can
+achieve — if even `dd` only reaches ~50 MiB/s on the now-90%-full filesystem, the write
+path is exonerated too and the disk simply is what it is.
+
 ### 6.6 the bucket-compose route against real GCS
 
 The bucket-compose route has never touched real infrastructure — not the auth path, not
@@ -2199,15 +2423,27 @@ disks.
 
 | Scenario | VM | disk | total | ×300 |
 |---|---|---|---|---|
-| today: 4.0 h, n1-standard-8 | $0.32 | $0.83 | $1.15 | $345 |
-| downloader 4×: 1.0 h, same VM | $0.08 | $0.83 | $0.91 | **$273** |
-| …and oversize the disk to 742 GB | $0.08 | $1.95 | $2.03 | **$608** |
-| …instead, localize on a 2-vCPU node | $0.01 | $0.83 | $0.85 | **$254** |
+| today: 4.97 h, n1-standard-8 | $0.40 | $0.83 | $1.23 | $369 |
+| **measured: 1.62 h, same VM** | **$0.13** | **$0.83** | **$0.96** | **$288** |
+| …and oversize the disk to 742 GB | $0.13 | $1.95 | $2.08 | **$624** |
+| …instead, localize on a 2-vCPU node | $0.02 | $0.83 | $0.85 | **$255** |
+| hypothetical, at the disk's ceiling: 0.90 h | $0.07 | $0.83 | $0.90 | **$270** |
+
+Row 1 and row 2 are **measured** (§6.3): 4.97 h single-stream against 1.62 h at 16
+connections, both on the real 279 GiB BAM to a 316 GB pd-standard disk. The VM figures
+derive from the $0.08/h preemptible n1-standard-8 rate implied by the original table. Rows
+3–5 are arithmetic on those.
+
+The last row prices the ~35 minutes §6.3 leaves unexplained. **It is worth $18 per 300
+disks — about 6%.** That is the honest size of the prize §6.5c is chasing, and it is
+small enough that "report the 3.07× and move on" is a defensible answer if the cause turns
+out to be the source rather than our write path.
 
 **1. The disk is the larger line item, and the downloader cannot touch it.** At 48 h
-retention the disk costs $0.83 against $0.32 of VM time, and retention is set by reuse, not
-by how fast the disk was filled. The downloader's cost ceiling is the VM share — about 21%.
-It is still worth shipping; it is just not where most of the money is.
+retention the disk costs $0.83 against $0.40 of VM time, and retention is set by reuse, not
+by how fast the disk was filled. The downloader's cost ceiling is the VM share — about 33%
+of the per-disk total, of which the measured run captures $0.27 (**22% off the total**, $81
+per 300 disks). It is still worth shipping; it is just not where most of the money is.
 
 **2. Do not oversize the disk.** A disk exists for 48 h but is *written* for a few of them,
 so paying for gigabytes across the whole lifetime to save time in a small fraction of it
@@ -2254,23 +2490,32 @@ unlimited fan-out is what the rodisk exists for. Do not change the type.
 Record these in `update_localization.md` §13 whatever the outcome — a negative result here
 is as useful as a positive one, and more useful than an unmeasured assumption:
 
-| Question | Where it comes from |
-|---|---|
-| **pd-standard write/read at 316 GB** — the constraint everything else sits under | §4.1 `dd` |
-| **Is snapshot conversion viable, or arithmetically dead?** | §4.2 extrapolation |
-| Does a snapshot-restored disk read slower than a natively-written one? | §4.2 final `dd` vs §4.1 read |
-| `connections` default (currently 8) | §6.1 knee |
-| Source/NIC ceiling, independent of any disk | §6.1 peak throughput |
-| Disk or network as the limit | §6.2 plateau vs §6.1, and the reported peaks |
-| Speedup on the real 300 GB BAM vs. today's 4 h | §6.3 |
-| Memory bounded? | §6.1 peak RSS |
-| md5 correct from S3 and GDC | §6.4 |
-| Frontier or checkpoint on ext4? | §6.5 |
-| Punch-hole recovery correct? | §6.5 |
-| the bucket-compose route on real GCS, and its token source | §6.6 |
-| `/bin/sh` in the container | §3 probe |
-| Resume across a real preemption | §7 |
+| Question | Where it comes from | Answer |
+|---|---|---|
+| **pd-standard write/read at 316 GB** — the constraint everything else sits under | §4.1 `dd` | 92.3 MB/s write, 91.6 MB/s read; `peak disk write` 87.7–88.1 MiB/s across every sweep |
+| **Is snapshot conversion viable, or arithmetically dead?** | §4.2 extrapolation | not measured — left off the critical path |
+| Does a snapshot-restored disk read slower than a natively-written one? | §4.2 final `dd` vs §4.1 read | not measured |
+| `connections` default (currently 8) | §6.1 knee | **16.** No knee against the source (linear to the `MAX_CONNECTIONS` cap); 16 is where the *disk* saturates |
+| Source/NIC ceiling, independent of any disk | §6.1 peak throughput | 227–230 MiB/s to tmpfs; ~16 MiB/s per connection, so the cap is per-connection |
+| Disk or network as the limit | §6.2 plateau vs §6.1, and the reported peaks | the **disk**, at prefix size: 78.61 of 87.78 MiB/s = 90% |
+| Speedup on the real 300 GB BAM vs. today's 4 h | §6.3 | **4.97 h → 1.62 h = 3.07×**, under the ≥4× target |
+| Memory bounded? | §6.1 peak RSS | yes — 86.24 MiB on 279 GiB, 63.64 MiB on 4 GiB at the same connection count |
+| md5 correct from S3 and GDC | §6.4 | `hash ok` on the full 279 GiB BAM against a 9849-part ETag |
+| Frontier or checkpoint on ext4? | §6.5 | **frontier** — first time that path has run anywhere |
+| Punch-hole recovery correct? | §6.5 | yes — 111.8 MiB refetched after a 64 MiB hole, hash CORRECT, both before and after the writer change |
+| Resume overhead | §6.5 / §6.5a | 0.8% before the deferred writer, **2.2%** after; a broken frontier would show ~75% |
+| Does in-transfer hashing (#19) pay off? | §6.3 | yes, completely — `verify 0.0s` with a real ETag, ~52 min of read-back avoided |
+| HTTP vs the S3 API | §6.5b | 6.9% apart on the download phase; the presigned path wins but the transport is not the bottleneck |
+| Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c | **OPEN** — source-cold-range vs our own extent growth, not yet separated |
+| the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
+| `/bin/sh` in the container | §3 probe | dash |
+| Resume across a real preemption | §7 | not measured — needs a SLURM cluster, not a single node |
 
-Report the §6.3 number as **"4 h → X h on the real BAM"**, not as the sweep's internal
-speedup. The internal figure is measured against a single stream on the same hardware; the
-number that matters to anyone waiting on a pipeline is the one against today's behaviour.
+Report the §6.3 number as **"4.97 h → 1.62 h on the real BAM"**, not as the sweep's
+internal speedup. The internal figure is measured against a single stream on the same
+hardware; the number that matters to anyone waiting on a pipeline is the one against
+today's behaviour.
+
+And report the **3.07×** alongside it rather than §6.2's 4.92×. The larger figure is true
+of a 4 GiB prefix and not of the object anyone localizes, and the difference between them
+is the open question in §6.5c.
