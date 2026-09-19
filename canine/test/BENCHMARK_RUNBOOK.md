@@ -3260,20 +3260,42 @@ is why the command above does that rather than adding `rshared` to §3.
 Everything from an already-running node — §1–§6.5 done, container up on the old image,
 localization disk present. Nothing here tears the node down.
 
-#### 0. Re-establish the shell
+#### 0. Re-establish the shell — ask the node, do not type it
 
-A new SSH session has none of these. `$DISK` is only needed if you also re-run §6.3.
+A new SSH session has none of these. Nothing here needs to be remembered: the node knows
+its own identity, and `backend_zone()` reads the same metadata server in production.
 
 ```bash
 # on the node
-export PROJECT=<your project>
-export ZONE=<the node's zone>
-export NODE=pdl-bench
-export DISK=<your canine-bench-... disk>
-export REGION=${ZONE%-*}                 # buckets are regional; zone minus the suffix
+MD=http://metadata.google.internal/computeMetadata/v1
+mdget() { curl -s -H "Metadata-Flavor: Google" "$MD/$1"; }
+
+export NODE=$(mdget instance/name)
+ZONE_PATH=$(mdget instance/zone)         # projects/<number>/zones/<zone>
+export ZONE=${ZONE_PATH##*/}
+export PROJECT=$(mdget project/project-id)
+export PROJECT_NUMBER=$(mdget project/numeric-project-id)
+export REGION=${ZONE%-*}                 # buckets are regional; _zone_to_region() does this
 export FUSE_BUCKET=pdl-fuse-$(date +%s)  # the localization target, NOT §2's source bucket
-echo "$REGION / $FUSE_BUCKET"
+
+# the localization disk, by its GCE device name -- only needed if you re-run §6.3
+export DISK=$(ls /dev/disk/by-id/google-* 2>/dev/null \
+              | grep -v -- '-part[0-9]*$' | sed 's|.*/google-||' \
+              | grep -v '^persistent-disk-0$' | head -1)
+
+printf 'node=%s zone=%s region=%s project=%s (%s) disk=%s\n' \
+  "$NODE" "$ZONE" "$REGION" "$PROJECT" "$PROJECT_NUMBER" "${DISK:-none}"
 ```
+
+**Derive rather than type, because a wrong zone is silent here.** The bucket is regional;
+put it in the wrong region and every read crosses regions, a zonal Rapid Cache can never
+hit (§5b of `LOCALIZATION.md` — the cache is zonal, the bucket regional), and the numbers
+come back plausible and wrong. Asking the node removes the class of error entirely, and it
+is what `backend_zone()` falls back to anyway.
+
+`$PROJECT_NUMBER` is not used below, but it is what production's bucket names carry
+(`wolf-<project_number>-<region>-<hash>`), so having it makes a hand-made bucket
+comparable to a real one.
 
 Keep `$FUSE_BUCKET` distinct from §2's `$BUCKET`. That one holds the *source* test objects;
 this one is the destination under test, and the teardown below deletes it outright.
