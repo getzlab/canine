@@ -3255,6 +3255,189 @@ is why the command above does that rather than adding `rshared` to §3.
 
 ---
 
+### 6.6a Full sequence from an existing bench node
+
+Everything from an already-running node — §1–§6.5 done, container up on the old image,
+localization disk present. Nothing here tears the node down.
+
+#### 0. Re-establish the shell
+
+A new SSH session has none of these. `$DISK` is only needed if you also re-run §6.3.
+
+```bash
+# on the node
+export PROJECT=<your project>
+export ZONE=<the node's zone>
+export NODE=pdl-bench
+export DISK=<your canine-bench-... disk>
+export REGION=${ZONE%-*}                 # buckets are regional; zone minus the suffix
+export FUSE_BUCKET=pdl-fuse-$(date +%s)  # the localization target, NOT §2's source bucket
+echo "$REGION / $FUSE_BUCKET"
+```
+
+Keep `$FUSE_BUCKET` distinct from §2's `$BUCKET`. That one holds the *source* test objects;
+this one is the destination under test, and the teardown below deletes it outright.
+
+#### 1. Create the bucket
+
+Mirrors what `create_bucket_mount()` does (`LOCALIZATION.md` §3), including the two flags
+that are easy to omit and expensive to omit:
+
+```bash
+# on the node
+cat > /tmp/lifecycle.json <<'EOF'
+{"rule":[{"action":{"type":"Delete"},"condition":{"daysSinceCustomTime":1}}]}
+EOF
+
+gcloud storage buckets create "gs://$FUSE_BUCKET" \
+  --project "$PROJECT" \
+  --location="$REGION" \
+  --soft-delete-duration=0 \
+  --lifecycle-file=/tmp/lifecycle.json
+
+gcloud storage buckets describe "gs://$FUSE_BUCKET" \
+  --format='value(name,location,soft_delete_policy)'
+```
+
+`--soft-delete-duration=0` matters more here than in production: new buckets otherwise
+retain **and bill** deleted objects for 7 days, so a 279 GiB benchmark you delete today
+keeps charging until next week. `--lifecycle-file` is a backstop for the same reason.
+
+**No Rapid Cache yet.** The uncached bucket is the baseline (§13.48); the cache is step 5
+and has to be provisioned by hand on this bucket, because
+`get_or_create_rapid_cache()` targets the workflow bucket instead.
+
+#### 2. Update the container
+
+Full detail in §3a. From a running node:
+
+```bash
+# on the node
+sudo docker exec slurm sh -c 'gcsfuse --version 2>/dev/null || echo NO GCSFUSE'
+```
+
+If that says `NO GCSFUSE`, restart on an image that has it, or install in place — §3a has
+both. The container is `--rm`, so after restarting you must redo §3's script copy and, if
+you want §6.3 again, §4's disk mount. The disk itself survives.
+
+```bash
+# on the node -- after the container is back
+sudo docker exec slurm mkdir -p /tmp/pdl
+sudo docker cp /tmp/benchmark_localization.py slurm:/tmp/pdl/
+sudo docker cp /tmp/parallel_download.py      slurm:/tmp/pdl/
+pdl() { sudo docker exec slurm python3 /tmp/pdl/benchmark_localization.py "$@"; }
+
+sudo docker exec slurm sh -c 'gcsfuse --version; ls /tmp/pdl'
+```
+
+Re-copy the scripts from your workstation first if `/tmp/*.py` on the node is stale — the
+downloader has changed since the last run (16-connection default, `k9pdl-io`).
+
+#### 3. Mount the bucket read-write
+
+This is the mount `kind == "mount"` uploads use, at the path `LOCALIZATION.md` §4c gives
+it. Read-write, and inside the container:
+
+```bash
+# on the node
+sudo docker exec slurm bash -c '
+  export GOOGLE_APPLICATION_CREDENTIALS=/root/.config/gcloud/application_default_credentials.json
+  [ -f "$GOOGLE_APPLICATION_CREDENTIALS" ] || { echo "no ADC -- redo §2"; exit 1; }
+  mkdir -p /mnt/localize/'"$FUSE_BUCKET"'
+  mountpoint -q /mnt/localize/'"$FUSE_BUCKET"' || \
+    gcsfuse --implicit-dirs '"$FUSE_BUCKET"' /mnt/localize/'"$FUSE_BUCKET"'
+  mount | grep '"$FUSE_BUCKET"'
+  touch /mnt/localize/'"$FUSE_BUCKET"'/.writable && echo "RW ok"'
+```
+
+`gcsfuse` resolves credentials via ADC and ignores `CLOUDSDK_CONFIG`, so that export is
+load-bearing: without it the identity silently becomes the metadata server's service
+account, which may have different bucket permissions than the one production uses.
+
+#### 4. Steps 1–2: does the route gate fire? (small input, minutes)
+
+The one that has to pass before any throughput number means anything. Use a **small**
+object — this is a correctness check, and 279 GiB proves nothing extra.
+
+```bash
+# on the node
+pdl routeb --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
+           --gs-url "gs://$FUSE_BUCKET/route-check.bin" \
+           --mount-dir "/mnt/localize/$FUSE_BUCKET" \
+           --json /tmp/routeb.json
+```
+
+Read the stderr it echoes for the chosen route:
+
+* **`bucket-compose`** → the gate fired. Proceed.
+* **`stage-publish`** → `gs_url_for` could not resolve a bucket from `/proc/mounts`, and
+  the transfer is staging onto the **25 GB boot disk**. Stop: at full size that is an
+  ENOSPC, and it is the exact failure §13.48 exists to catch. Capture
+  `sudo docker exec slurm cat /proc/mounts | grep fuse` and stop there.
+* **`in-place`** → the destination was not seen as FUSE at all. Same: stop.
+
+Then confirm what landed, which is step 2:
+
+```bash
+# on the node
+gcloud storage ls -L "gs://$FUSE_BUCKET/route-check.bin" | grep -iE "custom.?time|size"
+gcloud storage ls "gs://$FUSE_BUCKET/**" | head
+```
+
+`customTime` must be present. Without it the object is invisible to the lifecycle rule and
+never expires — `LOCALIZATION.md` §3. On this route the downloader writes via the API
+rather than through the mount, so the produce script's post-unmount stamping is the thing
+being checked.
+
+#### 5. Step 4: throughput, uncached, at size
+
+```bash
+# on the node
+pdl sweep --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --dest-dir "/mnt/localize/$FUSE_BUCKET" \
+          --connections 16 \
+          --keep \
+          --json /tmp/fuse-300g.json
+```
+
+`--keep` because §6.3 taught that lesson the expensive way: without it the sweep deletes
+its own artifact and a follow-up measurement costs another full transfer.
+
+Run the §6.5i ladder against the mount as well if the number looks too good — a cached or
+burst-prone destination shows the same shape a `pd-standard` did, and two consecutive
+stages agreeing is still the bar.
+
+#### 6. Step §6.7: size the timeout
+
+```bash
+# on the node
+pdl claim --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
+          --s3-endpoint-url "$S3_ENDPOINT" \
+          --gs-url "gs://$FUSE_BUCKET/claim-test.bam" \
+          --mount-dir "/mnt/localize/$FUSE_BUCKET" \
+          --repeat 3 \
+          --inputs-per-localization <largest real input count> \
+          --json /tmp/claim.json
+```
+
+#### 7. Tear down the bucket
+
+The node can stay. The bucket should not — 279 GiB of objects bills whether or not anyone
+reads them.
+
+```bash
+# on the node
+sudo docker exec slurm sh -c 'fusermount -u /mnt/localize/'"$FUSE_BUCKET"' || :'
+gcloud storage rm -r "gs://$FUSE_BUCKET" --project "$PROJECT"
+gcloud storage buckets list --project "$PROJECT" --filter="name~pdl-fuse-"
+```
+
+That last line is the one worth running twice: a bucket named with a timestamp is easy to
+lose track of, and this is the only thing that finds the ones from earlier attempts.
+
+---
+
 ### 6.7 Size `bucket_upload_wait_tries` — should the timeout go back to 1 hour?
 
 The default was raised 60 → 180 (1 h → 3 h) in `update_localization.md` §13.49, on risk
