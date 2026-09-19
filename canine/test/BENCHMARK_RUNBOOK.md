@@ -1522,9 +1522,15 @@ result.
 
 The deferred manifest writer then moved this row from 66.49 to 78.59 MiB/s (**+18.2%**) and
 flipped the verdict from `MOSTLY disk-bound` to `the DISK is the limit: sustained writes are
-within 10% of the device's peak`. At 78.61 of 87.78 MiB/s the destination is **90%**
-saturated, so at this extent the answer is settled: the disk is the ceiling, 16 connections
-reach it, and more would only buy idle sockets.
+within 10% of the device's peak`.
+
+**Do not trust that 90% figure, and do not trust these rows as disk measurements at all.**
+§6.5d established that a 4 GiB write on a 28 GB-RAM node largely lands in page cache and
+the process exits before writeback completes — the full-size run's first two heartbeat
+intervals absorb 32.5 and 27.6 GB before settling. So these rows measure memory as much as
+the device, and the sustained rate is §6.3's 49 MiB/s. The *relative* comparison between
+rows is still sound, because every row is contaminated identically; the absolute numbers
+and the "% of device" are not.
 
 Hold that conclusion to *this extent*. §6.3 runs the same configuration at 279 GiB and gets
 56% of the same device.
@@ -2347,6 +2353,87 @@ Note this measures `dd`'s sequential-per-chunk writes, not the downloader's inte
 ones, so it is a **lower bound** on the effect: sixteen workers writing concurrently at
 scattered offsets can only fragment more than one process writing 64 MiB at a time.
 
+#### Measured — and the premise of §6.5c/§6.5d was wrong
+
+```
+apparent   4GiB: 54s for 4 GiB out of order   5 extents
+apparent 279GiB: 49s for 4 GiB out of order   5 extents
+```
+
+**Read the first arm's stride before reading anything else.** `4 * 1024 / 64` is 64 MiB,
+exactly the write size, so that arm tiled `0..4096 MiB` with no gaps — it wrote
+contiguously in descending order, which ext4 coalesces. It is a control, not an arm, and
+5 extents is the correct answer for it.
+
+The second arm did scatter, and `filefrag -v` proves it: 4464 MiB logical stride, 64 MiB
+writes, `du` 279G apparent against 4.1G allocated. "5 extents" is `filefrag` counting
+**physical fragments**, not logical islands — the physical offsets run contiguously
+(`50651136`, `50667520`, `50683904`, …), so ext4 packed all 64 logically-scattered islands
+into one packed physical run. Logical scatter costs nothing here: 84 MiB/s against the
+control's 76.
+
+**But the whole line of inquiry rested on a degradation that does not exist.** The
+full-size run's own heartbeat, in the output already pasted into this runbook, gives the
+bytes between successive progress lines:
+
+```
+32.5  27.6  18.5 | 14.0 13.9 14.1 13.8 13.9 13.9 14.0 13.8 13.8 13.9 14.0 14.0 13.9 14.0 13.9   GB
+```
+
+**Flat to 1.7% across the last fifteen intervals — the last ~85% of a 97-minute run.**
+Disk fullness and extent-tree depth both grow monotonically; neither can produce a flat
+rate. Both are eliminated, for free, by data collected before either hypothesis existed.
+
+And the first three intervals are the explanation for everything else: **32.5 + 27.6 GB
+absorbed before writeback caught up, on a node with 28 GB of RAM.** A 4 GiB prefix run
+never leaves that regime — the file fits in page cache several times over and the process
+exits before the disk has seen most of it. So:
+
+* **The prefix runs' 75–80 MiB/s is not a disk rate**, and §6.2's "90% of the device" is
+  an artifact of measuring memory. `dd conv=fdatasync` in §4.1 forces the flush and is
+  honest; the sweep does not, and cannot, because the downloader's job ends at `close()`.
+* **There was never a 4 GiB-vs-279 GiB degradation to explain.** There is one cache-
+  assisted short measurement and one true sustained measurement, which were never
+  comparable. §6.5c's source test was still worth its two minutes — it independently
+  confirmed 240 MiB/s of source headroom — but the question it was built to answer was
+  malformed.
+
+#### §6.5e The only question left: what does this disk do under *our* write pattern?
+
+49 MiB/s sustained is the real number. §4.1's 92.3 MB/s is **one sequential writer with
+`conv=fdatasync`**; the downloader is sixteen concurrent writers at scattered offsets with
+a periodic full-file `fsync` underneath. §4.1a already found this disk losing throughput
+to concurrency on *reads* — 86/85/76/62 MiB/s at 1/2/4/8 — so the pattern is the obvious
+suspect and it has never been measured for writes.
+
+```bash
+sudo docker exec slurm sh -c '
+  D=/mnt/rwdisks/'"$DISK"'
+  START=$(date +%s); i=0
+  while [ $i -lt 16 ]; do
+    dd if=/dev/zero of=$D/conc.$i.bin bs=1M count=1024 conv=fdatasync 2>/dev/null &
+    i=$((i + 1))
+  done
+  wait
+  echo "16 concurrent writers: $(( $(date +%s) - START ))s for 16 GiB"
+  rm -f $D/conc.*.bin
+  START=$(date +%s)
+  dd if=/dev/zero of=$D/seq.bin bs=1M count=16384 conv=fdatasync 2>/dev/null
+  echo "1 sequential writer  : $(( $(date +%s) - START ))s for 16 GiB"
+  rm -f $D/seq.bin'
+```
+
+`conv=fdatasync` on both arms, so neither can hide in page cache. 16 GiB each, ~6 minutes
+total, no network.
+
+* **Concurrent ≈ 49 MiB/s, sequential ≈ 88** → the disk simply is this slow under our
+  access pattern, nothing in the download path is broken, and 1.62 h is the honest answer
+  for pd-standard. The lever is the disk type or fewer, larger sequential writes — a
+  design change with its own resume cost, not a bug fix.
+* **Both ≈ 88** → the disk handles our pattern fine and the loss is inside the downloader
+  after all, with the periodic full-file `fsync` as the remaining suspect: it is the one
+  thing `dd` does not reproduce.
+
 Pair it with the destination in isolation, on the disk in its current state:
 
 ```bash
@@ -2612,7 +2699,8 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 | Resume overhead | §6.5 / §6.5a | 0.8% before the deferred writer, **2.2%** after; a broken frontier would show ~75% |
 | Does in-transfer hashing (#19) pay off? | §6.3 | yes, completely — `verify 0.0s` with a real ETag, ~52 min of read-back avoided |
 | HTTP vs the S3 API | §6.5b | 6.9% apart on the download phase; the presigned path wins but the transport is not the bottleneck |
-| Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **narrowed to our write path.** The source does ~240 MiB/s at any depth (§6.5c), 2.6× the disk; ENOSPC ruled out. Extent depth vs disk fullness vs frontier scan still to separate (§6.5d) |
+| Why full size runs at 56% of the device when 4 GiB runs at 90% | §6.5c / §6.5d | **the question was malformed.** The 4 GiB rows measure page cache (28 GB RAM), so 90% is an artifact; the full-size run's throughput is **flat to 1.7%** across 85% of its duration, which eliminates fullness and extent growth outright. Source, ENOSPC and logical scatter all separately eliminated |
+| Is 49 MiB/s sustained a defect or just this disk under our access pattern? | §6.5e | **OPEN** — §4.1's 92.3 MB/s is one sequential writer; sixteen concurrent scattered writers has never been measured. §4.1a found concurrency hurting *reads* on this disk |
 | Source ceiling with no disk in the path at all | §6.5c | 227–256 MiB/s to `/dev/null`, head and 250 GiB deep alike — agrees with §6.1's tmpfs figure by a different route |
 | the bucket-compose route on real GCS, and its token source | §6.6 | not measured — `gcsfuse` absent from the image |
 | `/bin/sh` in the container | §3 probe | dash |
