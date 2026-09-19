@@ -3240,13 +3240,33 @@ pdl routeb --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
            --json /tmp/routeb.json
 ```
 
-**Read the token source line carefully, because this is where the mock node can diverge
-from production.** A real worker authenticates with user credentials copied from NFS by
-`docker_copy_gcloud_credentials.sh`, so it takes the `gcloud` path. With §3's credentials
-mount in place, `gcloud` should work here too — that is what the mount is for. If it
-reports the **metadata server** instead, the mount is missing or unreadable and you are
-exercising the compute service account rather than the identity production uses, which may
-have different bucket permissions.
+**`token source : metadata server` is expected, and this line used to be read backwards.**
+It once said that metadata meant the credentials mount was missing. It does not: both the
+benchmark and `GcsClient._fetch_token` try the metadata server **first** and only fall
+back to `gcloud`, so on any GCE node metadata always wins. The line reports that you are
+on GCE, and can never say `gcloud fallback` there — it is not a diagnostic of which
+credentials are mounted.
+
+**What it does tell you is which identity writes to the destination bucket: the node's
+compute service account, not you.** That is a real divergence to plan for rather than
+detect afterwards. A bucket you created with your own `gcloud` is not necessarily readable
+or writable by that SA, and the failure arrives as a 403 during upload — after the source
+probe has already passed, so it looks like a bucket problem rather than an identity one.
+Grant it up front:
+
+```bash
+# on the node
+SA=$(curl -s -H "Metadata-Flavor: Google" \
+  http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email)
+echo "the downloader will write as: $SA"
+
+gcloud storage buckets add-iam-policy-binding "gs://$FUSE_BUCKET" \
+  --member="serviceAccount:$SA" --role=roles/storage.objectAdmin --project "$PROJECT"
+```
+
+`objectAdmin` rather than `objectCreator`: the route composes parts and then **deletes**
+them, and a creator-only SA leaves every part behind at full size — 279 GiB of silent
+extra storage on top of the object.
 
 **`gcsfuse` is not in the image on `wolf-2.0-update`**, and neither is `rclone` — its
 Dockerfile install is commented out, though `conf/rclone.conf` ships. Only `fuse-overlayfs`
@@ -3409,13 +3429,26 @@ account, which may have different bucket permissions than the one production use
 The one that has to pass before any throughput number means anything. Use a **small**
 object — this is a correctness check, and 279 GiB proves nothing extra.
 
+The §2 objects are in a **private** bucket over plain `https`, so the source needs an auth
+header exactly as §6.1 says — without it every run dies in under a second with
+`permanent failure probing the object: probe failed with HTTP 403`, which is a *source*
+failure and reads like a destination one:
+
 ```bash
-# on the node
+# on the node -- tokens last about an hour, so mint it right before the run
+export GCS_AUTH="Authorization: Bearer $(gcloud auth print-access-token)"
+
 pdl routeb --url "$URL_12G" --size $SIZE_12G --md5 "$MD5_12G" \
+           --header "$GCS_AUTH" \
            --gs-url "gs://$FUSE_BUCKET/route-check.bin" \
            --mount-dir "/mnt/localize/$FUSE_BUCKET" \
            --json /tmp/routeb.json
 ```
+
+Note the two identities in play, which is why a 403 needs reading carefully: `--header`
+carries **your** token to the *source*, while the destination is written with the **node's
+compute SA** (see the token-source note in §6.6). A 403 on the probe is the source; a 403
+during upload is the SA binding above.
 
 Read the stderr it echoes for the chosen route:
 
