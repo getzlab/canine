@@ -1459,3 +1459,139 @@ class TestTheADCLabelIsHonest:
         monkeypatch.setattr(pdl.os.path, "expanduser", lambda p: "/nonexistent-home")
 
         assert pdl.GcsClient.adc_file() is None
+
+
+# ---------------------------------------------------------------------------
+# multipart ETag verification on the bucket route
+# ---------------------------------------------------------------------------
+
+class TestBucketRouteVerifiesAMultipartETag:
+    """
+    This route used to refuse ETag sources outright -- `EXIT_FAIL`, "ETag verification
+    is not available for a composed object" -- which meant the real workload could not
+    be localized to a bucket at all. A 279 GiB S3 object has a multipart ETag and no
+    whole-file md5, so it would transfer for hours and then fail at compose.
+
+    `verify()` could not be reused: it takes a local file path and re-reads it, and the
+    whole point of this route is that no bytes touch local disk. So the digests are
+    accumulated in flight instead, the same way #19 does on the in-place route, and
+    assembled afterwards.
+
+    Note what the ETag alone does and does not prove. It establishes that the bytes
+    *relayed* match the source; that GCS stored those bytes is a separate check, run
+    before compose, comparing each part's recorded md5 to what GCS reports. The pair is
+    what removes the read-back -- which is why these tests also pin that a corrupted
+    upload is still caught.
+    """
+
+    PART = MIB          # pretend S3 part length
+    CHUNK = 2 * MIB     # a chunk spans two parts, as it does in production
+
+    @staticmethod
+    def expected_etag(payload, part_length):
+        parts = [payload[i:i + part_length]
+                 for i in range(0, len(payload), part_length)]
+        joined = b"".join(hashlib.md5(p).digest() for p in parts)
+        return "{}-{}".format(hashlib.md5(joined).hexdigest(), len(parts))
+
+    def run(self, tmp_path, monkeypatch, gcs, payload, etag=None, **overrides):
+        force_bucket_route(monkeypatch)
+        with Server(payload) as source:
+            return pdl.run(options_for(
+                str(tmp_path / "sample.bam"), source.url(), len(payload),
+                check_etag=etag or self.expected_etag(payload, self.PART),
+                part_length=self.PART, min_chunk=self.CHUNK, **overrides))
+
+    def test_a_multipart_etag_source_now_succeeds(self, tmp_path, monkeypatch, gcs,
+                                                  payload, payload_md5):
+        rc = self.run(tmp_path, monkeypatch, gcs, payload)
+        assert rc == pdl.EXIT_OK
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+
+    def test_it_reads_nothing_back_on_the_happy_path(self, tmp_path, monkeypatch, gcs,
+                                                     payload, capsys):
+        """
+        The entire reason for hashing in flight. A read-back of the composed object
+        would be a second full transfer of it -- measured at 62% of the wall clock on
+        the md5 path (§6.6a), which is what this avoids.
+        """
+        self.run(tmp_path, monkeypatch, gcs, payload)
+        err = capsys.readouterr().err
+        assert "0 re-read" in err, err.splitlines()[-1] if err else "(no output)"
+
+    def test_a_wrong_etag_fails_rather_than_passing(self, tmp_path, monkeypatch, gcs,
+                                                    payload):
+        bogus = "{}-{}".format("0" * 32, 7)
+        rc = self.run(tmp_path, monkeypatch, gcs, payload, etag=bogus)
+        assert rc == pdl.EXIT_FAIL
+
+    def test_the_short_final_part_is_handled(self, tmp_path, monkeypatch, gcs):
+        """The payload is deliberately not a multiple of the part length."""
+        odd = os.urandom(3 * MIB + 7919)
+        rc = self.run(tmp_path, monkeypatch, gcs, odd)
+        assert rc == pdl.EXIT_OK
+        assert gcs.state.objects[OBJECT] == odd
+
+    def test_the_digests_are_per_s3_part_not_per_chunk(self, tmp_path, monkeypatch,
+                                                       gcs, payload):
+        """
+        The keyspace trap, asserted directly. A chunk is one uploaded GCS part but
+        TWO S3 parts here, so an implementation that recorded one digest per chunk
+        would assemble an ETag with half the part count -- and would still look like a
+        working ETag. Verifying against a chunk-length ETag must therefore FAIL.
+        """
+        chunk_etag = self.expected_etag(payload, self.CHUNK)
+        part_etag = self.expected_etag(payload, self.PART)
+        assert chunk_etag != part_etag, "the fixture must distinguish the two"
+
+        assert self.run(tmp_path, monkeypatch, gcs, payload,
+                        etag=chunk_etag) == pdl.EXIT_FAIL
+        assert self.run(tmp_path, monkeypatch, gcs, payload,
+                        etag=part_etag) == pdl.EXIT_OK
+
+    def test_an_etag_without_a_part_length_is_refused_not_assumed(
+            self, tmp_path, monkeypatch, gcs, payload):
+        """An opaque ETag is not an md5-of-md5s; there is nothing to reproduce."""
+        force_bucket_route(monkeypatch)
+        with Server(payload) as source:
+            rc = pdl.run(options_for(
+                str(tmp_path / "sample.bam"), source.url(), len(payload),
+                check_etag="opaque-not-a-digest"))
+        assert rc == pdl.EXIT_FAIL
+
+    def test_digests_survive_a_preemption_and_only_the_gap_is_re_read(
+            self, tmp_path, monkeypatch, gcs, payload):
+        """
+        Resume is the case the per-part fallback exists for. Digests recorded before
+        the interruption must persist in the manifest, the parts straddling the resume
+        point were never seen from byte zero so they are deliberately unrecorded, and
+        those -- and only those -- are read back.
+
+        All-or-nothing fallback would turn one preemption into a full re-download of a
+        279 GiB object, which is the cost this whole mechanism exists to avoid.
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        etag = self.expected_etag(payload, self.PART)
+
+        with Server(payload) as source:
+            gcs.state.uploads_seen = 0
+            gcs.state.fail_uploads_after = 4
+            try:
+                first = pdl.run(options_for(
+                    dest, source.url(), len(payload), check_etag=etag,
+                    part_length=self.PART, min_chunk=self.CHUNK, retries=0))
+            finally:
+                gcs.state.fail_uploads_after = None
+            assert first != pdl.EXIT_OK, "the run was supposed to be interrupted"
+
+            recorded = (read_manifest(gcs) or {}).get("part_md5", {})
+            assert recorded, "no part digests survived the interruption"
+
+            rc = pdl.run(options_for(
+                dest, source.url(), len(payload), check_etag=etag,
+                part_length=self.PART, min_chunk=self.CHUNK))
+
+        assert rc == pdl.EXIT_OK
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == \
+            hashlib.md5(payload).hexdigest()

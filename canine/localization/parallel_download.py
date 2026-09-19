@@ -1775,56 +1775,33 @@ class _AlreadyDone:
 CHUNK_ALREADY_DONE = _AlreadyDone()
 
 
-class PosixChunkSink:
+class PartHashingSink:
     """
-    Writes chunks in place into the sparse destination file (the in-place route).
+    In-flight md5s of the S3 parts a multipart ETag is built from.
 
-    Durable progress comes from the file's own extents, so there is nothing to keep in
-    sync -- see the module docstring.
+    Shared by both sinks that can produce one, because the rule below is subtle enough
+    that a second copy would drift: **a part is hashed only if this process saw it from
+    its first byte onward, contiguously.** Anything else is left unrecorded rather than
+    recorded wrong -- after a preemption the resumed chunk starts mid-part, and a digest
+    over the tail of a part is not a digest of the part.
+
+    That conservatism is what makes the recorded digests safe to trust without
+    re-reading: an unrecorded part costs one 29 MiB read, a wrongly recorded one costs a
+    corrupt object that verifies.
+
+    Chunk starts are always multiples of part_length (plan_chunks guarantees it) and a
+    chunk spans a whole number of parts except possibly the last, so a buffer maps onto
+    a contiguous run of parts with no partial-part bookkeeping beyond the object's tail.
+
+    Subclasses provide `part_length`, `size`, and call `_init_part_hashing()`.
     """
 
-    needs_local_file = True
-
-    # 1 MiB balances memory against write granularity; pwrite is durable as soon as the
-    # filesystem commits, so there is no un-acknowledged window to bound.
-    read_block = READ_BLOCK
-
-    def __init__(self, fd, manifest, chunks, dest, part_length=None, size=None):
-        self.fd = fd
-        self.manifest = manifest
-        self.chunks = chunks
-        self.dest = dest
-        # S3 part length, when the caller wants a multipart ETag. Hashing as the bytes
-        # go past removes the full read-back verify() would otherwise perform -- which
-        # measures as long as the download itself on a persistent disk.
+    def _init_part_hashing(self, part_length, size):
         self.part_length = part_length
         self.size = size
-        self._parts = {}          # part index -> {"md5": ..., "next": expected offset}
-        self._pending = {}        # chunk index -> {part index: hex} awaiting commit
+        self._parts = {}      # part index -> {"md5": ..., "next": expected offset}
+        self._pending = {}    # chunk index -> {part index: hex} awaiting commit
         self._parts_lock = threading.Lock()
-        self.use_checkpoints = not manifest.state.get("seek_hole", True)
-        self.checkpoint_interval = (
-            manifest.state.get("checkpoint_interval") or FALLBACK_CHECKPOINT_INTERVAL
-        )
-        self._last_checkpoint = {}
-
-    def resume_offset(self, index):
-        start, end = self.chunks[index]
-        if self.manifest.is_complete(index):
-            return end
-        if self.use_checkpoints:
-            recorded = self.manifest.checkpoint_offset(index)
-            offset = min(max(start, recorded), end)
-        else:
-            offset = chunk_frontier(self.fd, start, end)
-            # a frontier must be monotonic and within the chunk; anything else means the
-            # derivation cannot be trusted, so rewind to the chunk start
-            if not start <= offset <= end:
-                log("chunk {}: implausible frontier {}, restarting chunk".format(
-                    index, offset))
-                offset = start
-        self._last_checkpoint[index] = offset
-        return offset
 
     def _part_bounds(self, part_index):
         start = part_index * self.part_length
@@ -1832,19 +1809,7 @@ class PosixChunkSink:
         return start, end
 
     def _hash(self, chunk_index, offset, buf):
-        """
-        Fold `buf` into the md5 of each S3 part it covers.
-
-        Chunk starts are always multiples of part_length (plan_chunks guarantees it), and
-        a chunk is a whole number of parts except possibly the last -- so a buffer maps
-        onto a contiguous run of parts with no partial-part bookkeeping at the edges
-        beyond the file's own tail.
-
-        A part is only hashed if this process saw it from its first byte onward,
-        contiguously. After a preemption the resumed chunk starts mid-way, so the parts
-        straddling that point were never seen whole and are simply left unrecorded --
-        verify() re-reads exactly those.
-        """
+        """Fold `buf` into the md5 of each S3 part it covers."""
         view = memoryview(buf)
         with self._parts_lock:
             while view:
@@ -1872,6 +1837,61 @@ class PosixChunkSink:
 
                 view = view[take:]
                 offset += take
+
+    def take_part_digests(self, index):
+        """Detach this chunk's finished part digests, on the worker that finished it."""
+        if self.part_length:
+            with self._parts_lock:
+                return self._pending.pop(index, None) or {}
+        return {}
+
+
+class PosixChunkSink(PartHashingSink):
+    """
+    Writes chunks in place into the sparse destination file (the in-place route).
+
+    Durable progress comes from the file's own extents, so there is nothing to keep in
+    sync -- see the module docstring.
+    """
+
+    needs_local_file = True
+
+    # 1 MiB balances memory against write granularity; pwrite is durable as soon as the
+    # filesystem commits, so there is no un-acknowledged window to bound.
+    read_block = READ_BLOCK
+
+    def __init__(self, fd, manifest, chunks, dest, part_length=None, size=None):
+        self.fd = fd
+        self.manifest = manifest
+        self.chunks = chunks
+        self.dest = dest
+        # S3 part length, when the caller wants a multipart ETag. Hashing as the bytes
+        # go past removes the full read-back verify() would otherwise perform -- which
+        # measures as long as the download itself on a persistent disk.
+        self._init_part_hashing(part_length, size)
+        self.use_checkpoints = not manifest.state.get("seek_hole", True)
+        self.checkpoint_interval = (
+            manifest.state.get("checkpoint_interval") or FALLBACK_CHECKPOINT_INTERVAL
+        )
+        self._last_checkpoint = {}
+
+    def resume_offset(self, index):
+        start, end = self.chunks[index]
+        if self.manifest.is_complete(index):
+            return end
+        if self.use_checkpoints:
+            recorded = self.manifest.checkpoint_offset(index)
+            offset = min(max(start, recorded), end)
+        else:
+            offset = chunk_frontier(self.fd, start, end)
+            # a frontier must be monotonic and within the chunk; anything else means the
+            # derivation cannot be trusted, so rewind to the chunk start
+            if not start <= offset <= end:
+                log("chunk {}: implausible frontier {}, restarting chunk".format(
+                    index, offset))
+                offset = start
+        self._last_checkpoint[index] = offset
+        return offset
 
     def write(self, index, offset, buf):
         if self.part_length:
@@ -1903,10 +1923,7 @@ class PosixChunkSink:
         _pending at the moment the chunk's last byte was written -- which is what makes it
         safe for a later, batched fsync to cover them. Does no I/O and cannot raise.
         """
-        if self.part_length:
-            with self._parts_lock:
-                return self._pending.pop(index, None) or {}
-        return {}
+        return self.take_part_digests(index)
 
     def commit(self, batch):
         """
@@ -1932,7 +1949,7 @@ class PosixChunkSink:
         os.fsync(self.fd)
 
 
-class BucketChunkSink:
+class BucketChunkSink(PartHashingSink):
     """
     Uploads each chunk as its own GCS object through a resumable upload session, then
     composes them server-side (the bucket-compose route).
@@ -1959,7 +1976,8 @@ class BucketChunkSink:
     # in-flight part. A bigger block would trade that guarantee for fewer requests.
     read_block = GCS_UPLOAD_GRANULARITY
 
-    def __init__(self, client, bucket, parts_prefix, manifest, chunks):
+    def __init__(self, client, bucket, parts_prefix, manifest, chunks,
+                 part_length=None, size=None):
         self.client = client
         self.bucket = bucket
         self.parts_prefix = parts_prefix
@@ -1968,6 +1986,11 @@ class BucketChunkSink:
         self._digests = {}
         self._completed = set()
         self._lock = threading.Lock()
+        # Two independent digest keyspaces, and conflating them is the trap: `_digests`
+        # above is per CHUNK (one chunk is one uploaded GCS part, checked against what
+        # GCS stored before compose), while the mixin's is per S3 PART of the *source*,
+        # which is what a multipart ETag is built from. A chunk spans several S3 parts.
+        self._init_part_hashing(part_length, size)
 
     def part_name(self, index):
         return "{}/{:05d}".format(self.parts_prefix, index)
@@ -2035,6 +2058,9 @@ class BucketChunkSink:
                 else:
                     self._digests[index] = False   # no longer contiguous
 
+        if self.part_length:
+            self._hash(index, offset, buf)
+
         metadata, committed = self.client.upload_range(
             session, buf, offset - start, end - start
         )
@@ -2075,12 +2101,24 @@ class BucketChunkSink:
                 "part {} sent all its bytes but the upload session did not "
                 "complete".format(index)
             )
-        return self.part_digest(index)
+        # (chunk digest, S3-part digests). Opaque to the Downloader, which only passes
+        # whatever chunk_ready returns straight back into commit -- the two sinks
+        # already return different shapes.
+        return (self.part_digest(index), self.take_part_digests(index))
 
     def commit(self, batch):
-        digests = {index: digest for index, digest in batch if digest}
+        digests = {}
+        part_md5s = {}
+        for index, state in batch:
+            chunk_digest, parts = state if isinstance(state, tuple) else (state, {})
+            if chunk_digest:
+                digests[index] = chunk_digest
+            part_md5s.update(parts)
         self.manifest.record_chunks_done(
             [index for index, _ in batch], None, chunk_digests=digests)
+        # Separate write, because record_chunks_done owns the chunk keyspace. Both land
+        # in the same manifest object; on this route there is no data fd to fsync first.
+        self.manifest.record_part_md5s(part_md5s, None)
 
     def chunk_done(self, index):
         state = self.chunk_ready(index)
@@ -2767,6 +2805,55 @@ def gcs_object_md5(metadata):
         return None
 
 
+def multipart_etag_from_gcs(client, bucket, name, part_length, size, manifest):
+    """
+    The source's multipart ETag, from digests recorded as the bytes were relayed.
+
+    The bucket-compose route has no local file to re-read -- the VM is a pure relay --
+    so the in-place route's `verify()` cannot be reused here. What can be reused is the
+    reason it is cheap: every S3 part's md5 was computed in flight and persisted to the
+    manifest, so on the happy path this reads nothing and issues no GET at all.
+
+    Parts that were not recorded -- the ones straddling a preemption's resume point --
+    are read back individually from the composed object. Per part, not all-or-nothing:
+    after one preemption that is a handful of 29 MiB ranged reads instead of a 279 GiB
+    download.
+
+    This does NOT stand alone as proof the object is correct. It establishes that the
+    bytes *relayed* match the source's ETag; that those bytes are what GCS actually
+    stored is established separately, before compose, by comparing each part's recorded
+    md5 against the md5 GCS reports for the uploaded object. Both checks together are
+    what make the read-back unnecessary -- which is why the pre-compose check must not
+    be skipped when a digest happens to be missing.
+    """
+    if size == 0:
+        return None, 0
+    n_parts = (size + part_length - 1) // part_length
+
+    digests = [None] * n_parts
+    reread = 0
+    for index in range(n_parts):
+        recorded = manifest.part_md5(index) if manifest is not None else None
+        if recorded:
+            try:
+                digests[index] = binascii.unhexlify(recorded)
+                continue
+            except (binascii.Error, ValueError):
+                pass
+        start = index * part_length
+        end = min(start + part_length, size)
+        payload = client.download_range(bucket, name, start, end)
+        if len(payload) != end - start:
+            raise TransientError(
+                "short read hashing part {} of {}: {} of {} bytes".format(
+                    index, name, len(payload), end - start))
+        digests[index] = hashlib.md5(payload).digest()
+        reread += 1
+
+    return "{}-{}".format(
+        hashlib.md5(b"".join(digests)).hexdigest(), n_parts), reread
+
+
 def verify_bucket_object(client, bucket, name, size, options, block=READ_BUFFER):
     """
     Verify a composed object against the source's declared hash by reading it back.
@@ -2833,7 +2920,9 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
         log("resuming: {}/{} parts already complete".format(
             sum(1 for i in range(len(chunks)) if manifest.is_complete(i)), len(chunks)))
 
-    sink = BucketChunkSink(client, bucket, parts_prefix, manifest, chunks)
+    sink = BucketChunkSink(
+        client, bucket, parts_prefix, manifest, chunks,
+        part_length=options.part_length if options.check_etag else None, size=size)
     downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
 
     try:
@@ -2888,9 +2977,21 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
             client.delete_object(bucket, object_name)
             manifest.unlink()
             return EXIT_FAIL
+    elif options.check_etag and options.part_length:
+        actual, reread = multipart_etag_from_gcs(
+            client, bucket, object_name, options.part_length, size, manifest)
+        log("etag from {} recorded part digests, {} re-read".format(
+            (size + options.part_length - 1) // options.part_length - reread, reread))
+        expected = options.check_etag.strip().strip('"')
+        if actual != expected:
+            log("ETag mismatch after compose: expected {}, got {}".format(
+                expected, actual))
+            return EXIT_FAIL
+        digest = actual
     elif options.check_etag:
-        log("ETag verification is not available for a composed object; "
-            "pass --check-md5 to verify this destination")
+        # An ETag without a part length is an opaque string, not an md5-of-md5s, so
+        # there is nothing to reproduce. Refusing beats passing silently.
+        log("ETag verification needs --part-length to reproduce an md5-of-md5s")
         return EXIT_FAIL
 
     # Parts are deleted explicitly. The GCS JSON API's objects.compose has no
