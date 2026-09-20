@@ -3787,8 +3787,19 @@ a verdict against both candidates:
   180 (current default)   3.00 h   ENOUGH
 ```
 
-**Decision rule: return to 60 only if it reads `ENOUGH` with `--repeat 3` or more, at
-≥96 GiB, and with the real input count.** Any of the four guards firing means the answer
+**Answered — the default is now 90.** The two full-size §6.6 runs (2031.4 s and 2045.8 s,
+0.7% apart) are the measurement this section existed to take, so running `pdl claim
+--repeat 3` at full size would have spent ~1.7 h of transfers adding a third sample to a
+number already bracketed. Applying its own arithmetic: 0.57 h + the 60 s create ceiling,
+doubled, is 71 polls; 90 rounds up without turning a preemption into a three-hour stall.
+60 would have fired occasionally; 180 was 2.5x over.
+
+The unit is **bytes, not a count of inputs** — `--localization-bytes`. A 279 GiB BAM plus
+a 9 MB index is four inputs and ~1.0x the time; two BAMs is two inputs and 2.0x. `gs://`
+inputs contribute nothing, taking canine's server-side rewrite instead of this path.
+
+**Re-run it if your largest localization changes shape, with `--repeat 3` or more, at
+≥96 GiB, and the real byte total.** Any of the four guards firing means the answer
 is not yet supported:
 
 | guard | why it blocks the decision |
@@ -3796,7 +3807,7 @@ is not yet supported:
 | `ONE-SHOT` | fewer than 3 usable runs; the tail has not been sampled |
 | `WIDE SPREAD` | slowest > 1.5× fastest, so the tail is wider than the runs show |
 | `SHORT MEASUREMENT` | under 96 GiB, where §6.5i's 2× burst inflates the rate and **under-sizes** the ceiling |
-| `SINGLE INPUT` | sized for one object against a timeout that covers a whole localization |
+| `SIZED FOR ONE OBJECT` | sized for one object against a timeout that covers a whole localization — pass `--localization-bytes` |
 
 Two costs sit outside what it measures and are named in its output: the customTime
 stamping pass scales with object *count*, and a take-over worker's own retry budget stacks

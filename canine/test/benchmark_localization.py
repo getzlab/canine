@@ -2353,8 +2353,9 @@ def command_claim(args):
     args.size = size
     heading("sizing bucket_upload_wait_tries")
     say("gs url  : {}".format(args.gs_url))
-    say("size    : {} per object, {} object(s) per localization".format(
-        human(size), args.inputs_per_localization))
+    say("size    : {} relayed per run".format(human(size)))
+    say("per loc : {} -- the largest real localization's non-GCS bytes".format(
+        human(getattr(args, "localization_bytes", None) or size)))
     say("repeats : {}".format(args.repeat))
     say()
 
@@ -2387,14 +2388,22 @@ def command_claim(args):
         return {"claim": {"runs": runs, "usable": 0}}
 
     slowest = max(good)
-    per_set = slowest * args.inputs_per_localization
+    # Scale by BYTES, not by a count of inputs. The count was the wrong unit: a set of
+    # one 279 GiB BAM plus a 9 MB index is four inputs and ~1.0x the time, while two
+    # BAMs is two inputs and 2.0x. And only non-GCS inputs count at all -- gs:// sources
+    # take canine's server_side path, a GCS-to-GCS rewrite that moves no bytes through
+    # this VM.
+    total_bytes = getattr(args, "localization_bytes", None) or args.size
+    multiple = total_bytes / float(args.size) if args.size else 1.0
+    per_set = slowest * multiple
     overhead = BUCKET_CREATE_POLL_CEILING
     claim_seconds = per_set + overhead
     recommended = int(math.ceil(claim_seconds * args.safety / BUCKET_CLAIM_POLL_SECONDS))
 
     say("slowest relay          : {:.1f}s  (mean {:.1f}s over {} ok run(s))".format(
         slowest, sum(good) / len(good), len(good)))
-    say("x {} input(s) per set   : {:.1f}s".format(args.inputs_per_localization, per_set))
+    say("x {} per localization   : {:.1f}s  ({:.2f}x this object)".format(
+        human(total_bytes), per_set, multiple))
     say("+ create/label overhead: {:.1f}s  (bucket-create polling ceiling)".format(overhead))
     say("= claim duration       : {:.1f}s = {:.2f} h".format(
         claim_seconds, claim_seconds / 3600.0))
@@ -2431,10 +2440,11 @@ def command_claim(args):
         say("sustained rate -- which UNDER-sizes a timeout. Measure at >=96 GiB before")
         say("lowering anything.")
         say()
-    if args.inputs_per_localization == 1:
-        say("SINGLE INPUT: the timeout covers a whole localization, and most real ones")
-        say("carry several inputs. Pass --inputs-per-localization with the largest set")
-        say("you actually localize, or this sizes for the easiest case.")
+    if multiple <= 1.0:
+        say("SIZED FOR ONE OBJECT: the timeout covers a whole localization. If your")
+        say("largest set relays more than {} from non-GCS sources, pass".format(
+            human(args.size)))
+        say("--localization-bytes with that total or this sizes for the easiest case.")
         say()
 
     say("Also outside this measurement, and outside the transfer: the customTime")
@@ -2445,7 +2455,8 @@ def command_claim(args):
         "runs": runs,
         "slowest_seconds": slowest,
         "claim_seconds": claim_seconds,
-        "inputs_per_localization": args.inputs_per_localization,
+        "localization_bytes": total_bytes,
+        "localization_multiple": multiple,
         "safety": args.safety,
         "recommended_tries": recommended,
         "sufficient_at_60": recommended <= 60,
@@ -2669,9 +2680,11 @@ def build_parser():
     claim.add_argument("--connections", type=int, default=MAX_CONNECTIONS_HINT)
     claim.add_argument("--repeat", type=int, default=3,
                        help="relays to time; a ceiling is a tail question, not a mean one")
-    claim.add_argument("--inputs-per-localization", type=int, default=1,
-                       help="objects in the largest real input SET -- the timeout covers "
-                            "the whole localization, not one object")
+    claim.add_argument("--localization-bytes", dest="localization_bytes", type=int,
+                       help="total bytes the largest real localization relays -- i.e. the "
+                            "sum over its non-GCS inputs, since gs:// sources are copied "
+                            "server-side and never touch this path. Defaults to --size. "
+                            "The timeout covers a whole localization, not one object")
     claim.add_argument("--safety", type=float, default=2.0,
                        help="multiplier applied to the slowest observed relay")
 

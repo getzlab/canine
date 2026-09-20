@@ -504,31 +504,25 @@ class TestNonGsSourcesUseAReadWriteMount:
 class TestTheUploadWaitCeiling:
     """
     `bucket_upload_wait_tries` x 60s is how long a worker waits for a sibling's upload
-    before declaring the claim stale and requeueing. Too short and the timeout stops
-    being an error path: a healthy upload is declared dead and taken over mid-flight,
-    costing a duplicate transfer of the whole object, reported only as a warning.
+    before declaring the claim stale and requeueing. It has to clear the longest
+    legitimate localization -- below that, healthy uploads are taken over mid-flight and
+    a duplicate transfer is charged on every large input, reported only as a warning.
 
-    **The value cannot be derived from anything measured yet, and an earlier version of
-    this test pretended otherwise.** It anchored on 1.62 h for 300 GB -- which is the
-    *pd-standard download* time from BENCHMARK_RUNBOOK.md 6.3, a different path. The
-    bucket route is a relay: source -> JSON API, with no disk in it anywhere. Sizing a
-    bucket constant off a disk measurement is the same category error the runbook spent
-    6.5c-6.5i unwinding.
+    It is also the recovery time when an uploader genuinely dies, which on preemptible
+    workers is routine. So it is bounded on BOTH sides, and a test that only checks the
+    floor would wave through a value that stalls every preemption for hours.
 
-    What is actually known about the relay is a floor: the source delivers ~227-240
-    MiB/s at 16 connections with no disk in the path (6.1, 6.5c), so 279 GiB cannot
-    take less than ~0.35 h. The upload side -- GCS ingest from an n1-standard-8 -- is
-    **unmeasured**, so there is no upper bound, and on the floor alone the old 1 h
-    default may well have been adequate.
-
-    So 180 is a provisional choice on risk asymmetry, not a computed one. Too small
-    fails silently and repeatedly; too large only slows recovery from a genuinely dead
-    uploader, which is visible in the logs. #20 step 4 measures the relay and supplies
-    the real number -- until then this test exists to stop the default drifting down
-    without data, not to claim the current value is right.
+    Now derived rather than guessed. 60 was arbitrary; 180 was a placeholder from risk
+    asymmetry while this route's throughput was unknown (§13.49). The bucket route
+    measures 0.57 h for the largest real input -- twice, agreeing to 0.7% -- so
+    0.57 h + 60 s bucket-create ceiling, doubled, is 71 polls.
     """
 
-    PROVISIONAL_DEFAULT = 180
+    # BENCHMARK_RUNBOOK.md §6.6: 2031.4 s and 2045.8 s for 278.91 GiB. A literal, not
+    # derived from the default, so the test cannot agree with whatever the default is.
+    MEASURED_LOCALIZATION_SECONDS = 2045.8
+    BUCKET_CREATE_CEILING_SECONDS = 60
+    SAFETY = 2.0
 
     @staticmethod
     def _default():
@@ -537,26 +531,30 @@ class TestTheUploadWaitCeiling:
         return inspect.signature(
             AbstractLocalizer.__init__).parameters["bucket_upload_wait_tries"].default
 
-    def test_the_default_is_not_lowered_without_a_measurement(self):
-        assert self._default() >= self.PROVISIONAL_DEFAULT, (
-            "the wait ceiling was lowered to {} ({:.2f} h). That may well be correct -- "
-            "but the relay's throughput is still unmeasured (#20 step 4), so lower it "
-            "with a number, not a guess.".format(
-                self._default(), self._default() * 60 / 3600.0))
+    def _needed(self):
+        claim = self.MEASURED_LOCALIZATION_SECONDS + self.BUCKET_CREATE_CEILING_SECONDS
+        return claim * self.SAFETY / 60.0
 
-    def test_the_default_clears_the_known_floor_with_room(self):
+    def test_it_clears_the_measured_localization_with_the_safety_factor(self):
+        assert self._default() >= self._needed(), (
+            "{} polls ({:.2f} h) does not cover a measured {:.2f} h localization at "
+            "{}x safety -- healthy uploads would be taken over".format(
+                self._default(), self._default() / 60.0,
+                self.MEASURED_LOCALIZATION_SECONDS / 3600.0, self.SAFETY))
+
+    def test_it_is_not_so_large_that_a_preemption_stalls_for_hours(self):
         """
-        The one bound that is real: the source cannot deliver 279 GiB faster than
-        ~0.35 h (227-240 MiB/s, no disk in the path), so the relay cannot either.
-        A ceiling near that floor would fire on every large input.
+        The other side, which the 180 placeholder failed. The ceiling is also how long
+        every sibling waits after an uploader dies, and on preemptible workers that is
+        not an edge case.
         """
-        source_floor_hours = 0.35
-        hours = self._default() * 60 / 3600.0
-        assert hours >= 4 * source_floor_hours, (
-            "{:.2f} h leaves under 4x over the {:.2f} h source-side floor, and the "
-            "upload side is unmeasured".format(hours, source_floor_hours)) 
+        assert self._default() <= 2.5 * self._needed(), (
+            "{} polls ({:.2f} h) is {:.1f}x what the measurement needs; that is the "
+            "stall after every preemption".format(
+                self._default(), self._default() / 60.0,
+                self._default() / self._needed()))
 
     def test_the_emitted_loop_uses_the_configured_value(self):
         """The constant is only worth pinning if it reaches the generated script."""
-        assert "-ge 180" in script_for([gs_item()], wait_tries=180)
+        assert "-ge 90" in script_for([gs_item()], wait_tries=90)
         assert "-ge 7" in script_for([gs_item()], wait_tries=7)

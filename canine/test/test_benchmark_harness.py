@@ -2393,15 +2393,32 @@ class TestSizingTheUploadWaitCeiling:
         assert slow["recommended_tries"] > fast["recommended_tries"]
         assert slow["slowest_seconds"] == 3000
 
-    def test_it_scales_to_the_input_set(self, tmp_path, monkeypatch, capsys):
+    def test_it_scales_by_bytes_not_by_a_count_of_inputs(self, tmp_path, monkeypatch,
+                                                         capsys):
         """
-        The timeout covers a localization, not an object. Sizing from one input and
-        deploying against a twelve-input set under-sizes by roughly 12x.
+        The timeout covers a localization, not an object -- but the unit is BYTES.
+
+        This took a count of inputs first, which is the wrong unit and quietly assumes
+        they are all the same size: one 279 GiB BAM plus a 9 MB index is four inputs and
+        ~1.0x the time, while two BAMs is two inputs and 2.0x. Scaling by count would
+        have over-sized the first by 4x and the real workload is the first.
         """
-        one, _ = self.run(tmp_path, monkeypatch, capsys, [600, 600, 600])
-        many, _ = self.run(tmp_path, monkeypatch, capsys, [600, 600, 600],
-                           inputs_per_localization=12)
-        assert many["recommended_tries"] > 5 * one["recommended_tries"]
+        size = 100 * bench.GIB
+        one, _ = self.run(tmp_path, monkeypatch, capsys, [600, 600, 600], size=size)
+        # four inputs, but only a rounding error more data than one
+        indices, _ = self.run(tmp_path, monkeypatch, capsys, [600, 600, 600], size=size,
+                              localization_bytes=size + 3 * (9 * 1024 * 1024))
+        twice, _ = self.run(tmp_path, monkeypatch, capsys, [600, 600, 600], size=size,
+                            localization_bytes=2 * size)
+
+        # Within a try -- math.ceil turns the 1.0003x into a single extra poll. The
+        # claim is "negligible", not "identical"; a count-based scaler would have said
+        # 4x here, which is the failure being guarded against.
+        assert indices["recommended_tries"] <= one["recommended_tries"] + 1, (
+            "a BAM plus small indices was sized as several whole BAMs: {} vs {}".format(
+                indices["recommended_tries"], one["recommended_tries"]))
+        assert indices["recommended_tries"] < 2 * one["recommended_tries"]
+        assert twice["recommended_tries"] > 1.8 * one["recommended_tries"]
 
     def test_a_single_run_is_flagged_as_not_a_distribution(
             self, tmp_path, monkeypatch, capsys):
@@ -2424,9 +2441,9 @@ class TestSizingTheUploadWaitCeiling:
         assert "SHORT MEASUREMENT" in out
         assert "UNDER-sizes" in out
 
-    def test_a_single_input_set_is_flagged(self, tmp_path, monkeypatch, capsys):
+    def test_sizing_for_one_object_is_flagged(self, tmp_path, monkeypatch, capsys):
         _, out = self.run(tmp_path, monkeypatch, capsys, [600, 610, 605])
-        assert "SINGLE INPUT" in out
+        assert "SIZED FOR ONE OBJECT" in out
 
     def test_every_relay_failing_reports_no_result_rather_than_a_number(
             self, tmp_path, monkeypatch, capsys):

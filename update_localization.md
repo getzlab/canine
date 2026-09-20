@@ -4001,3 +4001,43 @@ analysis can use that with more confidence than a single figure.
 | speedup | — | 3.07x | **8.7x** |
 | consumer read | — | 43.9 MiB/s | **109 MiB/s** |
 | storage 24–48 h | — | $0.42–$0.83 | **$0.20–$0.39** |
+
+### 13.52 `bucket_upload_wait_tries` settled at 90, and the unit was wrong
+
+§13.49 raised this to 180 as an explicit placeholder, chosen on risk asymmetry because
+the relay's throughput was unknown. It is now known, so the placeholder can go.
+
+**No new benchmark was needed.** §6.6's two full-size runs — 2031.4 s and 2045.8 s, 0.7%
+apart — are exactly what `pdl claim` exists to produce. Running it at `--repeat 3` would
+have spent ~1.7 h of transfers adding a third sample to a number two runs already
+bracket. Applying its arithmetic directly: 0.57 h + the 60 s bucket-create ceiling,
+doubled for safety, is **71 polls**. The default is now **90**.
+
+| | ceiling | verdict |
+|---|---|---|
+| 60 (original) | 1.00 h | would fire occasionally on a healthy upload |
+| **90** | **1.50 h** | clears the measurement at 2x safety, 1.3x the need |
+| 180 (§13.49) | 3.00 h | 2.5x over — three hours of stall per preemption |
+
+The constant is bounded on **both** sides and §13.49 only argued one. Below the
+measurement, healthy uploads are declared dead and taken over mid-flight, charging a
+duplicate transfer on every large input. Above it, the same number is how long every
+sibling waits after an uploader genuinely dies — routine on preemptible workers. The
+tests now pin both, and mutating the default to 60, 180 or 300 each fails one of them.
+
+#### The parameter was measuring the wrong thing
+
+`pdl claim` took `--inputs-per-localization`, a **count**, and multiplied the transfer
+time by it. That silently assumes every input is the same size. The real shape of this
+workload is one BAM plus one index: **four inputs would be ~1.0x the time, and a
+count-based scaler would have said 4x.** Two BAMs is two inputs and genuinely 2.0x.
+
+So the unit is bytes — `--localization-bytes`, the total the largest real localization
+relays. And only some inputs count at all: `gs://` sources take canine's `server_side`
+path, a GCS-to-GCS rewrite that moves nothing through the VM, so a set of one S3 BAM and
+three reference genomes is still a multiplier of 1.
+
+This is the same error as §13.49's, one level down. That one sized a relay constant from
+a disk measurement; this one sized it in the wrong unit. Both were plausible quantities
+standing in for the quantity that mattered, and both survived review until something
+forced the arithmetic to be written out.

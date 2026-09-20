@@ -147,8 +147,8 @@ take-over harmless.
   ("A conflicting operation is currently in progress"), which means the create is still in
   flight — not that the bucket is readable. So the worker polls `buckets describe` up to 30
   times at 2s before reading the label; failing that, `exit 5` (`base.py:1289`).
-- **Someone else is uploading.** `sleep 60`, up to `bucket_upload_wait_tries` times (default 180,
-  so a ~3 hour ceiling). On timeout the worker sets `wolf=stale`, releases the claim, and
+- **Someone else is uploading.** `sleep 60`, up to `bucket_upload_wait_tries` times (default 90,
+  so a ~1.5 hour ceiling). On timeout the worker sets `wolf=stale`, releases the claim, and
   `exit 5` (`base.py:1314`). **This ceiling has to exceed the longest localization you expect**,
   or it fires on healthy uploads and every large input gets taken over mid-flight — while also
   being the recovery time when an uploader genuinely dies. Sized in
@@ -241,7 +241,7 @@ Pass from wolF via `LocalizeToBucket(files=..., <kwarg>=...)`, or workflow-wide 
 | `localize_to_persistent_disk` | `False` | Master switch for this whole path. `LocalizeToBucket` sets it `True`. Also forces `common = False` (`base.py:158`). |
 | `localization_expiry_days` | `1` | `daysSinceCustomTime` in the lifecycle rule. Bounds *idle* storage, not the life of a running workflow — live content has its clock refreshed on every localization and by the heartbeat. Raise it if you re-run the same inputs over several days and would rather pay for storage than re-transfer. |
 | `bucketmount_heartbeat_seconds` | `3600` | How often a held mount re-stamps customTime (§7). Must be `< localization_expiry_days * 86400 / 4`, else `ValueError` at construction (`base.py:181`) — for the default 1-day expiry, anything `< 21600`. |
-| `bucket_upload_wait_tries` | `180` | 60-second polls a worker waits for a sibling's upload before declaring the claim stale and requeueing (`exit 5`) — a ~3 hour ceiling. Raised from 60; **provisional**, pending a measurement of this path's throughput. Sizing procedure and results: `canine/test/BENCHMARK_RUNBOOK.md` §6.7. Rationale: `update_localization.md` §13.49. |
+| `bucket_upload_wait_tries` | `90` | 60-second polls a worker waits for a sibling's upload before declaring the claim stale and requeueing (`exit 5`) — a ~1.5 hour ceiling. **Derived, not guessed**: the bucket route measures 0.57 h for the largest real input, so 0.57 h + the 60 s create ceiling, doubled, is 71 polls. Bounded on both sides — below it healthy uploads are taken over mid-flight, above it every preemption stalls siblings for the full window. Scale by **bytes** if your largest set relays more (`pdl claim --localization-bytes`); a BAM plus indices is ~1.0x, two BAMs is 2.0x, and `gs://` inputs do not count. `canine/test/BENCHMARK_RUNBOOK.md` §6.6/§6.7. |
 | `allow_requester_pays` | `False` | If `False`, reading from a requester-pays source raises instead of silently billing `project`. |
 | `persistent_disk_dry_run` | `False` | Return the `bucketmount://` URLs that *would* be produced without creating or uploading anything. |
 
