@@ -3804,3 +3804,97 @@ plucked from nowhere — it was a real measurement, correctly obtained, of a dif
 system. That is the failure mode this whole effort keeps producing, and the reason the
 runbook's tables now carry an explicit `extent` column: **a figure is only usable together
 with the conditions it was measured under, and "measured" is not the same as "relevant".**
+
+### 13.50 The bucket route clears the target, and the cap was one of our constants
+
+§6.6 ran. The measurements, and what they overturn.
+
+#### The gate holds
+
+`select_route` reaches `bucket-compose` on a real read-write gcsfuse mount: `rc=0`,
+**192 parts composed** for a 12 GiB object, and parts exist only on that route. §13.48's
+first step — the one everything else was conditional on — passes. `LOCALIZATION.md` §4c's
+hazard, a parallel writer silently staging onto the 25 GB boot disk, is gated in practice
+and not just in principle.
+
+`gcloud storage ls -L` also settles the crc32c question empirically: `Component-Count: 192`,
+`Hash (CRC32C)` present, **no `Hash (MD5)` line at all**.
+
+#### Two constants of ours, not the infrastructure
+
+The first bucket measurements were disappointing — 40.8 MiB/s at 8 connections, then
+70.1 with a GCS source, then 64.4 with the real GDC source. Against the pd-standard's
+43.9 MiB/s that is 1.47x: real, but nowhere near the ≥4x the disk path had failed to
+reach, and it looked like the bucket was simply not the answer.
+
+It was not the bucket. **Per-worker upload was 4.71 MiB/s from the GDC S3 endpoint and
+4.76 MiB/s from a GCS object** — two unrelated networks, 1% apart. Agreement like that
+cannot come from either end; it comes from something we control. A resumable PUT costs
+~53 ms round-trip whatever it carries, and the route sent one per 256 KiB
+(`GCS_UPLOAD_GRANULARITY`), so the rate was arithmetic and the ceiling was ~72 MiB/s at 16
+connections regardless of what anything else could do.
+
+That block was deliberate, bounding bytes-read-but-not-yet-durable to <256 KiB per
+in-flight chunk. The guarantee was real and **mispriced**: at 8 MiB the worst case is
+128 MiB across 16 chunks — 0.045% of a 279 GiB object, on a preemption that already costs
+minutes of restart — against a 5x throughput cap paid on every transfer, preempted or not.
+
+| 96 GiB, GDC S3, 16 conns | 256 KiB | 8 MiB |
+|---|---|---|
+| relay | 64.4 MiB/s | **146.4** |
+| per-worker upload | 4.71 | **39.2** |
+| workers inside upload | 13.67 of 16 | **3.73** |
+| `io` read share | 12% | **76%** |
+
+The bottleneck flipped to the source, which is where it belongs.
+
+#### The answer to the question this effort started with
+
+| | pd-standard | bucket |
+|---|---|---|
+| 278.91 GiB | 1.62 h | **~0.63 h** |
+| vs today's 4.97 h | 3.07x | **7.9x** |
+| storage 24–48 h | $0.42–$0.83 | **$0.20–$0.39** |
+
+**≥4x is cleared.** And the storage is 2.1x cheaper as well, because GCS bills stored
+bytes while a disk bills provisioned size — 316 GB provisioned to hold 279 GiB, the
+capacity headroom §13.15 spent a table on.
+
+#### What this overturns
+
+* **§13.46's "the disk is the answer" stands as a fact about the disk and is no longer
+  the conclusion.** 43.9 MiB/s sustained, the downloader within 1% of `dd` — all still
+  true. It simply stopped being the ceiling that matters, because the workload does not
+  have to go through a disk.
+* **§13.46's disk-sizing economics are moot on this path.** Oversizing needed ~12 IO-bound
+  consumers to break even at a spot VM rate; the bucket needs none, is faster, and costs
+  less to store. The analysis was correct and is now about a road not taken.
+* **§6.5g's "do not build the reader/writer split" was route-specific and the other route
+  is different.** On the pd-standard the overlap ceiling was 1.05x. Here it is 1.32x, and
+  against a source measured at ~240 MiB/s a decoupled loop could take 146 toward ~193.
+  Worth building now; it was not then.
+* **§13.49's `bucket_upload_wait_tries` placeholder can be re-derived.** At ~0.63 h for the
+  largest realistic input, the 1 h ceiling it was raised from was probably adequate after
+  all, and 180 is over-provisioned. §6.7's `pdl claim` supplies the number — and the input
+  count question still needs answering, since the timeout covers a whole localization.
+
+#### What is not yet established
+
+The full-size run with verification is in flight and is the first exercise of the ETag
+path against real GCS; `etag from 9849 recorded part digests, 0 re-read` is the claim.
+crc32c remains unimplemented — it is the only digest a composite carries and the only one
+that combines across out-of-order parallel chunks, so it would make verification
+metadata-only rather than a read-back on the md5 path. And peak RSS went 61 → 397 MiB:
+accumulation is ruled out (flat at ~32 MiB across a 32x size range, in isolation) but the
+397 itself was not reproduced, so that risk is bounded rather than explained.
+
+#### The pattern, one more time
+
+Three months of this effort have produced the same lesson in four different places: §6.5c–
+§6.5i compared a sustained rate against a burst rate, §13.49 sized a relay constant from a
+disk measurement, §13.46 priced VM time at on-demand rates for a preemptible VM, and this
+section found a 5x throughput cap sitting in a constant that had been chosen for a reason
+nobody re-examined. **Every one was a correct number applied to the wrong system.** The
+defense that actually worked, each time, was a second measurement taken under deliberately
+different conditions — two disk sizes, two sources, two block sizes — because a wrong
+premise survives repetition and dies on contrast.

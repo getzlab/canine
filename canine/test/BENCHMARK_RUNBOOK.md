@@ -3328,6 +3328,102 @@ is why the command above does that rather than adding `rshared` to §3.
 
 ---
 
+#### Measured — the bucket route, and one constant worth 2.3x
+
+Gate first (§6.6 step 1), on a 12 GiB object: `rc=0`, **`192 parts composed (verified)`**.
+192 x 64 MiB is exactly 12 GiB, and parts only exist on `bucket-compose` — so
+`select_route` resolved the bucket from `/proc/mounts` on a real read-write gcsfuse mount
+and never wrote through it. The hazard `LOCALIZATION.md` §4c warns about (a parallel
+writer silently falling back to staging on the 25 GB boot disk) is gated, on real
+infrastructure, for the first time.
+
+`gcloud storage ls -L` on the result:
+
+```
+Component-Count: 192          composite, from exactly our parts
+Hash (CRC32C):   IBw8KQ==     present
+                              no Hash (MD5) line at all
+```
+
+That last absence is why `verify_bucket_object` re-reads: a composite object carries no
+md5, so a whole-file md5 source can only be checked by downloading it again. On that
+12 GiB run the read-back was **516 s of 826 s — 62% of the wall clock.** It does not apply
+to the real workload, which is a multipart ETag and now verifies from recorded digests.
+
+##### The A/B: `--upload-block`, 96 GiB prefix, GDC S3 → bucket, 16 connections
+
+| | 256 KiB | **8 MiB** | |
+|---|---|---|---|
+| relay | 64.4 MiB/s | **146.4 MiB/s** | **2.27x** |
+| total incl. compose | 57.7 | **125.4** | 2.18x |
+| per-worker upload | 4.71 MiB/s | **39.2** | 8.3x |
+| workers inside upload | 13.67 of 16 | **3.73** | |
+| `io` read share | 12% | **76%** | bottleneck flipped |
+| overlap ceiling | 1.14x | 1.32x | |
+| compose | 76.3 s | 16.1 s | |
+| peak NIC | 93.5 MiB/s | 216.9 | |
+| peak RSS | 61 MiB | 397 MiB | see below |
+
+**What identified the cause was two sources agreeing.** At 256 KiB the per-worker upload
+rate was **4.71 MiB/s from the GDC S3 endpoint and 4.76 MiB/s from a GCS object** — two
+unrelated networks, 1% apart. A resumable PUT costs ~53 ms round-trip whatever it carries,
+so the rate was arithmetic: 256 KiB / 53 ms, capping 16 connections at ~72 MiB/s no matter
+what either end could do. Nothing about the source or GCS was ever involved.
+
+After the change the loop is **76% read** — the route is source-bound, which is where it
+should be. §6.5c measured that source at ~240 MiB/s to `/dev/null`, and the 1.32x overlap
+ceiling says a reader/writer split could take 146 toward ~193. **Note that reverses §6.5g's
+conclusion for this route**: on the pd-standard the ceiling was 1.05x and decoupling was
+not worth building. Here it is worth ~30%. The recommendation was route-specific and said
+so; this is the other route.
+
+##### Against the disk
+
+| | pd-standard | bucket |
+|---|---|---|
+| sustained / relay | 43.9 MiB/s | **146.4** (3.3x) |
+| 278.91 GiB | 1.62 h | **~0.54 h relay, ~0.63 h total** |
+| vs today's 4.97 h | 3.07x | **7.9x–9.2x** |
+| storage, 24–48 h | $0.42–$0.83 (316 GB provisioned) | **$0.20–$0.39** (279 GB stored) |
+
+**The ≥4x target is cleared**, by the route the disk could not reach — and the storage is
+2.1x cheaper besides, because GCS bills stored bytes while a disk bills provisioned size
+and needs capacity headroom the bucket does not.
+
+##### Peak RSS: 61 → 397 MiB, bounded not leaking
+
+The cost of the larger block, and the guard flagged it. Investigated before the full-size
+run:
+
+* **Accumulation ruled out.** One subprocess per configuration, source generating bytes
+  rather than holding them: peak RSS is **flat at ~32 MiB from 64 MiB to 2 GiB** — 32x the
+  data, no growth. Consistent with the structure, since every container that grows is keyed
+  by chunk or part index (3283 chunks, 9849 digests at full size).
+* **The 397 MiB was not reproduced**, because that probe stubs `upload_range` and the PUT
+  body is where the memory almost certainly is. Risk bounded, number unexplained.
+
+Two earlier versions of that probe measured nothing: `ru_maxrss` is a process-wide
+high-water mark, so parametrised rows in one process are cumulative, and the fake source
+held the whole payload in RAM so RSS grew with size by construction. Both showed up as a
+monotonic sequence with nothing to do with the downloader.
+
+The §6.2 RSS guard now budgets `4 x connections x upload_block` rather than a fixed
+256 MiB, because the old ceiling and its "~1 MiB per connection" claim both predate
+`--upload-block` and reported a correct run as suspicious.
+
+##### Still open
+
+* **The full-size run with verification** — in flight. It is the first exercise of the
+  ETag path against real GCS, and the line to read is
+  `etag from 9849 recorded part digests, 0 re-read`.
+* **crc32c** — a composite advertises only crc32c, and it is the one digest that combines
+  across out-of-order parallel chunks. Would make verification metadata-only rather than a
+  read-back on the md5 path. Unimplemented.
+* **Consumer read rate through gcsfuse** — the benchmark's own re-read measures it for
+  free; §13.46's cost model needed exactly that number and did not have it.
+
+---
+
 ### 6.6a Full sequence from an existing bench node
 
 Everything from an already-running node — §1–§6.5 done, container up on the old image,
@@ -3863,7 +3959,11 @@ carries the narrative once a row is filled in.
 | Does the composed object land where the post-unmount `ls` check looks? | §6.6 step 2 | not measured |
 | Is customTime stamped on it? | §6.6 step 2 | not measured — unstamped means invisible to the lifecycle rule, so it never expires |
 | Two writers on one `plan_id` | §6.6 step 3 | **done, in the fake.** Object correct, loser requeues, no leaked parts (`TestTwoWritersOnOneObject`). Unverified against real GCS |
-| Relay throughput, uncached bucket, ≥96 GiB | §6.6 step 4 | not measured — the number that replaces 43.9 MiB/s |
+| Relay throughput, uncached bucket, ≥96 GiB | §6.6 step 4 | **146.4 MiB/s relay, 125.4 total** (96 GiB, GDC S3, 16 conns, 8 MiB block) — 3.3× the disk. Extrapolates to ~0.63 h for 278.91 GiB, **7.9× today's 4.97 h**; the ≥4× target is cleared |
+| What was capping it at 64 MiB/s? | §6.6 step 4 | **our own 256 KiB upload block.** A PUT costs ~53 ms whatever it carries. Identified by two unrelated sources agreeing to 1% (4.71 and 4.76 MiB/s per worker); fixed by `--upload-block`, default 8 MiB |
+| Does the route gate fire on a real RW gcsfuse mount? | §6.6 step 1 | **yes** — `192 parts composed`, and parts exist only on `bucket-compose` |
+| Does a composite carry an md5? | §6.6 step 2 | **no** — `Component-Count: 192`, `Hash (CRC32C)` present, no MD5 line. Which is why the md5 path re-reads (516 s of 826 s, 62%) and why the ETag path had to be built |
+| Peak RSS with an 8 MiB block | §6.6 | **397 MiB**, up from 61. Bounded, not leaking: flat at ~32 MiB across a 32× object-size range in isolation. The 397 itself is unexplained |
 | Relay throughput with Rapid Cache | §6.6 step 5 | not measured — cache must be provisioned by hand on the `wolf-...` bucket |
 | **Should `bucket_upload_wait_tries` go back to 60?** | §6.7 `pdl claim` | not measured. Currently **180**, a placeholder from risk asymmetry (§13.49); characterization runs suggest it can come down |
 | Largest input count in one real localization | needed as `--inputs-per-localization` | **not known — ask.** It multiplies the answer above directly |
