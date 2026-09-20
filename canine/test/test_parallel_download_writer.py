@@ -69,11 +69,19 @@ class FakeSource:
 
 
 class Options:
-    def __init__(self, dest, size, connections):
+    def __init__(self, dest, size, connections, commit_linger=0):
         self.dest = dest
         self.size = size
         self.connections = connections
         self.retries = 2
+        # No linger by default. This file tests the ORDERING rule -- that a chunk
+        # finishing during an fsync waits for the next round -- which needs commits to
+        # start promptly so there is an in-flight commit to finish during. With the
+        # production 2 s window every arrival coalesced into one batch and
+        # test_a_chunk_finishing_during_an_fsync_waits_for_the_next_round stopped
+        # exercising its own case. Its guard caught that; the linger is tested for its
+        # own sake in TestTheManifestWriterBatches.
+        self.commit_linger = commit_linger
 
 
 class Recorder:

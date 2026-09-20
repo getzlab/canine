@@ -1351,6 +1351,25 @@ GCS_UPLOAD_GRANULARITY = 256 * 1024
 # get preempted is the wrong side of that trade.
 DEFAULT_UPLOAD_BLOCK = 8 * 1024 * 1024
 
+# How long the manifest writer waits for more completions before paying the fixed cost of
+# a rewrite, and the most it will accumulate.
+#
+# The writer took the whole queue the instant it woke, so batching only happened when
+# chunks arrived *during* a commit. On the in-place route they do -- an fsync is slow
+# enough that 3283 chunks committed in 2 batches. On the bucket route a commit takes
+# ~0.23 s and the next chunk is ~0.55 s away, so every batch was one chunk and `commit`
+# grew from 8% of wall at 12 GiB to 43% at full size: 2.14x the chunks but 7.2x the time,
+# because each write re-uploads a manifest that now carries 9849 part digests too.
+#
+# Lingering does not weaken the ordering rule the batching rests on. The queue is still
+# snapshotted before the fsync begins, so everything in the snapshot finished writing
+# before it -- the snapshot is simply taken later. What it does widen is work at risk: a
+# crash during the window re-fetches whatever had not been committed, bounded by the
+# window times the completion rate. At full size that is ~4 chunks, against the 279 GiB
+# the manifest exists to protect.
+COMMIT_LINGER_SECONDS = 2.0
+COMMIT_MAX_BATCH = 64
+
 # A single compose call accepts at most this many sources; more are tree-composed.
 GCS_COMPOSE_MAX_SOURCES = 32
 
@@ -2187,6 +2206,9 @@ class Downloader:
         self._read_seconds = 0.0
         self._write_seconds = 0.0
         self._io_blocks = 0
+        self._commit_linger = getattr(options, "commit_linger", None)
+        if self._commit_linger is None:
+            self._commit_linger = COMMIT_LINGER_SECONDS
         # Wall time summed over every chunk_done -- the manifest rewrite, its fsyncs and
         # the wait for Manifest._lock. This is the only work that grows with the CHUNK
         # COUNT rather than the byte count, and the 279 GiB run fell to 50% of the disk
@@ -2238,6 +2260,16 @@ class Downloader:
                     self._writer_cv.wait()
                 if not self._writer_queue:
                     return                      # stopped and drained
+                # Let more completions land before rewriting the manifest. Skipped
+                # entirely when stopping, so teardown never waits on it.
+                if self._commit_linger > 0 and not self._writer_stop:
+                    deadline = time.monotonic() + self._commit_linger
+                    while (len(self._writer_queue) < COMMIT_MAX_BATCH
+                           and not self._writer_stop):
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._writer_cv.wait(remaining)
                 batch = self._writer_queue
                 self._writer_queue = []
             started = time.time()
@@ -3751,6 +3783,11 @@ def build_parser():
                         help="simultaneous ranged GETs (0/1 = single stream)")
     parser.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK,
                         dest="min_chunk", help="smallest chunk worth its own request")
+    parser.add_argument("--commit-linger", dest="commit_linger", type=float,
+                        default=COMMIT_LINGER_SECONDS,
+                        help="seconds the manifest writer waits for more chunk "
+                             "completions before committing. 0 commits each one "
+                             "immediately, which costs a full manifest rewrite per chunk")
     parser.add_argument("--upload-block", dest="upload_block", type=int,
                         default=DEFAULT_UPLOAD_BLOCK,
                         help="bytes per PUT on the bucket-compose route; must be a "

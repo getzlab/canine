@@ -14,6 +14,7 @@ import inspect
 import os
 import subprocess
 import threading
+import time
 
 import pytest
 
@@ -70,6 +71,10 @@ def options_for(dest, url, size, **overrides):
         "--connections", str(overrides.pop("connections", 4)),
         "--min-chunk", str(overrides.pop("min_chunk", MIB)),
         "--retries", str(overrides.pop("retries", 3)),
+        # No linger in tests: payloads are tiny, so a 2 s window per commit round would
+        # add minutes across the suite for no coverage. The linger itself is tested
+        # directly in TestTheManifestWriterBatches.
+        "--commit-linger", str(overrides.pop("commit_linger", 0)),
     ]
     for key, value in overrides.items():
         argv += ["--" + key.replace("_", "-"), str(value)]
@@ -1703,3 +1708,88 @@ class TestTheUploadBlockIsTunableAndBounded:
 
         assert rc == pdl.EXIT_OK
         assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+
+
+class TestTheManifestWriterBatches:
+    """
+    `commit` grew from 8% of wall at 12 GiB to 43% at full size -- 2.14x the chunks
+    between the 96 GiB and 279 GiB runs but 7.2x the time, because each commit rewrites
+    a manifest that now carries 9849 part digests as well as 3283 chunk records, and
+    `mean batch 1.0` said the batching meant to amortise that never engaged.
+
+    The writer took the whole queue the instant it woke, so batching only happened when
+    chunks arrived *during* a commit. That is true on the in-place route, where an fsync
+    is slow enough that 3283 chunks committed in 2 batches. On the bucket route a commit
+    is ~0.23 s and completions are ~0.55 s apart, so it never was.
+
+    The `NOT BATCHED` guard reported this on all three bucket runs and was twice
+    explained away -- "nothing to batch at 4.7 MiB/s", then "it will fix itself when the
+    upload block goes up". It was measuring a real property throughout, which is why
+    these tests assert batch *size* rather than that a commit happened.
+    """
+
+    def _committer(self, linger, arrivals, gap, settle=0.0):
+        """
+        Drive the writer directly: `arrivals` completions `gap` apart, then wait
+        `settle` before stopping.
+
+        `settle` exists because without it the stop flag can be set before the writer
+        has even entered the linger, so the outer guard skips the window and a test
+        aimed at the stop path never reaches it -- which is how the first version of
+        test_stopping_does_not_wait_out_the_linger passed with the stop check removed.
+        """
+        batches = []
+
+        class Sink:
+            def commit(self, batch):
+                batches.append(len(batch))
+
+        class Options:
+            commit_linger = linger
+
+        d = pdl.Downloader.__new__(pdl.Downloader)
+        d.sink = Sink()
+        d._writer = None
+        d._writer_cv = threading.Condition()
+        d._commit_seconds = 0.0
+        d._commit_batches = 0
+        d._commit_chunks = 0
+        d._commit_linger = linger
+        d._start_writer()
+        try:
+            for i in range(arrivals):
+                d._enqueue_done(i, None)
+                time.sleep(gap)
+            time.sleep(settle)
+        finally:
+            d._stop_writer()
+        return batches
+
+    def test_without_linger_every_commit_is_one_chunk(self):
+        """The observed behaviour, reproduced: arrivals slower than the commit."""
+        batches = self._committer(linger=0, arrivals=6, gap=0.05)
+        assert batches, "nothing was committed"
+        assert max(batches) == 1, (
+            "expected unbatched commits with no linger, got {}".format(batches))
+
+    def test_with_linger_the_same_arrivals_coalesce(self):
+        batches = self._committer(linger=0.5, arrivals=6, gap=0.05)
+        assert max(batches) > 1, (
+            "linger did not coalesce anything: {}".format(batches))
+        assert sum(batches) == 6, "every completion must still be committed exactly once"
+
+    def test_stopping_does_not_wait_out_the_linger(self):
+        """
+        Teardown must not pay the window. A long linger with a single arrival should
+        still drain promptly, because _stop_writer sets the flag the wait checks.
+        """
+        started = time.monotonic()
+        # settle: make sure the writer is genuinely inside the window before stopping.
+        batches = self._committer(linger=30.0, arrivals=1, gap=0, settle=0.3)
+        elapsed = time.monotonic() - started
+        assert sum(batches) == 1
+        assert elapsed < 10, "teardown waited on the linger: {:.1f}s".format(elapsed)
+
+    def test_nothing_is_lost_or_duplicated_under_linger(self):
+        batches = self._committer(linger=0.2, arrivals=25, gap=0.01)
+        assert sum(batches) == 25
