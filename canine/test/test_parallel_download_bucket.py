@@ -1793,3 +1793,115 @@ class TestTheManifestWriterBatches:
     def test_nothing_is_lost_or_duplicated_under_linger(self):
         batches = self._committer(linger=0.2, arrivals=25, gap=0.01)
         assert sum(batches) == 25
+
+
+class TestAStaleMarkerCannotFakeCompletion:
+    """
+    The bucket route's done marker was believed on its own. `run()` checked
+    `os.path.getsize(dest)` for the local routes and, finding no local file here, treated
+    that as "nothing to check" and returned EXIT_OK unconditionally.
+
+    So any marker that outlived its object made a run succeed in milliseconds having
+    transferred nothing -- and a benchmark would record the resulting absurd throughput
+    as a valid measurement. **Observed, not hypothetical**: after `route-check.bin` was
+    removed from the benchmark bucket, `.route-check.bin.k9pdl.done` was still sitting
+    there on its own.
+
+    Same class as the POSIX-route bug fixed in b205d77 ("A done marker without its file
+    is not completion"), on the one route that had been exempted from the fix. A marker
+    is only worth anything if it can be falsified; the bucket route's evidence is the
+    object, so the marker records its URL.
+    """
+
+    def _marker(self, tmp_path, gcs, size, **extra):
+        dest = str(tmp_path / "sample.bam")
+        _, marker_path = pdl.sidecar_paths(dest)
+        pdl.write_done_marker(marker_path, size, "plan-1", "d" * 32,
+                              route=pdl.ROUTE_BUCKET, **extra)
+        return dest
+
+    def test_a_marker_whose_object_is_gone_is_not_completion(self, tmp_path, gcs,
+                                                             monkeypatch, payload,
+                                                             payload_md5, capsys):
+        force_bucket_route(monkeypatch)
+        dest = self._marker(tmp_path, gcs, len(payload),
+                            gs_url="gs://{}/{}".format(BUCKET, OBJECT))
+        # the marker claims completion; the bucket is empty
+        assert OBJECT not in gcs.state.objects
+
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+
+        assert rc == pdl.EXIT_OK
+        assert "does not exist" in capsys.readouterr().err
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5, (
+            "the stale marker was believed and nothing was transferred")
+
+    def test_a_marker_whose_object_is_the_wrong_size_is_not_completion(
+            self, tmp_path, gcs, monkeypatch, payload, payload_md5, capsys):
+        force_bucket_route(monkeypatch)
+        dest = self._marker(tmp_path, gcs, len(payload),
+                            gs_url="gs://{}/{}".format(BUCKET, OBJECT))
+        gcs.state.objects[OBJECT] = b"truncated"
+
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+
+        assert rc == pdl.EXIT_OK
+        assert "expected" in capsys.readouterr().err
+        assert gcs.state.objects[OBJECT] == payload
+
+    def test_a_valid_marker_still_short_circuits(self, tmp_path, gcs, monkeypatch,
+                                                 payload, payload_md5):
+        """
+        The property being preserved. Re-localizing an input that is genuinely present
+        is what job_avoid depends on; a check that rejected good markers would turn
+        every re-run into a full re-upload.
+        """
+        force_bucket_route(monkeypatch)
+        dest = self._marker(tmp_path, gcs, len(payload),
+                            gs_url="gs://{}/{}".format(BUCKET, OBJECT))
+        gcs.state.objects[OBJECT] = payload
+        gcs.state.composite[OBJECT] = 1
+
+        with Server(payload) as source:
+            before = source.state.snapshot()["sent"]
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+            after = source.state.snapshot()["sent"]
+
+        assert rc == pdl.EXIT_OK
+        assert after == before, "a valid marker must not re-transfer"
+
+    def test_a_marker_with_no_url_is_not_trusted(self, tmp_path, gcs, monkeypatch,
+                                                 payload, payload_md5, capsys):
+        """
+        Markers written before the URL was recorded. The URL is re-derived from the
+        mount table when possible; when it cannot be, the marker is not believed --
+        a redundant transfer is the right direction to fail in.
+        """
+        force_bucket_route(monkeypatch)
+        dest = self._marker(tmp_path, gcs, len(payload))       # no gs_url
+        monkeypatch.setattr(pdl, "read_mounts", lambda: [])
+
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5))
+
+        assert rc == pdl.EXIT_OK
+        assert "cannot be checked" in capsys.readouterr().err
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+
+    def test_the_url_is_recorded_on_a_real_run(self, tmp_path, gcs, monkeypatch,
+                                               payload, payload_md5):
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            pdl.run(options_for(dest, source.url(), len(payload),
+                                check_md5=payload_md5))
+        _, marker_path = pdl.sidecar_paths(dest)
+        with open(marker_path) as fh:
+            marker = json.load(fh)
+        assert marker.get("gs_url") == "gs://{}/{}".format(BUCKET, OBJECT)

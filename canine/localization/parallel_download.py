@@ -1071,15 +1071,26 @@ def try_lock(fd):
 # completion marker
 # --------------------------------------------------------------------------------
 
-def write_done_marker(path, size, plan_id, digest, route=ROUTE_POSIX):
+def write_done_marker(path, size, plan_id, digest, route=ROUTE_POSIX, gs_url=None):
     """
-    `route` is recorded because the marker is checked before the route is chosen.
+    `route` is recorded because the marker is checked before the route is chosen, and
+    `gs_url` so that the bucket route's completion can be checked at all.
 
-    Only the routes that leave a local file can have that file's presence verified;
-    bucket-compose leaves none, so demanding one there turns a valid short-circuit into
-    a full re-upload. An absent field in an older marker is read as ROUTE_POSIX, which
-    is the safe direction: a mis-applied presence check costs a redundant transfer,
-    while a skipped one reports success for a file that is not there.
+    Every route's marker has to be falsifiable. A marker is a hidden sidecar, so
+    anything that removes the payload without sweeping dotfiles leaves it behind
+    claiming something that is gone -- and a marker believed without evidence reports
+    success having transferred nothing.
+
+    The local routes check `os.path.getsize(dest)`. bucket-compose has no local file, and
+    that was originally read as "nothing to check", which made it the one route where a
+    stale marker was undetectable. Observed in practice: `route-check.bin` deleted from a
+    bucket, `.route-check.bin.k9pdl.done` left behind, and the next run would have
+    returned EXIT_OK in milliseconds. Recording the URL makes the object itself
+    checkable, which is the same evidence the local routes use.
+
+    An absent field in an older marker is read as ROUTE_POSIX, which is the safe
+    direction: a mis-applied presence check costs a redundant transfer, a skipped one
+    reports success for data that is not there.
     """
     payload = {
         "schema_version": SCHEMA_VERSION,
@@ -1088,6 +1099,8 @@ def write_done_marker(path, size, plan_id, digest, route=ROUTE_POSIX):
         "hash": digest,
         "route": route,
     }
+    if gs_url:
+        payload["gs_url"] = gs_url
     fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         os.write(fd, json.dumps(payload).encode("utf-8"))
@@ -3058,7 +3071,8 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     for name in part_names:
         client.delete_object(bucket, name)
 
-    write_done_marker(marker_path, size, plan_id, digest, route=ROUTE_BUCKET)
+    write_done_marker(marker_path, size, plan_id, digest, route=ROUTE_BUCKET,
+                      gs_url=decision.gs_url)
     manifest.unlink()
     log("complete: {} bytes composed from {} parts{}".format(
         size, len(part_names), " (verified)" if digest else ""))
@@ -3506,6 +3520,53 @@ def open_destination(dest, size):
     return fd
 
 
+def marker_object_present(marker, dest, options):
+    """
+    Whether the composed object a bucket-route marker claims actually exists, at size.
+
+    Returns `(present, why_not)`. One metadata call, against a marker that would
+    otherwise be believed on its own.
+
+    The URL is taken from the marker, and derived from the mount table when the marker
+    predates that field -- `gs_url_for` reads /proc/mounts and runs none of
+    `select_route`'s probes, so this stays cheap and does not need the route decided
+    first.
+
+    **When the URL cannot be resolved at all, the marker is not trusted.** That costs a
+    redundant transfer for an older marker on a destination whose mount has since gone,
+    which is the direction to fail in: the alternative is the behaviour this function
+    exists to remove.
+    """
+    gs_url = marker.get("gs_url")
+    if not gs_url:
+        mounts = read_mounts()
+        mount = resolve_mount(dest, mounts) if mounts else None
+        gs_url = gs_url_for(dest, mount) if mount else None
+    if not gs_url:
+        return False, ("it is a bucket-route marker with no gs:// URL recorded and none "
+                       "could be resolved from the mount table, so it cannot be checked")
+
+    try:
+        bucket, name = split_gs_url(gs_url)
+    except ValueError:
+        return False, "its recorded gs:// URL is malformed: {}".format(gs_url)
+
+    try:
+        metadata = GcsClient(timeout=options.timeout).get_object(bucket, name)
+    except PermanentError:
+        return False, "{} does not exist".format(gs_url)
+    except TransientError as e:
+        # Cannot prove absence, so do not act on it. Re-transferring is expensive and a
+        # transient GCS error is not evidence the object is gone.
+        return False, "{} could not be checked ({}); re-transferring to be safe".format(
+            gs_url, e)
+
+    actual = int(metadata.get("size", -1))
+    if actual != options.size:
+        return False, "{} is {} bytes, expected {}".format(gs_url, actual, options.size)
+    return True, ""
+
+
 def run(options):
     dest = options.dest
     manifest_path, marker_path = sidecar_paths(dest)
@@ -3527,18 +3588,21 @@ def run(options):
             # stage-publish route has always done exactly this (see
             # `os.path.exists(staged) and os.path.getsize(staged) == size`); the
             # primary route was the outlier.
-            # bucket-compose leaves no local file, so there is nothing to check and
-            # demanding one would turn a valid short-circuit into a full re-upload.
-            expects_file = marker.get("route", ROUTE_POSIX) != ROUTE_BUCKET
-            try:
-                present = os.path.getsize(dest) == options.size
-            except OSError:
-                present = False
-            if present or not expects_file:
+            # bucket-compose leaves no local file, so its evidence is the object in
+            # the bucket instead -- see marker_object_present().
+            if marker.get("route", ROUTE_POSIX) == ROUTE_BUCKET:
+                present, why = marker_object_present(marker, dest, options)
+            else:
+                try:
+                    present = os.path.getsize(dest) == options.size
+                except OSError:
+                    present = False
+                why = "{} is missing or the wrong size".format(dest)
+            if present:
                 log("already complete per {}".format(os.path.basename(marker_path)))
                 return EXIT_OK
-            log("{} claims completion but {} is missing or the wrong size; "
-                "ignoring the marker".format(os.path.basename(marker_path), dest))
+            log("{} claims completion but {}; ignoring the marker".format(
+                os.path.basename(marker_path), why))
 
     size = options.size
     if size is None or size < 0:
