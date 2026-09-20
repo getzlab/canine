@@ -3898,3 +3898,72 @@ nobody re-examined. **Every one was a correct number applied to the wrong system
 defense that actually worked, each time, was a second measurement taken under deliberately
 different conditions — two disk sizes, two sources, two block sizes — because a wrong
 premise survives repetition and dies on contrast.
+
+### 13.51 Measured at full size: 4.97 h → 0.56 h, verified, no read-back
+
+The full 278.91 GiB BAM, GDC S3 → bucket, 16 connections, 8 MiB block:
+
+```
+2031.41 s   140.60 MiB/s   relay 1802.4s   compose 36.5s   hash ok
+etag from 9849 recorded part digests, 0 re-read
+```
+
+| | today | pd-standard | **bucket** |
+|---|---|---|---|
+| 278.91 GiB | 4.97 h | 1.62 h | **0.564 h** |
+| speedup | — | 3.07x | **8.8x** |
+
+**§8.5's ≥4x target is met**, on the path the disk could not reach, with the object
+verified against its real multipart ETag.
+
+#### What the run establishes beyond the headline
+
+* **`0 re-read`.** The ETag came entirely from digests recorded as the bytes were relayed.
+  This route returned `EXIT_FAIL` on any ETag source until §6.6 — it could not localize the
+  actual workload at all — and it now verifies a 279 GiB object without fetching a byte
+  back. #19's guarantee, extended to the relay.
+* **Nothing degraded at scale.** 3283 chunks, 9849 parts, a three-level compose tree in
+  36.5 s, `wire 1.01x` (no duplicate fetching), `streams 15.47 of 16`, peak RSS 402 MiB
+  inside its budget. The 96 GiB prefix predicted 146.4 MiB/s relay and the full object
+  delivered 158.5.
+* **Consumers gain too: 106.63 MiB/s through gcsfuse**, from the benchmark's own re-read
+  of the finished object. That is 2.4x the pd-standard's sustained read, and it is the
+  number §13.46's break-even analysis needed and did not have. Both sides of that cost
+  model now favour the bucket.
+
+#### One thing got worse, and it is mine
+
+`commit` was 8% of wall at 12 GiB, 16% at 96 GiB, and **43% at full size** — 768.3 s over
+3221 batches, `mean batch 1.0`. Scaling is superlinear: 2.14x the chunks between the 96 GiB
+and full-size runs, 7.2x the commit time.
+
+The cause is the ETag work. The manifest is rewritten **in full on every chunk completion**,
+and it now carries 9849 part digests alongside 3283 chunk records — so each write
+re-uploads a larger document, and the cost goes as chunks x manifest size. At ~0.55 s
+between completions the deferred writer drains each one before the next arrives, so the
+batching meant to amortise this never engages.
+
+It is off the worker pool and not in the critical path (`relay 1802 + compose 36` accounts
+for the 2031 s wall), so it cost nothing measurable here. It is still ~1.6 GB of redundant
+uploads running alongside the transfer, and it grows quadratically — at 1 TB it would stop
+being free. A short accumulation window in the writer is the fix.
+
+**The `NOT BATCHED` guard fired on all three runs and I explained it away twice** — once as
+"nothing to batch at 4.7 MiB/s", once as "it will fix itself when the upload block goes
+up". Both were plausible and neither was checked against the next data point. The guard was
+measuring a real property the whole time.
+
+#### Where this leaves the effort
+
+The original question — 300 GB BAMs taking upwards of 4 hours — is answered: **0.56 h,
+verified, on infrastructure that also stores the result 2.1x cheaper**. What remains is
+tidying rather than discovery:
+
+* the commit scaling above;
+* **crc32c**, still unimplemented, which would make md5-sourced objects verify from
+  metadata instead of a 62%-of-wall read-back;
+* **`bucket_upload_wait_tries`**, raised to 180 against a 1.62 h worst case (§13.49) and
+  now facing a 0.56 h one — `pdl claim` can re-derive it, and the answer is probably that
+  the original 60 was fine;
+* the **reader/writer split**, which §6.5g rejected at a 1.05x ceiling on the disk and
+  which is 1.41x here — worth ~40% on a route that is now 71% read-bound.

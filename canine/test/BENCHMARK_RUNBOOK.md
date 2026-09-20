@@ -3377,7 +3377,55 @@ conclusion for this route**: on the pd-standard the ceiling was 1.05x and decoup
 not worth building. Here it is worth ~30%. The recommendation was route-specific and said
 so; this is the other route.
 
+##### Full size, verified — the result
+
+```
+278.91 GiB   2031.41 s   140.60 MiB/s   peak NIC 222.63   peak RSS 402 MiB   hash ok
+   phases: relay 1802.4s  compose 36.5s
+   streams: 15.47 of 16        wire: 1.01x payload
+   io     : read 19737.0s / write 8143.8s (71% read, overlap ceiling 1.41x)
+   etag from 9849 recorded part digests, 0 re-read
+   re-read 278.91 GiB in 44m38s (106.63 MiB/s)    <- the BENCHMARK's independent check
+```
+
+**`hash ok`, and `0 re-read`.** The multipart ETag was assembled entirely from digests
+recorded as the bytes were relayed — no part of the 279 GiB was fetched back from GCS.
+This is the first exercise of that path against real infrastructure; it returned
+`EXIT_FAIL` on any ETag source until §6.6 forced the issue.
+
+Everything held at 3283 chunks and 9849 parts: `wire 1.01x` (no duplicate fetching),
+`streams 15.47 of 16`, a three-level compose tree in 36.5 s, and peak RSS inside the
+budget rather than flagged.
+
+**Relay 158.5 MiB/s, total 140.6 MiB/s, 0.564 h.** Against today's 4.97 h that is
+**8.8x**, and 2.9x the pd-standard's 1.62 h.
+
+**Consumer reads through gcsfuse: 106.63 MiB/s**, from the benchmark's own re-read. That
+is 2.4x the pd-standard's sustained rate, so the bucket is faster for consumers as well as
+producers — the number §13.46's break-even analysis needed and did not have.
+
+##### The commit cost is scaling superlinearly
+
+| | chunks | commit | per chunk |
+|---|---|---|---|
+| 96 GiB | 1536 | 106.5 s | 0.069 s |
+| **279 GiB** | **3283** | **768.3 s** | **0.234 s** |
+
+2.14x the chunks, **7.2x the commit time**. The manifest is rewritten in full on every
+chunk completion, and the ETag work added 9849 part digests to a document that already
+carried 3283 chunk records — so each write re-uploads a larger object, and `mean batch
+1.0` says the batching meant to amortise it never engages. At ~0.55 s between completions
+the writer drains each one before the next arrives.
+
+It is **off the worker pool**, so it is not in the critical path — `relay 1802 + compose
+36 ≈ the 2031 s wall` — but it is roughly 1.6 GB of redundant manifest uploads running
+concurrently with the transfer. The `NOT BATCHED` guard has been correct every time it
+fired and was twice explained away here; a short accumulation window in the writer is the
+obvious fix.
+
 ##### Against the disk
+
+
 
 | | pd-standard | bucket |
 |---|---|---|
@@ -3959,7 +4007,10 @@ carries the narrative once a row is filled in.
 | Does the composed object land where the post-unmount `ls` check looks? | §6.6 step 2 | not measured |
 | Is customTime stamped on it? | §6.6 step 2 | not measured — unstamped means invisible to the lifecycle rule, so it never expires |
 | Two writers on one `plan_id` | §6.6 step 3 | **done, in the fake.** Object correct, loser requeues, no leaked parts (`TestTwoWritersOnOneObject`). Unverified against real GCS |
-| Relay throughput, uncached bucket, ≥96 GiB | §6.6 step 4 | **146.4 MiB/s relay, 125.4 total** (96 GiB, GDC S3, 16 conns, 8 MiB block) — 3.3× the disk. Extrapolates to ~0.63 h for 278.91 GiB, **7.9× today's 4.97 h**; the ≥4× target is cleared |
+| Relay throughput, uncached bucket | §6.6 step 4 | **MEASURED AT FULL SIZE: 158.5 MiB/s relay, 140.6 total, 0.564 h for 278.91 GiB, `hash ok`.** 4.97 h → 0.564 h = **8.8×**, against the ≥4× target the disk path could not reach at 3.07× |
+| Does the ETag verify without a read-back? | §6.6 step 4 | **yes — `etag from 9849 recorded part digests, 0 re-read`.** #19's guarantee on a route that refused ETag sources entirely until this section |
+| Consumer read rate through gcsfuse | §6.6 step 4 | **106.63 MiB/s** (the benchmark's own re-read, 278.91 GiB in 44m38s) — 2.4× the pd-standard's sustained read |
+| Why is `commit` 43% of wall at full size? | §6.6 step 4 | **OPEN.** 2.14× the chunks but 7.2× the commit time: the manifest is rewritten whole per chunk and now carries 9849 part digests too, while `mean batch 1.0` says batching never engages. Off the worker pool, so not in the critical path |
 | What was capping it at 64 MiB/s? | §6.6 step 4 | **our own 256 KiB upload block.** A PUT costs ~53 ms whatever it carries. Identified by two unrelated sources agreeing to 1% (4.71 and 4.76 MiB/s per worker); fixed by `--upload-block`, default 8 MiB |
 | Does the route gate fire on a real RW gcsfuse mount? | §6.6 step 1 | **yes** — `192 parts composed`, and parts exist only on `bucket-compose` |
 | Does a composite carry an md5? | §6.6 step 2 | **no** — `Component-Count: 192`, `Hash (CRC32C)` present, no MD5 line. Which is why the md5 path re-reads (516 s of 826 s, 62%) and why the ETag path had to be built |
