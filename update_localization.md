@@ -4041,3 +4041,56 @@ This is the same error as §13.49's, one level down. That one sized a relay cons
 a disk measurement; this one sized it in the wrong unit. Both were plausible quantities
 standing in for the quantity that mattered, and both survived review until something
 forced the arithmetic to be written out.
+
+### 13.53 The reader/writer split: +6%, reverted, and the ceiling was loose
+
+§13.51 listed this as the last optimisation worth having: §6.5g had rejected it for the
+pd-standard at a 1.05x overlap ceiling, the bucket route showed 1.38x and 73% read, and
+the rejection was explicitly route-specific.
+
+Built as a single-slot prefetch per chunk — not a reader/writer pool, because a pool
+reorders writes and two invariants forbid that (GCS resumable sessions must be written
+sequentially, and `_hash` only records an S3 part seen contiguously from its first byte).
+Measured against two baseline runs 0.7% apart: **1911.6 s against 2038.6 s, −6.2%.**
+
+Real, and a quarter of what was advertised. Perfect overlap would have been ~1297 s of
+relay; this reached 1679.9 s, **22% of the available gain**. The reason is in the same
+`io` line: **write time rose 9.2%** while read fell 12.6%. Once the two halves genuinely
+run at once they contend — for the NIC (peak 223 → 247 MiB/s) and for the interpreter —
+so part of the saving came straight back. The ceiling *rose* to 1.47x, which says a
+deeper queue would not help either.
+
+**Reverted.** 6% on a target already met at 8.7x, against a thread pool and a
+drain-on-rewind path in the hot loop, and +30% memory that pushed peak RSS past the
+guard's budget. The code is gone; the number stays.
+
+#### The transferable finding
+
+`overlap ceiling` is `(read + write) / max(read, write)` — an upper bound on decoupling
+*if the halves are independent*. On the pd-standard they were, and it correctly said
+there was nothing to get. Here they are not, and it overstated the gain by a factor of
+four.
+
+So it is a screening statistic, not a forecast: **a low ceiling reliably says "don't
+bother", a high one only says "worth measuring".** §6.5g's conclusion was right for the
+right reason and this one was right for a reason I had to build the thing to discover.
+
+#### And the tests were wrong four times
+
+Worth recording because the failure wore a different disguise each time, and three of
+them passed:
+
+1. Counted reads *executing* at `connections=1` — the pool is single-threaded there, so
+   two submitted reads simply queue.
+2. Counted globally across streams — would have flagged correct code, since N connections
+   legitimately read from N streams at once.
+3. Keyed on `id(getattr(fn, "__self__", None))` — every non-bound-method submission,
+   including the verification pool's, collapsed into one bucket and reported 7
+   outstanding on correct code.
+4. The real one: with the default 8 MiB block against a 1 MiB chunk there is exactly one
+   block per chunk, so the read-ahead never fires. **Every test in the class was passing
+   against an unreachable feature.**
+
+The first three are variations on measuring the wrong quantity. The fourth is this
+effort's signature defect — a test that exercises nothing and reports success — and it
+survived three rounds of me specifically looking for that.

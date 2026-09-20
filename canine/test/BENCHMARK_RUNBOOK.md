@@ -3479,6 +3479,43 @@ The §6.2 RSS guard now budgets `4 x connections x upload_block` rather than a f
 256 MiB, because the old ceiling and its "~1 MiB per connection" claim both predate
 `--upload-block` and reported a correct run as suspicious.
 
+##### The reader/writer split: built, measured at +6%, reverted
+
+§6.5g rejected this for the pd-standard at a 1.05x overlap ceiling. On the bucket route
+the ceiling was 1.38x and `io` showed 73% read, so it looked worth having. Built as a
+single-slot prefetch per chunk — a pool would reorder writes, which a GCS resumable
+session and `_hash`'s contiguity rule both forbid — and measured against two baseline
+runs 0.7% apart:
+
+| | no prefetch | prefetch |
+|---|---|---|
+| total | 2038.6 s | **1911.6 s (−6.2%)** |
+| relay | 1787.6 s | 1679.9 s |
+| read | 20128.3 s | 17591.9 s (−12.6%) |
+| write | 7619.9 s | **8319.6 s (+9.2%)** |
+| peak NIC | 223.4 MiB/s | 247.5 |
+| peak RSS | 403.9 MiB | **523.6 MiB (+30%)** |
+
+Real — 6.2% is well outside the baseline spread — but **22% of what the ceiling
+advertised.** Perfect overlap would have put relay at ~1297 s.
+
+**Write time rose 9.2%, which is the explanation.** Once the read and the upload actually
+run at once they contend, for the NIC and for the interpreter, so part of what the overlap
+saved on the read side came back on the write side. The ceiling *rose* to 1.47x rather
+than falling toward 1.0, which says the remaining overlap is not reachable by making the
+queue deeper either — the contention is the limit, not the slot count.
+
+**Reverted.** 6% on a target already exceeded twice over, against a thread pool and a
+drain-on-rewind path in the hot loop, and a 30% memory rise that put peak RSS over the
+guard's budget. Recorded here rather than left as a commit because the useful output is
+the number: **this route's read/write overlap is worth ~6%, not the 38% its ceiling
+suggests, and the ceiling overstates it because the two halves contend.**
+
+That also generalises the §6.5g note. `overlap ceiling` is an upper bound on a decoupled
+loop *if the halves are independent*. On the disk they were (1.05x, nothing to get); here
+they are not, and the bound is loose by a factor of four. Treat it as a screening
+statistic, not a forecast.
+
 ##### Still open
 
 * **The full-size run with verification** — in flight. It is the first exercise of the

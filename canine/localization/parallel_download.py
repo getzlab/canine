@@ -2219,14 +2219,6 @@ class Downloader:
         self._read_seconds = 0.0
         self._write_seconds = 0.0
         self._io_blocks = 0
-        # Read-ahead pool, one slot per worker: a worker submits at most one read at a
-        # time, so `connections` threads can never queue. Disabled with --no-prefetch,
-        # which is also how the A/B in §6.8 is run.
-        self._prefetch = None
-        if getattr(options, "prefetch", True):
-            self._prefetch = ThreadPoolExecutor(
-                max_workers=max(1, options.connections),
-                thread_name_prefix="k9pdl-read")
         self._commit_linger = getattr(options, "commit_linger", None)
         if self._commit_linger is None:
             self._commit_linger = COMMIT_LINGER_SECONDS
@@ -2383,42 +2375,21 @@ class Downloader:
             # would put 285k acquisitions through 16 threads to measure something the
             # lock itself would then distort.
             io = [0.0, 0.0, 0]
-            # Single-slot read-ahead: the read for block N+1 is issued BEFORE block N is
-            # written, so the two overlap. Only ever one read in flight on the stream --
-            # the previous one has returned before the next is submitted -- which is what
-            # keeps this safe on a single HTTP response.
-            #
-            # Deliberately per chunk rather than a shared reader/writer pool. A pool
-            # would reorder writes, and two invariants forbid that: uploads within a GCS
-            # resumable session must be sequential, and _hash only records an S3 part it
-            # saw contiguously from its first byte. Per-chunk prefetch keeps both and
-            # still recovers the overlap, which `io`'s ceiling says is all there is to
-            # get (1.38x on the bucket route, 1.05x on the disk -- see §6.5g).
-            pending = None
             try:
                 while offset < end:
                     want = min(self.sink.read_block, end - offset)
                     mark = time.time()
-                    if pending is None:
-                        buf = stream.read(want)
-                    else:
-                        # Time spent here is the reader still holding up the writer,
-                        # which is exactly what the io split should now show shrinking.
-                        buf, pending = pending.result(), None
+                    buf = stream.read(want)
                     after_read = time.time()
                     io[0] += after_read - mark
                     if not buf:
                         raise TransientError(
                             "short read at {} ({} bytes short)".format(offset, end - offset)
                         )
-                    sent_to = offset + len(buf)
-                    if self._prefetch is not None and sent_to < end:
-                        pending = self._prefetch.submit(
-                            stream.read, min(self.sink.read_block, end - sent_to))
-                    write_started = time.time()
                     durable = self.sink.write(index, offset, buf)
-                    io[1] += time.time() - write_started
+                    io[1] += time.time() - after_read
                     io[2] += 1
+                    sent_to = offset + len(buf)
                     self.progress.add(len(buf))
                     with self._progress_lock:
                         self.made_progress = True
@@ -2452,17 +2423,6 @@ class Downloader:
                     raise TransientError(str(e))
                 self._backoff(attempts, "chunk {}: {}".format(index, e))
             finally:
-                # Drain any outstanding read BEFORE closing the stream it is reading
-                # from. Its buffer is discarded: after a rewind it holds bytes for an
-                # offset we are no longer at, and after an error the stream is being
-                # abandoned anyway. Closing underneath a live read would surface as a
-                # spurious IOError from a thread nothing is waiting on.
-                if pending is not None:
-                    try:
-                        pending.result()
-                    except BaseException:                      # noqa: BLE001
-                        pass
-                    pending = None
                 try:
                     stream.close()
                 except (IOError, OSError):
@@ -2624,11 +2584,6 @@ class Downloader:
             # be racing a live writer otherwise. In `finally` so a worker blowing up still
             # cannot leave the thread running.
             writer_error = self._stop_writer()
-            # Every worker drains its own pending read in its own finally, so by here
-            # the pool is idle; this just releases the threads.
-            if self._prefetch is not None:
-                self._prefetch.shutdown(wait=True)
-                self._prefetch = None
         if writer_error is not None:
             errors.append(writer_error)
         self._log_concurrency(workers, len(pending), time.time() - wall_started)
@@ -3892,10 +3847,6 @@ def build_parser():
                         help="simultaneous ranged GETs (0/1 = single stream)")
     parser.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK,
                         dest="min_chunk", help="smallest chunk worth its own request")
-    parser.add_argument("--no-prefetch", dest="prefetch", action="store_false",
-                        help="read and write strictly in sequence within each chunk. "
-                             "The default overlaps them, which the io split says is "
-                             "worth up to the reported overlap ceiling")
     parser.add_argument("--commit-linger", dest="commit_linger", type=float,
                         default=COMMIT_LINGER_SECONDS,
                         help="seconds the manifest writer waits for more chunk "
