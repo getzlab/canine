@@ -3423,6 +3423,26 @@ concurrently with the transfer. The `NOT BATCHED` guard has been correct every t
 fired and was twice explained away here; a short accumulation window in the writer is the
 obvious fix.
 
+**Fixed and re-measured** (`969c9cb`, a 2 s linger before snapshotting):
+
+| | before | after |
+|---|---|---|
+| `commit` | 768.3 s, **43% of wall** | **138.4 s, 8%** |
+| batches | 3221, mean 1.0 | 685, mean **4.8** |
+| per batch | 0.239 s | 0.202 s |
+| relay | 1802.4 s | 1787.6 s (−0.8%) |
+| total | 2031.4 s | 2045.8 s (+0.7%) |
+| hash | ok | ok |
+
+**5.55x less commit time and the headline did not move.** ±1% on both phases is noise,
+which is the confirmation that mattered: commit really was off the critical path, so this
+removed the concurrent upload traffic without buying — or costing — transfer time. Per-batch
+cost is unchanged at ~0.2 s, as expected; a manifest rewrite costs what it costs, there are
+simply 4.8x fewer of them.
+
+Consumer read through gcsfuse, measured twice: **106.63 and 111.09 MiB/s** — ~109 MiB/s,
+2.5x the pd-standard's sustained read.
+
 ##### Against the disk
 
 
@@ -4010,7 +4030,7 @@ carries the narrative once a row is filled in.
 | Relay throughput, uncached bucket | §6.6 step 4 | **MEASURED AT FULL SIZE: 158.5 MiB/s relay, 140.6 total, 0.564 h for 278.91 GiB, `hash ok`.** 4.97 h → 0.564 h = **8.8×**, against the ≥4× target the disk path could not reach at 3.07× |
 | Does the ETag verify without a read-back? | §6.6 step 4 | **yes — `etag from 9849 recorded part digests, 0 re-read`.** #19's guarantee on a route that refused ETag sources entirely until this section |
 | Consumer read rate through gcsfuse | §6.6 step 4 | **106.63 MiB/s** (the benchmark's own re-read, 278.91 GiB in 44m38s) — 2.4× the pd-standard's sustained read |
-| Why is `commit` 43% of wall at full size? | §6.6 step 4 | **OPEN.** 2.14× the chunks but 7.2× the commit time: the manifest is rewritten whole per chunk and now carries 9849 part digests too, while `mean batch 1.0` says batching never engages. Off the worker pool, so not in the critical path |
+| Why is `commit` 43% of wall at full size? | §6.6 step 4 | **FIXED** (`969c9cb`). The writer took the queue the instant it woke, so batching only happened when chunks arrived during a commit — true on the disk (slow fsync), never on the bucket (0.23 s commit, 0.55 s arrivals). A 2 s linger: **768.3 s → 138.4 s, 43% → 8%, mean batch 1.0 → 4.8**, headline unchanged |
 | What was capping it at 64 MiB/s? | §6.6 step 4 | **our own 256 KiB upload block.** A PUT costs ~53 ms whatever it carries. Identified by two unrelated sources agreeing to 1% (4.71 and 4.76 MiB/s per worker); fixed by `--upload-block`, default 8 MiB |
 | Does the route gate fire on a real RW gcsfuse mount? | §6.6 step 1 | **yes** — `192 parts composed`, and parts exist only on `bucket-compose` |
 | Does a composite carry an md5? | §6.6 step 2 | **no** — `Component-Count: 192`, `Hash (CRC32C)` present, no MD5 line. Which is why the md5 path re-reads (516 s of 826 s, 62%) and why the ETag path had to be built |

@@ -3967,3 +3967,37 @@ tidying rather than discovery:
   the original 60 was fine;
 * the **reader/writer split**, which §6.5g rejected at a 1.05x ceiling on the disk and
   which is 1.41x here — worth ~40% on a route that is now 71% read-bound.
+
+#### 13.51a Confirmed: the commit fix, and what "off the critical path" means
+
+Re-ran the full 278.91 GiB with the linger (§13.51's open item, `969c9cb`):
+
+| | before | after |
+|---|---|---|
+| `commit` | 768.3 s, 43% of wall | **138.4 s, 8%** |
+| batches | 3221, mean 1.0 | 685, mean **4.8** |
+| relay | 1802.4 s | 1787.6 s |
+| total | 2031.4 s | 2045.8 s |
+| hash | ok | ok |
+
+**5.55x less commit work; the headline did not move.** That is the confirmation, not a
+disappointment: `commit` was always off the worker pool, so the prediction was that fixing
+it would change the concurrent load and nothing else. ±1% on both phases is noise. Had the
+total dropped, it would have meant the manifest traffic was contending with the transfer
+after all — which nothing had shown, and which this rules out.
+
+Per-batch cost is unchanged at ~0.2 s. A manifest rewrite costs what it costs; the fix was
+never about making it cheaper, only about doing it 4.8x less often.
+
+Consumer read through gcsfuse now has two independent measurements — **106.63 and
+111.09 MiB/s** — so ~109 MiB/s, 2.5x the pd-standard's sustained read. §13.46's break-even
+analysis can use that with more confidence than a single figure.
+
+**The final numbers for the effort, verified twice:**
+
+| | today | pd-standard | bucket |
+|---|---|---|---|
+| 278.91 GiB | 4.97 h | 1.62 h | **0.57 h** |
+| speedup | — | 3.07x | **8.7x** |
+| consumer read | — | 43.9 MiB/s | **109 MiB/s** |
+| storage 24–48 h | — | $0.42–$0.83 | **$0.20–$0.39** |
