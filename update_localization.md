@@ -4133,23 +4133,50 @@ So: **no part length from metadata, no ETag path.** Same conclusion as §13.28 �
 *better no verification than one that fails on correct data* — extended to the optimization
 it would have enabled.
 
-**There is no safe variant here, and an earlier draft of this section claimed there
-was.** It suggested that when a DRS URI resolves into a bucket we hold credentials for —
-"the GDC case" — `head-object --part-number 1` would give an authoritative part length.
-That misread how GDC is reached. `HandleGDCHTTPURL` matches
-`https://api.(awg.)?gdc.cancer.gov/(files|data)/<uuid>` and immediately rewrites it to
-`drs://dg.4dfc:<uuid>`: **GDC goes *through* DRS, to an API, with no bucket, no key and no
-credentialed endpoint at any point.**
+**There is no safe variant here, and two earlier drafts of this section got the reason
+wrong.** The first claimed one existed: when a DRS URI resolves into a bucket we hold
+credentials for — "the GDC case" — `head-object --part-number 1` would give an
+authoritative part length. The second corrected that to "GDC has no credentialed
+endpoint", which is also false. The accurate picture:
 
-The credentialed S3 case that does exist is `HandleAWSURL` against an explicit
-`aws_endpoint_url` — the jamboree object store — which is a different endpoint reached a
-different way, and which already takes the authoritative path and needs none of this.
+`HandleGDCHTTPURL` tries DRS **first** and falls back to the GDC API:
 
-So the position is simpler than the draft implied: **on every DRS path in this workload
-the part length is unobtainable, therefore the multipart-ETag fast path is unreachable for
-DRS inputs.** Not "declined pending a safer variant" — there isn't one to wait for. The
-`0 re-read` result belongs to sources that supply bucket, key and credentials, and DRS by
-construction does not.
+```python
+try:
+    self.uri = gdc_drs_root + self.uuid
+    self.drs_obj = HandleDRSURI(self.uri, **self.extra_args)
+except:
+    canine_logging.warning("Re-attempting with GDC API")   # X-Auth-Token
+```
+
+The GDC API **is** credentialed — an `X-Auth-Token` header for controlled data. It is
+tried second only because it is historically slower than a signed URL. What it lacks is
+not credentials but an **S3 API surface**: it is an HTTP file endpoint, so there is no
+bucket, no key and no `head-object` to ask. Same for the DRSHub signed URL, whose
+credential is embedded in the signature.
+
+**And the decisive objection, which neither draft reached: a multipart ETag is a property
+of an upload, not of the content.** The DRSHub-supplied object and the GDC-API-served
+object may live in *different object stores*, uploaded with different part sizes — so the
+same bytes can carry two different ETags and two different strides. There is no canonical
+part length for a GDC file at all. That is precisely why drshub publishes `hashes`
+(md5, a property of the content) and not an ETag.
+
+Which makes the failure mode concrete rather than theoretical. `HandleDRSURI` sets
+`url_refresh_cmd = resolver`, so an expired signature **re-resolves through drshub
+mid-transfer** — the mechanism that makes DRS usable at all. If that resolution lands on a
+different store, the part digests already computed against the first layout are compared
+against the second's ETag, mismatch, `PermanentError`, `discard()`, do-not-retry. A
+byte-perfect 279 GiB download destroyed by the code path that exists to keep the transfer
+alive.
+
+So the rule is not "decline until we find a safer variant" but something sharper: **an
+ETag may only ever be trusted from the same response whose bytes are being hashed, and
+never as an attribute of the file.** On the S3 source that condition holds — bucket, key,
+endpoint and credentials are fixed for the whole transfer and `head-object` answers
+authoritatively about that object in that store. On DRS it cannot be made to hold, because
+the source may legitimately change underneath. The `0 re-read` result belongs to sources
+that pin bucket, key and credentials; DRS by construction does not pin any of them.
 
 **Cost of declining, so it is priced rather than forgotten:** a large DRS input keeps its
 whole-file md5 read-back. To a bucket destination that measured 43 min for 279 GiB against
