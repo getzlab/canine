@@ -4094,3 +4094,53 @@ them passed:
 The first three are variations on measuring the wrong quantity. The fourth is this
 effort's signature defect — a test that exercises nothing and reports success — and it
 survived three rounds of me specifically looking for that.
+
+### 13.54 Declined: deriving the S3 part length for DRS-supplied signed URLs
+
+A DRS input goes through the parallel downloader already (`HandleDRSURI`, mode `"url"`,
+with `url_refresh_cmd = resolver` so an expired signature re-resolves through drshub), but
+it verifies with drshub's **whole-file md5**. That cannot be assembled from out-of-order
+parallel chunks, so it forces the read-back the multipart-ETag path avoids — 62% of wall
+on the bucket route, ~52 min on the disk.
+
+The ETag itself is available: S3 returns `ETag: "<md5>-<N>"` on a GET, including through a
+presigned URL, and the downloader's probe already makes that request and discards the
+header. What is *not* available is the part length. `?partNumber=1` cannot be appended to
+a presigned URL, because the signature covers the query string.
+
+It is derivable. `P` must satisfy `P ∈ [ceil(size/N), floor((size-1)/(N-1))]`, and for the
+279 GiB object that window is 3087 bytes wide and contains exactly one multiple of 1 MiB —
+30408704, the true 29 MiB. Uniqueness holds whenever `P < N MiB`, i.e. for the large
+many-part objects where the saving matters.
+
+**Declined anyway, and the reasoning is worth keeping.** §13.28 established that a wrong
+stride is not a missed optimization: `verify()` raises `PermanentError`, `discard()`
+deletes the file, and the job exits do-not-retry — a byte-perfect 279 GiB download thrown
+away. Today the stride is authoritative (`head-object --part-number 1` and `2`, plus the
+`(count-1) x first + last == size` identity). A derived stride has no such confirmation, so
+a mismatch is ambiguous between bad bytes and bad arithmetic.
+
+The proposed resolution was to demote on mismatch — treat it as derivation failure and
+fall back to drshub's md5 rather than discarding, which DRS uniquely permits because it
+supplies an independent whole-file digest. That is sound on paper and wrong in practice:
+**the fallback runs only on mismatch, so it is the least-exercised path in the system, and
+its job is to prevent destroying a 279 GiB download.** Code with that duty cycle and those
+stakes is the wrong place to put confidence. The uniqueness test has the same problem — it
+must be decided at runtime, and the moderate-`N` boundary is simultaneously where a wrong
+answer is likeliest and where it gets least testing.
+
+So: **no part length from metadata, no ETag path.** Same conclusion as §13.28 —
+*better no verification than one that fails on correct data* — extended to the optimization
+it would have enabled.
+
+**The one variant that would be safe** is worth noting for later. When a DRS URI resolves
+to an S3 URL in a bucket we already hold credentials for — the GDC case, since
+`HandleAWSURL` exists for that endpoint — `head-object --part-number 1` gives an
+authoritative part length and nothing is derived. That reuses the path the S3 source
+already takes; the only new work is recognising the resolved host and reusing the
+credentials. Worth revisiting if DRS-to-GDC proves a common shape.
+
+**Cost of declining, so it is priced rather than forgotten:** a large DRS input keeps its
+whole-file md5 read-back. To a bucket destination that measured 43 min for 279 GiB against
+~35 min of transfer, so verification is the larger half. Accepted; correctness is not worth
+trading for it.
