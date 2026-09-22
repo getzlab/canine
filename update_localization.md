@@ -4182,3 +4182,66 @@ that pin bucket, key and credentials; DRS by construction does not pin any of th
 whole-file md5 read-back. To a bucket destination that measured 43 min for 279 GiB against
 ~35 min of transfer, so verification is the larger half. Accepted; correctness is not worth
 trading for it.
+
+### 13.55 `--gunzip` on the bucket route: refused now, decompressed post-compose later
+
+`run()` dispatches to `run_bucket_route` / `run_staged_route` and returns **before** the
+gunzip block, which lives on the POSIX path only. So a `Content-Encoding: gzip` source
+localized to a gcsfuse mount was relayed to GCS still compressed and composed, and since
+`compose` sets no `contentEncoding`, GCS will not transcode it on read and gcsfuse serves
+the gzip stream verbatim under a name promising plain content. Silent wrong output,
+surfacing only in whatever tool reads the mount.
+
+Reachable from exactly two handlers — `HandleGCSSignedURL` and `HandleOtherURL`, the only
+callers of `_probe_http_metadata` and therefore the only ones that set
+`body_is_compressed`. **`gs://` inputs are unaffected**: they take the `server_side` path,
+where `gcloud storage cp` decompresses. `.bam`/`.bai`/`.bcf`/`.csi`/`.tbi` are unaffected
+because `name_implies_gzip` suppresses the flag.
+
+Which is what makes it worth stopping for: `file_handlers.py:509` records removing exactly
+this inconsistency — *"previously the same object arrived decompressed via gs:// but
+compressed via a signed URL"* — and the bucket route reintroduced it, for the same
+objects, on the destination `create_bucket_mount()` is making the default.
+
+Refused for now (`8fbc620`): `EXIT_FAIL` when a route cannot honour the flag.
+
+#### Two constraints, and the plan they killed
+
+**Gzip is sequential.** Chunk N cannot be decoded without N−1, so a parallel chunked
+transfer can never decompress *in flight* on any route. **And the advertised digest covers
+the compressed bytes**, so verification must precede decompression — which also means the
+decompressed output has no digest to check against. "Received bytes verified, then
+transformed" is the strongest guarantee available anywhere.
+
+My first reading of the sequentiality constraint was that it *forced* routing gunzip
+inputs to stage-publish, since that route has a disk to materialize onto. That was wrong,
+and wrong in an expensive direction: stage-publish downloads onto the pd-standard at
+44 MiB/s, so a 279 GiB input would take ~1.8 h against ~34 min on the relay path, plus a
+staging disk sized for the compressed object.
+
+The constraint says the compressed bytes must exist somewhere before decompression. It
+does not say they must exist on a local disk — **after compose they exist in the bucket.**
+
+#### The design
+
+Keep the relay untouched. After compose, and after the existing hash validation of the
+composed compressed object, run a streaming second pass: read it back with sequential
+`download_range` calls, through `zlib.decompressobj`, into a fresh resumable upload, then
+delete the intermediate. Every primitive already exists on `GcsClient`, and it needs **no
+local disk** — both halves stream, memory stays at one buffer.
+
+GCS has no server-side decompression, so this is a genuine full read+write: roughly
+45–90 min for 279 GiB. But the exposed sources are signed GCS URLs and plain-http
+`.vcf`/`.tsv`, typically orders of magnitude smaller than a BAM, and the alternative was
+paying the slow disk for the *entire* transfer rather than one pass over a small file.
+
+What it has to get right is crash consistency across two objects: the done marker must not
+claim completion until the decompressed object exists, a preemption mid-pass must leave a
+resumable state rather than the compressed object sitting under the final name, and the
+intermediate must be deleted with the same care — it is a full second copy of the data.
+
+One thing to measure before building any of it, because it could remove the pass entirely:
+**set `contentEncoding: gzip` on the composed object and see whether gcsfuse serves decoded
+bytes.** If it does, the fix is a metadata field. §4.7 flags precisely this as the case
+where metadata size disagrees with bytes delivered, so it is an experiment, not an
+assumption — an hour on a rebuilt node.

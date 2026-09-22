@@ -3662,13 +3662,18 @@ def run(options):
         options.url or "", size, options.check_etag or options.check_md5, chunk_size
     )
 
-    # Decompression is a POSIX-route capability, and not by accident: **gzip is a
+    # Decompression is a POSIX-route capability today, and not by accident: **gzip is a
     # sequential stream**, so chunk N cannot be decoded without N-1 and a parallel
     # chunked transfer can never decompress in flight. The compressed bytes have to be
     # materialized somewhere first, which is why this route writes a .k9pdl.gz sidecar
-    # and rewrites it afterwards. bucket-compose has no local file at all, so it cannot
-    # be taught to do this; stage-publish has one but copies the staged bytes through
-    # unchanged.
+    # and rewrites it afterwards. bucket-compose has no local file, and stage-publish
+    # has one but copies the staged bytes through unchanged.
+    #
+    # That does not mean the bucket route cannot be fixed, only that it cannot be fixed
+    # in flight -- after compose the compressed bytes DO exist, in the bucket. The
+    # planned fix (#24) keeps the relay untouched and adds a post-compose streaming
+    # pass: read the composed object back, through zlib, into a fresh resumable upload,
+    # then delete the intermediate. No local disk, since both halves stream.
     #
     # The ordering matters too, and constrains any future fix: **the advertised digest
     # covers the COMPRESSED bytes**, so verification must happen before decompression --
