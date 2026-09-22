@@ -175,6 +175,48 @@ A GCS rewrite: no bytes touch any VM at all. `-n` so a requeued shard does not r
 directory source is copied into its parent, or `cp -r gs://a/d gs://B/k/d` would produce
 `gs://B/k/d/d/...` (`base.py:1188`).
 
+**Content-Encoding: gzip sources are decompressed, not copied verbatim.** A `gs://` source
+object can carry `Content-Encoding: gzip` as transport metadata — meant to be served
+transparently decompressed, the way a web server gzips an HTML response in transit while the
+browser shows plain text. The plain `cp -r` above is a server-side rewrite that preserves that
+metadata (and the still-compressed bytes underneath) onto the destination verbatim. Every reader
+of the bucket-mounted destination — gcsfuse, and confirmed live even `gcloud storage
+cat`/`gsutil cat` used directly against it — gets the raw compressed bytes back rather than the
+promised transparent decompression; GCS's decompressive transcoding does not reliably apply to
+these clients' own downloads. A consumer with no gzip-awareness of its own has no way to know it
+needs to gunzip anything first — confirmed live as a GATK `.dict` reference input failing with
+"Failed to load reference dictionary", with nothing in that error pointing at Content-Encoding as
+the cause.
+
+Clearing the Content-Encoding metadata afterward (`objects update --clear-content-encoding`) was
+tried first, live, and does **not** fix this: it only removes the tag that would have triggered
+transcoding for a request that doesn't disable it, while the object's physically stored bytes
+remain compressed regardless — confirmed live via matching md5/crc32c before and after. The only
+reliable fix is to materialize the actual decompressed bytes: download (always raw, per above),
+`gunzip`, and upload that as fresh content with no encoding tag at all, so nothing downstream has
+to guess:
+
+```bash
+if [ "$(gcloud storage objects describe<rp> <src> --format="value(content_encoding)")" == "gzip" ]; then
+  CANINE_DECOMP_TMP=$(mktemp)
+  gcloud storage cat<rp> <src> | gunzip > "$CANINE_DECOMP_TMP"
+  gcloud storage cp -n --custom-time="$CANINE_BUCKET_CT" "$CANINE_DECOMP_TMP" <dst>
+  rm -f "$CANINE_DECOMP_TMP"
+else
+  gcloud storage cp -r -n<rp> --custom-time="$CANINE_BUCKET_CT" <src> <dst>   # unchanged fast path
+fi
+```
+
+This trades a free server-side rewrite for a real download+reupload through the worker VM, but
+only for the rare object that actually carries the tag — every ordinary `gs://` source (no
+Content-Encoding) still takes the original fast path untouched. `rp_string` is applied to the new
+`describe`/`cat` calls too, since the source may be requester-pays regardless of which branch is
+taken (`base.py:1202`).
+
+Not handled: directory sources (`is_dir`) are not decompression-checked object-by-object — real
+recursive-case work with no live need for it yet, every case found in production has been a
+single reference file — so a directory source still takes the plain, unconditional `cp -r`.
+
 ### b. `copy` — files already on the shared mount → `HandleRegularFile` (`localization_mode == "local"`)
 
 Typically an upstream task's output. The worker uploads it from where it already lives, adding
@@ -544,5 +586,6 @@ Normally you don't need this task at all.
 give-up, because every cause here is transient or node-local.
 
 **Tests:** `canine/test/test_localizer_bucket_upload_pure.py` (bucket naming, layout, state
-machine, upload plan), `canine/test/test_localizer_reachability_pure.py` (reachability, leases,
-heartbeat), `canine/test/test_rapid_cache_pure.py`. All pure — no cluster, no GCP credentials.
+machine, upload plan, and `TestContentEncoding` for the gzip decompress-on-copy branch above),
+`canine/test/test_localizer_reachability_pure.py` (reachability, leases, heartbeat),
+`canine/test/test_rapid_cache_pure.py`. All pure — no cluster, no GCP credentials.
