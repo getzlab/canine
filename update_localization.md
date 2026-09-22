@@ -4240,8 +4240,37 @@ claim completion until the decompressed object exists, a preemption mid-pass mus
 resumable state rather than the compressed object sitting under the final name, and the
 intermediate must be deleted with the same care — it is a full second copy of the data.
 
-One thing to measure before building any of it, because it could remove the pass entirely:
-**set `contentEncoding: gzip` on the composed object and see whether gcsfuse serves decoded
-bytes.** If it does, the fix is a metadata field. §4.7 flags precisely this as the case
-where metadata size disagrees with bytes delivered, so it is an experiment, not an
-assumption — an hour on a rebuilt node.
+#### Measured: `contentEncoding` does not help, and would make it worse
+
+The one thing that could have removed the pass entirely was setting `contentEncoding:
+gzip` on the composed object and letting GCS transcode on read. Measured on a throwaway
+VM with **gcsfuse 3.11.2**, the version the worker image pins — three objects, the same
+938-byte gzip payload, differing only in metadata:
+
+```
+                 gcsfuse ls   bytes read   md5
+  plain.txt       360000       360000      5e4f4051…   plaintext
+  gz-noenc.txt       938          938      40f322be…   gzip
+  gz-enc.txt         938          938      40f322be…   gzip   <- Content-Encoding: gzip
+  head -c 2 gz-enc.txt -> 1f8b                                    still a gzip stream
+```
+
+**gcsfuse ignores `contentEncoding` entirely.** The encoded object is byte-identical to
+the unencoded one for a reader, so the metadata buys nothing. It is at least
+self-consistent — 938 reported, 938 delivered — so this is *not* §4.7's
+metadata-disagrees-with-bytes trap. It is simpler: stored bytes, served verbatim.
+
+The same objects through `gcloud storage cp`, which is what the `server_side` path uses:
+
+```
+  gz-enc.txt      360000 bytes  md5=5e4f4051…   decompressed
+  gz-noenc.txt       938 bytes  md5=40f322be…   gzip
+```
+
+So `gcloud` **does** honour it and gcsfuse does not. Which turns a would-be fix into a
+new defect: setting `contentEncoding` makes the object **ambiguous** — decoded for a
+consumer using `gcloud storage cp`, still gzipped for one reading the mount. Two answers
+for one file. That is worse than today's state, which is at least consistently wrong.
+
+**Do not set `contentEncoding` on the composed object.** The post-compose decompress pass
+is required, and this measurement is why.
