@@ -4133,12 +4133,23 @@ So: **no part length from metadata, no ETag path.** Same conclusion as §13.28 �
 *better no verification than one that fails on correct data* — extended to the optimization
 it would have enabled.
 
-**The one variant that would be safe** is worth noting for later. When a DRS URI resolves
-to an S3 URL in a bucket we already hold credentials for — the GDC case, since
-`HandleAWSURL` exists for that endpoint — `head-object --part-number 1` gives an
-authoritative part length and nothing is derived. That reuses the path the S3 source
-already takes; the only new work is recognising the resolved host and reusing the
-credentials. Worth revisiting if DRS-to-GDC proves a common shape.
+**There is no safe variant here, and an earlier draft of this section claimed there
+was.** It suggested that when a DRS URI resolves into a bucket we hold credentials for —
+"the GDC case" — `head-object --part-number 1` would give an authoritative part length.
+That misread how GDC is reached. `HandleGDCHTTPURL` matches
+`https://api.(awg.)?gdc.cancer.gov/(files|data)/<uuid>` and immediately rewrites it to
+`drs://dg.4dfc:<uuid>`: **GDC goes *through* DRS, to an API, with no bucket, no key and no
+credentialed endpoint at any point.**
+
+The credentialed S3 case that does exist is `HandleAWSURL` against an explicit
+`aws_endpoint_url` — the jamboree object store — which is a different endpoint reached a
+different way, and which already takes the authoritative path and needs none of this.
+
+So the position is simpler than the draft implied: **on every DRS path in this workload
+the part length is unobtainable, therefore the multipart-ETag fast path is unreachable for
+DRS inputs.** Not "declined pending a safer variant" — there isn't one to wait for. The
+`0 re-read` result belongs to sources that supply bucket, key and credentials, and DRS by
+construction does not.
 
 **Cost of declining, so it is priced rather than forgotten:** a large DRS input keeps its
 whole-file md5 read-back. To a bucket destination that measured 43 min for 279 GiB against
