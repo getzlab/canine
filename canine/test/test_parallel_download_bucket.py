@@ -1905,3 +1905,94 @@ class TestAStaleMarkerCannotFakeCompletion:
         with open(marker_path) as fh:
             marker = json.load(fh)
         assert marker.get("gs_url") == "gs://{}/{}".format(BUCKET, OBJECT)
+
+
+class TestGunzipIsRefusedWhereItCannotBeHonoured:
+    """
+    `--gunzip` rewrites a local file after the transfer, so only the POSIX route can do
+    it. `run()` dispatched to the bucket and staged routes and returned *before* the
+    gunzip block, which meant the flag was silently dropped: the object landed
+    still-gzipped, `compose` sets no `contentEncoding` so GCS will not transcode it on
+    read, and gcsfuse serves the gzip stream verbatim under a name promising plain
+    content. The failure surfaces in whatever tool reads the mount, with nothing
+    pointing back at localization.
+
+    Reachable from exactly two handlers -- `HandleGCSSignedURL` and `HandleOtherURL`,
+    the only callers of `_probe_http_metadata` and therefore the only ones that set
+    `body_is_compressed`. `gs://` inputs are unaffected: they take the `server_side`
+    path, where `gcloud storage cp` decompresses.
+
+    Which is the sharp part. `file_handlers.py:509` records removing exactly this
+    inconsistency -- "previously the same object arrived decompressed via gs:// but
+    compressed via a signed URL" -- and the bucket route reintroduced it for the same
+    objects, on the destination `create_bucket_mount()` is making the default.
+
+    Refusing is not the fix; it is the difference between a stopped job and a silent
+    one. The fix is #24: decline the bucket route for gunzip inputs and decompress
+    during stage-publish's copy.
+    """
+
+    def test_the_bucket_route_refuses_rather_than_storing_compressed_bytes(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5, capsys):
+        force_bucket_route(monkeypatch)
+        with Server(payload) as source:
+            argv = options_for(str(tmp_path / "sample.txt"), source.url(),
+                               len(payload), check_md5=payload_md5)
+            argv.gunzip = True
+            rc = pdl.run(argv)
+
+        assert rc == pdl.EXIT_FAIL
+        err = capsys.readouterr().err
+        assert "cannot decompress" in err
+        assert OBJECT not in gcs.state.objects, (
+            "refused, but an object was written anyway")
+
+    def test_the_staged_route_refuses_too(self, tmp_path, monkeypatch, gcs, payload,
+                                          payload_md5, capsys):
+        """
+        stage-publish copies the staged bytes through unchanged, so it has the same
+        hole -- and the POSIX comment claiming "same ordering as the stage-publish
+        route" was wrong about it.
+        """
+        monkeypatch.setattr(pdl, "select_route", lambda dest, **kw: pdl.RouteDecision(
+            pdl.ROUTE_STAGED, "test: forced staged route"))
+        with Server(payload) as source:
+            argv = options_for(str(tmp_path / "sample.txt"), source.url(),
+                               len(payload), check_md5=payload_md5)
+            argv.gunzip = True
+            rc = pdl.run(argv)
+
+        assert rc == pdl.EXIT_FAIL
+        assert "cannot decompress" in capsys.readouterr().err
+
+    def test_the_posix_route_still_decompresses(self, tmp_path, monkeypatch, capsys):
+        """
+        The capability being preserved. A refusal that also broke the route which CAN
+        decompress would trade one silent failure for a loud pointless one.
+        """
+        import gzip as gziplib
+        plain = b"chrom\tpos\tref\talt\n" * 4096
+        body = gziplib.compress(plain)
+        dest = str(tmp_path / "variants.tsv")
+
+        monkeypatch.setattr(pdl, "select_route", lambda d, **kw: pdl.RouteDecision(
+            pdl.ROUTE_POSIX, "test: forced posix", seek_hole=False))
+        with Server(body) as source:
+            argv = options_for(dest, source.url(), len(body),
+                               check_md5=hashlib.md5(body).hexdigest())
+            argv.gunzip = True
+            rc = pdl.run(argv)
+
+        assert rc == pdl.EXIT_OK
+        with open(dest, "rb") as fh:
+            assert fh.read() == plain, "the POSIX route must still decompress"
+
+    def test_no_gunzip_leaves_every_route_working(self, tmp_path, monkeypatch, gcs,
+                                                  payload, payload_md5):
+        """The refusal must be conditional on the flag, not on the route."""
+        force_bucket_route(monkeypatch)
+        with Server(payload) as source:
+            assert pdl.run(options_for(str(tmp_path / "a.bam"), source.url(),
+                                       len(payload),
+                                       check_md5=payload_md5)) == pdl.EXIT_OK
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5

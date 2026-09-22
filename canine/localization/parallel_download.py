@@ -3662,6 +3662,40 @@ def run(options):
         options.url or "", size, options.check_etag or options.check_md5, chunk_size
     )
 
+    # Decompression is a POSIX-route capability, and not by accident: **gzip is a
+    # sequential stream**, so chunk N cannot be decoded without N-1 and a parallel
+    # chunked transfer can never decompress in flight. The compressed bytes have to be
+    # materialized somewhere first, which is why this route writes a .k9pdl.gz sidecar
+    # and rewrites it afterwards. bucket-compose has no local file at all, so it cannot
+    # be taught to do this; stage-publish has one but copies the staged bytes through
+    # unchanged.
+    #
+    # The ordering matters too, and constrains any future fix: **the advertised digest
+    # covers the COMPRESSED bytes**, so verification must happen before decompression --
+    # and the decompressed output therefore has no digest to check against at all. The
+    # most any route can offer is "the bytes received were verified, then transformed",
+    # which is exactly what the sidecar ordering below provides.
+    #
+    # Ignoring the flag there is not a missed optimization, it is silently wrong output:
+    # the object lands still-gzipped, `compose` sets no contentEncoding so GCS will not
+    # transcode it on read, and gcsfuse serves the gzip stream verbatim under a name
+    # that promises plain content. The failure surfaces later, in whatever tool reads
+    # the mount, with nothing pointing back here.
+    #
+    # It also re-creates precisely the inconsistency file_handlers.py:509 records
+    # removing -- "previously the same object arrived decompressed via gs:// but
+    # compressed via a signed URL" -- since gs:// inputs take gcloud storage cp, which
+    # decompresses, while a signed URL for the same object comes through here.
+    #
+    # So: refuse. A loud stop costs a localization; silent corruption costs whatever
+    # downstream conclusions were drawn from the wrong bytes before anyone noticed.
+    if options.gunzip and decision.route != ROUTE_POSIX:
+        log("--gunzip was requested but the {} route cannot decompress: it has no local "
+            "file to rewrite, so the object would be stored still-compressed under a "
+            "name promising decoded content. Refusing rather than writing bytes a "
+            "reader cannot use. ({})".format(decision.route, decision.reason))
+        return EXIT_FAIL
+
     if decision.route == ROUTE_BUCKET:
         return run_bucket_route(options, decision, source, size, chunks, plan_id,
                                 manifest_path, marker_path)
