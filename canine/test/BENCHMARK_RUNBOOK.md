@@ -3771,6 +3771,9 @@ pdl claim --s3-bucket "$S3_BUCKET" --s3-key "$S3_KEY" \
 
 #### 7. Tear down the bucket
 
+**Run §6.6b first if you are going to run it at all** — it needs this bucket and this
+mount, and re-creating them costs another pass through steps 1–3.
+
 The node can stay. The bucket should not — 279 GiB of objects bills whether or not anyone
 reads them.
 
@@ -3783,6 +3786,244 @@ gcloud storage buckets list --project "$PROJECT" --filter="name~pdl-fuse-"
 
 That last line is the one worth running twice: a bucket named with a timestamp is easy to
 lose track of, and this is the only thing that finds the ones from earlier attempts.
+
+---
+
+### 6.6b `--gunzip` on the bucket route — the only part with no real-GCS coverage
+
+Everything in this route has now run against real GCS except the decompress pass
+(`update_localization.md` §13.56). That pass is verified against the **fake** service only,
+and it is the one place where the fake could be wrong in a way that matters, because it
+uses a request shape nothing else in canine sends: a resumable PUT with
+`Content-Range: bytes X-Y/*`.
+
+Three specific things to find out, none of which the fake can settle:
+
+1. **Does GCS accept the unknown-total PUT sequence at all**, and does it accept it
+   repeatedly? The decompressed length cannot be known in advance — gzip's `ISIZE` is
+   modulo 2³², so it is unusable above 4 GiB — so every PUT but the last declares `*`.
+   GCS documents a 256 KiB multiple as the requirement; the fake enforces that, but
+   only because I wrote it to.
+2. **Does the commit frontier ever lag what was sent?** The pass trusts the returned
+   `Range` header rather than its own byte count and re-sends the difference. If real GCS
+   always commits everything, that branch has never executed anywhere.
+3. **Does a ranged GET with `Accept-Encoding: gzip` return the stored bytes?** GCS refuses
+   to combine ranges with transcoding, which is *why* the downloader asks for the encoded
+   body — but that is read from the documentation, not measured.
+
+This is a correctness run, not a throughput one. Use a small object first.
+
+#### 1. Create a gzip-encoded source object
+
+The source has to be served `Content-Encoding: gzip`, which means the metadata must be set
+at upload time. `--gzip-local-all` is deliberately **not** used: it would have `gcloud`
+compress on the fly, and then the local md5 would not be the digest of what is stored.
+Compress first, so the digest is knowable.
+
+**Size it by PUT count, not by bytes.** This is the whole point of the run, and highly
+compressible text gets it wrong: the pass reads 8 MiB of compressed input at a time and
+flushes whatever that decodes to, so the number of unknown-total PUTs is roughly
+one PUT per read — i.e. **the PUT count is the compressed size ÷ 8 MiB**, independent of
+the compression ratio. A 30 MB `.gz` therefore makes about four PUTs no matter how well it
+compresses, and `seq` output at ~20:1 would make the decompressed object enormous for that
+same four.
+
+The generator below measures **1.88:1**, giving ≈322 MB plain, ≈171 MB compressed and
+**~20 unknown-total PUTs** — enough to exercise the sequence, and about two minutes to
+build. Scale the `range(6000)` if you want more.
+
+```bash
+# on the node
+cd /tmp
+# Mixed content: structured columns plus a genuinely random one. The random column has
+# to be freshly generated -- a fixed string sliced cyclically has only a handful of
+# distinct values and compresses ~15:1, which puts the compressed size (and therefore
+# the PUT count) nowhere near where you think it is.
+python3 - <<'PY' > gz-src.tsv
+import os, base64
+for chunk in range(6000):
+    noise = base64.b64encode(os.urandom(24 * 1000)).decode()
+    base = chunk * 1000
+    print("\n".join(
+        "chr1\t%d\tA\tG\tPASS\t%s" % (base + i, noise[i * 32:(i + 1) * 32])
+        for i in range(1000)))
+PY
+gzip -k -6 gz-src.tsv                      # leaves gz-src.tsv and gz-src.tsv.gz
+
+PLAIN_SIZE=$(stat -c %s gz-src.tsv)
+GZ_SIZE=$(stat -c %s gz-src.tsv.gz)
+GZ_MD5=$(md5sum gz-src.tsv.gz | cut -d' ' -f1)
+echo "compressed $GZ_SIZE -> plain $PLAIN_SIZE (ratio $((PLAIN_SIZE / GZ_SIZE)):1)"
+echo "expect about $((GZ_SIZE / 8388608)) unknown-total PUTs; md5(compressed)=$GZ_MD5"
+```
+
+Check the echoed ratio against the 1.88 above before uploading. If it is far higher the
+generator degenerated and the PUT estimate is wrong; if the estimate is under ~10, make the
+file bigger — a pass that finishes in two PUTs demonstrates almost nothing about the
+sequence, which is the one failure mode this run exists to avoid.
+
+```bash
+# Upload the COMPRESSED bytes, labelled as gzip-encoded. The name has no .gz on purpose:
+# it is what the object decodes to, which is what the metadata claims.
+#
+# NOT --gzip-local-all: that has gcloud compress on the fly, so the stored digest would
+# be of bytes that never existed locally and $GZ_MD5 would not match.
+gcloud storage cp gz-src.tsv.gz "gs://$FUSE_BUCKET/src/encoded.tsv" \
+  --content-encoding=gzip --content-type=text/tab-separated-values \
+  --project "$PROJECT"
+```
+
+Confirm the metadata took, and that the stored md5 is the **compressed** digest — if it
+is not, `gcloud` re-encoded and the run will fail verification for the wrong reason:
+
+```bash
+# on the node
+gcloud storage ls -L "gs://$FUSE_BUCKET/src/encoded.tsv" \
+  | grep -iE "content-encoding|content-type|size|md5"
+python3 -c "import base64,sys; print(base64.b64decode(sys.argv[1]).hex())" <paste the md5Hash>
+# that hex must equal $GZ_MD5
+```
+
+#### 2. Check the range-plus-encoding assumption before the run
+
+One `curl`, and it saves debugging a failure three layers down. `Accept-Encoding: gzip`
+plus a `Range` must return **206** with `Content-Encoding: gzip`:
+
+```bash
+# on the node
+export GCS_AUTH="Authorization: Bearer $(gcloud auth print-access-token)"
+curl -s -D - -o /dev/null -H "$GCS_AUTH" -H "Accept-Encoding: gzip" -H "Range: bytes=0-99" \
+  "https://storage.googleapis.com/$FUSE_BUCKET/src/encoded.tsv" | head -20
+```
+
+* **206 + `Content-Encoding: gzip` + `Content-Range: bytes 0-99/$GZ_SIZE`** → as designed.
+* **200 and no `Content-Encoding`** → GCS transcoded and ignored the range. The run will
+  fetch the whole object per chunk; stop and record it, because the downloader's
+  assumption is then wrong and `--gunzip` on this route needs rethinking, not tuning.
+
+#### 3. The run
+
+```bash
+# on the node
+pdl routeb --url "https://storage.googleapis.com/$FUSE_BUCKET/src/encoded.tsv" \
+           --size "$GZ_SIZE" --md5 "$GZ_MD5" \
+           --header "$GCS_AUTH" \
+           --gunzip \
+           --gs-url "gs://$FUSE_BUCKET/gunzip-check.tsv" \
+           --mount-dir "/mnt/localize/$FUSE_BUCKET" \
+           --json /tmp/gunzip-routeb.json
+```
+
+`--size` and `--md5` are both the **compressed** object's, because that is what the server
+advertises and what the sidecar is verified against. Passing the plain size here is the
+easy mistake and fails at the range probe with a size mismatch.
+
+Expect, in order:
+
+```
+route bucket-compose: ...
+k9pdl-phase relay ...
+k9pdl-phase compose ...
+k9pdl-phase gunzip ...
+decompressed <GZ_SIZE> bytes into <PLAIN_SIZE> bytes
+complete: <GZ_SIZE> bytes composed from N parts (verified)
+```
+
+`(verified)` refers to the **compressed** sidecar. The decompressed object has no digest
+to check against and never will — that is inherent, not a gap.
+
+#### 4. What to confirm afterwards
+
+```bash
+# on the node
+# a) the destination is the DECOMPRESSED length, and is not a gzip stream
+gcloud storage ls -l "gs://$FUSE_BUCKET/gunzip-check.tsv"      # must be $PLAIN_SIZE
+gcloud storage cat "gs://$FUSE_BUCKET/gunzip-check.tsv" | head -c 2 | xxd
+#    must NOT be 1f 8b
+
+# b) it matches byte for byte
+gcloud storage cat "gs://$FUSE_BUCKET/gunzip-check.tsv" | md5sum
+md5sum /tmp/gz-src.tsv                                          # the two must agree
+
+# c) the intermediates are gone -- the sidecar is a full second copy of the data.
+#    The .k9pdl.done marker is EXPECTED to survive: it is what makes a re-run a no-op.
+gcloud storage ls "gs://$FUSE_BUCKET/**" \
+  | grep -E "k9pdl\.(gz|json|parts)" || echo "intermediates clean"
+
+# d) the marker records both lengths, or every re-run re-downloads
+sudo docker exec slurm cat "/mnt/localize/$FUSE_BUCKET/.gunzip-check.tsv.k9pdl.done"
+#    size == $GZ_SIZE, stored_size == $PLAIN_SIZE
+
+# e) customTime, same as §6.6a step 4 -- without it the lifecycle rule never expires it
+gcloud storage ls -L "gs://$FUSE_BUCKET/gunzip-check.tsv" | grep -i custom
+```
+
+If the shell was re-established between steps, re-derive the two sizes rather than
+retyping them — `$PLAIN_SIZE` and `$GZ_SIZE` are the whole basis of these comparisons:
+
+```bash
+PLAIN_SIZE=$(stat -c %s /tmp/gz-src.tsv); GZ_SIZE=$(stat -c %s /tmp/gz-src.tsv.gz)
+GZ_MD5=$(md5sum /tmp/gz-src.tsv.gz | cut -d' ' -f1)
+```
+
+Then **run it a second time, unchanged**. It must exit 0 in under a second with `already
+complete per ...` and no transfer. This is the check worth doing deliberately: the marker
+was unusable on the in-place route for as long as `--gunzip` has existed, and the only
+reason nobody noticed is that no one ever ran a gzip-encoded input twice.
+
+#### 5. The extension branch, against real GCS
+
+The other half of the decision: a name that promises gzip. `.bam`/`.bcf`/`.bai`/`.tbi` are
+gzip containers by design, so "decode it" and "keep it" are both defensible and the
+tiebreak is whether the *decoded* bytes still start `1f 8b`. Cheap to check, and it uses
+the real service's metadata rather than a fixture's:
+
+```bash
+# on the node -- singly compressed, mislabelled: stored bytes ALREADY are the bgzf
+gcloud storage cp gz-src.tsv.gz "gs://$FUSE_BUCKET/src/mislabelled.gz" \
+  --content-encoding=gzip --project "$PROJECT"
+
+pdl routeb --url "https://storage.googleapis.com/$FUSE_BUCKET/src/mislabelled.gz" \
+           --size "$GZ_SIZE" --md5 "$GZ_MD5" --header "$GCS_AUTH" --gunzip \
+           --gs-url "gs://$FUSE_BUCKET/keep-check.gz" \
+           --mount-dir "/mnt/localize/$FUSE_BUCKET" --json /tmp/gunzip-keep.json
+```
+
+Expect `singly-compressed` in the stderr, `gunzip phase : did not decode`, and a
+destination of **`$GZ_SIZE`** — still a valid gzip file, which is what the name promises:
+
+```bash
+gcloud storage cp "gs://$FUSE_BUCKET/keep-check.gz" /tmp/keep-check.gz
+gzip -t /tmp/keep-check.gz && echo "still gzip: correct"
+cmp /tmp/keep-check.gz /tmp/gz-src.tsv.gz && echo "byte-identical to what was uploaded"
+```
+
+A destination of `$PLAIN_SIZE` here is the failure mode this branch exists to prevent — a
+decompressed stream in a file called `.gz`, which for a real `.bam` is a file `samtools`
+cannot open.
+
+#### 6. Known gap: the decode pass is not itself resumable
+
+Worth knowing before a forced-preemption run (§7) reports it as a defect. A preemption
+mid-decode loses the destination's resumable session, and the retry redoes the **whole
+decode**. It does not redo the download: the parts and the verified sidecar survive
+deliberately, which is why the requeue path leaves them in place.
+
+That was a deliberate trade — the decode is one pass over a GCS object at API speed, while
+the download is the expensive half — but it means decode time is paid per preemption. If
+these sources turn out to be large rather than the `.vcf`/`.tsv` sizes expected, the pass
+needs a manifest of its own and this is the measurement that would justify one.
+
+#### 7. Clean up the extra source objects
+
+```bash
+# on the node
+gcloud storage rm "gs://$FUSE_BUCKET/src/**" "gs://$FUSE_BUCKET/gunzip-check.tsv" \
+                  "gs://$FUSE_BUCKET/keep-check.gz" 2>/dev/null || :
+# the markers too, or a later run of §6.6a's route check short-circuits on them
+sudo docker exec slurm sh -c 'rm -f /mnt/localize/'"$FUSE_BUCKET"'/.*.k9pdl.done'
+rm -f /tmp/gz-src.tsv /tmp/gz-src.tsv.gz /tmp/keep-check.gz
+```
 
 ---
 
@@ -4086,6 +4327,12 @@ carries the narrative once a row is filled in.
 | Relay throughput with Rapid Cache | §6.6 step 5 | not measured — cache must be provisioned by hand on the `wolf-...` bucket |
 | **Should `bucket_upload_wait_tries` go back to 60?** | §6.7 `pdl claim` | not measured. Currently **180**, a placeholder from risk asymmetry (§13.49); characterization runs suggest it can come down |
 | Largest input count in one real localization | needed as `--inputs-per-localization` | **not known — ask.** It multiplies the answer above directly |
+| Does GCS accept the unknown-total PUT sequence (`bytes X-Y/*`)? | §6.6b step 3 | **not measured.** Verified against the fake only, and the fake's 256 KiB-multiple rule is enforced because it was written to be, not because it was observed |
+| Does a ranged GET with `Accept-Encoding: gzip` return the stored bytes? | §6.6b step 2 | **not measured** — read from the docs. A 200 with no `Content-Encoding` means GCS transcoded and ignored the range, which invalidates the whole approach rather than needing a tune |
+| Does the commit frontier ever lag what was sent? | §6.6b step 3 | **not measured.** The pass re-sends the difference; if real GCS always commits everything, that branch has never run anywhere |
+| Is the `--gunzip` done marker believed on a second run? | §6.6b step 4 | **not measured.** It was unusable on the in-place route for as long as `--gunzip` has existed, because nothing ever ran a gzip-encoded input twice |
+| Does the `.gz`/`.bam` keep-as-is branch fire against real metadata? | §6.6b step 5 | **not measured.** Correct in the fake for `.gz`/`.bam`/`.bcf`/`.bai`/`.tbi`/`.bgz` |
+| Decompress throughput, and is per-preemption decode cost acceptable? | §6.6b step 6 | **not measured.** The pass is deliberately not resumable — a preemption redoes the whole decode, though never the download |
 
 Report the §6.3 number as **"4.97 h → 1.62 h on the real BAM"**, not as the sweep's
 internal speedup. The internal figure is measured against a single stream on the same

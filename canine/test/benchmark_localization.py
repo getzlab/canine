@@ -1129,6 +1129,13 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     # per-connection results when every row was the same single curl.
     fell_back = re.search(r"falling back to a single stream: (.*)", stderr)
 
+    # The --gunzip pass, when one ran. Absent means one of three different things and
+    # the caller has to be able to tell them apart: the flag was off, the flag was on but
+    # the server's metadata was wrong so the bytes were kept as received, or the route
+    # refused. The decompressed length is the only number available -- the advertised
+    # digest covers the compressed bytes, so the output has nothing to verify against.
+    expanded = re.search(r"decompressed (\d+) bytes into (\d+) bytes", stderr)
+
     # Per-chunk bookkeeping, the only cost that grows with chunk count rather than bytes.
     book = re.search(r"k9pdl-bookkeeping ([\d.]+)s over (\d+) calls "
                      r"\(mean ([\d.]+)s, ([\d.]+)% of", stderr)
@@ -1150,6 +1157,8 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
 
     return {
         "phases": phases,
+        "decompressed_from": int(expanded.group(1)) if expanded else None,
+        "decompressed_to": int(expanded.group(2)) if expanded else None,
         "fell_back": fell_back.group(1).strip() if fell_back else None,
         "bookkeeping_seconds": float(book.group(1)) if book else None,
         "bookkeeping_calls": int(book.group(2)) if book else None,
@@ -2502,12 +2511,39 @@ def command_routeb(args):
     dest = os.path.join(args.mount_dir, os.path.basename(args.gs_url))
     say("dest         : {} (must be on the gcsfuse mount for the route to be chosen)"
         .format(dest))
+    extra = []
+    if getattr(args, "gunzip", False):
+        extra.append("--gunzip")
+        say("gunzip       : on -- parts compose into <object>.k9pdl.gz, that sidecar is")
+        say("               verified, then it is read back through zlib into a second")
+        say("               resumable upload. --md5 must cover the COMPRESSED bytes")
     outcome = run_download(source_args(args, dest, args.size), dest, args.size,
-                           args.connections, args.min_chunk, verification=verification)
+                           args.connections, args.min_chunk, verification=verification,
+                           extra=extra)
     say("rc={} in {} seconds".format(outcome["returncode"], outcome["seconds"]))
     for line in outcome["stderr_tail"]:
         say("  {}".format(line))
-    return {"routeb": {"token_source": token_source, "outcome": outcome}}
+
+    result = {"token_source": token_source, "outcome": outcome}
+    if getattr(args, "gunzip", False):
+        # The decompressed object has no digest to check -- the advertised one covers the
+        # compressed bytes -- so what is recorded instead is the length it reached and
+        # how long the pass took. "Did not decode" is a legitimate result when the
+        # server's metadata was wrong, and has to be distinguishable from a refusal.
+        decompressed_to = outcome["decompressed_to"]
+        result["gunzip"] = {
+            "ran": decompressed_to is not None,
+            "compressed_bytes": outcome["decompressed_from"],
+            "decompressed_bytes": decompressed_to,
+            "seconds": outcome["phases"].get("gunzip"),
+        }
+        say("gunzip phase : {}".format(
+            "{} -> {} bytes in {}s".format(
+                outcome["decompressed_from"], decompressed_to,
+                outcome["phases"].get("gunzip"))
+            if decompressed_to is not None
+            else "did not decode -- kept as received, or refused; read the stderr"))
+    return {"routeb": result}
 
 
 # --------------------------------------------------------------------------------
@@ -2670,6 +2706,12 @@ def build_parser():
     routeb.add_argument("--mount-dir", required=True,
                         help="the gcsfuse mount the destination lives on")
     routeb.add_argument("--connections", type=int, default=DEFAULT_CONNECTIONS_HINT)
+    routeb.add_argument("--gunzip", action="store_true",
+                        help="exercise the post-compose decompress pass. The source must "
+                             "be served Content-Encoding: gzip, and --md5 must be the "
+                             "digest of the COMPRESSED bytes -- that is what the server "
+                             "advertises and what gets verified. Only the fake GCS has "
+                             "ever run the unknown-total PUT sequence this uses")
 
     claim = sub.add_parser(
         "claim", help="size bucket_upload_wait_tries from repeated relay timings")
