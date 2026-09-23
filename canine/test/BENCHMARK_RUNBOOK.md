@@ -4091,14 +4091,29 @@ against 88–96 steady — a ~2.4× penalty.** It applies to every composed obje
 of the gcloud-uploaded ones, and it is flat in component count. The decode always reads a
 sidecar it has just composed, so it always pays it.
 
-That makes the read stage the interesting target, and not via threading: the decode reads
-at roughly **a third of what the same object yields once warm**. A parallel read-ahead —
-several ranged GETs in flight feeding the sequential inflater — is compatible with gzip's
-sequentiality (only the *inflate* must be serial) and attacks the larger number. Measure
-that before building any pipeline.
+That made the read stage the target, and not via threading: the decode was reading at
+roughly a third of what the same object yields once warm. A parallel read-ahead — several
+ranged GETs in flight feeding the sequential inflater — is compatible with gzip, which
+constrains only the *inflate*. **Built and measured (`--decode-readahead`, default 4):**
 
-**Build the two-thread split** if you build anything — it is the whole prize at 170 MB and
-80% of it at 852 MB — but the read-ahead is likely worth more.
+| depth | routeb total | decode | blocked on read | write share |
+|---|---|---|---|---|
+| 1 | 102.94 / 101.17 s | 67.8 / 68.8 s | 26.80 / 28.95 s | 45% / 43% |
+| **4** | **72.12 / 72.37 s** | **39.8 / 40.7 s** | **0.273 / 0.241 s** | 72% / 73% |
+
+Two reps each, depths alternated so ordering is not a confound, all four outputs
+byte-identical. **Whole-run 1.41×, decode phase 1.70×, and time blocked on reads falls
+108×** — at depth 4 the fetch disappears entirely behind the inflate and the upload.
+
+Depth came from a rotated 5-rep sweep on never-read objects: 59.3 MB/s median at depth 1
+against 140.3 at depth 4 (2.37×), non-overlapping ranges, by-slot medians flat. Depth 8
+(105.2) and 16 (110.6) are both worse than 4, in two independent sweeps.
+
+**This supersedes the pipelining recommendation above.** With the read gone, write is 72%
+of the decode and the 3-stage ceiling drops from 2.23–2.35× to **1.36–1.39×** — the
+read-ahead captured most of what the pipeline was going to, for one bounded queue instead
+of a threaded pipeline. What is left is hiding the 10.6 s inflate behind the 29 s write,
+worth ~72 s → ~53 s. The bottleneck is now the single sequential resumable upload.
 
 **The ceiling is an upper bound.** Read and write are both network on the same NIC, so
 overlapping them may contend in a way the arithmetic does not model — §13.53 records
@@ -4561,7 +4576,8 @@ carries the narrative once a row is filled in.
 | Does the harness's single-stream fallback verify anything? | §6.6b step 3 | **no — and it exits 0.** Without `Accept-Encoding: gzip` the run fell back to a bare `curl` (no `--legacy-cmd` in the benchmark), verified nothing, decoded nothing, and returned rc=0 in 8.8 s. On this route a fallback is never a pass |
 | **Which decode stage dominates — is the 5× worth pipelining?** | §6.6b step 3, `k9pdl-gunzip` | **balanced, so yes — unlike the relay.** At 852 MB: write 45% / read 40% / inflate 16%, **ceiling 2.25×**, `pipe2` **1.80×** (65.3 s → 36.3 s two-thread, → 29.0 s three-thread). At 170 MB `pipe2 == ceiling == 1.73×`. Build two-thread first. Upper bound only: both ends share one NIC |
 | Why is the third thread worth more at 852 MB than at 170 MB? | §6.6b step 3, `gunzip-readbench-grid.json` | **ANSWERED: the first read of a freshly-written object is ~2.4× slower** (33–40 MB/s vs 88–96 steady), and the decode always reads a sidecar it just composed. **Not** component count (flat 1→51), **not** size (isolated reads 87 vs 90 MB/s), **not** md5 warming (3.306 s vs 3.302 s). The 70.4 MB/s that started this was an outlier — repeats give 51.5, 51.6 |
-| Is the decode's read worth attacking directly? | `gunzip-readbench-grid.json` | **probably more than pipelining is.** It runs at ~⅓ of the same object's warm throughput. A parallel read-ahead feeding the sequential inflater is compatible with gzip (only *inflate* must be serial) and targets the bigger number. Unmeasured |
+| Is the decode's read worth attacking directly? | `gunzip-e2e-depth*.json` | **yes, and it is built.** `--decode-readahead 4`: whole-run **1.41×** (102.9/101.2 s → 72.1/72.4 s), decode **1.70×**, blocked-on-read **26.8/28.9 s → 0.27/0.24 s**. Depth from a rotated 5-rep sweep: 59.3 MB/s at depth 1 vs 140.3 at depth 4, non-overlapping; 8 and 16 are worse |
+| What is the decode's bottleneck now? | `gunzip-e2e-depth4.json` | **the upload — 72% of the decode.** The 3-stage ceiling fell from 2.23–2.35× to 1.36–1.39×, so the read-ahead took most of what a pipeline would have. What remains is hiding the 10.6 s inflate behind the 29 s write (~72 s → ~53 s) |
 | Do the decode's read and write interfere? | `gunzip-warm-*.json` | **looked for, not found.** Against a cold isolated baseline the interleaved read is 19% slower at 852 MB and 30% *faster* at 170 MB — inconsistent in sign, so not a result. The ceiling's independence assumption is untested, not disproven |
 | Does the decode scale linearly, and does multi-member hold at size? | §6.6b step 3 | **yes to both.** 170402482→328888890 in 10.6 s and 852012410→1644444450 in 65.3 s — 5.0× the bytes, 6.2× the time. A **5-member** 852 MB source decoded byte-exact, so `GzipStreamDecoder` holds on real GCS at 102 blocks, not just in the fake |
 | decode-to-relay ratio | §6.6b step 3 | **4.2× at 170 MB, 7.9× at 852 MB.** It widens with size because the relay is 16-way and scales, while the decode is one sequential stream. §13.57's "5×" was a single point on a rising curve |

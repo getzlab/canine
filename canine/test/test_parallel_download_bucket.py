@@ -2354,7 +2354,7 @@ class TestTheBucketRouteDecompresses:
 
         line = re.search(
             r"k9pdl-gunzip read ([\d.]+)s inflate ([\d.]+)s write ([\d.]+)s "
-            r"over (\d+) blocks \((\d+) -> (\d+) bytes, "
+            r"over (\d+) blocks \(readahead \d+, (\d+) -> (\d+) bytes, "
             r"ceiling ([\d.]+)x, pipe2 ([\d.]+)x\)", capsys.readouterr().err)
         assert line, "the decode ran but reported no stage split"
 
@@ -2418,6 +2418,130 @@ class TestTheBucketRouteDecompresses:
         with pytest.raises((pdl.PermanentError, pdl.TransientError)):
             pdl.decompress_object(client, BUCKET, "misaligned.gz", "misaligned",
                                   granularity=pdl.GCS_UPLOAD_GRANULARITY + 1)
+
+
+class TestTheDecodeReadAhead:
+    """
+    Measured: a single sequential stream reads a never-read object at 59.3 MB/s median,
+    depth 4 at 140.3, with non-overlapping ranges over five reps and the depth order
+    rotated (the first attempt ran depth 1 first every time, which charged it with
+    whatever penalty running first carries).
+
+    Only the FETCH is parallel. Inflation stays sequential because gzip gives no choice,
+    so order preservation is not a nicety here -- out-of-order delivery produces a
+    corrupt object, not a slow one.
+    """
+
+    class _Recorder:
+        """Counts concurrent download_range calls and can serve them out of order."""
+
+        def __init__(self, payloads, delay=0.0):
+            self.payloads = payloads
+            self.delay = delay
+            self.live = 0
+            self.peak = 0
+            self.calls = []
+            self._lock = threading.Lock()
+
+        def download_range(self, bucket, name, start, end):
+            with self._lock:
+                self.live += 1
+                self.peak = max(self.peak, self.live)
+                self.calls.append(start)
+            try:
+                # Later blocks finish first, so a scheme that yielded on completion
+                # rather than in order would be caught rather than merely unlucky.
+                time.sleep(self.delay * (1.0 if start else 3.0))
+                return self.payloads[start]
+            finally:
+                with self._lock:
+                    self.live -= 1
+
+    def _payloads(self, size, block):
+        return {start: bytes([start // block % 251]) * min(block, size - start)
+                for start in range(0, size, block)}
+
+    @pytest.mark.parametrize("depth", [1, 2, 4, 8])
+    def test_blocks_arrive_in_order_and_complete(self, depth):
+        size, block = 40, 4
+        payloads = self._payloads(size, block)
+        client = self._Recorder(payloads)
+        got = b"".join(pdl.ranged_blocks(client, "b", "o", size, block, depth))
+        assert got == b"".join(payloads[s] for s in sorted(payloads))
+
+    def test_out_of_order_completion_still_yields_in_order(self):
+        """The property that matters: a later block finishing first must not jump it."""
+        size, block = 40, 4
+        payloads = self._payloads(size, block)
+        client = self._Recorder(payloads, delay=0.01)
+        got = b"".join(pdl.ranged_blocks(client, "b", "o", size, block, 4))
+        assert got == b"".join(payloads[s] for s in sorted(payloads))
+
+    def test_the_window_is_bounded_and_not_merely_the_pool(self):
+        """
+        Peak memory is depth * READ_BUFFER only if the SUBMISSION window is bounded.
+
+        Counting concurrent calls does not show this and this test originally did,
+        which made it useless: `ThreadPoolExecutor(max_workers=depth)` caps concurrency
+        by itself, so a version that submits every block up front keeps peak
+        concurrency at `depth` while completed payloads pile up in futures until the
+        whole object is in memory. Verified -- that mutation passed the concurrency
+        assertion. The observable is how far the fetches run ahead of the consumer.
+        """
+        size, block, depth = 4000, 4, 4          # 1000 blocks
+        client = self._Recorder(self._payloads(size, block), delay=0.001)
+        stream = pdl.ranged_blocks(client, "b", "o", size, block, depth)
+        next(stream)                             # consume exactly one block
+        time.sleep(0.3)                          # let it run away if nothing stops it
+        started = len(client.calls)
+        stream.close()
+        assert started <= depth + 1, (
+            "{} of {} fetches started while the consumer took one block: the window is "
+            "unbounded and the object buffers in memory".format(
+                started, size // block))
+        assert client.peak > 1, "nothing overlapped, so the bound was not exercised"
+
+    def test_depth_one_issues_no_threads_and_stays_sequential(self):
+        size, block = 40, 4
+        client = self._Recorder(self._payloads(size, block), delay=0.002)
+        list(pdl.ranged_blocks(client, "b", "o", size, block, 1))
+        assert client.peak == 1, "depth 1 must remain a plain sequential loop"
+
+    def test_closing_early_does_not_leak_the_pool(self):
+        """
+        keep-as-is returns from inside the read loop, so the generator is abandoned
+        part-way. The pool has to shut down rather than keep threads alive.
+        """
+        before = threading.active_count()
+        size, block = 4000, 4
+        client = self._Recorder(self._payloads(size, block), delay=0.001)
+        stream = pdl.ranged_blocks(client, "b", "o", size, block, 4)
+        next(stream)
+        stream.close()
+        for _ in range(100):
+            if threading.active_count() <= before:
+                break
+            time.sleep(0.05)
+        assert threading.active_count() <= before, "read-ahead threads outlived the stream"
+
+    def test_the_decode_is_correct_at_every_depth(self, tmp_path, monkeypatch, gcs,
+                                                  plain_text):
+        """End to end: the depth must change throughput, never the bytes."""
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        for depth in (1, 4):
+            gcs.state.objects.clear()
+            force_bucket_route(monkeypatch,
+                               gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+            with Server(body) as source:
+                argv = gunzip_options(tmp_path, source.url(), body)
+                argv.decode_readahead = depth
+                marker = pdl.sidecar_paths(str(tmp_path / "variants.tsv"))[1]
+                if os.path.exists(marker):
+                    os.unlink(marker)
+                assert pdl.run(argv) == pdl.EXIT_OK
+            assert gcs.state.objects[PLAIN_OBJECT] == plain_text, (
+                "depth {} changed the output".format(depth))
 
 
 class TestTheGzipDecoderSpansMembers:

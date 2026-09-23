@@ -62,6 +62,7 @@ not import canine.
 
 import argparse
 import base64
+import collections
 import binascii
 import errno
 import hashlib
@@ -103,6 +104,23 @@ SCHEMA_VERSION = 1
 # for more.
 DEFAULT_CONNECTIONS = 16
 MAX_CONNECTIONS = 16
+
+# Ranged GETs in flight while reading the compressed sidecar back for --gunzip.
+#
+# 4, measured. A single sequential stream reads a never-read object at 59.3 MB/s median
+# (42.9-72.2 over five reps); depth 4 reads it at 140.3 (129.3-147.7). The ranges do not
+# overlap, and the depth order was rotated across reps after a first attempt put depth 1
+# first every time and so charged it with whatever penalty running first carries -- the
+# by-slot medians came out flat, which is what says the effect is depth and not order.
+#
+# More is not better and the curve is not monotonic: depth 8 measures 105.2 and depth 16
+# 110.6, both well under depth 4, in two independent sweeps. Peak memory is
+# DECODE_READAHEAD * READ_BUFFER = 32 MiB.
+#
+# This parallelises only the FETCH. Inflation stays strictly sequential because gzip
+# gives no choice -- which is the same observation that made the post-compose design
+# possible at all, applied one layer down.
+DEFAULT_DECODE_READAHEAD = 4
 DEFAULT_MIN_CHUNK = 64 * 1024 * 1024
 
 # Chunk boundaries are aligned to this so that every chunk start is also block-aligned
@@ -2979,8 +2997,47 @@ class GzipStreamDecoder:
         return tail
 
 
+def ranged_blocks(client, bucket, name, size, block, depth):
+    """
+    Yield an object's blocks in order, with up to `depth` ranged GETs in flight.
+
+    Order is preserved because the consumer is a gzip inflater and gzip is sequential.
+    Only the fetch is parallel -- which is the point: the read was measured at a third
+    of what the same object yields once warm, and a read-ahead attacks that without
+    touching the part that cannot be parallelised.
+
+    Bounded at `depth` outstanding requests, so peak memory is `depth * block` whatever
+    the object's size. `depth <= 1` is the plain sequential loop, kept so the two can be
+    compared on one code path rather than two.
+    """
+    offsets = iter(range(0, size, block))
+    if depth <= 1:
+        for start in offsets:
+            yield client.download_range(bucket, name, start, min(start + block, size))
+        return
+
+    def fetch(start):
+        return pool.submit(client.download_range, bucket, name,
+                           start, min(start + block, size))
+
+    with ThreadPoolExecutor(max_workers=depth,
+                            thread_name_prefix="k9pdl-decode-read") as pool:
+        inflight = collections.deque()
+        for start in offsets:
+            inflight.append(fetch(start))
+            if len(inflight) >= depth:
+                break
+        while inflight:
+            payload = inflight.popleft().result()
+            start = next(offsets, None)
+            if start is not None:
+                inflight.append(fetch(start))
+            yield payload
+
+
 def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
-                      granularity=GCS_UPLOAD_GRANULARITY):
+                      granularity=GCS_UPLOAD_GRANULARITY,
+                      readahead=DEFAULT_DECODE_READAHEAD):
     """
     Stream `source` through gunzip into a new object `dest`, entirely in the bucket.
 
@@ -3044,65 +3101,74 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
                 dest.rsplit("/", 1)[-1], magic[:4]))
         return False
 
-    while read_at < size:
-        end = min(read_at + block, size)
-        mark = time.monotonic()
-        payload = client.download_range(bucket, source, read_at, end)
-        stage["read"] += time.monotonic() - mark
-        blocks += 1
-        if not payload:
-            raise TransientError("read-back returned nothing at {}".format(read_at))
-        read_at += len(payload)
-
-        try:
+    # With a read-ahead, `stage["read"]` is time the decode spent BLOCKED on a block,
+    # not time spent fetching -- fetching overlaps itself. That is the number that
+    # matters for the pipeline arithmetic, but it is not comparable to a depth-1 run's
+    # read total, so the depth is logged alongside it.
+    stream = ranged_blocks(client, bucket, source, size, block, readahead)
+    try:
+        while read_at < size:
             mark = time.monotonic()
-            pending += decoder.feed(payload)
-            stage["inflate"] += time.monotonic() - mark
-        except zlib.error as e:
-            if session is not None or decoder.produced:
-                # Past the header and part-way through a stream: this is corruption,
-                # not mislabelled metadata, and the caller must not publish a truncation.
-                raise PermanentError(
-                    "could not decompress gs://{}/{}: {}".format(bucket, source, e))
-            # The server advertised Content-Encoding: gzip over bytes that are not
-            # gzip. Keep them rather than failing the localization over the server's
-            # metadata being wrong -- same call gunzip_to makes on BadGzipFile.
-            return keep_as_is(
-                "gs://{}/{} was advertised as gzip-encoded but is not gzip ({}); "
-                "keeping the bytes as received".format(bucket, source, e))
+            payload = next(stream, None)
+            stage["read"] += time.monotonic() - mark
+            blocks += 1
+            if not payload:
+                raise TransientError("read-back returned nothing at {}".format(read_at))
+            read_at += len(payload)
 
-        if not checked and len(pending) >= len(magic):
-            if not decide():
-                return size, False
-            checked = True
+            try:
+                mark = time.monotonic()
+                pending += decoder.feed(payload)
+                stage["inflate"] += time.monotonic() - mark
+            except zlib.error as e:
+                if session is not None or decoder.produced:
+                    # Past the header and part-way through a stream: this is corruption,
+                    # not mislabelled metadata, and the caller must not publish a truncation.
+                    raise PermanentError(
+                        "could not decompress gs://{}/{}: {}".format(bucket, source, e))
+                # The server advertised Content-Encoding: gzip over bytes that are not
+                # gzip. Keep them rather than failing the localization over the server's
+                # metadata being wrong -- same call gunzip_to makes on BadGzipFile.
+                return keep_as_is(
+                    "gs://{}/{} was advertised as gzip-encoded but is not gzip ({}); "
+                    "keeping the bytes as received".format(bucket, source, e))
 
-        if not checked:
-            continue
+            if not checked and len(pending) >= len(magic):
+                if not decide():
+                    return size, False
+                checked = True
 
-        # Only whole granules may be sent while the total is still unknown.
-        sendable = (len(pending) // granularity) * granularity
-        if sendable:
-            mark = time.monotonic()
-            if session is None:
-                session = client.start_resumable_upload(bucket, dest)
-            chunk = bytes(pending[:sendable])
-            del pending[:sendable]
-            _, committed = client.upload_range(session, chunk, offset, None)
-            stage["write"] += time.monotonic() - mark
-            if committed is None or committed <= offset:
-                # A granule-aligned PUT that persists nothing is not progress, and
-                # silently buffering the chunk to try again would grow `pending` by the
-                # whole decompressed object. Requeue instead; the parts survive, so the
-                # retry repeats only the decode.
-                raise TransientError(
-                    "upload session persisted nothing at {}".format(offset))
-            # GCS is authoritative about what persisted, and it is not obliged to be
-            # everything that was sent. Whatever it did not take goes back on the front
-            # of the buffer and is re-sent with the next granule.
-            if committed < offset + len(chunk):
-                pending[:0] = chunk[committed - offset:]
-            offset = committed
+            if not checked:
+                continue
 
+            # Only whole granules may be sent while the total is still unknown.
+            sendable = (len(pending) // granularity) * granularity
+            if sendable:
+                mark = time.monotonic()
+                if session is None:
+                    session = client.start_resumable_upload(bucket, dest)
+                chunk = bytes(pending[:sendable])
+                del pending[:sendable]
+                _, committed = client.upload_range(session, chunk, offset, None)
+                stage["write"] += time.monotonic() - mark
+                if committed is None or committed <= offset:
+                    # A granule-aligned PUT that persists nothing is not progress, and
+                    # silently buffering the chunk to try again would grow `pending` by the
+                    # whole decompressed object. Requeue instead; the parts survive, so the
+                    # retry repeats only the decode.
+                    raise TransientError(
+                        "upload session persisted nothing at {}".format(offset))
+                # GCS is authoritative about what persisted, and it is not obliged to be
+                # everything that was sent. Whatever it did not take goes back on the front
+                # of the buffer and is re-sent with the next granule.
+                if committed < offset + len(chunk):
+                    pending[:0] = chunk[committed - offset:]
+                offset = committed
+
+    finally:
+        # Shuts the pool down; at most `readahead` blocks are still in flight,
+        # which matters on the keep-as-is paths that return from inside the loop.
+        stream.close()
     mark = time.monotonic()
     pending += decoder.flush()
     stage["inflate"] += time.monotonic() - mark
@@ -3118,7 +3184,7 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
             session, bytes(pending), offset, total)
         if metadata is not None:
             stage["write"] += time.monotonic() - mark
-            report_decode_stages(stage, blocks, size, total)
+            report_decode_stages(stage, blocks, size, total, readahead)
             return total, True
         if committed is None or committed <= offset:
             raise TransientError(
@@ -3130,11 +3196,11 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
     # the total finalizes it, which is exactly what session_offset sends.
     client.session_offset(session, total)
     stage["write"] += time.monotonic() - mark
-    report_decode_stages(stage, blocks, size, total)
+    report_decode_stages(stage, blocks, size, total, readahead)
     return total, True
 
 
-def report_decode_stages(stage, blocks, compressed, decompressed):
+def report_decode_stages(stage, blocks, compressed, decompressed, readahead=1):
     """
     Emit the decode's read/inflate/write split, in the shape `k9pdl-io` uses.
 
@@ -3159,8 +3225,8 @@ def report_decode_stages(stage, blocks, compressed, decompressed):
     slowest = max(stage.values())
     two_stage = max(stage["read"] + stage["inflate"], stage["write"])
     log("k9pdl-gunzip read {:.3f}s inflate {:.3f}s write {:.3f}s over {} blocks "
-        "({} -> {} bytes, ceiling {:.2f}x, pipe2 {:.2f}x)".format(
-            stage["read"], stage["inflate"], stage["write"], blocks,
+        "(readahead {}, {} -> {} bytes, ceiling {:.2f}x, pipe2 {:.2f}x)".format(
+            stage["read"], stage["inflate"], stage["write"], blocks, readahead,
             compressed, decompressed,
             total / slowest if slowest > 0 else 1.0,
             total / two_stage if two_stage > 0 else 1.0))
@@ -3323,7 +3389,9 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
         try:
             with phase("gunzip", size):
                 stored_size, decoded = decompress_object(
-                    client, bucket, compose_target, object_name)
+                    client, bucket, compose_target, object_name,
+                    readahead=getattr(options, "decode_readahead",
+                                      DEFAULT_DECODE_READAHEAD))
         except PermanentError as e:
             # The compressed bytes already matched the advertised digest, so a
             # mid-stream decode failure means the source object itself is broken and
@@ -4181,6 +4249,13 @@ def build_parser():
                              "round-trip regardless of size) and widens the bound on "
                              "work discarded by a preemption".format(
                                  GCS_UPLOAD_GRANULARITY))
+    parser.add_argument("--decode-readahead", dest="decode_readahead", type=int,
+                        default=DEFAULT_DECODE_READAHEAD,
+                        help="ranged GETs in flight while reading the compressed "
+                             "sidecar back for --gunzip (default: %(default)s). Only "
+                             "the fetch is parallel; inflation stays sequential. 1 "
+                             "restores the old single-stream read. Peak extra memory "
+                             "is this times {} bytes".format(READ_BUFFER))
     parser.add_argument("--header", action="append", default=[],
                         help="extra request header, 'Name: value' (repeatable)")
     parser.add_argument("--s3-bucket", dest="s3_bucket")

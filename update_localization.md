@@ -4621,3 +4621,78 @@ So the order is: measure a read-ahead first, pipeline second, resume manifest no
 (§13.58 unchanged). And the cold-read penalty is worth understanding on its own — it
 applies equally to the md5 verify read-back, which is the other full-object sequential
 read on this route and ~5.8 s of unattributed time in the original §6.6b run.
+
+### 13.61 The read-ahead, built and measured: 1.41x whole-run, and it supersedes the pipeline
+
+§13.60 found the decode's read stage running at a third of the same object's warm
+throughput and suggested a parallel read-ahead. Prototyped, measured, then built
+(`--decode-readahead`, default 4).
+
+#### Choosing the depth took three attempts, and the first two were invalid
+
+**v1** minted fresh objects with `compose` and its depth-1 validity arm came out at
+**88.6 MB/s** instead of the 33-40 cold figure. Compose moves no bytes, so the composed
+copy references the same backing storage and inherits its cache state -- the objects were
+never cold and the sweep measured the warm path. The arm existed precisely to catch this,
+and did.
+
+**v2** used separate uploads, which do get their own storage, but ran the depths in the
+order `[1,2,4,8,16]` within every rep. Depth 1 was therefore the first read of its burst
+three times out of three, absorbing whatever penalty running first carries. The 1.9x it
+reported was partly an artifact of the schedule.
+
+**v3** rotated the depth order across five reps. By-slot medians came out flat (99.4,
+107.7, 105.9, 107.0, 103.3), which is what says the effect is depth and not order:
+
+| depth | median | range | vs depth 1 |
+|---|---|---|---|
+| 1 | 59.3 | 42.9-72.2 | 1.00x |
+| 2 | 105.0 | 93.0-119.1 | 1.77x |
+| **4** | **140.3** | **129.3-147.7** | **2.37x** |
+| 8 | 105.2 | 98.8-107.7 | 1.78x |
+| 16 | 110.6 | 99.4-112.8 | 1.87x |
+
+Ranges do not overlap between depth 1 and anything else, nor between depth 4 and the
+rest. The curve is not monotonic -- 8 and 16 are both worse than 4, in two independent
+sweeps -- so "more in flight" is not the mechanism and 4 is not a floor to raise later.
+
+#### End to end
+
+Two reps at each depth, alternated so ordering is not a confound, 852013000 ->
+1644444450 bytes, all four outputs byte-identical:
+
+| depth | routeb total | decode | blocked on read | write share of decode |
+|---|---|---|---|---|
+| 1 | 102.94 / 101.17 s | 67.8 / 68.8 s | 26.80 / 28.95 s | 45% / 43% |
+| **4** | **72.12 / 72.37 s** | **39.8 / 40.7 s** | **0.273 / 0.241 s** | 72% / 73% |
+
+**Whole-run 1.41x, decode phase 1.70x, and time blocked on reads falls 108x.** At depth 4
+the fetch vanishes entirely behind the inflate and the upload; `stage["read"]` stops
+measuring fetch time and starts measuring how often the consumer outruns the queue, which
+is close to never.
+
+#### It supersedes the pipelining recommendation
+
+§13.59 and §13.60 both ended with "build the two-thread split". With the read gone that is
+no longer the right next move: write is now 72% of the decode and the 3-stage ceiling has
+fallen from **2.23-2.35x to 1.36-1.39x**. The read-ahead captured most of what the
+pipeline was going to capture, for one bounded queue rather than a threaded pipeline with
+a shutdown protocol.
+
+What remains is hiding the 10.6 s inflate behind the 29 s write -- roughly 72 s -> 53 s,
+and only if the two do not interfere, which is untested. The real bottleneck is now the
+**single sequential resumable upload at 55-57 MB/s**. Parallelising that is not possible
+within one session (offsets must advance in order), but it is exactly what the relay
+already does with N sessions and a compose. That is the next thing worth pricing, not a
+pipeline.
+
+#### A test that measured nothing, again
+
+The bound on in-flight requests is what keeps peak memory at `depth * READ_BUFFER`, and
+the first version of that test asserted on *concurrent* calls. It passed against a
+mutation that submits every block up front, because `ThreadPoolExecutor(max_workers=depth)`
+caps concurrency by itself while completed payloads pile up in futures until the whole
+object is resident. Same error as the relay's prefetch tests (§13.53) and the same shape
+as counting executing reads at `connections=1`. Rewritten to measure how far the fetches
+run ahead of the consumer: it now fails with "966 of 1000 fetches started while the
+consumer took one block".

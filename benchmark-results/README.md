@@ -129,3 +129,26 @@ Two corrections to earlier write-ups fall out. The 70.4 MB/s small-object read i
 interference, which `d278e39` asserted as the reason to distrust the ceiling, is **not
 established**: against the cold isolated baseline the decode's interleaved read is 19%
 slower at 852 MB and 30% *faster* at 170 MB. Inconsistent in sign, so not a finding.
+
+### Read-ahead (`gunzip-readahead-depth-sweep.json`, `gunzip-e2e-depth*.json`)
+
+Depth sweep on never-read objects, five reps with the depth order **rotated** (an earlier
+attempt ran depth 1 first in every rep, which charged it with the run-first penalty;
+by-slot medians here are flat, 99.4-107.7, so order is not the effect):
+
+| depth | median MB/s | range |
+|---|---|---|
+| 1 | 59.3 | 42.9-72.2 |
+| **4** | **140.3** | **129.3-147.7** |
+| 8 / 16 | 105.2 / 110.6 | both worse than 4 |
+
+End to end at 852013000 -> 1644444450, depths alternated, all outputs byte-identical:
+
+| depth | total | decode | blocked on read |
+|---|---|---|---|
+| 1 | 102.94 / 101.17 s | 67.8 / 68.8 s | 26.80 / 28.95 s |
+| 4 | 72.12 / 72.37 s | 39.8 / 40.7 s | 0.273 / 0.241 s |
+
+1.41x whole-run, 1.70x on the decode, 108x less time blocked on reads. Afterwards the
+write is 72% of the decode and the 3-stage ceiling drops 2.23-2.35x -> 1.36-1.39x, so
+this supersedes the pipelining case rather than adding to it.
