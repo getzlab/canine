@@ -89,3 +89,43 @@ Both ceilings are upper bounds on non-independent stages: read and write share o
 The decode/relay ratio **widens with size** — 4.2× to 7.9× — because the relay is 16-way
 and scales while the decode is one sequential stream. §13.57's "5.0×" was one point on a
 rising curve, not a constant.
+
+### The read discriminator (`gunzip-readbench-grid.json`, `gunzip-warm-*.json`)
+
+`d278e39` showed the decode's read stage halving between 170 MB and 852 MB, which made a
+third pipeline thread look size-dependent. Three candidates were on the table: run
+variance, a real size effect, and composite component count. **It is none of them.**
+
+`gunzip-readbench-grid.json` — sequential 8 MiB `download_range` reads over a
+size x component-count grid, 3 interleaved reps, via the real `GcsClient`:
+
+| object | components | first read | steady (best of 3) |
+|---|---|---|---|
+| `src/big.gz` 852 MB | 1 (uploaded) | 87.1 | 87.1 MB/s |
+| `big-c4` / `c13` / `c51` | 4 / 13 / 51 | 33.9 / 37.0 / 38.1 | 91.4 / 91.6 / 88.4 |
+| `src/small.gz` 170 MB | 1 (uploaded) | 83.9 | 90.1 |
+| `small-c1` / `c3` / `c11` | 1 / 3 / 11 | 38.5 / 40.5 / 40.4 | 95.5 / 89.6 / 93.2 |
+
+Component count is flat, both cold and steady. Size is flat. What is **not** flat is the
+first read of a freshly-written object: 33-40 MB/s against 88-96 steady, a ~2.4x penalty
+that applies to every composed object and to none of the gcloud-uploaded ones. **The
+decode always reads a sidecar it has just composed, so it always pays this.**
+
+`gunzip-warm-*.json` — the same decode with and without `--md5`, i.e. with and without a
+full verify read-back immediately before the decode's own read:
+
+| run | read MB/s | inflate MB/s | write MB/s |
+|---|---|---|---|
+| small, md5 | 51.5 | 158.3 | 54.9 |
+| small, no md5 | 51.6 | 159.7 | 48.3 |
+| big, md5 | 28.8 | 156.2 | 55.4 |
+| big, no md5 | 32.0 | 159.8 | 54.8 |
+
+3.306 s vs 3.302 s on the small read: the verify pass does **not** warm the sidecar.
+Inflate (156-160) and write (48-55) are flat across a 5x size range, now n=4.
+
+Two corrections to earlier write-ups fall out. The 70.4 MB/s small-object read in
+`gunzip-split-170m.json` was the outlier -- repeats give 51.5 and 51.6. And read/write
+interference, which `d278e39` asserted as the reason to distrust the ceiling, is **not
+established**: against the cold isolated baseline the decode's interleaved read is 19%
+slower at 852 MB and 30% *faster* at 170 MB. Inconsistent in sign, so not a finding.

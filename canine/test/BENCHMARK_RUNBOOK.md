@@ -4076,29 +4076,36 @@ moved:
 | **read** | **70.4 MB/s** | **32.7 MB/s** | **×0.46** |
 
 Inflate and write scale essentially perfectly. The third thread's advantage appeared
-**entirely because read halved**, pushing `read + inflate` past `write`. Three hypotheses,
-none yet separable at n=1 per size:
+**entirely because read halved**. The discriminator has since been run (2026-09-23,
+`benchmark-results/gunzip-readbench-grid.json`), and the cause is none of the three
+candidates that were on the table:
 
-* **variance** — one run each; a single-stream GCS read swinging 2× is ordinary, and both
-  70 and 33 MB/s are plausible for one stream;
-* a genuine **size effect** on sequential single-stream reads;
-* **component count** — the small object composed from **3** parts, the big from **13**.
-  Part count scales with object size, so if reading across a composite degrades with
-  components, read throughput falls with size systematically. This is the most testable
-  of the three and would be fixable without touching threading at all.
+| hypothesis | verdict |
+|---|---|
+| composite **component count** (3 parts vs 13) | **exonerated** — steady reads 88–96 MB/s at 1/3/4/11/13/51 components, flat |
+| a real **size** effect | **exonerated** — isolated reads are 87 MB/s at 852 MB and 90 at 170 MB |
+| the md5 read-back **warms** the sidecar | **refuted** — 3.306 s vs 3.302 s with and without `--md5` |
 
-The discriminator is cheap: repeat each size ~3× and, separately, hold size fixed while
-varying `--connections`/`--min-chunk` to change the part count. If read is consistently
-~33 MB/s at 13 components and ~70 at 3, it is the compose fan-out, not the size.
+What it actually is: **the first read of a freshly-written object runs at 33–40 MB/s
+against 88–96 steady — a ~2.4× penalty.** It applies to every composed object and to none
+of the gcloud-uploaded ones, and it is flat in component count. The decode always reads a
+sidecar it has just composed, so it always pays it.
 
-Until that runs, **build the two-thread split** — it is the whole prize at 170 MB and 80%
-of it at 852 MB under either explanation — and leave the third thread until the read
-number is understood.
+That makes the read stage the interesting target, and not via threading: the decode reads
+at roughly **a third of what the same object yields once warm**. A parallel read-ahead —
+several ranged GETs in flight feeding the sequential inflater — is compatible with gzip's
+sequentiality (only the *inflate* must be serial) and attacks the larger number. Measure
+that before building any pipeline.
 
-**The ceiling is an upper bound and these two stages are not independent.** Read and write
-are both network on the same NIC, so overlapping them contends for the same bandwidth in
-a way the arithmetic does not model — §13.53 records exactly this caveat costing a
-predicted win. Treat 2.25× as "worth an experiment", not as a forecast.
+**Build the two-thread split** if you build anything — it is the whole prize at 170 MB and
+80% of it at 852 MB — but the read-ahead is likely worth more.
+
+**The ceiling is an upper bound.** Read and write are both network on the same NIC, so
+overlapping them may contend in a way the arithmetic does not model — §13.53 records
+exactly this caveat costing a predicted win. Note though that interference was *looked
+for and not found*: against a cold isolated baseline the decode's interleaved read is 19%
+slower at 852 MB and 30% **faster** at 170 MB, which is inconsistent in sign and so is not
+a result. Treat 2.25× as "worth an experiment", not as a forecast.
 
 `(verified)` refers to the **compressed** sidecar. The decompressed object has no digest
 to check against and never will — that is inherent, not a gap.
@@ -4553,7 +4560,9 @@ carries the narrative once a row is filled in.
 | Decompress throughput, and is per-preemption decode cost acceptable? | §6.6b step 3 | **the decode is 5.0× the relay** — 11.6 s vs 2.3 s, 59% of a 19.78 s run. Relay is 16-way at 74.1 MB/s; the decode is one sequential stream at 28.4 MB/s written, so the gap is structural and grows with the compression ratio. §13.55's "cheap second pass" framing was wrong. Still not resumable: a preemption redoes the decode, never the download |
 | Does the harness's single-stream fallback verify anything? | §6.6b step 3 | **no — and it exits 0.** Without `Accept-Encoding: gzip` the run fell back to a bare `curl` (no `--legacy-cmd` in the benchmark), verified nothing, decoded nothing, and returned rc=0 in 8.8 s. On this route a fallback is never a pass |
 | **Which decode stage dominates — is the 5× worth pipelining?** | §6.6b step 3, `k9pdl-gunzip` | **balanced, so yes — unlike the relay.** At 852 MB: write 45% / read 40% / inflate 16%, **ceiling 2.25×**, `pipe2` **1.80×** (65.3 s → 36.3 s two-thread, → 29.0 s three-thread). At 170 MB `pipe2 == ceiling == 1.73×`. Build two-thread first. Upper bound only: both ends share one NIC |
-| Why is the third thread worth more at 852 MB than at 170 MB? | §6.6b step 3 | **open — and not because of size as such.** Per byte, inflate (×1.01) and write (×1.06) scale perfectly; **read alone halved, 70.4 → 32.7 MB/s**, which is the whole reason `read+inflate` overtook `write`. Candidates: run variance (n=1 each), a real size effect, or **component count** (3 parts vs 13 — the most likely, and fixable without threading). Discriminate by repeating each size and by varying part count at fixed size |
+| Why is the third thread worth more at 852 MB than at 170 MB? | §6.6b step 3, `gunzip-readbench-grid.json` | **ANSWERED: the first read of a freshly-written object is ~2.4× slower** (33–40 MB/s vs 88–96 steady), and the decode always reads a sidecar it just composed. **Not** component count (flat 1→51), **not** size (isolated reads 87 vs 90 MB/s), **not** md5 warming (3.306 s vs 3.302 s). The 70.4 MB/s that started this was an outlier — repeats give 51.5, 51.6 |
+| Is the decode's read worth attacking directly? | `gunzip-readbench-grid.json` | **probably more than pipelining is.** It runs at ~⅓ of the same object's warm throughput. A parallel read-ahead feeding the sequential inflater is compatible with gzip (only *inflate* must be serial) and targets the bigger number. Unmeasured |
+| Do the decode's read and write interfere? | `gunzip-warm-*.json` | **looked for, not found.** Against a cold isolated baseline the interleaved read is 19% slower at 852 MB and 30% *faster* at 170 MB — inconsistent in sign, so not a result. The ceiling's independence assumption is untested, not disproven |
 | Does the decode scale linearly, and does multi-member hold at size? | §6.6b step 3 | **yes to both.** 170402482→328888890 in 10.6 s and 852012410→1644444450 in 65.3 s — 5.0× the bytes, 6.2× the time. A **5-member** 852 MB source decoded byte-exact, so `GzipStreamDecoder` holds on real GCS at 102 blocks, not just in the fake |
 | decode-to-relay ratio | §6.6b step 3 | **4.2× at 170 MB, 7.9× at 852 MB.** It widens with size because the relay is 16-way and scales, while the decode is one sequential stream. §13.57's "5×" was a single point on a rising curve |
 | Is a resume manifest for the decode worth it? | analysis, not yet measured | **no, at current sizes.** `zlib` exposes no `inflatePrime` and `decompressobj.copy()` is in-memory, so a resume must re-read and re-inflate the prefix regardless — a manifest buys back the upload third only. Expected loss without one is ≈`4×10⁻⁶·D²` s; ~1.5 s at a 10-minute decode, ~15 min at a 4-hour one. Revisit only if a real input decodes for hours |

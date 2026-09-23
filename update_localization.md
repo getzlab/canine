@@ -4569,3 +4569,55 @@ manifest still buys only the upload third, which is **45%** of the decode at the
 size — but pipelining attacks the whole 65 s for every run, while a manifest attacks a
 fraction of it only when a preemption lands. Pipelining first remains right, and by a
 wider margin than the earlier arithmetic suggested.
+
+### 13.60 The discriminator: it was none of the three candidates
+
+§13.59 recorded the decode's read stage halving between 170 MB and 852 MB, with three
+candidate causes. Ran the experiment (2026-09-23; `benchmark-results/gunzip-readbench-grid.json`,
+`gunzip-warm-*.json`). Design: a size x component-count grid read with the real
+`GcsClient.download_range` at 8 MiB blocks, 3 reps interleaved across objects so drift
+hits everything equally; plus the decode run with and without `--md5` to test whether the
+verify read-back warms the sidecar for the decode that follows.
+
+| hypothesis | verdict |
+|---|---|
+| composite **component count** | **exonerated** — 88–96 MB/s steady at 1/3/4/11/13/51 components |
+| a real **size** effect | **exonerated** — isolated reads 87 MB/s at 852 MB, 90 at 170 MB |
+| the md5 read-back **warms** it | **refuted** — 3.306 s vs 3.302 s, identical |
+
+**What it is: the first read of a freshly-written object runs at 33–40 MB/s against
+88–96 MB/s steady.** A ~2.4× penalty, flat in component count, applying to all six
+freshly-composed objects and to neither gcloud-uploaded source (spread across 3 reps:
+2.2–2.7× for composed, 1.02–1.07× for uploaded). The decode always reads a sidecar it
+composed moments earlier, so it always pays it.
+
+Two earlier claims fall:
+
+* The **70.4 MB/s** small-object read in §13.59 was an outlier. Repeats give 51.5 and
+  51.6, so the small/big read gap is 1.7×, not 2.15×.
+* **Read/write interference**, which §13.59 offered as the reason to distrust the
+  ceiling, is **not established**. Against the cold isolated baseline the decode's
+  interleaved read is 19% slower at 852 MB and 30% *faster* at 170 MB — inconsistent in
+  sign. The ceiling's independence assumption remains untested rather than disproven, and
+  I should not have asserted it as a caveat with evidence behind it.
+
+Inflate (156–160 MB/s) and write (48–55 MB/s) are now flat across a 5× size range at n=4,
+so the decode's only size-sensitive stage is the read, and only inside the decode loop.
+
+#### This changes what to build first
+
+The pipelining numbers are unchanged and reproduce well (`pipe2` 1.74–1.90 at 170 MB,
+3-stage 2.23–2.35 at 852 MB, across four further runs). But the read stage is running at
+**roughly a third of what the same object yields once warm**, and pipelining does not make
+a read faster — it only hides it behind the write.
+
+A **parallel read-ahead** does attack it: several ranged GETs in flight feeding the
+sequential inflater. This is compatible with gzip's sequentiality, which constrains only
+the *inflate* — the same observation that made the post-compose design possible at all
+(§13.55). It is also the fix the relay already has, and the relay reads at 74–103 MB/s
+where this reads at 30–51.
+
+So the order is: measure a read-ahead first, pipeline second, resume manifest not at all
+(§13.58 unchanged). And the cold-read penalty is worth understanding on its own — it
+applies equally to the md5 verify read-back, which is the other full-object sequential
+read on this route and ~5.8 s of unattributed time in the original §6.6b run.
