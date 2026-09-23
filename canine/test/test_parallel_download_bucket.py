@@ -2155,6 +2155,50 @@ class TestTheBucketRouteDecompresses:
         assert gcs.state.objects[target] == inner
         assert gziplib.decompress(gcs.state.objects[target]) == plain_text
 
+    @pytest.mark.parametrize("extension", [".bam", ".bcf", ".bai", ".tbi", ".bgz"])
+    def test_the_bgzf_family_names_get_the_same_double_gzip_check(
+            self, tmp_path, monkeypatch, gcs, extension):
+        """
+        `.gz` is not the only name that promises gzip. BGZF is a valid gzip container --
+        that is the whole point of it, so standard readers work -- which is why .bam,
+        .bcf and the .bai/.tbi/.csi indices are in NAMED_FORMAT_MAGIC's gzip family. A
+        naive gzip-only list would decode a .bam served with Content-Encoding: gzip into
+        a raw BAM stream, which is not a valid .bam at all.
+
+        Both directions on one name, because the pair is the actual contract: the check
+        cannot be "does the extension imply gzip", it has to be "do the DECODED bytes
+        still start 1f 8b".
+        """
+        import gzip as gziplib
+        # Multi-member, as bgzip writes; the inner object is what the name promises.
+        bgzf = b"".join(gziplib.compress(b"block-%d\t%s\n" % (i, b"z" * 90000))
+                        for i in range(3))
+        target = "inputs/aligned" + extension
+        dest = str(tmp_path / ("aligned" + extension))
+
+        # Doubly compressed: strip the transport layer, leave the BGZF.
+        body = gziplib.compress(bgzf)
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, target))
+        with Server(body) as source:
+            argv = options_for(dest, source.url(), len(body),
+                               check_md5=hashlib.md5(body).hexdigest())
+            argv.gunzip = True
+            assert pdl.run(argv) == pdl.EXIT_OK
+        assert gcs.state.objects[target] == bgzf, (
+            "a transport-encoded {} must lose exactly one layer".format(extension))
+
+        # Singly compressed with the metadata set by mistake: the stored bytes already
+        # are the BGZF, so decoding would leave a raw stream under a name promising one.
+        gcs.state.objects.clear()
+        os.unlink(pdl.sidecar_paths(dest)[1])
+        with Server(bgzf) as source:
+            argv = options_for(dest, source.url(), len(bgzf),
+                               check_md5=hashlib.md5(bgzf).hexdigest())
+            argv.gunzip = True
+            assert pdl.run(argv) == pdl.EXIT_OK
+        assert gcs.state.objects[target] == bgzf, (
+            "a mislabelled {} must keep the bytes it arrived with".format(extension))
+
     def test_the_marker_records_the_decompressed_size(self, tmp_path, monkeypatch, gcs,
                                                       plain_text):
         """
