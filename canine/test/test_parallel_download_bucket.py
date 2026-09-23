@@ -15,6 +15,7 @@ import os
 import subprocess
 import threading
 import time
+import zlib
 
 import pytest
 
@@ -1928,24 +1929,10 @@ class TestGunzipIsRefusedWhereItCannotBeHonoured:
     objects, on the destination `create_bucket_mount()` is making the default.
 
     Refusing is not the fix; it is the difference between a stopped job and a silent
-    one. The fix is #24: decline the bucket route for gunzip inputs and decompress
-    during stage-publish's copy.
+    one. The bucket route was fixed in #24 and now decompresses after compose (see
+    TestTheBucketRouteDecompresses); stage-publish copies its staged bytes through
+    unchanged and still has nowhere to hang a transform, so it still refuses.
     """
-
-    def test_the_bucket_route_refuses_rather_than_storing_compressed_bytes(
-            self, tmp_path, monkeypatch, gcs, payload, payload_md5, capsys):
-        force_bucket_route(monkeypatch)
-        with Server(payload) as source:
-            argv = options_for(str(tmp_path / "sample.txt"), source.url(),
-                               len(payload), check_md5=payload_md5)
-            argv.gunzip = True
-            rc = pdl.run(argv)
-
-        assert rc == pdl.EXIT_FAIL
-        err = capsys.readouterr().err
-        assert "cannot decompress" in err
-        assert OBJECT not in gcs.state.objects, (
-            "refused, but an object was written anyway")
 
     def test_the_staged_route_refuses_too(self, tmp_path, monkeypatch, gcs, payload,
                                           payload_md5, capsys):
@@ -1996,3 +1983,397 @@ class TestGunzipIsRefusedWhereItCannotBeHonoured:
                                        len(payload),
                                        check_md5=payload_md5)) == pdl.EXIT_OK
         assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+
+
+# ---------------------------------------------------------------------------
+# #24: decompressing on the bucket route
+# ---------------------------------------------------------------------------
+
+PLAIN_OBJECT = "inputs/variants.tsv"
+GZ_SIDECAR = PLAIN_OBJECT + ".k9pdl.gz"
+
+
+def gunzip_options(tmp_path, url, body, **overrides):
+    argv = options_for(str(tmp_path / "variants.tsv"), url, len(body),
+                       check_md5=hashlib.md5(body).hexdigest(), **overrides)
+    argv.gunzip = True
+    return argv
+
+
+@pytest.fixture
+def plain_text():
+    # Has to decompress to well over one 256 KiB granule, or the unknown-total PUT path
+    # -- the entire reason upload_range grew a `total=None` -- never runs and the class
+    # would pass against a feature it does not reach.
+    return b"".join(
+        b"chr1\t%d\tA\tG\tPASS\n" % i for i in range(60000))
+
+
+class TestTheBucketRouteDecompresses:
+    """
+    #24. gzip is a sequential stream, so nothing can decode it in flight -- chunk N
+    needs N-1. But after compose the compressed bytes exist as one object, and from
+    there the decode is a streaming read-back through zlib into a second resumable
+    upload. No local disk, and the relay is untouched.
+
+    The ordering is forced rather than chosen: the advertised digest covers the
+    COMPRESSED bytes, so verification has to happen against the sidecar, before
+    decoding. The decompressed object consequently has no digest of its own to check --
+    the guarantee on offer is "the bytes received were verified, then transformed",
+    which is the same one the in-place route gives.
+    """
+
+    def test_the_destination_holds_decoded_bytes(self, tmp_path, monkeypatch, gcs,
+                                                 plain_text):
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            rc = pdl.run(gunzip_options(tmp_path, source.url(), body))
+
+        assert rc == pdl.EXIT_OK
+        assert gcs.state.objects[PLAIN_OBJECT] == plain_text
+
+    def test_the_compressed_sidecar_and_parts_are_cleaned_up(
+            self, tmp_path, monkeypatch, gcs, plain_text):
+        """
+        Peak storage is compressed + decompressed. Leaving the sidecar behind doubles
+        the bucket's footprint per input and, worse, leaves an object under a name
+        nothing else will ever sweep.
+        """
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+
+        leftovers = [n for n in gcs.state.object_names() if n != PLAIN_OBJECT]
+        assert leftovers == [], "the sidecar, parts or manifest survived: {}".format(
+            leftovers)
+
+    def test_a_corrupt_transfer_is_caught_before_anything_is_decoded(
+            self, tmp_path, monkeypatch, gcs, plain_text, capsys):
+        """
+        The digest covers the compressed bytes, so it is the only check that can run
+        at all -- and it must gate the decode. Decoding first would publish a
+        destination object derived from bytes that were never verified.
+        """
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            argv = gunzip_options(tmp_path, source.url(), body)
+            argv.check_md5 = hashlib.md5(b"not these bytes").hexdigest()
+            rc = pdl.run(argv)
+
+        assert rc == pdl.EXIT_FAIL
+        assert "verification failed" in capsys.readouterr().err
+        assert PLAIN_OBJECT not in gcs.state.objects, (
+            "verification failed but a decoded object was published anyway")
+        assert GZ_SIDECAR not in gcs.state.objects
+
+    def test_multi_member_gzip_is_decoded_whole(self, tmp_path, monkeypatch, gcs):
+        """
+        bgzip writes concatenated gzip members, and a BAM is exactly that. A decoder
+        built on a single zlib.decompressobj stops at the first member's end and
+        reports success, which would silently truncate every bgzipped input to its
+        first block -- the worst possible failure here, because the output is still a
+        readable file.
+        """
+        import gzip as gziplib
+        members = [b"member-%d\t%s\n" % (i, b"x" * 200000) for i in range(4)]
+        plain = b"".join(members)
+        body = b"".join(gziplib.compress(m) for m in members)
+
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+
+        assert gcs.state.objects[PLAIN_OBJECT] == plain
+
+    def test_bytes_that_are_not_gzip_are_kept_as_received(
+            self, tmp_path, monkeypatch, gcs, capsys):
+        """
+        A server can advertise Content-Encoding: gzip over bytes that are not gzip.
+        Failing the localization over the server's metadata being wrong would strand a
+        file that is perfectly fine; the in-place route keeps the bytes, and so does
+        this one.
+        """
+        body = b"plain,csv,content\n" * 20000
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+
+        assert gcs.state.objects[PLAIN_OBJECT] == body
+        assert "is not gzip" in capsys.readouterr().err
+
+    def test_a_singly_compressed_object_named_gz_keeps_its_stored_bytes(
+            self, tmp_path, monkeypatch, gcs, plain_text, capsys):
+        """
+        The other half of gunzip_to's refinement. Content-Encoding: gzip set on an
+        already-.gz object is a common upload slip: the stored bytes ALREADY are the
+        .gz the name promises, so decoding would leave plain text in a file called
+        .gz. Decided from the first decoded bytes, before any upload starts.
+        """
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        target = "inputs/variants.vcf.gz"
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, target))
+        with Server(body) as source:
+            argv = options_for(str(tmp_path / "variants.vcf.gz"), source.url(),
+                               len(body), check_md5=hashlib.md5(body).hexdigest())
+            argv.gunzip = True
+            assert pdl.run(argv) == pdl.EXIT_OK
+
+        assert gcs.state.objects[target] == body, (
+            "a .gz name must hold gzip bytes")
+        assert "singly-compressed" in capsys.readouterr().err
+
+    def test_a_doubly_compressed_object_named_gz_is_decoded_once(
+            self, tmp_path, monkeypatch, gcs, plain_text):
+        """
+        The distinguishing case: a .gz additionally encoded for transport. Removing one
+        layer yields the original .gz, which is what the name promises. Same invariant
+        as above, opposite decision -- so the check cannot just be "does it end in .gz".
+        """
+        import gzip as gziplib
+        inner = gziplib.compress(plain_text)
+        body = gziplib.compress(inner)
+        target = "inputs/variants.vcf.gz"
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, target))
+        with Server(body) as source:
+            argv = options_for(str(tmp_path / "variants.vcf.gz"), source.url(),
+                               len(body), check_md5=hashlib.md5(body).hexdigest())
+            argv.gunzip = True
+            assert pdl.run(argv) == pdl.EXIT_OK
+
+        assert gcs.state.objects[target] == inner
+        assert gziplib.decompress(gcs.state.objects[target]) == plain_text
+
+    def test_the_marker_records_the_decompressed_size(self, tmp_path, monkeypatch, gcs,
+                                                      plain_text):
+        """
+        The marker's `size` identifies the plan, so it stays the compressed length. The
+        falsifiability check compares the marker against what is actually in the bucket,
+        and with --gunzip that is the DECOMPRESSED object -- so without a separate
+        stored_size the check disagrees on every run and the marker can never be
+        believed. A marker that is never believed is the same as no marker.
+        """
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        dest = str(tmp_path / "variants.tsv")
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            argv = gunzip_options(tmp_path, source.url(), body)
+            assert pdl.run(argv) == pdl.EXIT_OK
+
+        marker = pdl.read_done_marker(pdl.sidecar_paths(dest)[1])
+        assert marker["size"] == len(body)
+        assert marker["stored_size"] == len(plain_text)
+
+        # And the second run has to believe it, without touching the source at all --
+        # the marker is checked before the range probe, so this is exactly zero.
+        with Server(body) as source:
+            second = gunzip_options(tmp_path, source.url(), body)
+            assert pdl.run(second) == pdl.EXIT_OK
+            assert source.state.snapshot()["requests"] == 0, (
+                "the marker was written but not believed; every run re-transfers")
+
+    def test_a_crash_before_the_decode_does_not_publish_a_partial_destination(
+            self, tmp_path, monkeypatch, gcs, plain_text):
+        """
+        Preemption is the normal case, not the exception. An unfinished resumable upload
+        is invisible in the bucket, so the destination either exists whole or not at all
+        -- but the compressed sidecar and the parts must survive, or the retry pays for
+        the download again rather than just the decode.
+        """
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+
+        # One-shot, rather than monkeypatch.undo(): the gcs fixture patches the client's
+        # endpoints through the same monkeypatch, so undoing would also unpatch the fake
+        # service and the retry would address real GCS.
+        real = pdl.decompress_object
+        calls = []
+
+        def die_once(*args, **kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise pdl.TransientError("test: GCS went away mid-decompress")
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(pdl, "decompress_object", die_once)
+        # One server across both runs, deliberately: the plan id is derived from the URL,
+        # so a second Server on a fresh port would invalidate the manifest and the resume
+        # under test would be replaced by a full restart -- which is what the first draft
+        # of this test measured.
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(
+                tmp_path, source.url(), body)) == pdl.EXIT_REQUEUE, (
+                    "a transient error in the decode must requeue; any other nonzero "
+                    "code tells SLURM not to retry")
+
+            assert PLAIN_OBJECT not in gcs.state.objects
+            assert GZ_SIDECAR in gcs.state.objects, (
+                "the verified compressed bytes were thrown away; the retry "
+                "re-downloads")
+
+            # The retry pays for the decode, not the download: one ranged GET for the
+            # range probe and nothing else, because every chunk is already complete.
+            before = source.state.snapshot()["range_requests"]
+            assert pdl.run(gunzip_options(
+                tmp_path, source.url(), body)) == pdl.EXIT_OK
+            after = source.state.snapshot()["range_requests"]
+            assert after - before <= 1, (
+                "resumed after the crash but re-downloaded the object "
+                "({} ranged reads)".format(after - before))
+        assert gcs.state.objects[PLAIN_OBJECT] == plain_text
+
+    def test_a_stream_that_cannot_be_decoded_cleans_up_instead_of_leaking(
+            self, tmp_path, monkeypatch, gcs, plain_text, capsys):
+        """
+        The other side of the requeue. A mid-stream decode failure happens on bytes that
+        already matched the advertised digest, so the source object itself is broken and
+        no retry can help -- which makes EXIT_FAIL correct, and makes leaving the parts
+        and the sidecar behind a leak nothing will ever collect.
+        """
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+
+        def die(*args, **kwargs):
+            raise pdl.PermanentError("test: truncated gzip stream")
+
+        monkeypatch.setattr(pdl, "decompress_object", die)
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(
+                tmp_path, source.url(), body)) == pdl.EXIT_FAIL
+
+        assert gcs.state.object_names() == [], (
+            "a do-not-retry failure left objects behind: {}".format(
+                gcs.state.object_names()))
+
+    def test_the_unknown_total_path_is_actually_taken(self, tmp_path, monkeypatch, gcs,
+                                                      plain_text):
+        """
+        The guard on this whole class. `upload_range` grew `total=None` for exactly one
+        caller, and if the decoded output happened to fit in a single final PUT then
+        every test above would pass without that code ever running -- the same way a
+        prefetch test once passed against an 8 MiB block it could not reach.
+        """
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        assert len(plain_text) > pdl.GCS_UPLOAD_GRANULARITY, (
+            "the fixture no longer decompresses past one granule")
+
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+
+        assert gcs.state.unknown_total_puts >= 1, (
+            "the decode finished in one PUT, so total=None was never exercised")
+
+    def test_a_misaligned_chunk_of_unknown_total_is_rejected(self, monkeypatch, gcs,
+                                                             plain_text):
+        """
+        Why the output is buffered to a granule at all. GCS accepts an unknown-total PUT
+        only when its length is a multiple of 256 KiB; sending anything else fails the
+        request. Driven directly, because a run that buffered wrongly would fail with a
+        400 from deep inside the relay and be hard to read.
+        """
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        client = pdl.GcsClient(timeout=30)
+        client.put_object(BUCKET, "misaligned.gz", body)
+
+        with pytest.raises((pdl.PermanentError, pdl.TransientError)):
+            pdl.decompress_object(client, BUCKET, "misaligned.gz", "misaligned",
+                                  granularity=pdl.GCS_UPLOAD_GRANULARITY + 1)
+
+
+class TestTheGzipDecoderSpansMembers:
+    """
+    zlib.decompressobj decodes exactly one gzip member and then sets eof, leaving the
+    rest in unused_data. Concatenated members are valid gzip and are how bgzip writes,
+    so the single-decompressobj version of this would truncate a BAM to its first block
+    and report success -- readable output, wrong content, no error anywhere.
+
+    `gzip.open`, which the in-place route uses, handles this for free. Tested directly
+    because the end-to-end version cannot distinguish "decoded all members" from
+    "the payload happened to be one member".
+    """
+
+    def test_one_member_round_trips(self):
+        import gzip as gziplib
+        plain = b"single member\n" * 1000
+        decoder = pdl.GzipStreamDecoder()
+        out = decoder.feed(gziplib.compress(plain)) + decoder.flush()
+        assert out == plain
+        assert decoder.produced == len(plain)
+
+    def test_concatenated_members_are_all_decoded(self):
+        import gzip as gziplib
+        members = [b"a" * 1000, b"b" * 1000, b"c" * 1000]
+        body = b"".join(gziplib.compress(m) for m in members)
+        decoder = pdl.GzipStreamDecoder()
+        out = decoder.feed(body) + decoder.flush()
+        assert out == b"".join(members)
+
+    def test_members_split_across_feeds_are_reassembled(self):
+        """
+        The real caller feeds fixed-size blocks off the wire, so member boundaries land
+        anywhere -- including mid-header and mid-trailer. Stepping one byte at a time
+        covers every one of those alignments.
+        """
+        import gzip as gziplib
+        members = [b"x" * 300, b"y" * 300]
+        body = b"".join(gziplib.compress(m) for m in members)
+        decoder = pdl.GzipStreamDecoder()
+        out = bytearray()
+        for i in range(len(body)):
+            out += decoder.feed(body[i:i + 1])
+        out += decoder.flush()
+        assert bytes(out) == b"".join(members)
+
+    def test_trailing_nul_padding_is_not_a_member(self):
+        """
+        Some writers pad to a block boundary. Those zeros are not a malformed member,
+        and the reference implementation ignores them.
+        """
+        import gzip as gziplib
+        plain = b"padded\n" * 100
+        decoder = pdl.GzipStreamDecoder()
+        out = decoder.feed(gziplib.compress(plain) + b"\x00" * 512) + decoder.flush()
+        assert out == plain
+
+    def test_bytes_that_are_not_gzip_raise_before_producing_output(self):
+        """
+        The signal decompress_object keys its keep-as-is decision on: an error with
+        nothing produced means a bad header, which is mislabelled metadata rather than
+        corruption. An error after output means a truncated stream, which is not
+        recoverable and must not be published.
+        """
+        decoder = pdl.GzipStreamDecoder()
+        with pytest.raises(zlib.error):
+            decoder.feed(b"this is not gzip at all, not even close")
+        assert decoder.produced == 0
+
+    def test_a_truncated_member_produces_output_then_stops(self):
+        import gzip as gziplib
+        plain = b"truncated\n" * 5000
+        body = gziplib.compress(plain)[:len(gziplib.compress(plain)) // 2]
+        decoder = pdl.GzipStreamDecoder()
+        decoder.feed(body)
+        assert decoder.produced > 0, (
+            "a half stream must decode its prefix, or the mid-stream error case "
+            "cannot be told apart from a bad header")

@@ -164,6 +164,24 @@ k9pdl-commit 94.7s over 212 batches (3283 chunks, mean batch 15.5, 1.6% of 5748.
   effectively per-chunk — a state that looks identical to a healthy run if you only read
   the throughput.
 
+Decompression, when the source arrived `Content-Encoding: gzip`:
+
+```
+k9pdl-phase gunzip 291.7s, 287.4 MB/s
+decompressed 3060000000 bytes into 9884127232 bytes
+```
+
+This runs on the in-place and bucket-compose routes, always **after** verification — the
+advertised digest covers the *compressed* bytes, so they have to be checked before
+anything is decoded, and the decompressed output consequently has no digest of its own.
+stage-publish copies its staged bytes through unchanged and refuses `--gunzip` outright
+rather than storing a gzip stream under a name promising plain content.
+
+Two log lines mean the decode was deliberately skipped and the stored bytes kept, both
+because the server's metadata was wrong rather than the data: `is not gzip` (the object is
+not a gzip stream at all) and `singly-compressed` (the name promises `.gz` and decoding
+would have produced something that is not). Neither is a failure.
+
 Completion:
 
 ```
@@ -201,6 +219,12 @@ Beside each destination, while a download is in flight:
 | `.<name>.k9pdl.json` | chunk manifest — resume state |
 | `.<name>.k9pdl.done` | completion marker, with size, plan id and digest |
 | `<name>.k9pdl.gz` | compressed sidecar, only with `--gunzip` |
+
+The done marker records two lengths when `--gunzip` is in play. `size` is what was
+transferred and is what identifies the plan; `stored_size` is what actually landed on the
+destination. The marker is only believed if the destination still matches `stored_size`,
+so without the second field the check would compare a decompressed file against a
+compressed length, disagree every time, and re-download on every run.
 
 The manifest is removed on success; the done marker is kept, and is what makes a re-run of
 `localization.sh` after a preemption a no-op instead of a re-download. On the bucket-compose route (a

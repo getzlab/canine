@@ -4183,7 +4183,7 @@ whole-file md5 read-back. To a bucket destination that measured 43 min for 279 G
 ~35 min of transfer, so verification is the larger half. Accepted; correctness is not worth
 trading for it.
 
-### 13.55 `--gunzip` on the bucket route: refused now, decompressed post-compose later
+### 13.55 `--gunzip` on the bucket route: why it was refused, and the design (built in §13.56)
 
 `run()` dispatches to `run_bucket_route` / `run_staged_route` and returns **before** the
 gunzip block, which lives on the POSIX path only. So a `Content-Encoding: gzip` source
@@ -4274,3 +4274,65 @@ for one file. That is worse than today's state, which is at least consistently w
 
 **Do not set `contentEncoding` on the composed object.** The post-compose decompress pass
 is required, and this measurement is why.
+
+### 13.56 The decompress pass, built
+
+Implements the design in §13.55. `decompress_object(client, bucket, source, dest)` reads
+the composed object back in `READ_BUFFER` ranges, feeds them through zlib, and writes the
+output into a second resumable upload. No local disk; memory is one block plus at most one
+granule of buffered output.
+
+The bucket route now mirrors the in-place route exactly. Parts compose into
+`<object>.k9pdl.gz` rather than into the destination, that sidecar is what the digest is
+checked against, the decode publishes the destination, and only then are the sidecar and
+the parts deleted. The refusal in `run()` stays for stage-publish, which still has no
+transform step to hang this on.
+
+Four things this surfaced that the design note did not anticipate.
+
+**The unknown total.** The decompressed length cannot be known in advance — gzip's ISIZE
+is modulo 2**32, so it is unusable above 4 GiB, and measuring it honestly means
+decompressing the object twice. So `upload_range` grew `total=None`, which sends
+`Content-Range: bytes X-Y/*`. GCS accepts such a PUT only when its length is a multiple of
+the 256 KiB commit granularity, which is why output is buffered to a granule before it is
+sent; the final PUT carries the real total and is what completes the session. When the
+decoded length lands exactly on a granule boundary there is nothing left to send, and the
+session is finalized by a bodiless `bytes */TOTAL` — which is what `session_offset`
+already sends.
+
+**Multi-member gzip.** `zlib.decompressobj` decodes exactly one gzip member and then sets
+`eof`, leaving the rest in `unused_data`. Concatenated members are valid gzip and are how
+bgzip writes, so the obvious single-decompressobj implementation would truncate every
+bgzipped input to its first block **and report success** — readable output, wrong content,
+no error anywhere. `gzip.open`, which the in-place route uses, handles this for free.
+`GzipStreamDecoder` does it by hand, and ignores trailing NUL padding for the same reason
+the reference implementation does.
+
+**The marker could never be believed.** The done marker's falsifiability check compares the
+marker's `size` against what is actually on the destination. With `--gunzip` those are
+different numbers by definition, so the check disagreed on every run and the marker was
+worthless — a re-run re-downloaded the whole object. This was **already true of the
+in-place route**, and had been since `--gunzip` was added; it went unnoticed because
+nothing measured a second run of a gzip-encoded input. Fixed by recording `stored_size`
+alongside `size`: `size` still identifies the plan, `stored_size` is what the presence
+check compares.
+
+**Exit codes.** Found by mutation-testing the new tests: a `TransientError` raised inside
+the decode pass escaped `run()` as an uncaught traceback, which SLURM reads as
+do-not-retry. The pass now distinguishes the two cases properly. A transient failure
+requeues (5) and deliberately leaves the parts, the sidecar and the manifest in place, so
+the retry pays for the decode and not the download. A `PermanentError` means a mid-stream
+decode failure on bytes that already matched the advertised digest — the source object
+itself is broken, no retry can help — so it cleans everything up rather than leaking a
+full second copy of the data that nothing will ever collect.
+
+The "server's metadata is wrong" cases are kept, not failed, matching `gunzip_to`: bytes
+that are not gzip at all, and a `.gz`-named destination where decoding would not produce
+gzip (the metadata was set on a singly-compressed object). Both are decided from the first
+decoded bytes, before any upload starts, so the fallback costs one single-source compose —
+a server-side copy — rather than a discarded upload.
+
+126 tests on the bucket route, 773 across the parallel-download suites. Mutation-checked
+against five mutations: a single-member decoder, unbuffered output, a skipped sidecar
+delete, a dropped `stored_size`, and ignoring the flag entirely — the last of which is the
+original bug, and fails nine ways.

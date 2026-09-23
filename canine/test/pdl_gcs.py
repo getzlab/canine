@@ -46,6 +46,9 @@ class FakeGcs:
         # the *first* N and so leaves nothing committed.
         self.fail_uploads_after = None
         self.uploads_seen = 0
+        # PUTs that declared their total as "*". Counted so a test can prove the
+        # unknown-total path was actually taken rather than assuming it.
+        self.unknown_total_puts = 0
 
     def new_session(self, name):
         with self.lock:
@@ -182,9 +185,16 @@ def make_handler(state):
                 total = int(status_query.group(1))
                 with state.lock:
                     committed = session["committed"]
-                    if committed >= total and total > 0:
-                        self._json(200, self._object_metadata(
-                            session["name"], bytes(session["buf"])))
+                    if committed >= total:
+                        # total == 0 finalizes an empty object, which is how a resumable
+                        # session is completed when the last data PUT already sent
+                        # everything -- the gunzip pass ends that way whenever the
+                        # decoded length lands on a granule boundary.
+                        data = bytes(session["buf"][:total])
+                        state.objects[session["name"]] = data
+                        state.composite[session["name"]] = 1
+                        del state.sessions[session_id]
+                        self._json(200, self._object_metadata(session["name"], data))
                         return
                 if committed == 0:
                     self._send(308)
@@ -192,11 +202,27 @@ def make_handler(state):
                     self._send(308, b"", {"Range": "bytes=0-{}".format(committed - 1)})
                 return
 
-            upload = re.match(r"^bytes (\d+)-(\d+)/(\d+)$", content_range)
+            upload = re.match(r"^bytes (\d+)-(\d+)/(\d+|\*)$", content_range)
             if not upload:
                 self._json(400, {"error": {"message": "bad Content-Range"}})
                 return
-            start, end, total = (int(upload.group(i)) for i in (1, 2, 3))
+            start, end = int(upload.group(1)), int(upload.group(2))
+            # "*" means the final length is not known yet, which the gunzip pass needs:
+            # the decompressed size cannot be computed without decompressing. GCS accepts
+            # such a PUT only when its length is a multiple of the 256 KiB commit
+            # granularity, and rejects it otherwise -- modelled here so a caller that
+            # buffers wrongly fails loudly instead of silently working against the fake.
+            if upload.group(3) == "*":
+                with state.lock:
+                    state.unknown_total_puts += 1
+                if (end + 1 - start) % state.commit_granularity:
+                    self._json(400, {"error": {"message": (
+                        "chunk of unknown total must be a multiple of {}".format(
+                            state.commit_granularity))}})
+                    return
+                total = None
+            else:
+                total = int(upload.group(3))
 
             with state.lock:
                 state.uploads_seen += 1
@@ -225,7 +251,7 @@ def make_handler(state):
                 if state.truncate_uploads_to is not None:
                     sent_to = min(sent_to, start + state.truncate_uploads_to)
 
-                if sent_to >= total:
+                if total is not None and sent_to >= total:
                     committed = total
                 else:
                     # only whole granules persist
@@ -234,7 +260,7 @@ def make_handler(state):
                     committed = max(committed, session["committed"])
                 session["committed"] = committed
 
-                if committed >= total:
+                if total is not None and committed >= total:
                     data = bytes(buf[:total])
                     state.objects[session["name"]] = data
                     state.composite[session["name"]] = 1

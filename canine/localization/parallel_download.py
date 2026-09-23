@@ -78,6 +78,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 
 SCHEMA_VERSION = 1
@@ -1071,10 +1072,17 @@ def try_lock(fd):
 # completion marker
 # --------------------------------------------------------------------------------
 
-def write_done_marker(path, size, plan_id, digest, route=ROUTE_POSIX, gs_url=None):
+def write_done_marker(path, size, plan_id, digest, route=ROUTE_POSIX, gs_url=None,
+                      stored_size=None):
     """
     `route` is recorded because the marker is checked before the route is chosen, and
     `gs_url` so that the bucket route's completion can be checked at all.
+
+    `size` is the transferred (source) length, which is what identifies the plan. With
+    --gunzip that is NOT what ends up on the destination, so `stored_size` records the
+    decompressed length separately. Without it the falsifiability check below compares
+    a decompressed file against a compressed length, always disagrees, and re-transfers
+    on every run -- a marker that can never be believed is the same as no marker.
 
     Every route's marker has to be falsifiable. A marker is a hidden sidecar, so
     anything that removes the payload without sweeping dotfiles leaves it behind
@@ -1101,6 +1109,8 @@ def write_done_marker(path, size, plan_id, digest, route=ROUTE_POSIX, gs_url=Non
     }
     if gs_url:
         payload["gs_url"] = gs_url
+    if stored_size is not None and stored_size != size:
+        payload["stored_size"] = stored_size
     fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
     try:
         os.write(fd, json.dumps(payload).encode("utf-8"))
@@ -1615,12 +1625,18 @@ class GcsClient:
         Persisted bytes can never be overwritten, so re-sending an already-committed
         range is harmless, which is what makes a retry safe.
         """
+        # total=None sends "bytes X-Y/*", which is how GCS is told the final length is
+        # not yet known. The gunzip pass needs it: the decompressed size cannot be known
+        # in advance -- gzip's ISIZE is modulo 2**32, unusable above 4 GiB -- and
+        # measuring it would mean decompressing the object twice. The last call passes a
+        # real total, and that is what completes the session.
         end = offset + len(chunk) - 1
         status, headers, body = self.request(
             "PUT", session_uri, body=chunk,
             headers={
                 "Content-Length": str(len(chunk)),
-                "Content-Range": "bytes {}-{}/{}".format(offset, end, total),
+                "Content-Range": "bytes {}-{}/{}".format(
+                    offset, end, "*" if total is None else total),
             },
             expect=(200, 201, 308),
         )
@@ -2923,6 +2939,178 @@ def multipart_etag_from_gcs(client, bucket, name, part_length, size, manifest):
         hashlib.md5(b"".join(digests)).hexdigest(), n_parts), reread
 
 
+class GzipStreamDecoder:
+    """
+    Incremental gzip decoder that spans member boundaries.
+
+    `zlib.decompressobj(16 + MAX_WBITS)` decodes exactly one gzip member and then sets
+    `eof`, leaving everything after it in `unused_data`. Concatenated members are a
+    perfectly valid gzip stream, though, and are how bgzip writes -- so a decoder that
+    stopped at the first member would silently truncate a BAM or a bgzipped VCF to its
+    first block and report success. `gzip.open`, which the in-place route uses, handles
+    this for free; here it has to be done by hand.
+
+    Trailing NUL padding after the last member is ignored, matching the reference
+    implementation: some writers pad to a block boundary, and those zeros are not a
+    malformed member.
+    """
+
+    def __init__(self):
+        self._decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        self.produced = 0
+
+    def feed(self, payload):
+        out = bytearray()
+        data = payload
+        while data:
+            out += self._decoder.decompress(data)
+            if not self._decoder.eof:
+                break
+            data = self._decoder.unused_data
+            self._decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
+            if not data.strip(b"\x00"):
+                break
+        self.produced += len(out)
+        return bytes(out)
+
+    def flush(self):
+        tail = self._decoder.flush()
+        self.produced += len(tail)
+        return tail
+
+
+def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
+                      granularity=GCS_UPLOAD_GRANULARITY):
+    """
+    Stream `source` through gunzip into a new object `dest`, entirely in the bucket.
+
+    The in-place route's equivalent is `gunzip_to`, which has a local file to rewrite.
+    This route has none, so the object is read back in ranges, decoded in flight, and
+    written into a fresh resumable upload. Nothing touches disk and nothing is buffered
+    beyond one block, which matters because these objects run to hundreds of gigabytes.
+
+    The decompressed length cannot be known in advance -- gzip's ISIZE is modulo 2**32,
+    so it is unusable above 4 GiB, and measuring it honestly would mean decompressing
+    twice -- so every PUT but the last declares its total as `*`. That is the whole
+    reason `upload_range` accepts `total=None`. GCS only accepts an unknown-total PUT
+    whose length is a multiple of 256 KiB, which is why output is buffered to
+    `granularity` before it is sent.
+
+    Returns `(written, decoded)`. `decoded` is False when the bytes were kept as
+    received, for the same two reasons `gunzip_to` keeps them:
+
+      * the object is not gzip at all, despite the advertised Content-Encoding;
+      * `dest`'s name promises a gzip-family format and decoding did not produce it,
+        meaning the metadata was set on an object that was only compressed once and the
+        stored bytes already are what the name promises.
+
+    Both are decided from the first decoded bytes, before any upload starts, so the
+    fallback costs one server-side compose rather than a discarded upload.
+    """
+    size = int(client.get_object(bucket, source).get("size", 0))
+    magic = expected_magic(dest)
+    decoder = GzipStreamDecoder()
+
+    session = None
+    pending = bytearray()
+    offset = 0
+    read_at = 0
+    checked = magic is None
+
+    def keep_as_is(reason):
+        # A single-source compose is a server-side copy: no bytes move, and the
+        # intermediate is deleted by the caller exactly as it would have been.
+        log(reason)
+        client.compose(bucket, dest, [source])
+        return size, False
+
+    def decide():
+        # Called once enough output exists to compare, or at end of stream.
+        if bytes(pending[:len(magic)]) == magic:
+            return True
+        keep_as_is(
+            "{} is named for {} content but decoding did not produce it; the "
+            "content-encoding metadata is set on a singly-compressed object, so the "
+            "stored bytes are kept as-is".format(
+                dest.rsplit("/", 1)[-1], magic[:4]))
+        return False
+
+    while read_at < size:
+        end = min(read_at + block, size)
+        payload = client.download_range(bucket, source, read_at, end)
+        if not payload:
+            raise TransientError("read-back returned nothing at {}".format(read_at))
+        read_at += len(payload)
+
+        try:
+            pending += decoder.feed(payload)
+        except zlib.error as e:
+            if session is not None or decoder.produced:
+                # Past the header and part-way through a stream: this is corruption,
+                # not mislabelled metadata, and the caller must not publish a truncation.
+                raise PermanentError(
+                    "could not decompress gs://{}/{}: {}".format(bucket, source, e))
+            # The server advertised Content-Encoding: gzip over bytes that are not
+            # gzip. Keep them rather than failing the localization over the server's
+            # metadata being wrong -- same call gunzip_to makes on BadGzipFile.
+            return keep_as_is(
+                "gs://{}/{} was advertised as gzip-encoded but is not gzip ({}); "
+                "keeping the bytes as received".format(bucket, source, e))
+
+        if not checked and len(pending) >= len(magic):
+            if not decide():
+                return size, False
+            checked = True
+
+        if not checked:
+            continue
+
+        # Only whole granules may be sent while the total is still unknown.
+        sendable = (len(pending) // granularity) * granularity
+        if sendable:
+            if session is None:
+                session = client.start_resumable_upload(bucket, dest)
+            chunk = bytes(pending[:sendable])
+            del pending[:sendable]
+            _, committed = client.upload_range(session, chunk, offset, None)
+            if committed is None or committed <= offset:
+                # A granule-aligned PUT that persists nothing is not progress, and
+                # silently buffering the chunk to try again would grow `pending` by the
+                # whole decompressed object. Requeue instead; the parts survive, so the
+                # retry repeats only the decode.
+                raise TransientError(
+                    "upload session persisted nothing at {}".format(offset))
+            # GCS is authoritative about what persisted, and it is not obliged to be
+            # everything that was sent. Whatever it did not take goes back on the front
+            # of the buffer and is re-sent with the next granule.
+            if committed < offset + len(chunk):
+                pending[:0] = chunk[committed - offset:]
+            offset = committed
+
+    pending += decoder.flush()
+    if not checked and not decide():
+        return size, False
+
+    total = offset + len(pending)
+    if session is None:
+        session = client.start_resumable_upload(bucket, dest)
+    while offset < total:
+        metadata, committed = client.upload_range(
+            session, bytes(pending), offset, total)
+        if metadata is not None:
+            return total, True
+        if committed is None or committed <= offset:
+            raise TransientError(
+                "final upload made no progress at {}/{}".format(offset, total))
+        del pending[:committed - offset]
+        offset = committed
+    # Everything is sent but no PUT completed the session -- either there was nothing to
+    # send at all, or the last one committed its bytes with a 308. A bodiless PUT naming
+    # the total finalizes it, which is exactly what session_offset sends.
+    client.session_offset(session, total)
+    return total, True
+
+
 def verify_bucket_object(client, bucket, name, size, options, block=READ_BUFFER):
     """
     Verify a composed object against the source's declared hash by reading it back.
@@ -2967,6 +3155,12 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     bucket, object_name = split_gs_url(decision.gs_url)
     client = GcsClient(timeout=options.timeout)
     parts_prefix = "{}.k9pdl.parts".format(object_name)
+
+    # With --gunzip the parts compose into a compressed sidecar, not into the destination:
+    # the advertised checksum covers the compressed bytes, so they have to be verified
+    # before anything is decoded. Same ordering, and the same sidecar name, as the
+    # in-place route -- verify what was received, then transform it.
+    compose_target = "{}.k9pdl.gz".format(object_name) if options.gunzip else object_name
 
     # The manifest lives in the bucket, next to the destination object, so it travels with
     # the data and is committed by a single atomic media upload. It deliberately does NOT
@@ -3031,7 +3225,7 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
             return EXIT_FAIL
 
     with phase("compose"):
-        composed = compose_tree(client, bucket, object_name, part_names)
+        composed = compose_tree(client, bucket, compose_target, part_names)
     if int(composed.get("size", -1)) != size:
         log("composed object is {} bytes, expected {}".format(composed.get("size"), size))
         return EXIT_FAIL
@@ -3039,17 +3233,17 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     digest = None
     if options.check_md5:
         try:
-            digest = verify_bucket_object(client, bucket, object_name, size, options)
+            digest = verify_bucket_object(client, bucket, compose_target, size, options)
         except PermanentError as e:
             log("verification failed: {}".format(e))
             for name in part_names:
                 client.delete_object(bucket, name)
-            client.delete_object(bucket, object_name)
+            client.delete_object(bucket, compose_target)
             manifest.unlink()
             return EXIT_FAIL
     elif options.check_etag and options.part_length:
         actual, reread = multipart_etag_from_gcs(
-            client, bucket, object_name, options.part_length, size, manifest)
+            client, bucket, compose_target, options.part_length, size, manifest)
         log("etag from {} recorded part digests, {} re-read".format(
             (size + options.part_length - 1) // options.part_length - reread, reread))
         expected = options.check_etag.strip().strip('"')
@@ -3064,6 +3258,40 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
         log("ETag verification needs --part-length to reproduce an md5-of-md5s")
         return EXIT_FAIL
 
+    # Decode before anything is cleaned up. The parts and the compressed sidecar are the
+    # only copy of the transferred bytes, so if a preemption lands mid-decompress the
+    # next attempt repeats compose, verify and decode -- never the download. An
+    # unfinished resumable upload is invisible in the bucket, so there is no half-written
+    # destination for that attempt to trip over.
+    stored_size = None
+    if options.gunzip:
+        try:
+            with phase("gunzip", size):
+                stored_size, decoded = decompress_object(
+                    client, bucket, compose_target, object_name)
+        except PermanentError as e:
+            # The compressed bytes already matched the advertised digest, so a
+            # mid-stream decode failure means the source object itself is broken and
+            # no retry can help. Clean up for the same reason the verification failure
+            # above does: nothing is coming back for these.
+            log("{}".format(e))
+            for name in part_names:
+                client.delete_object(bucket, name)
+            client.delete_object(bucket, compose_target)
+            manifest.unlink()
+            return EXIT_FAIL
+        except TransientError as e:
+            # Requeue, and deliberately leave the parts, the sidecar and the manifest
+            # in place: the retry then pays only for the decode. Letting this escape
+            # would leave the shell with an uncaught traceback and an exit code SLURM
+            # reads as do-not-retry, which is the one outcome the exit codes exist to
+            # prevent.
+            log("transient failure decompressing; requesting requeue: {}".format(e))
+            return EXIT_REQUEUE
+        if decoded:
+            log("decompressed {} bytes into {} bytes".format(size, stored_size))
+        client.delete_object(bucket, compose_target)
+
     # Parts are deleted explicitly. The GCS JSON API's objects.compose has no
     # deleteSourceObjects parameter (contrary to the design note), so a crash between
     # compose and here leaves orphaned parts; the next run's cleanup below removes them,
@@ -3072,7 +3300,7 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
         client.delete_object(bucket, name)
 
     write_done_marker(marker_path, size, plan_id, digest, route=ROUTE_BUCKET,
-                      gs_url=decision.gs_url)
+                      gs_url=decision.gs_url, stored_size=stored_size)
     manifest.unlink()
     log("complete: {} bytes composed from {} parts{}".format(
         size, len(part_names), " (verified)" if digest else ""))
@@ -3561,9 +3789,10 @@ def marker_object_present(marker, dest, options):
         return False, "{} could not be checked ({}); re-transferring to be safe".format(
             gs_url, e)
 
+    expected = marker.get("stored_size", options.size)
     actual = int(metadata.get("size", -1))
-    if actual != options.size:
-        return False, "{} is {} bytes, expected {}".format(gs_url, actual, options.size)
+    if actual != expected:
+        return False, "{} is {} bytes, expected {}".format(gs_url, actual, expected)
     return True, ""
 
 
@@ -3594,7 +3823,8 @@ def run(options):
                 present, why = marker_object_present(marker, dest, options)
             else:
                 try:
-                    present = os.path.getsize(dest) == options.size
+                    present = (os.path.getsize(dest)
+                               == marker.get("stored_size", options.size))
                 except OSError:
                     present = False
                 why = "{} is missing or the wrong size".format(dest)
@@ -3662,30 +3892,25 @@ def run(options):
         options.url or "", size, options.check_etag or options.check_md5, chunk_size
     )
 
-    # Decompression is a POSIX-route capability today, and not by accident: **gzip is a
-    # sequential stream**, so chunk N cannot be decoded without N-1 and a parallel
-    # chunked transfer can never decompress in flight. The compressed bytes have to be
-    # materialized somewhere first, which is why this route writes a .k9pdl.gz sidecar
-    # and rewrites it afterwards. bucket-compose has no local file, and stage-publish
-    # has one but copies the staged bytes through unchanged.
+    # Decompression can never happen in flight on ANY route: **gzip is a sequential
+    # stream**, so chunk N cannot be decoded without N-1. The compressed bytes have to be
+    # materialized somewhere first and rewritten afterwards. in-place does that with a
+    # .k9pdl.gz sidecar on disk; bucket-compose does it with a .k9pdl.gz object and a
+    # streaming read-back through zlib into a second resumable upload (#24). stage-publish
+    # is the one route that still cannot: it stages the bytes and copies them through
+    # unchanged, with no transform step to hang this on.
     #
-    # That does not mean the bucket route cannot be fixed, only that it cannot be fixed
-    # in flight -- after compose the compressed bytes DO exist, in the bucket. The
-    # planned fix (#24) keeps the relay untouched and adds a post-compose streaming
-    # pass: read the composed object back, through zlib, into a fresh resumable upload,
-    # then delete the intermediate. No local disk, since both halves stream.
-    #
-    # The ordering matters too, and constrains any future fix: **the advertised digest
-    # covers the COMPRESSED bytes**, so verification must happen before decompression --
+    # The ordering is the same on both routes that can, and is forced: **the advertised
+    # digest covers the COMPRESSED bytes**, so verification happens before decompression,
     # and the decompressed output therefore has no digest to check against at all. The
-    # most any route can offer is "the bytes received were verified, then transformed",
-    # which is exactly what the sidecar ordering below provides.
+    # most either route offers is "the bytes received were verified, then transformed".
     #
-    # Ignoring the flag there is not a missed optimization, it is silently wrong output:
-    # the object lands still-gzipped, `compose` sets no contentEncoding so GCS will not
-    # transcode it on read, and gcsfuse serves the gzip stream verbatim under a name
-    # that promises plain content. The failure surfaces later, in whatever tool reads
-    # the mount, with nothing pointing back here.
+    # Ignoring the flag on the remaining route is not a missed optimization, it is
+    # silently wrong output: the object lands still-gzipped, `compose` sets no
+    # contentEncoding so GCS will not transcode it on read, and gcsfuse serves the gzip
+    # stream verbatim under a name that promises plain content (measured -- gcsfuse
+    # ignores contentEncoding entirely). The failure surfaces later, in whatever tool
+    # reads the mount, with nothing pointing back here.
     #
     # It also re-creates precisely the inconsistency file_handlers.py:509 records
     # removing -- "previously the same object arrived decompressed via gs:// but
@@ -3694,11 +3919,12 @@ def run(options):
     #
     # So: refuse. A loud stop costs a localization; silent corruption costs whatever
     # downstream conclusions were drawn from the wrong bytes before anyone noticed.
-    if options.gunzip and decision.route != ROUTE_POSIX:
-        log("--gunzip was requested but the {} route cannot decompress: it has no local "
-            "file to rewrite, so the object would be stored still-compressed under a "
-            "name promising decoded content. Refusing rather than writing bytes a "
-            "reader cannot use. ({})".format(decision.route, decision.reason))
+    if options.gunzip and decision.route not in (ROUTE_POSIX, ROUTE_BUCKET):
+        log("--gunzip was requested but the {} route cannot decompress: it copies the "
+            "staged bytes through unchanged, so the object would be stored "
+            "still-compressed under a name promising decoded content. Refusing rather "
+            "than writing bytes a reader cannot use. ({})".format(
+                decision.route, decision.reason))
         return EXIT_FAIL
 
     if decision.route == ROUTE_BUCKET:
@@ -3744,6 +3970,7 @@ def run(options):
         discard(target, manifest)
         return EXIT_FAIL
 
+    stored_size = None
     if options.gunzip:
         try:
             with phase("gunzip", size):
@@ -3753,13 +3980,14 @@ def run(options):
             discard(target, manifest)
             return EXIT_FAIL
         log("decompressed {} bytes into {} bytes".format(size, expanded))
+        stored_size = expanded
         # peak disk is compressed + decompressed; give the space back immediately
         try:
             os.unlink(target)
         except OSError:
             pass
 
-    write_done_marker(marker_path, size, plan_id, digest)
+    write_done_marker(marker_path, size, plan_id, digest, stored_size=stored_size)
     if manifest is not None:
         manifest.unlink()
     log("complete: {} bytes{}".format(size, " (verified)" if digest else ""))
