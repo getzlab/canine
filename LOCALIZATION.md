@@ -280,16 +280,21 @@ GiB-hour at roughly 4x standard storage (Iowa: $0.0001233/GiB-hour, ~$0.089/GiB-
 the transfer it saves is $0/GiB within North America. An in-region workload pays purely for read
 latency — worth it for an input read by many shards, wasteful for read-once work. Provisioning
 failure is logged and startup continues; it affects speed, not correctness
-(`imageTransient.py:189`).
+(`imageTransient.py`).
 
-> **Caveat — verify before relying on it.** `get_or_create_rapid_cache()` is called on
-> `config["storage_bucket"]` (`imageTransient.py:192`, `gcpTransient.py:254`), which
-> `__enter__` sets to the *workflow* bucket `canine-<project>-<workflow_name>`
-> (`get_or_create_workflow_bucket`, `utils.py:294`). The per-localization `wolf-...` buckets are
-> never passed to it, and `grep storage_bucket canine/localization/*.py` returns nothing — the
-> localization path never reads that config key at all. As written, `rapid_cache=True` therefore
-> provisions a cache on a bucket that bucket-mounted localization does not read. The workflow
-> bucket is a leftover from the earlier one-bucket-per-workflow design.
+> **What it actually caches.** `get_or_create_rapid_cache()` is called on
+> `config["results_bucket"]` (`imageTransient.py`), with `ingest_on_write=True`. That makes it
+> accelerate the producer-consumer handoff: a result written by one worker is pulled into the
+> cache as it lands, so the downstream shard reading it hits cache rather than cold GCS. It does
+> **not** accelerate the write side — object metadata is never cached — so it does nothing for a
+> workspace mounted read-write under `workdir_mode="bucket"`. In `workdir_mode="shared"` there is
+> no results bucket, so `rapid_cache=True` warns and provisions nothing.
+>
+> It previously pointed at a per-workflow bucket `canine-<project>-<workflow_name>` that no code
+> ever read — a leftover from the earlier one-bucket-per-workflow design, and pure cost. Both that
+> bucket and `get_or_create_workflow_bucket()` have been removed. The per-localization `wolf-...`
+> *input* buckets are still not cached: they are created on demand by the localizer, so there is
+> no single name for the backend to hand to a cache instance.
 
 Also note the Rapid Cache is **zonal** while the localization bucket is **regional**: one cache
 instance per zone per bucket, and a worker in another zone of the same region gets a silent miss.

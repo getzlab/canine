@@ -9,7 +9,7 @@ import sys
 from .local import LocalSlurmBackend
 from ..utils import (
     get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, canine_logging,
-    get_or_create_workflow_bucket, get_or_create_rapid_cache, get_or_create_results_bucket
+    get_or_create_rapid_cache, get_or_create_results_bucket
 )
 
 import googleapiclient.discovery as gd
@@ -179,17 +179,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             # start Slurm controller (and associated programs)
             self.init_slurm()
 
-            # get-or-create the bucket backing bucket-mounted localization
-            # (RODISK replacement); a genuine creation failure aborts
-            # startup here, before any node/job work begins
-            self.config["storage_bucket"] = get_or_create_workflow_bucket(
-                self.config["compute_zone"], self.config["project"], self.config["workflow_name"]
-            )
-
-            # get-or-create the bucket that task *outputs* are pushed to under
-            # local_workdir. Separate from storage_bucket above: that one backs
-            # bucket-mounted inputs and its objects are short-lived cache
-            # entries, whereas these are results with their own retention.
+            # get-or-create the bucket that task *outputs* are pushed to.
+            # A genuine creation failure aborts startup here, before any
+            # node/job work begins.
             if self.config["workdir_mode"] != "shared":
                 self.config["results_bucket"] = get_or_create_results_bucket(
                     self.config["compute_zone"], self.config["project"],
@@ -201,23 +193,38 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             # is not free and not always a win: cache storage bills per GiB-hour
             # at roughly 4x standard storage, while the transfer it would save
             # is $0 for a same-region read, so an in-region workload pays purely
-            # for read latency. Worth it for inputs read by many shards, wasteful
-            # for read-once work.
+            # for read latency. Worth it for results read back by many shards,
+            # wasteful for read-once work.
+            #
+            # It caches *reads* only. ingest_on_write means a result written by
+            # one worker is pulled into the cache as it lands, so the downstream
+            # shard that reads it hits cache rather than cold GCS -- but the
+            # write itself gets no acceleration, because object metadata is
+            # never cached. That is why this accelerates the producer-consumer
+            # handoff and does nothing for a workspace mounted read-write.
+            #
+            # Only meaningful when there is a results bucket to cache: in shared
+            # mode outputs stay on the NFS mount and never go through GCS.
             #
             # Best-effort when enabled: it affects read speed, not correctness,
             # so a failure is logged and startup continues rather than aborting.
-            if self.config["rapid_cache"]:
+            if self.config["rapid_cache"] and self.config["results_bucket"] is not None:
                 try:
                     get_or_create_rapid_cache(
-                        self.config["storage_bucket"], self.config["compute_zone"],
-                        ttl = self.config["rapid_cache_ttl"]
+                        self.config["results_bucket"], self.config["compute_zone"],
+                        ttl = self.config["rapid_cache_ttl"], ingest_on_write = True
                     )
                 except Exception as e:
                     canine_logging.warning(
                         "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
-                            self.config["storage_bucket"], e
+                            self.config["results_bucket"], e
                         )
                     )
+            elif self.config["rapid_cache"]:
+                canine_logging.warning(
+                    "rapid_cache is set but workdir_mode is 'shared', so there is no "
+                    "results bucket to cache; continuing without cache acceleration."
+                )
 
             # start nodes
             self.init_nodes()

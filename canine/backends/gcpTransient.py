@@ -10,7 +10,6 @@ import warnings
 from .remote import RemoteSlurmBackend
 from ..utils import (
     get_default_gcp_zone, get_default_gcp_project, ArgumentHelper, check_call, gcp_hourly_cost, canine_logging,
-    get_or_create_workflow_bucket, get_or_create_rapid_cache
 )
 # import paramiko
 import yaml
@@ -232,33 +231,20 @@ class TransientGCPSlurmBackend(RemoteSlurmBackend):
             time.sleep(60)
             canine_logging.info1("Slurm controller is ready. Please call .wait_for_cluster_ready() to wait until the slurm compute nodes are ready to accept work")
 
-            # get-or-create the bucket backing bucket-mounted localization
-            # (RODISK replacement); a genuine creation failure aborts
-            # startup here, before any node/job work begins
-            self.config["storage_bucket"] = get_or_create_workflow_bucket(
-                self.config["zone"], self.project, self.workflow_name
-            )
-
-            # Rapid Cache is opt-in per workflow (rapid_cache=True), because it
-            # is not free and not always a win: cache storage bills per GiB-hour
-            # at roughly 4x standard storage, while the transfer it would save
-            # is $0 for a same-region read, so an in-region workload pays purely
-            # for read latency. Worth it for inputs read by many shards, wasteful
-            # for read-once work.
-            #
-            # Best-effort when enabled: it affects read speed, not correctness,
-            # so a failure is logged and startup continues rather than aborting.
+            # Rapid Cache caches one named bucket. This backend has no
+            # workdir_mode and so no results bucket, and the per-localization
+            # input buckets are created on demand by the localizer rather than
+            # by the backend -- so there is nothing here to point a cache at.
+            # It used to be provisioned against a "workflow bucket" that no
+            # code ever read, which made it pure cost. Kept as an accepted
+            # kwarg so callers are not broken, but say plainly that it does
+            # nothing here rather than silently billing for a useless cache.
             if self.rapid_cache:
-                try:
-                    get_or_create_rapid_cache(
-                        self.config["storage_bucket"], self.config["zone"], ttl = self.rapid_cache_ttl
-                    )
-                except Exception as e:
-                    canine_logging.warning(
-                        "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
-                            self.config["storage_bucket"], e
-                        )
-                    )
+                canine_logging.warning(
+                    "rapid_cache is not supported by TransientGCPSlurmBackend -- there is "
+                    "no single bucket for it to accelerate. Use ImageTransient/"
+                    "DockerTransient with workdir_mode set, where results go to a bucket."
+                )
 
             return self
         except:

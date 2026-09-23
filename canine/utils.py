@@ -356,43 +356,6 @@ def localization_bucket_name(project_number: str, region: str, content_hash: str
         raise ValueError("Computed an invalid GCS bucket name: {!r}".format(name))
     return name
 
-def get_or_create_workflow_bucket(zone: str, project: str, workflow_name: typing.Optional[str] = None) -> str:
-    """
-    Get or create the standard regional bucket backing bucket-mounted
-    (RODISK-replacement) localization for one workflow. The name is
-    deterministic -- canine-<project>-<sanitized workflow_name> -- so
-    repeated or concurrent runs of the same workflow reuse the same
-    bucket rather than creating a new one each time. Also idempotently
-    ensures a "delete 5 days after last touched" lifecycle rule is present
-    (keyed on customTime, not object age -- see BUCKET_FUSE_MIGRATION.md).
-    Raises on a genuine creation failure (permissions, quota, bad zone).
-    """
-    client = gcloud_storage_client()
-    prefix = "canine-{}-".format(project)
-    name_budget = 63 - len(prefix)
-    sanitized = _sanitize_bucket_name_component(workflow_name or "default")[:name_budget]
-    bucket_name = prefix + sanitized
-
-    bucket = client.bucket(bucket_name)
-    if not bucket.exists():
-        try:
-            bucket = client.create_bucket(bucket_name, project=project, location=_zone_to_region(zone))
-        except google.api_core.exceptions.Conflict:
-            # bucket was created concurrently by another run of the same
-            # workflow; this is the expected reuse case, not an error
-            bucket = client.bucket(bucket_name)
-            bucket.reload()
-
-    has_lifecycle_rule = any(
-        rule.get("action", {}).get("type") == "Delete" and "daysSinceCustomTime" in rule.get("condition", {})
-        for rule in bucket.lifecycle_rules
-    )
-    if not has_lifecycle_rule:
-        bucket.add_lifecycle_delete_rule(days_since_custom_time=5)
-        bucket.patch()
-
-    return bucket_name
-
 def get_or_create_results_bucket(
     zone: str, project: str, namespace: str, expiry_days: typing.Optional[int] = 30
 ) -> str:
@@ -437,9 +400,7 @@ def get_or_create_results_bucket(
 
     # Reconcile the lifecycle rule on every call, not just at creation. The
     # bucket outlives any single run, so a later run with a different
-    # expiry_days must actually change the rule -- note get_or_create_workflow_bucket
-    # above only checks whether *some* daysSinceCustomTime rule exists and never
-    # updates it, which is not good enough here.
+    # expiry_days must actually change the rule.
     # snapshot once: lifecycle_rules is a property yielding a fresh generator on
     # each access, so it must not be iterated twice as if it were a list
     current = list(bucket.lifecycle_rules)

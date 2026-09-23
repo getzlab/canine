@@ -50,21 +50,68 @@ class TestGating:
         call = src.index("get_or_create_rapid_cache(")
         assert gate < call, "provisioning must be inside the flag check"
 
-    def test_gcp_transient_gates_on_the_flag(self):
-        src = inspect.getsource(TransientGCPSlurmBackend.__enter__)
-        gate = src.index("if self.rapid_cache:")
-        call = src.index("get_or_create_rapid_cache(")
-        assert gate < call, "provisioning must be inside the flag check"
-
-    @pytest.mark.parametrize("cls,attr", [
-        (TransientImageSlurmBackend, "__enter__"),
-        (TransientGCPSlurmBackend, "__enter__"),
-    ])
-    def test_failure_stays_non_fatal(self, cls, attr):
+    def test_failure_stays_non_fatal(self):
         """Cache affects read speed, not correctness; it must never fail startup."""
-        src = inspect.getsource(getattr(cls, attr))
+        src = inspect.getsource(TransientImageSlurmBackend.__enter__)
         seg = src[src.index("get_or_create_rapid_cache("):]
         assert "except Exception" in seg
+
+
+class TestCachesTheResultsBucket:
+    """
+    The cache used to be provisioned against a per-workflow bucket that nothing
+    ever read (`grep storage_bucket canine/localization/` returned nothing), so
+    rapid_cache=True billed ~4x standard storage to accelerate an empty bucket.
+    It now caches the bucket that task outputs actually land in.
+    """
+
+    def test_provisions_the_results_bucket(self):
+        src = inspect.getsource(TransientImageSlurmBackend.__enter__)
+        call = src[src.index("get_or_create_rapid_cache("):]
+        assert 'self.config["results_bucket"]' in call.split(")")[0]
+
+    def test_does_not_reference_the_deleted_workflow_bucket(self):
+        src = inspect.getsource(TransientImageSlurmBackend.__enter__)
+        assert "storage_bucket" not in src
+        assert "get_or_create_workflow_bucket" not in src
+
+    def test_workflow_bucket_helper_is_gone(self):
+        """Its only caller was the dead cache path; leaving it invites re-use."""
+        import canine.utils
+        assert not hasattr(canine.utils, "get_or_create_workflow_bucket")
+
+    def test_ingest_on_write_is_explicit(self):
+        """
+        This is what makes the cache useful at all here: it populates as a
+        producer writes, so the consumer's read-after-write hits cache. It does
+        not speed up the write -- object metadata is never cached.
+        """
+        src = inspect.getsource(TransientImageSlurmBackend.__enter__)
+        call = src[src.index("get_or_create_rapid_cache("):]
+        assert "ingest_on_write = True" in call.split(")")[0]
+
+    def test_skipped_when_there_is_no_results_bucket(self):
+        """
+        In shared mode outputs stay on the NFS mount, so results_bucket is None.
+        Passing None through would provision a cache for the literal string
+        "None" or raise inside startup.
+        """
+        src = inspect.getsource(TransientImageSlurmBackend.__enter__)
+        gate = src.index('if self.config["rapid_cache"]')
+        call = src.index("get_or_create_rapid_cache(")
+        assert 'self.config["results_bucket"] is not None' in src[gate:call]
+
+    def test_gcp_transient_no_longer_provisions_a_cache(self):
+        """
+        That backend has no workdir_mode and so no results bucket, and the
+        per-localization input buckets are created on demand by the localizer --
+        there is no single bucket for a cache to be pointed at. It warns instead
+        of silently billing for one.
+        """
+        src = inspect.getsource(TransientGCPSlurmBackend.__enter__)
+        assert "get_or_create_rapid_cache(" not in src
+        assert "if self.rapid_cache:" in src
+        assert "warning" in src[src.index("if self.rapid_cache:"):]
 
 
 class TestHelperCommand:

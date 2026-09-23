@@ -14,7 +14,6 @@ import pickle
 import threading
 import time
 import shutil
-import uuid
 
 from .imageTransient import TransientImageSlurmBackend, list_instances, get_gce_client
 from ..utils import (
@@ -48,10 +47,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
         image_project="broad-getzlab-workflows",
         image=None,
         storage_namespace="workspace",
-        storage_bucket=None,
         storage_disk=None,
         storage_disk_size="100",
-        rclone_bucket=None,
         worker_boot_disk_size=None,
         user=None,
         shutdown_on_exit=False,
@@ -64,11 +61,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                 raise ValueError(
                     "$USER not set in environment. Must explicitly pass user argument"
                 )
-
-        if rclone_bucket is not None and storage_disk is not None:
-            canine_logging.warning(
-                "You specified both a persistent disk and cloud bucket to store workflow outputs; will only store to bucket!"
-            )
 
         if "image" not in kwargs:
             kwargs["image"] = image
@@ -87,19 +79,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
             "clust_frac": 1.0,
             "user": user,
             "storage_namespace": storage_namespace,
-            # storage_bucket is the bucket backing bucket-mounted localization
-            # (bucketmount:// URLs). It is get-or-created automatically in
-            # TransientImageSlurmBackend.__enter__, which this class inherits, so
-            # it does not normally need to be passed.
-            "storage_bucket": storage_bucket,
-            # rclone_bucket is a *separate*, legacy mechanism: mount a bucket as
-            # the shared workspace via rclone and re-export it over NFS. It used
-            # to share the "storage_bucket" key, which meant enabling bucket
-            # localization also triggered the rclone path -- and rclone is not
-            # installed in the image (Dockerfile step 12 is commented out), so
-            # that combination raised RuntimeError. Kept separate so the two
-            # features are independently selectable.
-            "rclone_bucket": rclone_bucket,
             # Boot disk size for *worker* nodes, e.g. "200GB". This config dict is
             # pickled to /mnt/nfs/clust_conf/canine/backend_conf.pickle and read by
             # slurm_gcp_docker/slurm_resume.py when it creates nodes. None means
@@ -109,7 +88,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
             "worker_boot_disk_size": worker_boot_disk_size,
             "storage_disk": storage_disk,
             "storage_disk_size": storage_disk_size,
-            "storage_uuid": str(uuid.uuid4().hex[0:4]),
             "nfs_disk_type": (
                 kwargs["nfs_disk_type"] if "nfs_disk_type" in kwargs else "pd-standard"
             ),
@@ -187,7 +165,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
             )
 
         #
-        # create NFS/rclone bucket mountpoints
+        # create NFS mountpoint
         self.create_filesystem(uid, gid)
 
         # copy credential files to NFS
@@ -271,10 +249,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
         # allnodes = pd.read_pickle("/mnt/nfs/clust_conf/slurm/host_LuT.pickle")
 
     def stop(self):
-        # remove any bucket mount commands created by this instance
-        if os.path.exists(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh"):
-            os.remove(f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh")
-
         # if the Docker was not spun up by this context manager, do not tear
         # anything down -- we don't want to clobber an already running cluster
         if self.shutdown_on_exit and not self.preexisting_container:
@@ -358,19 +332,6 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                 )
                 raise
 
-        ## create root mountpoint for rclone bucket filesystems (will be bind mounted
-        #  into main mountpoint; for some reason, these cannot be nested in /mnt/nfs)
-        if not os.path.exists("/mnt/rclone"):
-            try:
-                subprocess.check_call("sudo mkdir /mnt/rclone", shell=True)
-                subprocess.check_call(f"sudo chown {uid}:{gid} /mnt/rclone", shell=True)
-            except:
-                # TODO: be more specific about exception catching
-                canine_logging.error(
-                    "Could not create rclone; see stack trace for details"
-                )
-                raise
-
     def init_storage(self):
         ## make /mnt/nfs NFS its own virtual filesystem
         # this is so that Canine's system for detecting whether files to be
@@ -383,94 +344,8 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
             executable="/bin/bash",
         )
 
-        ## mount bucket via rclone (unstable!)
-        ## NOTE: gated on rclone_bucket, not storage_bucket -- see __init__.
-        ## rclone is NOT installed in the image (Dockerfile step 12 is
-        ## commented out), so this path currently raises RuntimeError below if
-        ## enabled.
-        if self.config["rclone_bucket"] is not None:
-            canine_logging.info1(
-                f"Saving workflow results to bucket {self.config['rclone_bucket']} mounted at /mnt/nfs/{self.config['storage_namespace']} ..."
-            )
-
-            # TODO: check if bucket exists; create it if not
-
-            # generate cache disk if it doesn't exist
-            rc, stdout, stderr = self.invoke(
-                "gcloud_make_rwdisk {disk_name} {disk_size} {mount_prefix} false {node_name} {node_zone} {nfs_disk_type}".format(
-                    disk_name=f'cache-disk-{self.config["worker_prefix"]}',
-                    disk_size=100,
-                    mount_prefix="/tmp/rclone_cache",
-                    node_name=self.config["worker_prefix"],
-                    node_zone=self.config["compute_zone"],
-                    nfs_disk_type=self.config["nfs_disk_type"],
-                )
-            )
-            if rc != 0:
-                canine_logging.error(
-                    f"Could not generate bucket mountpoint; see error log for details:"
-                )
-                canine_logging.error(stderr.read().decode())
-                raise RuntimeError()
-
-            # invoke rclone inside docker to create bucket-backed FUSE filesystem
-            # this is complicated, because NFS cannot export a nested FUSE filesystem.
-            # we thus mount it outside of the NFS to /mnt/rclone/<bucket> (which will be exported to workers),
-            # and bind mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> (in order to access it on the controller)
-            # workers will NFS mount /mnt/rclone/<bucket> to /mnt/nfs/<bucket> for consistent paths.
-            rc, stdout, stderr = self.invoke(
-                """bash -c \
-                'set -e; export GOOGLE_APPLICATION_CREDENTIALS=$CLOUDSDK_CONFIG/application_default_credentials.json; \
-                 [ ! -d {mountpoint} ] && mkdir {mountpoint}; \
-                 [ ! -d {bind_mountpoint} ] && mkdir {bind_mountpoint}; \
-                 df -t fuse.rclone {mountpoint} || \
-                  rclone mount gcs:{bucket_name} {mountpoint} --daemon --links \
-                   --uid $HOST_UID --gid $HOST_GID --file-perms 0755 --allow-other \
-                   --vfs-cache-mode full --cache-dir /tmp/rclone_cache/ --vfs-cache-max-size 95Gi \
-                   --vfs-write-back 10m --vfs-cache-poll-interval 10m --vfs-fast-fingerprint \
-                   --vfs-cache-max-age 48h --dir-cache-time 2h --poll-interval 10m --no-modtime \
-                   --config /sgcpd/conf/rclone.conf; \
-                 df -t fuse.rclone {bind_mountpoint} || \
-                  mount --bind {mountpoint} {bind_mountpoint}'""".format(
-                    bucket_name=(
-                        self.config["rclone_bucket"][5:]
-                        if self.config["rclone_bucket"].startswith("gs://")
-                        else self.config["rclone_bucket"]
-                    ),
-                    mountpoint=f'/mnt/rclone/{self.config["storage_namespace"]}',
-                    bind_mountpoint=f'/mnt/nfs/{self.config["storage_namespace"]}',
-                ),
-                user="root",
-            )
-            if rc != 0:
-                canine_logging.error(
-                    f"Could not mount bucket; see error log for details:"
-                )
-                canine_logging.error(stderr.read().decode())
-                raise RuntimeError()
-
-            # export mount
-            subprocess.check_call(
-                f"sudo exportfs -o fsid=1,rw,async,no_subtree_check,insecure,no_root_squash *.internal:/mnt/rclone/{self.config['storage_namespace']}",
-                shell=True,
-            )
-
-            # save rclone mountpoint list (worker nodes will subsequently read this in to know what directories to mount after starting up)
-            # this file will be erased when backend is torn down
-            # TODO: use flock to remove file if backend crashes; when starting backend, check for unlocked files and remove them
-            # will need try/except on worker nodes to avoid them freezing up if they inadvertently attempt to mount non-exported buckets
-            with open(
-                f"/mnt/nfs/.rclone_mounts_{self.config['storage_uuid']}.sh", "w"
-            ) as f:
-                f.write(
-                    "if ! mountpoint -q /mnt/nfs/{mount_dir}; then sudo timeout -k 30 30 mount -o defaults,hard,intr ${{CONTROLLER_NAME}}:/mnt/rclone/{mount_dir} /mnt/nfs/{mount_dir} || echo 'Could not mount rclone mountpoint /mnt/rclone/{mount_dir}'; fi".format(
-                        mount_dir=self.config["storage_namespace"]
-                    )
-                )
-
         ## create disk
-        # note that bucket takes priority if both are specified
-        elif self.config["storage_disk"] is not None:
+        if self.config["storage_disk"] is not None:
             # GCP disks must match regex '^[a-z]([a-z0-9-]*[a-z0-9])?'; raise error if not
             if (
                 re.match("^[a-z]([a-z0-9-]*[a-z0-9])?$", self.config["storage_disk"])
@@ -501,7 +376,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                 canine_logging.error(stderr.read().decode())
                 raise RuntimeError()
 
-        ## no dedicated storage at all (storage_disk_size=0 and no rclone bucket)
+        ## no dedicated storage at all (storage_disk_size=0)
         # The staging tree -- job scripts, input/output symlinks, manifests, crc
         # sidecars -- still lives at /mnt/nfs/<namespace> under every workdir_mode,
         # it just no longer needs a disk of its own when the job workspace is on

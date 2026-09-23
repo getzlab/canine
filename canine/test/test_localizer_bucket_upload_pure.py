@@ -261,7 +261,7 @@ class TestCreateBucketMountLayouts:
 
     def test_direct_layout_is_a_dedicated_bucket_with_no_prefix(self):
         loc = make_localizer()
-        loc.backend.config = {"storage_bucket": "unused", "zone": "us-central1-c"}
+        loc.backend.config = {"zone": "us-central1-c"}
         loc.project = "proj"
         with patch("canine.localization.base.get_project_number", return_value="406002258908"):
             _, _, paths, _ = loc.create_bucket_mount(self._inputs(), dry_run=True)
@@ -393,7 +393,7 @@ class TestCreateBucketMountLayouts:
 
     def test_dry_run_emits_no_upload_plan(self):
         loc = make_localizer()
-        loc.backend.config = {"storage_bucket": "b", "zone": "us-central1-c"}
+        loc.backend.config = {"zone": "us-central1-c"}
         loc.project = "proj"
         with patch("canine.localization.base.get_project_number", return_value="406002258908"):
             _, skip, _, plan = loc.create_bucket_mount(self._inputs(), dry_run=True)
