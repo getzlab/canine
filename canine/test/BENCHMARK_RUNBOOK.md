@@ -4025,6 +4025,35 @@ the relay**.
 The ~5.8 s unaccounted for is the md5 read-back, which is not wrapped in a `phase()` on
 this route — worth knowing before reading the phase list as if it summed to the runtime.
 
+**The decode now reports its own split**, which is what decides whether that 5× is worth
+attacking and how:
+
+```
+k9pdl-gunzip read 4.102s inflate 1.088s write 6.410s over 21 blocks
+              (170401724 -> 328888890 bytes, ceiling 1.81x, pipe2 1.81x)
+```
+
+Read it the same way as `k9pdl-io`. The three stages run strictly in sequence, so each
+one's total is time the other two spent idle.
+
+* **`ceiling`** is `total / max(stage)` — what pipelining all three could recover, bounded
+  by 3.0 at a perfect three-way tie and 1.0 when one stage is everything. Deliberately not
+  `1/(1 - share)`, which assumes the hidden stages become free and reported infinity the
+  first time a stage rounded to zero.
+* **`pipe2`** is the same ceiling for the cheap version — one thread reading and
+  inflating, another uploading. The inflate is CPU and the other two are network, so this
+  is the split that needs no third queue. **If `pipe2` and `ceiling` are close, the third
+  thread buys nothing** and the two-thread version is the whole prize.
+
+A ceiling near **1.0** means one stage already dominates and there is nothing to hide
+behind it — stop, and do not build the pipeline. That is exactly what happened on the
+relay: 95% write-bound, ceiling 1.05×, and the prefetch built anyway measured **−6.2%**
+and was reverted (§13.53). Near **1.8×** means read and write are comparable and a
+two-thread split is worth trying.
+
+The numbers above are illustrative. **This has not been run on real GCS yet** — the
+instrumentation postdates the §6.6b run, so the next §6.6b execution is what fills it in.
+
 `(verified)` refers to the **compressed** sidecar. The decompressed object has no digest
 to check against and never will — that is inherent, not a gap.
 
@@ -4477,6 +4506,8 @@ carries the narrative once a row is filled in.
 | Does the `.gz`/`.bam` keep-as-is branch fire against real metadata? | §6.6b step 5 | **yes** — `singly-compressed ... stored bytes are kept as-is`, 0.3 s, `gzip -t` valid, `cmp` byte-identical. Note the kept object is `componentCount: 3` with no md5Hash (it publishes by compose, where in-place renames) |
 | Decompress throughput, and is per-preemption decode cost acceptable? | §6.6b step 3 | **the decode is 5.0× the relay** — 11.6 s vs 2.3 s, 59% of a 19.78 s run. Relay is 16-way at 74.1 MB/s; the decode is one sequential stream at 28.4 MB/s written, so the gap is structural and grows with the compression ratio. §13.55's "cheap second pass" framing was wrong. Still not resumable: a preemption redoes the decode, never the download |
 | Does the harness's single-stream fallback verify anything? | §6.6b step 3 | **no — and it exits 0.** Without `Accept-Encoding: gzip` the run fell back to a bare `curl` (no `--legacy-cmd` in the benchmark), verified nothing, decoded nothing, and returned rc=0 in 8.8 s. On this route a fallback is never a pass |
+| **Which decode stage dominates — is the 5× worth pipelining?** | §6.6b step 3, `k9pdl-gunzip` | **not measured** — the instrumentation postdates the run. `ceiling` near 1.0 means do not build it (the relay's 1.05× is why its prefetch was reverted at −6.2%); near 1.8× means a two-thread read+inflate ∥ write split is worth trying. Compare `pipe2` against `ceiling`: if they are close, a third thread buys nothing |
+| Is a resume manifest for the decode worth it? | analysis, not yet measured | **no, at current sizes.** `zlib` exposes no `inflatePrime` and `decompressobj.copy()` is in-memory, so a resume must re-read and re-inflate the prefix regardless — a manifest buys back the upload third only. Expected loss without one is ≈`4×10⁻⁶·D²` s; ~1.5 s at a 10-minute decode, ~15 min at a 4-hour one. Revisit only if a real input decodes for hours |
 
 Report the §6.3 number as **"4.97 h → 1.62 h on the real BAM"**, not as the sweep's
 internal speedup. The internal figure is measured against a single stream on the same

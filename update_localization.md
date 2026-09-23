@@ -4428,3 +4428,71 @@ One asymmetry left as-is: the keep-as-is branch publishes by composing the sidec
 destination comes back `componentCount: 3` with no `md5Hash`, where the in-place route
 renames and preserves the file. Bytes identical either way, and every bucket-route object
 already lacks an md5 (§6.6), so this is the route's existing property rather than a new one.
+
+### 13.58 Instrumenting the decode, and why not a resume manifest
+
+§13.57 measured the decode at 5.0× the relay. Two fixes suggest themselves — pipeline it,
+or make it resumable so a preemption does not redo it — and they point in different
+directions depending on which stage dominates. Nothing in the logs said which, so the
+decode now reports its own split:
+
+```
+k9pdl-gunzip read 4.102s inflate 1.088s write 6.410s over 21 blocks
+              (170401724 -> 328888890 bytes, ceiling 1.81x, pipe2 1.81x)
+```
+
+Same shape and same arithmetic as `k9pdl-io`: `ceiling` is `total / max(stage)`, bounded
+by 3.0 here rather than 2.0 because there are three stages. Deliberately not
+`1/(1 - share)` — that form assumes the hidden stages become free, and it reported
+infinity the first time a relay stage rounded to zero. `pipe2` is the ceiling for the
+cheap version, one thread reading and inflating against another uploading, which matters
+because the inflate is CPU and the other two are network; if `pipe2` and `ceiling` are
+close, a third thread buys nothing.
+
+**This is instrumentation, not a fix, and the distinction is the point.** The relay looked
+pipelineable by exactly the reasoning that makes the decode look pipelineable now. It
+measured 95% write-bound with a 1.05× ceiling, the prefetch got built anyway, and it came
+out **−6.2%** and was reverted (§13.53). The numbers in the sample above are illustrative;
+the next §6.6b run fills them in, and a ceiling near 1.0 is an instruction to stop.
+
+#### The manifest: no, and for a harder reason than cost
+
+**`zlib` cannot be checkpointed.** Python's stdlib exposes no `inflatePrime`, and
+`decompressobj.copy()` is in-memory only — it does not survive the process. The
+random-access gzip technique (`zran`, as used by `indexed_gzip`) needs exactly that
+primitive plus 32 KiB of history per checkpoint, and `parallel_download.py` is staged
+standalone onto nodes and must not take dependencies, so that route is closed by
+construction rather than by preference.
+
+So "resume the decode" can only mean: re-read the compressed prefix, re-inflate it,
+discard the output, and resume uploading at the frontier the resumable session already
+knows. **A manifest buys back the upload third only** — and the session frontier is
+already queryable via `session_offset`, so even that would not need a manifest, just a
+persisted session URI.
+
+Priced: inflate is ~1.1 s of the measured 11.6 s (329 MB at roughly 300 MB/s), so ~90% is
+serialized network across a 170 MB read and a 329 MB write. A resume saves at most ~60% of
+the decode, ~30% averaged over where a preemption lands. At ~5%/hour, expected loss
+without any of this is about `4×10⁻⁶·D²` seconds:
+
+| decode | implied gzip source | expected loss |
+|---|---|---|
+| 12 s | 170 MB | 0.0006 s |
+| 10 min | ~10 GB | 1.5 s |
+| 1 h | ~60 GB | 54 s |
+| 4 h | ~250 GB | ~15 min |
+
+It does not pay until the decode runs for hours, which needs a ~250 GB source that is
+**doubly** compressed. The realistic large-file case — a BGZF `.bam` mislabelled as
+gzip-encoded, singly compressed — takes the keep-as-is branch and aborts in **0.3 s**
+measured, because the decision comes from the first decoded bytes. `--gunzip` is never
+suppressed by extension (`file_handlers.py:598` sets it from `body_is_compressed` alone),
+so those files do reach the pass; they just leave it immediately.
+
+Deferred, with the trigger written down: revisit if a real input is ever observed decoding
+for hours. Pipelining is the better first move if the split says so, because it helps every
+run rather than the rare preempted one, and shrinks the preemption window as a side effect.
+
+Noted in passing: `name_implies_gzip` now has **no callers** — dead since the decision
+moved to `expected_magic`. Left alone here rather than mixed into an instrumentation
+change.

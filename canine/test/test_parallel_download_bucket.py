@@ -1143,7 +1143,13 @@ class TestTwoWritersOnOneObject:
         assert sent >= 1.5 * len(payload), (
             "writers did not overlap: source served {:.2f} payloads, so this measured "
             "a sequence, not a race".format(sent / len(payload)))
-        assert len(results) == writers, "a writer produced no result"
+        # The error goes in the message, not in a separate assertion above it: `errors`
+        # is only inspected by the callers, so a worker that raised used to fail here as
+        # "a writer produced no result" with the exception discarded. Observed once
+        # under parallel load and not reproducible in 9 subsequent runs -- which is
+        # exactly the case where the traceback is the only thing that would have helped.
+        assert len(results) == writers, (
+            "a writer produced no result; raised: {!r}".format(errors or None))
 
         return results, errors
 
@@ -2326,6 +2332,75 @@ class TestTheBucketRouteDecompresses:
 
         assert gcs.state.unknown_total_puts >= 1, (
             "the decode finished in one PUT, so total=None was never exercised")
+
+    def test_the_decode_reports_its_stage_split(self, tmp_path, monkeypatch, gcs,
+                                                plain_text, capsys):
+        """
+        The decode is 5.0x the relay on real GCS (§6.6b), and the two candidate fixes --
+        pipeline it, or give it a resume manifest -- point in different directions
+        depending on which stage dominates. That cannot be read off the phase total.
+
+        It also cannot be reasoned out: the relay looked pipelineable by exactly this
+        argument, measured 95% write-bound with a 1.05x ceiling, and the prefetch built
+        on that reasoning was reverted at -6.2%.
+        """
+        import gzip as gziplib
+        import re
+        body = gziplib.compress(plain_text)
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+
+        line = re.search(
+            r"k9pdl-gunzip read ([\d.]+)s inflate ([\d.]+)s write ([\d.]+)s "
+            r"over (\d+) blocks \((\d+) -> (\d+) bytes, "
+            r"ceiling ([\d.]+)x, pipe2 ([\d.]+)x\)", capsys.readouterr().err)
+        assert line, "the decode ran but reported no stage split"
+
+        read, inflate, write = (float(line.group(i)) for i in (1, 2, 3))
+        assert int(line.group(4)) >= 1
+        assert int(line.group(5)) == len(body)
+        assert int(line.group(6)) == len(plain_text)
+        assert inflate > 0, "inflate cannot be free; the timer is not around the work"
+        assert write > 0, "write cannot be free; the timer is not around the work"
+
+        # The ceiling is total/max, so it is bounded by the stage count and is 1.0 when
+        # one stage is everything. A formula of 1/(1-share) would report infinity here
+        # the moment a stage rounded to zero, which is how the relay's first version of
+        # this number was wrong.
+        ceiling = float(line.group(7))
+        assert 1.0 <= ceiling <= 3.0
+
+        # Recomputed from the PRINTED stages, which are rounded to 3 decimals -- and
+        # against the fake these run in milliseconds, so that rounding is a large
+        # relative error. Bound it explicitly rather than picking a tolerance that
+        # happens to pass: each stage is within +/- 0.0005 of its printed value, so the
+        # ceiling is within the interval those extremes produce.
+        eps = 0.0005
+        lo = [max(0.0, v - eps) for v in (read, inflate, write)]
+        hi = [v + eps for v in (read, inflate, write)]
+        assert sum(lo) / max(hi) <= ceiling <= sum(hi) / max(max(lo), eps), (
+            "ceiling {} is not total/max of the reported stages".format(ceiling))
+
+        pipe2 = float(line.group(8))
+        assert 1.0 <= pipe2 <= 2.0
+        assert pipe2 <= ceiling + 0.02, (
+            "a two-way split cannot beat the three-way one")
+
+    def test_no_stage_split_is_reported_when_nothing_was_decoded(
+            self, tmp_path, monkeypatch, gcs, capsys):
+        """
+        Keep-as-is starts no upload and finishes no decode, so there is no split to
+        report -- and reporting zeros would put a 1.00x ceiling in the log that reads
+        like a measured result rather than an absent one.
+        """
+        body = b"not gzip at all, whatever the metadata says\n" * 8000
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+        assert "k9pdl-gunzip read" not in capsys.readouterr().err
 
     def test_a_misaligned_chunk_of_unknown_total_is_rejected(self, monkeypatch, gcs,
                                                              plain_text):

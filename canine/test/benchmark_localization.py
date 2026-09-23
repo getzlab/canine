@@ -1136,6 +1136,14 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     # digest covers the compressed bytes, so the output has nothing to verify against.
     expanded = re.search(r"decompressed (\d+) bytes into (\d+) bytes", stderr)
 
+    # The decode's three stages, which run strictly in sequence. Captured because the
+    # question "is the decode worth pipelining, or worth a resume manifest?" cannot be
+    # answered from the phase total alone -- the relay looked pipelineable by the same
+    # reasoning and turned out 95% write-bound.
+    decode = re.search(r"k9pdl-gunzip read ([\d.]+)s inflate ([\d.]+)s write ([\d.]+)s "
+                       r"over (\d+) blocks \((\d+) -> (\d+) bytes, "
+                       r"ceiling ([\d.]+)x, pipe2 ([\d.]+)x\)", stderr)
+
     # Per-chunk bookkeeping, the only cost that grows with chunk count rather than bytes.
     book = re.search(r"k9pdl-bookkeeping ([\d.]+)s over (\d+) calls "
                      r"\(mean ([\d.]+)s, ([\d.]+)% of", stderr)
@@ -1159,6 +1167,12 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
         "phases": phases,
         "decompressed_from": int(expanded.group(1)) if expanded else None,
         "decompressed_to": int(expanded.group(2)) if expanded else None,
+        "decode_read_seconds": float(decode.group(1)) if decode else None,
+        "decode_inflate_seconds": float(decode.group(2)) if decode else None,
+        "decode_write_seconds": float(decode.group(3)) if decode else None,
+        "decode_blocks": int(decode.group(4)) if decode else None,
+        "decode_ceiling": float(decode.group(7)) if decode else None,
+        "decode_pipe2_ceiling": float(decode.group(8)) if decode else None,
         "fell_back": fell_back.group(1).strip() if fell_back else None,
         "bookkeeping_seconds": float(book.group(1)) if book else None,
         "bookkeeping_calls": int(book.group(2)) if book else None,
@@ -2543,6 +2557,24 @@ def command_routeb(args):
                 outcome["phases"].get("gunzip"))
             if decompressed_to is not None
             else "did not decode -- kept as received, or refused; read the stderr"))
+        if outcome["decode_ceiling"] is not None:
+            result["gunzip"].update({
+                "read_seconds": outcome["decode_read_seconds"],
+                "inflate_seconds": outcome["decode_inflate_seconds"],
+                "write_seconds": outcome["decode_write_seconds"],
+                "blocks": outcome["decode_blocks"],
+                "ceiling": outcome["decode_ceiling"],
+                "pipe2_ceiling": outcome["decode_pipe2_ceiling"],
+            })
+            # The whole point of collecting this: a ceiling near 1.0 means one stage
+            # already dominates and pipelining has nothing to hide behind it, which is
+            # how the relay's prefetch came to be reverted.
+            say("  stages     : read {}s / inflate {}s / write {}s over {} blocks"
+                .format(outcome["decode_read_seconds"],
+                        outcome["decode_inflate_seconds"],
+                        outcome["decode_write_seconds"], outcome["decode_blocks"]))
+            say("  overlap    : ceiling {}x (3-stage), {}x (read+inflate | write)"
+                .format(outcome["decode_ceiling"], outcome["decode_pipe2_ceiling"]))
     return {"routeb": result}
 
 

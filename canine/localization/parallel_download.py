@@ -3017,6 +3017,15 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
     read_at = 0
     checked = magic is None
 
+    # The three stages run strictly in sequence, so each one's total is time the other
+    # two spent idle. Measured rather than assumed because the obvious fix -- pipelining
+    # them -- was already tried on the relay and REVERTED at -6.2%: that loop turned out
+    # 95% write-bound, overlap ceiling 1.05x, so there was nothing to hide. Whether this
+    # loop is shaped the same way is an open question, and one nobody should answer by
+    # reasoning about it. See k9pdl-io for the relay's equivalent.
+    stage = {"read": 0.0, "inflate": 0.0, "write": 0.0}
+    blocks = 0
+
     def keep_as_is(reason):
         # A single-source compose is a server-side copy: no bytes move, and the
         # intermediate is deleted by the caller exactly as it would have been.
@@ -3037,13 +3046,18 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
 
     while read_at < size:
         end = min(read_at + block, size)
+        mark = time.monotonic()
         payload = client.download_range(bucket, source, read_at, end)
+        stage["read"] += time.monotonic() - mark
+        blocks += 1
         if not payload:
             raise TransientError("read-back returned nothing at {}".format(read_at))
         read_at += len(payload)
 
         try:
+            mark = time.monotonic()
             pending += decoder.feed(payload)
+            stage["inflate"] += time.monotonic() - mark
         except zlib.error as e:
             if session is not None or decoder.produced:
                 # Past the header and part-way through a stream: this is corruption,
@@ -3068,11 +3082,13 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
         # Only whole granules may be sent while the total is still unknown.
         sendable = (len(pending) // granularity) * granularity
         if sendable:
+            mark = time.monotonic()
             if session is None:
                 session = client.start_resumable_upload(bucket, dest)
             chunk = bytes(pending[:sendable])
             del pending[:sendable]
             _, committed = client.upload_range(session, chunk, offset, None)
+            stage["write"] += time.monotonic() - mark
             if committed is None or committed <= offset:
                 # A granule-aligned PUT that persists nothing is not progress, and
                 # silently buffering the chunk to try again would grow `pending` by the
@@ -3087,17 +3103,22 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
                 pending[:0] = chunk[committed - offset:]
             offset = committed
 
+    mark = time.monotonic()
     pending += decoder.flush()
+    stage["inflate"] += time.monotonic() - mark
     if not checked and not decide():
         return size, False
 
     total = offset + len(pending)
+    mark = time.monotonic()
     if session is None:
         session = client.start_resumable_upload(bucket, dest)
     while offset < total:
         metadata, committed = client.upload_range(
             session, bytes(pending), offset, total)
         if metadata is not None:
+            stage["write"] += time.monotonic() - mark
+            report_decode_stages(stage, blocks, size, total)
             return total, True
         if committed is None or committed <= offset:
             raise TransientError(
@@ -3108,7 +3129,41 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
     # send at all, or the last one committed its bytes with a 308. A bodiless PUT naming
     # the total finalizes it, which is exactly what session_offset sends.
     client.session_offset(session, total)
+    stage["write"] += time.monotonic() - mark
+    report_decode_stages(stage, blocks, size, total)
     return total, True
+
+
+def report_decode_stages(stage, blocks, compressed, decompressed):
+    """
+    Emit the decode's read/inflate/write split, in the shape `k9pdl-io` uses.
+
+    The ceiling is `total / max(stage)`, exactly as in `k9pdl-io` and for the same
+    reason: pipelining turns a serial `read then inflate then write` into
+    `max(read, inflate, write)`, so it can hide the smaller stages behind the largest
+    one and no more. Bounded by 3.0 here rather than 2.0, at a perfect three-way tie.
+    The 1/(1-share) form is wrong -- it assumes the hidden stages become free, and
+    reports infinity when one of them is already negligible.
+
+    `pipe2` is the ceiling for the cheap version of that fix -- one thread reading and
+    inflating, another uploading -- which is worth separating out because the inflate is
+    CPU and the other two are network, so the two-thread split is the one that does not
+    need a third queue. If `pipe2` and the full ceiling are close, the third thread buys
+    nothing.
+    """
+    # No zero guard: every path that reaches here has timed at least the final flush and
+    # the PUT that finalized the session, so the total is positive by construction. A
+    # guard would only look reassuring -- the case it appears to cover, keep-as-is,
+    # returns from decompress_object without calling this at all.
+    total = stage["read"] + stage["inflate"] + stage["write"]
+    slowest = max(stage.values())
+    two_stage = max(stage["read"] + stage["inflate"], stage["write"])
+    log("k9pdl-gunzip read {:.3f}s inflate {:.3f}s write {:.3f}s over {} blocks "
+        "({} -> {} bytes, ceiling {:.2f}x, pipe2 {:.2f}x)".format(
+            stage["read"], stage["inflate"], stage["write"], blocks,
+            compressed, decompressed,
+            total / slowest if slowest > 0 else 1.0,
+            total / two_stage if two_stage > 0 else 1.0))
 
 
 def verify_bucket_object(client, bucket, name, size, options, block=READ_BUFFER):
