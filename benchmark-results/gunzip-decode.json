@@ -1,0 +1,53 @@
+{
+  "routeb": {
+    "token_source": "metadata server",
+    "outcome": {
+      "phases": {
+        "relay": 2.3,
+        "compose": 0.1,
+        "gunzip": 11.6
+      },
+      "decompressed_from": 170401724,
+      "decompressed_to": 328888890,
+      "fell_back": null,
+      "bookkeeping_seconds": 0.0,
+      "bookkeeping_calls": 3,
+      "bookkeeping_mean": 0.0,
+      "bookkeeping_pct_workers": 0.0,
+      "read_seconds": 1.319,
+      "write_seconds": 3.745,
+      "loop_other_seconds": 0.001,
+      "io_blocks": 21,
+      "read_pct_of_loop": 26,
+      "overlap_ceiling": 1.35,
+      "commit_seconds": 0.1,
+      "commit_batches": 1,
+      "commit_chunks": 3,
+      "commit_mean_batch": 3.0,
+      "commit_pct_wall": 4.1,
+      "mean_streams": 2.17,
+      "workers": 3,
+      "connections": 16,
+      "returncode": 0,
+      "seconds": 19.78,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 141180928,
+      "nic_bytes": 522561491,
+      "disk_bytes": 1077248,
+      "peak_nic_bytes_per_s": 76701961.70854333,
+      "peak_disk_bytes_per_s": 515031.9956577179,
+      "stderr_tail": [
+        "[k9pdl] k9pdl-phase gunzip 11.6s, 14.7 MB/s",
+        "[k9pdl] decompressed 170401724 bytes into 328888890 bytes",
+        "[k9pdl] complete: 170401724 bytes composed from 3 parts (verified)"
+      ]
+    },
+    "gunzip": {
+      "ran": true,
+      "compressed_bytes": 170401724,
+      "decompressed_bytes": 328888890,
+      "seconds": 11.6
+    }
+  }
+}

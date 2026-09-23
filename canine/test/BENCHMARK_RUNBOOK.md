@@ -3579,8 +3579,16 @@ this one is the destination under test, and the teardown below deletes it outrig
 Mirrors what `create_bucket_mount()` does (`LOCALIZATION.md` §3), including the two flags
 that are easy to omit and expensive to omit:
 
+**Create it from your workstation, not the node.** The `v0.18.3` worker image ships
+**gcloud 406.0.0** (2022), whose `buckets create` has neither `--lifecycle-file` nor
+`--soft-delete-duration` — the first errors out with `did you mean '--flags-file'?` and
+the second does not exist at all, because soft delete postdates that release. Running this
+on the node leaves you with no bucket and, if you work around it by dropping the flags, a
+bucket that bills deleted objects for 7 days. `buckets update --lifecycle-file` does exist
+on 406 if you have no choice.
+
 ```bash
-# on the node
+# on your WORKSTATION
 cat > /tmp/lifecycle.json <<'EOF'
 {"rule":[{"action":{"type":"Delete"},"condition":{"daysSinceCustomTime":1}}]}
 EOF
@@ -3591,8 +3599,8 @@ gcloud storage buckets create "gs://$FUSE_BUCKET" \
   --soft-delete-duration=0 \
   --lifecycle-file=/tmp/lifecycle.json
 
-gcloud storage buckets describe "gs://$FUSE_BUCKET" \
-  --format='value(name,location,soft_delete_policy)'
+gcloud storage buckets describe "gs://$FUSE_BUCKET" --project "$PROJECT" \
+  --format='value(name,location,soft_delete_policy,lifecycle_config)'
 ```
 
 `--soft-delete-duration=0` matters more here than in production: new buckets otherwise
@@ -3634,11 +3642,21 @@ not use, so treat any number from it as provisional:
 SA=$(mdget instance/service-accounts/default/email)
 gcloud storage buckets add-iam-policy-binding "gs://$FUSE_BUCKET" \
   --member="serviceAccount:$SA" --role=roles/storage.objectAdmin --project "$PROJECT"
+# ...and this one too, if you will run any `gcloud storage` command AS that SA:
+gcloud storage buckets add-iam-policy-binding "gs://$FUSE_BUCKET" \
+  --member="serviceAccount:$SA" --role=roles/storage.legacyBucketReader --project "$PROJECT"
 ```
 
 `objectAdmin`, not `objectCreator`: the route composes parts and then **deletes** them, so
 a creator-only SA would leave every part behind — at full size that is 279 GiB of silent
 extra storage sitting on top of the object, and the run still reports success.
+
+**`objectAdmin` alone is not enough for `gcloud` itself.** It does not grant
+`storage.buckets.get`, which every `gcloud storage cp`/`ls` needs, so uploading a test
+object as the node SA fails with *"does not have storage.buckets.get access ... (or it may
+not exist)"* — a message that reads like a missing bucket. The downloader's own API calls
+never need it, which is why this only bites when you use `gcloud` on the node.
+`legacyBucketReader` is the narrow fix.
 
 #### 2. Update the container
 
@@ -3863,6 +3881,12 @@ file bigger — a pass that finishes in two PUTs demonstrates almost nothing abo
 sequence, which is the one failure mode this run exists to avoid.
 
 ```bash
+# Disable parallel composite upload FIRST. gcloud composite-uploads anything over 150 MB
+# by default, and a composite object has NO md5Hash at all -- so the verification below
+# silently becomes impossible, and the source stops resembling a real single-shot upload.
+# Observed: Component-Count 4 and no Hash (MD5) line on a 170 MB file.
+gcloud config set storage/parallel_composite_upload_threshold 500Mi
+
 # Upload the COMPRESSED bytes, labelled as gzip-encoded. The name has no .gz on purpose:
 # it is what the object decodes to, which is what the metadata claims.
 #
@@ -3874,45 +3898,92 @@ gcloud storage cp gz-src.tsv.gz "gs://$FUSE_BUCKET/src/encoded.tsv" \
 ```
 
 Confirm the metadata took, and that the stored md5 is the **compressed** digest — if it
-is not, `gcloud` re-encoded and the run will fail verification for the wrong reason:
+is not, `gcloud` re-encoded and the run will fail verification for the wrong reason. Read
+it from the JSON API rather than `ls -L`: the `gcloud` on the worker image is old enough
+that `ls -L` prints no MD5 line at all, which is indistinguishable from the composite case.
 
 ```bash
 # on the node
-gcloud storage ls -L "gs://$FUSE_BUCKET/src/encoded.tsv" \
-  | grep -iE "content-encoding|content-type|size|md5"
-python3 -c "import base64,sys; print(base64.b64decode(sys.argv[1]).hex())" <paste the md5Hash>
-# that hex must equal $GZ_MD5
+TOKEN=$(gcloud auth print-access-token)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://storage.googleapis.com/storage/v1/b/$FUSE_BUCKET/o/src%2Fencoded.tsv" \
+  | python3 -c "
+import base64,json,sys
+m=json.load(sys.stdin)
+print('size           :', m.get('size'))
+print('contentEncoding:', m.get('contentEncoding'))
+print('componentCount :', m.get('componentCount'))   # must be None
+h=m.get('md5Hash'); print('md5            :', base64.b64decode(h).hex() if h else None)
+"
+echo "expected       : $GZ_MD5"
 ```
 
-#### 2. Check the range-plus-encoding assumption before the run
+#### 2. `Accept-Encoding: gzip` is what makes ranges work at all — MEASURED
 
-One `curl`, and it saves debugging a failure three layers down. `Accept-Encoding: gzip`
-plus a `Range` must return **206** with `Content-Encoding: gzip`:
+Both halves of this were measured on 2026-09-23, and the result is stronger than the
+documentation suggested. Run both:
 
 ```bash
 # on the node
 export GCS_AUTH="Authorization: Bearer $(gcloud auth print-access-token)"
-curl -s -D - -o /dev/null -H "$GCS_AUTH" -H "Accept-Encoding: gzip" -H "Range: bytes=0-99" \
-  "https://storage.googleapis.com/$FUSE_BUCKET/src/encoded.tsv" | head -20
+
+echo "A. with Accept-Encoding: gzip"
+curl -s -D - -o /tmp/probeA.bin -H "$GCS_AUTH" -H "Accept-Encoding: gzip" \
+  -H "Range: bytes=0-99" \
+  "https://storage.googleapis.com/$FUSE_BUCKET/src/encoded.tsv" \
+  | grep -iE "^HTTP|content-encoding|content-range|content-length"
+echo "bytes: $(stat -c %s /tmp/probeA.bin)  first2: $(head -c 2 /tmp/probeA.bin | xxd -p)"
+
+echo "B. without it -- the trap"
+curl -s -D - -o /tmp/probeB.bin -H "$GCS_AUTH" -H "Range: bytes=0-99" \
+  "https://storage.googleapis.com/$FUSE_BUCKET/src/encoded.tsv" \
+  | grep -iE "^HTTP|content-encoding|content-range|content-length"
+echo "bytes: $(stat -c %s /tmp/probeB.bin)"
 ```
 
-* **206 + `Content-Encoding: gzip` + `Content-Range: bytes 0-99/$GZ_SIZE`** → as designed.
-* **200 and no `Content-Encoding`** → GCS transcoded and ignored the range. The run will
-  fetch the whole object per chunk; stop and record it, because the downloader's
-  assumption is then wrong and `--gunzip` on this route needs rethinking, not tuning.
+Measured:
+
+| | status | body |
+|---|---|---|
+| **A** with `Accept-Encoding: gzip` | **206**, `content-encoding: gzip`, `content-range: bytes 0-99/170401724` | 100 bytes, starting `1f8b` |
+| **B** without it | **200** — the `Range` is *ignored* | **328888890 bytes**, the whole decompressed object |
+
+So the header is not an optimization for getting the encoded body. **Without it GCS
+ignores `Range` entirely**, and the `Content-Range` total in A is the *compressed* length,
+which is what `--size` must match. Note `x-goog-stored-content-encoding` and
+`x-goog-stored-content-length` are returned either way — those describe what is stored,
+not what is being sent, so they are not the thing to check.
 
 #### 3. The run
+
+**`--header "Accept-Encoding: gzip"` is required**, and is the single easiest thing to
+leave off — `parallel_download.py` does not add it itself. In production
+`_pdl_command` emits it (`file_handlers.py:290`) alongside `--gunzip`; driving the
+downloader directly, you supply it.
 
 ```bash
 # on the node
 pdl routeb --url "https://storage.googleapis.com/$FUSE_BUCKET/src/encoded.tsv" \
            --size "$GZ_SIZE" --md5 "$GZ_MD5" \
            --header "$GCS_AUTH" \
+           --header "Accept-Encoding: gzip" \
            --gunzip \
            --gs-url "gs://$FUSE_BUCKET/gunzip-check.tsv" \
            --mount-dir "/mnt/localize/$FUSE_BUCKET" \
            --json /tmp/gunzip-routeb.json
 ```
+
+**What omitting it looks like, measured — and why it is worse than a failure.** The
+downloader notices (`falling back to a single stream: server returned HTTP 200 to a ranged
+request`) and hands off to `single_stream_fallback`. In production that runs the
+`legacy_cmd` `file_handlers` built, which carries its own hash check and gunzip pipeline.
+**The benchmark passes no `--legacy-cmd`**, so the fallback is a bare `curl` that verifies
+nothing and decodes nothing — and it exited **0** in 8.8 s having written a file that was
+right only by accident, because GCS transcoded it on the way out. The `gunzip phase : did
+not decode` line was the only signal.
+
+So: on this route, in a benchmark, **a fallback is never a pass.** If you see
+`falling back to a single stream`, the run measured `curl`, not the downloader.
 
 `--size` and `--md5` are both the **compressed** object's, because that is what the server
 advertises and what the sidecar is verified against. Passing the plain size here is the
@@ -3929,21 +4000,60 @@ decompressed <GZ_SIZE> bytes into <PLAIN_SIZE> bytes
 complete: <GZ_SIZE> bytes composed from N parts (verified)
 ```
 
+Measured 2026-09-23 on `n1-standard-8` / `us-east1-b`, 170401724 → 328888890:
+
+```
+token source : metadata server
+rc=0 in 19.78 seconds
+  k9pdl-phase relay 2.3s      <- 74.1 MB/s, 16 connections
+  k9pdl-phase compose 0.1s
+  k9pdl-phase gunzip 11.6s, 14.7 MB/s
+  decompressed 170401724 bytes into 328888890 bytes
+  complete: 170401724 bytes composed from 3 parts (verified)
+```
+
+**The decode is 5.0× the relay** — 11.6 s against 2.3 s, and 59% of the whole run. That is
+the number to carry, not the 58%-of-total: the relay is 16-way parallel at 74.1 MB/s while
+the decode is a single sequential read-plus-write at 28.4 MB/s against what it writes, so
+the gap is structural and widens with the compression ratio (every byte of ratio is
+another byte the decode writes and the relay never moved).
+
+Do **not** size this as "a cheap second pass over the object", which is how §13.55
+described it before anyone measured. For a 2:1 source, budget the decode at roughly **5×
+the relay**.
+
+The ~5.8 s unaccounted for is the md5 read-back, which is not wrapped in a `phase()` on
+this route — worth knowing before reading the phase list as if it summed to the runtime.
+
 `(verified)` refers to the **compressed** sidecar. The decompressed object has no digest
 to check against and never will — that is inherent, not a gap.
 
 #### 4. What to confirm afterwards
 
+Read the digest from the JSON API, not by catting the object — the destination is
+`$PLAIN_SIZE`, and two `gcloud storage cat | md5sum` calls over a 300 MB object is what
+made the first attempt at this step time out.
+
 ```bash
 # on the node
-# a) the destination is the DECOMPRESSED length, and is not a gzip stream
-gcloud storage ls -l "gs://$FUSE_BUCKET/gunzip-check.tsv"      # must be $PLAIN_SIZE
-gcloud storage cat "gs://$FUSE_BUCKET/gunzip-check.tsv" | head -c 2 | xxd
-#    must NOT be 1f 8b
+TOKEN=$(gcloud auth print-access-token)
 
-# b) it matches byte for byte
-gcloud storage cat "gs://$FUSE_BUCKET/gunzip-check.tsv" | md5sum
-md5sum /tmp/gz-src.tsv                                          # the two must agree
+# a+b) length, digest, and that it is not a gzip stream -- one metadata call
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://storage.googleapis.com/storage/v1/b/$FUSE_BUCKET/o/gunzip-check.tsv" \
+  | python3 -c "
+import base64,json,sys
+m=json.load(sys.stdin)
+print('size          :', m.get('size'))
+print('componentCount:', m.get('componentCount'))   # None -- a single resumable upload
+print('contentEncoding:', m.get('contentEncoding')) # None -- it is decoded now
+h=m.get('md5Hash'); print('md5           :', base64.b64decode(h).hex() if h else None)
+"
+echo "want size=$PLAIN_SIZE  md5=$(md5sum /tmp/gz-src.tsv | cut -d' ' -f1)"
+
+curl -s -H "Authorization: Bearer $TOKEN" -H "Range: bytes=0-1" \
+  "https://storage.googleapis.com/$FUSE_BUCKET/gunzip-check.tsv" | xxd -p
+#    must NOT be 1f8b
 
 # c) the intermediates are gone -- the sidecar is a full second copy of the data.
 #    The .k9pdl.done marker is EXPECTED to survive: it is what makes a re-run a no-op.
@@ -3953,10 +4063,18 @@ gcloud storage ls "gs://$FUSE_BUCKET/**" \
 # d) the marker records both lengths, or every re-run re-downloads
 sudo docker exec slurm cat "/mnt/localize/$FUSE_BUCKET/.gunzip-check.tsv.k9pdl.done"
 #    size == $GZ_SIZE, stored_size == $PLAIN_SIZE
-
-# e) customTime, same as §6.6a step 4 -- without it the lifecycle rule never expires it
-gcloud storage ls -L "gs://$FUSE_BUCKET/gunzip-check.tsv" | grep -i custom
 ```
+
+All four measured clean on 2026-09-23: `size 328888890`, `componentCount None`,
+`contentEncoding None`, md5 equal to the original plaintext's, first bytes `6368` (`ch`),
+only the destination and its marker left, and the marker reading
+`"size": 170401724, ..., "stored_size": 328888890`. A `cmp` against the original
+plaintext was byte-identical.
+
+**Do not check `customTime` here.** §6.6a step 4 does, and copying that across was wrong:
+`pdl routeb` never stamps it — that is canine's produce path, post-unmount — so it is
+`None` after a bare downloader run and always will be. Measured `None`; it is not a
+finding.
 
 If the shell was re-established between steps, re-derive the two sizes rather than
 retyping them — `$PLAIN_SIZE` and `$GZ_SIZE` are the whole basis of these comparisons:
@@ -3966,10 +4084,13 @@ PLAIN_SIZE=$(stat -c %s /tmp/gz-src.tsv); GZ_SIZE=$(stat -c %s /tmp/gz-src.tsv.g
 GZ_MD5=$(md5sum /tmp/gz-src.tsv.gz | cut -d' ' -f1)
 ```
 
-Then **run it a second time, unchanged**. It must exit 0 in under a second with `already
+Then **run it a second time, unchanged**. It must exit 0 in about a second with `already
 complete per ...` and no transfer. This is the check worth doing deliberately: the marker
 was unusable on the in-place route for as long as `--gunzip` has existed, and the only
 reason nobody noticed is that no one ever ran a gzip-encoded input twice.
+
+Measured: **`rc=0 in 1.25 seconds`**, `already complete per .gunzip-check.tsv.k9pdl.done`,
+against 19.78 s for the first run. `stored_size` works against real GCS.
 
 #### 5. The extension branch, against real GCS
 
@@ -3984,7 +4105,8 @@ gcloud storage cp gz-src.tsv.gz "gs://$FUSE_BUCKET/src/mislabelled.gz" \
   --content-encoding=gzip --project "$PROJECT"
 
 pdl routeb --url "https://storage.googleapis.com/$FUSE_BUCKET/src/mislabelled.gz" \
-           --size "$GZ_SIZE" --md5 "$GZ_MD5" --header "$GCS_AUTH" --gunzip \
+           --size "$GZ_SIZE" --md5 "$GZ_MD5" \
+           --header "$GCS_AUTH" --header "Accept-Encoding: gzip" --gunzip \
            --gs-url "gs://$FUSE_BUCKET/keep-check.gz" \
            --mount-dir "/mnt/localize/$FUSE_BUCKET" --json /tmp/gunzip-keep.json
 ```
@@ -3997,6 +4119,27 @@ gcloud storage cp "gs://$FUSE_BUCKET/keep-check.gz" /tmp/keep-check.gz
 gzip -t /tmp/keep-check.gz && echo "still gzip: correct"
 cmp /tmp/keep-check.gz /tmp/gz-src.tsv.gz && echo "byte-identical to what was uploaded"
 ```
+
+Measured, verbatim:
+
+```
+keep-check.gz is named for b'\x1f\x8b' content but decoding did not produce it; the
+content-encoding metadata is set on a singly-compressed object, so the stored bytes are
+kept as-is
+k9pdl-phase gunzip 0.3s, 574.7 MB/s
+complete: 170401724 bytes composed from 3 parts (verified)
+```
+
+0.3 s, because the decision is taken from the first decoded bytes and the fallback is a
+server-side compose — no upload is started and then discarded. `gzip -t` valid, `cmp`
+byte-identical.
+
+**One asymmetry worth knowing:** the kept object comes back `componentCount: 3` with **no
+`md5Hash`**, because keep-as-is publishes by composing the already-composed sidecar. The
+in-place route's equivalent is a rename, which preserves the file as-is. The bytes are
+identical either way — but on this route a consumer cannot read an md5 off the
+destination's metadata, which is already true of every bucket-route object (§6.6: "does a
+composite carry an md5? no") rather than something this branch introduces.
 
 A destination of `$PLAIN_SIZE` here is the failure mode this branch exists to prevent — a
 decompressed stream in a file called `.gz`, which for a real `.bam` is a file `samtools`
@@ -4327,12 +4470,13 @@ carries the narrative once a row is filled in.
 | Relay throughput with Rapid Cache | §6.6 step 5 | not measured — cache must be provisioned by hand on the `wolf-...` bucket |
 | **Should `bucket_upload_wait_tries` go back to 60?** | §6.7 `pdl claim` | not measured. Currently **180**, a placeholder from risk asymmetry (§13.49); characterization runs suggest it can come down |
 | Largest input count in one real localization | needed as `--inputs-per-localization` | **not known — ask.** It multiplies the answer above directly |
-| Does GCS accept the unknown-total PUT sequence (`bytes X-Y/*`)? | §6.6b step 3 | **not measured.** Verified against the fake only, and the fake's 256 KiB-multiple rule is enforced because it was written to be, not because it was observed |
-| Does a ranged GET with `Accept-Encoding: gzip` return the stored bytes? | §6.6b step 2 | **not measured** — read from the docs. A 200 with no `Content-Encoding` means GCS transcoded and ignored the range, which invalidates the whole approach rather than needing a tune |
-| Does the commit frontier ever lag what was sent? | §6.6b step 3 | **not measured.** The pass re-sends the difference; if real GCS always commits everything, that branch has never run anywhere |
-| Is the `--gunzip` done marker believed on a second run? | §6.6b step 4 | **not measured.** It was unusable on the in-place route for as long as `--gunzip` has existed, because nothing ever ran a gzip-encoded input twice |
-| Does the `.gz`/`.bam` keep-as-is branch fire against real metadata? | §6.6b step 5 | **not measured.** Correct in the fake for `.gz`/`.bam`/`.bcf`/`.bai`/`.tbi`/`.bgz` |
-| Decompress throughput, and is per-preemption decode cost acceptable? | §6.6b step 6 | **not measured.** The pass is deliberately not resumable — a preemption redoes the whole decode, though never the download |
+| Does GCS accept the unknown-total PUT sequence (`bytes X-Y/*`)? | §6.6b step 3 | **yes — measured 2026-09-23.** 170401724 → 328888890 in one run, destination md5 equal to the original plaintext and `cmp` byte-identical. ~21 granule-aligned PUTs of unknown total |
+| Does a ranged GET with `Accept-Encoding: gzip` return the stored bytes? | §6.6b step 2 | **yes, and the header matters far more than assumed.** With it: 206, `content-encoding: gzip`, `content-range: bytes 0-99/170401724` (the COMPRESSED total). **Without it: 200 and the Range is ignored entirely** — the full 328888890-byte decompressed body |
+| Does the commit frontier ever lag what was sent? | §6.6b step 3 | **never observed.** Every PUT committed what was sent, so the re-send branch still has no real-GCS coverage. Not evidence it is wrong; evidence it is unexercised |
+| Is the `--gunzip` done marker believed on a second run? | §6.6b step 4 | **yes — `rc=0 in 1.25 s`**, `already complete per ...`, no transfer, against 19.78 s for the first run. `stored_size` confirmed on real GCS |
+| Does the `.gz`/`.bam` keep-as-is branch fire against real metadata? | §6.6b step 5 | **yes** — `singly-compressed ... stored bytes are kept as-is`, 0.3 s, `gzip -t` valid, `cmp` byte-identical. Note the kept object is `componentCount: 3` with no md5Hash (it publishes by compose, where in-place renames) |
+| Decompress throughput, and is per-preemption decode cost acceptable? | §6.6b step 3 | **the decode is 5.0× the relay** — 11.6 s vs 2.3 s, 59% of a 19.78 s run. Relay is 16-way at 74.1 MB/s; the decode is one sequential stream at 28.4 MB/s written, so the gap is structural and grows with the compression ratio. §13.55's "cheap second pass" framing was wrong. Still not resumable: a preemption redoes the decode, never the download |
+| Does the harness's single-stream fallback verify anything? | §6.6b step 3 | **no — and it exits 0.** Without `Accept-Encoding: gzip` the run fell back to a bare `curl` (no `--legacy-cmd` in the benchmark), verified nothing, decoded nothing, and returned rc=0 in 8.8 s. On this route a fallback is never a pass |
 
 Report the §6.3 number as **"4.97 h → 1.62 h on the real BAM"**, not as the sweep's
 internal speedup. The internal figure is measured against a single stream on the same

@@ -29,3 +29,34 @@ Two pairs carry most of the argument:
 Read `read_seconds` / `write_seconds` / `overlap_ceiling` together: §13.53 records that
 the ceiling is an upper bound only when the two halves are independent, and on this route
 they contend, so it overstated the achievable gain by 4×.
+
+---
+
+## §6.6b raw results — `--gunzip` on the bucket route
+
+From a second `pdl-bench` (`n1-standard-8`, **`us-east1-b`**, 2026-09-23), gcsfuse 3.11.2
+on `slurm_gcp_docker:v0.18.3`. Source is a 170401724-byte gzip uploaded with
+`contentEncoding: gzip`, decoding to 328888890 bytes (1.93:1). Node and bucket deleted.
+
+| file | run | headline |
+|---|---|---|
+| `gunzip-decode.json` | the pass itself | relay 2.3 s, compose 0.1 s, **gunzip 11.6 s**, 19.78 s total. Destination md5 equals the original plaintext; `cmp` byte-identical |
+| `gunzip-rerun.json` | same command again | **1.25 s**, `already complete per ...`, no transfer — `stored_size` works on real GCS |
+| `gunzip-keep-as-is.json` | `.gz` name, singly compressed | 0.3 s decode phase, bytes kept, `gzip -t` valid, `cmp` byte-identical to the upload |
+| `gunzip-nofallbackheader.json` | **the trap** — `Accept-Encoding: gzip` omitted | `fell_back: true`, **rc=0 in 8.76 s**, verified nothing, decoded nothing |
+
+The two that carry the argument:
+
+* `gunzip-decode` vs `gunzip-nofallbackheader` — same object, one header apart. Without
+  `Accept-Encoding: gzip`, GCS returns **200 and ignores the Range**, the downloader falls
+  back to a bare `curl` (the benchmark supplies no `--legacy-cmd`, so nothing verifies or
+  decodes), and it **exits 0**. The output was correct only because GCS transcoded it on
+  the way out. On this route a fallback is never a pass.
+* `gunzip-decode`'s own phase split — the decode is **5.0× the relay** (11.6 s vs 2.3 s),
+  because the relay is 16-way at 74.1 MB/s and the decode is one sequential stream at
+  28.4 MB/s against what it writes. That ratio grows with the compression ratio, and it
+  contradicts the "cheap second pass" framing the design note (§13.55) used before anyone
+  measured it.
+
+`phases` does not sum to `seconds` here: the md5 read-back is not wrapped in a `phase()`
+on this route, which is the missing ~5.8 s.

@@ -4336,3 +4336,95 @@ a server-side copy — rather than a discarded upload.
 against five mutations: a single-member decoder, unbuffered output, a skipped sidecar
 delete, a dropped `stored_size`, and ignoring the flag entirely — the last of which is the
 original bug, and fails nine ways.
+
+### 13.57 §6.6b run: the pass works on real GCS, and one header does more than documented
+
+Ran §6.6b end to end on a fresh `pdl-bench` (`n1-standard-8`, `us-east1-b`, gcsfuse 3.11.2
+on `slurm_gcp_docker:v0.18.3`), 2026-09-23. Source 170401724 bytes gzip → 328888890 plain,
+1.93:1. Node and bucket torn down; raw JSON in `benchmark-results/gunzip-*.json`.
+
+**It works.** The unknown-total PUT sequence — the one request shape nothing else in
+canine sends, and the one thing the fake could have been wrong about — is accepted by real
+GCS. Destination md5 equals the original plaintext's and `cmp` is byte-identical. The
+marker is believed on a second run (**1.25 s** against 19.78 s), so `stored_size` is
+confirmed outside the fake. The keep-as-is branch fires on a `.gz` name in 0.3 s, and the
+kept bytes are byte-identical to what was uploaded.
+
+Three things the run established that the design did not.
+
+#### `Accept-Encoding: gzip` is what makes ranges work at all
+
+Measured both ways against the same object:
+
+| | status | body |
+|---|---|---|
+| with `Accept-Encoding: gzip` | **206**, `content-range: bytes 0-99/170401724` | 100 bytes, `1f8b` |
+| without | **200**, Range *ignored* | 328888890 bytes, fully decompressed |
+
+The header was documented as "ask for the encoded body". It is stronger than that: without
+it GCS ignores `Range` outright, so **no ranged transfer of a gzip-encoded object is
+possible without it**, and the `Content-Range` total is the compressed length that `--size`
+must match. `_pdl_command` emits it (`file_handlers.py:290`), so production is correct;
+anything driving `parallel_download.py` directly has to supply it, and the runbook's first
+draft of §6.6b did not.
+
+#### A fallback in a benchmark is not a pass
+
+Omitting it does not fail loudly. The downloader correctly detects the 200 and calls
+`single_stream_fallback`, which runs `options.legacy_cmd` — and in production that is the
+`file_handlers` pipeline carrying its own hash check and gunzip stages. **The benchmark
+passes no `--legacy-cmd`**, so the fallback is a bare `curl`: no verification, no decode,
+**rc=0 in 8.76 s**. The file it left was correct only because GCS transcoded it on the way
+out, and the sole signal was `gunzip phase : did not decode`.
+
+Not a product defect — the production path is covered — but it means a `routeb` run that
+falls back has measured `curl`, and the runbook now says so in those words.
+
+#### The decode is 5× the relay, not a cheap second pass
+
+§13.55 justified the post-compose design partly on the decode being one cheap extra pass.
+The phase split says otherwise:
+
+```
+relay   2.3s   (170 MB in, 16 connections, 74.1 MB/s)
+compose 0.1s
+gunzip 11.6s   (170 MB in, 329 MB out, 28.4 MB/s written)
+```
+
+**11.6 s against 2.3 s.** The gap is structural rather than incidental: the relay is
+16-way parallel and the decode is a single sequential read-plus-write that cannot be
+parallelised, because gzip is sequential — the same property that forced the post-compose
+design in the first place. It also widens with the compression ratio, since every point of
+ratio is another byte the decode writes and the relay never moved.
+
+That does not change the decision — the alternative was stage-publish at 44 MiB/s for the
+*entire* transfer, and refusing outright was worse than both — but "one cheap pass" was
+wrong and the sizing guidance in §6.6b now reads **5× the relay for a 2:1 source**. It also
+sharpens the resumability gap recorded in §6.6b step 6: a preemption costs the expensive
+half of the run, not the cheap one. If gzip-encoded inputs turn out to be BAM-sized rather
+than `.vcf`-sized, the decode needs a manifest of its own.
+
+#### Runbook errors this shook out
+
+All fixed in the same commit. Worth listing because five of the six were mine, written
+into §6.6b without being run:
+
+* §6.6a says to create the bucket **on the node**; the `v0.18.3` image ships gcloud
+  **406.0.0**, which has neither `--lifecycle-file` on `buckets create` nor
+  `--soft-delete-duration` at all. Create it from the workstation.
+* `objectAdmin` does not grant `storage.buckets.get`, so any `gcloud storage` call as the
+  node SA fails with *"or it may not exist"*, which reads like a missing bucket.
+  `legacyBucketReader` is the narrow fix. The downloader's own calls never need it.
+* `gcloud storage cp` parallel-composite-uploads at 150 MB, and a composite has **no
+  md5Hash** — so §6.6b's "confirm the stored digest is the compressed one" step silently
+  became impossible. Raise `storage/parallel_composite_upload_threshold` first.
+* §6.6b step 3 omitted `--header "Accept-Encoding: gzip"`, per above.
+* §6.6b step 4 checked `customTime`. `pdl routeb` never stamps it — that is canine's
+  produce path — so the check fails by construction. Removed.
+* The generator measured 1.93:1, not the 1.88 recorded from a local 1/20-scale probe.
+  Close enough that the PUT estimate held, and the runbook already said to check it.
+
+One asymmetry left as-is: the keep-as-is branch publishes by composing the sidecar, so the
+destination comes back `componentCount: 3` with no `md5Hash`, where the in-place route
+renames and preserves the file. Bytes identical either way, and every bucket-route object
+already lacks an md5 (§6.6), so this is the route's existing property rather than a new one.
