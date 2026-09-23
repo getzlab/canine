@@ -4522,9 +4522,31 @@ has something real to work with here.
 `pipe2` — one thread reading and inflating, another uploading — is **1.80×**, so the cheap
 two-thread version captures **80%** of the available win (65.3 s → 36.3 s, against 29.0 s
 for a full three-way split). At 170 MB `pipe2 == ceiling`, because `read + inflate` (4.5 s)
-is still under `write` (6.1 s) and a third thread would simply idle. The third thread only
-begins to pay once `read + inflate` overtakes `write`, which happens somewhere between
-these two sizes.
+is still under `write` (6.1 s) and a third thread would simply idle.
+
+**The tempting reading of those two rows is wrong.** "The third thread pays more on bigger
+files" is what they look like, and it is not what they measure. Per byte:
+
+| stage | 170 MB | 852 MB | change |
+|---|---|---|---|
+| inflate | 160.7 MB/s | 162.3 MB/s | ×1.01 |
+| write | 53.5 MB/s | 56.6 MB/s | ×1.06 |
+| **read** | **70.4 MB/s** | **32.7 MB/s** | **×0.46** |
+
+Inflate and write scale essentially perfectly; **read halved**, and that alone pushed
+`read + inflate` from 0.73× `write` to 1.25×. The third thread did not become more useful
+because the file got bigger — it became useful because read got slow. Three candidates,
+inseparable at n=1 per size: run variance (a single-stream GCS read swinging 2× is
+ordinary, and both numbers are plausible for one stream); a real size effect; or
+**component count**, since the small object composed from 3 parts and the big from 13, and
+part count scales with size. The third is the most testable and the only one that would be
+fixable without touching threading.
+
+This is §6.5c–§6.5f again, and I walked into it the same way: two measurements at
+different sizes, the difference attributed to the size, when the variable that actually
+moved was something else. There it was the disk's burst-versus-sustained behaviour. Here
+it is whatever slowed the read, and the discriminator is cheap — repeat each size, then
+hold size fixed and vary the part count via `--connections`/`--min-chunk`.
 
 **So: build the two-thread split first, re-measure, and only add the third if the table
 still says so at the size that matters.** And treat 2.25× as an experiment worth running,

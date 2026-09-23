@@ -79,6 +79,11 @@ headroom — and `pipe2` (one thread reading and inflating, another uploading) c
 of it at the larger size and *all* of it at the smaller, where `read + inflate` is still
 under `write`.
 
+**The two ceilings differ because read halved, not because the file grew.** Per byte,
+inflate went 160.7 → 162.3 MB/s (×1.01) and write 53.5 → 56.6 (×1.06); read went
+70.4 → 32.7 (×0.46). Unresolved at n=1 per size — variance, a real size effect, or the
+component count (3 parts vs 13). Do not quote the 2.25× as a size trend.
+
 Both ceilings are upper bounds on non-independent stages: read and write share one NIC.
 
 The decode/relay ratio **widens with size** — 4.2× to 7.9× — because the relay is 16-way

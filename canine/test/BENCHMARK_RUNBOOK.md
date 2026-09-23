@@ -4064,9 +4064,36 @@ here is that pipelining has something to work with:
 At the small size `pipe2 == ceiling`, because `read + inflate` (4.5 s) is still under
 `write` (6.1 s) — the two-thread split is the whole prize and a third thread would idle.
 At the big size `read + inflate` (36.2 s) overtakes `write` (29.1 s), so the third thread
-starts paying: 2.25× against 1.80×, i.e. **the cheap version captures 80% of the
-available win.** Build the two-thread version first and re-measure; only add the third if
-this table still says so at the size that matters.
+pays: 2.25× against 1.80×.
+
+**Do not read that as "three threads scale better with size."** Per byte, only one stage
+moved:
+
+| stage | 170 MB | 852 MB | change |
+|---|---|---|---|
+| inflate | 160.7 MB/s | 162.3 MB/s | ×1.01 |
+| write | 53.5 MB/s | 56.6 MB/s | ×1.06 |
+| **read** | **70.4 MB/s** | **32.7 MB/s** | **×0.46** |
+
+Inflate and write scale essentially perfectly. The third thread's advantage appeared
+**entirely because read halved**, pushing `read + inflate` past `write`. Three hypotheses,
+none yet separable at n=1 per size:
+
+* **variance** — one run each; a single-stream GCS read swinging 2× is ordinary, and both
+  70 and 33 MB/s are plausible for one stream;
+* a genuine **size effect** on sequential single-stream reads;
+* **component count** — the small object composed from **3** parts, the big from **13**.
+  Part count scales with object size, so if reading across a composite degrades with
+  components, read throughput falls with size systematically. This is the most testable
+  of the three and would be fixable without touching threading at all.
+
+The discriminator is cheap: repeat each size ~3× and, separately, hold size fixed while
+varying `--connections`/`--min-chunk` to change the part count. If read is consistently
+~33 MB/s at 13 components and ~70 at 3, it is the compose fan-out, not the size.
+
+Until that runs, **build the two-thread split** — it is the whole prize at 170 MB and 80%
+of it at 852 MB under either explanation — and leave the third thread until the read
+number is understood.
 
 **The ceiling is an upper bound and these two stages are not independent.** Read and write
 are both network on the same NIC, so overlapping them contends for the same bandwidth in
@@ -4525,7 +4552,8 @@ carries the narrative once a row is filled in.
 | Does the `.gz`/`.bam` keep-as-is branch fire against real metadata? | §6.6b step 5 | **yes** — `singly-compressed ... stored bytes are kept as-is`, 0.3 s, `gzip -t` valid, `cmp` byte-identical. Note the kept object is `componentCount: 3` with no md5Hash (it publishes by compose, where in-place renames) |
 | Decompress throughput, and is per-preemption decode cost acceptable? | §6.6b step 3 | **the decode is 5.0× the relay** — 11.6 s vs 2.3 s, 59% of a 19.78 s run. Relay is 16-way at 74.1 MB/s; the decode is one sequential stream at 28.4 MB/s written, so the gap is structural and grows with the compression ratio. §13.55's "cheap second pass" framing was wrong. Still not resumable: a preemption redoes the decode, never the download |
 | Does the harness's single-stream fallback verify anything? | §6.6b step 3 | **no — and it exits 0.** Without `Accept-Encoding: gzip` the run fell back to a bare `curl` (no `--legacy-cmd` in the benchmark), verified nothing, decoded nothing, and returned rc=0 in 8.8 s. On this route a fallback is never a pass |
-| **Which decode stage dominates — is the 5× worth pipelining?** | §6.6b step 3, `k9pdl-gunzip` | **balanced, so yes — unlike the relay.** At 852 MB: write 45% / read 40% / inflate 16%, **ceiling 2.25×**, `pipe2` **1.80×** (65.3 s → 36.3 s two-thread, → 29.0 s three-thread). At 170 MB `pipe2 == ceiling == 1.73×`, so the third thread only starts paying once `read+inflate` overtakes `write`. Build two-thread first. Upper bound only: both ends share one NIC |
+| **Which decode stage dominates — is the 5× worth pipelining?** | §6.6b step 3, `k9pdl-gunzip` | **balanced, so yes — unlike the relay.** At 852 MB: write 45% / read 40% / inflate 16%, **ceiling 2.25×**, `pipe2` **1.80×** (65.3 s → 36.3 s two-thread, → 29.0 s three-thread). At 170 MB `pipe2 == ceiling == 1.73×`. Build two-thread first. Upper bound only: both ends share one NIC |
+| Why is the third thread worth more at 852 MB than at 170 MB? | §6.6b step 3 | **open — and not because of size as such.** Per byte, inflate (×1.01) and write (×1.06) scale perfectly; **read alone halved, 70.4 → 32.7 MB/s**, which is the whole reason `read+inflate` overtook `write`. Candidates: run variance (n=1 each), a real size effect, or **component count** (3 parts vs 13 — the most likely, and fixable without threading). Discriminate by repeating each size and by varying part count at fixed size |
 | Does the decode scale linearly, and does multi-member hold at size? | §6.6b step 3 | **yes to both.** 170402482→328888890 in 10.6 s and 852012410→1644444450 in 65.3 s — 5.0× the bytes, 6.2× the time. A **5-member** 852 MB source decoded byte-exact, so `GzipStreamDecoder` holds on real GCS at 102 blocks, not just in the fake |
 | decode-to-relay ratio | §6.6b step 3 | **4.2× at 170 MB, 7.9× at 852 MB.** It widens with size because the relay is 16-way and scales, while the decode is one sequential stream. §13.57's "5×" was a single point on a rising curve |
 | Is a resume manifest for the decode worth it? | analysis, not yet measured | **no, at current sizes.** `zlib` exposes no `inflatePrime` and `decompressobj.copy()` is in-memory, so a resume must re-read and re-inflate the prefix regardless — a manifest buys back the upload third only. Expected loss without one is ≈`4×10⁻⁶·D²` s; ~1.5 s at a 10-minute decode, ~15 min at a 4-hour one. Revisit only if a real input decodes for hours |
