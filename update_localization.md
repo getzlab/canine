@@ -4496,3 +4496,54 @@ run rather than the rare preempted one, and shrinks the preemption window as a s
 Noted in passing: `name_implies_gzip` now has **no callers** — dead since the decision
 moved to `expected_magic`. Left alone here rather than mixed into an instrumentation
 change.
+
+### 13.59 The split, measured: this loop is not the relay, and 5× was a point on a curve
+
+Re-ran §6.6b on a fresh node with the §13.58 instrumentation, at two sizes. Raw JSON in
+`benchmark-results/gunzip-split-*.json`; node and bucket torn down.
+
+| | read | inflate | write | ceiling | pipe2 | decode/relay |
+|---|---|---|---|---|---|---|
+| 170402482 → 328888890, 1 member | 2.420 s (23%) | 2.047 s (19%) | 6.145 s (58%) | 1.73× | 1.73× | **4.2×** |
+| 852012410 → 1644444450, **5 members** | 26.080 s (40%) | 10.135 s (16%) | 29.077 s (45%) | **2.25×** | 1.80× | **7.9×** |
+
+Both byte-exact against the originals. The 852 MB source is five concatenated members, so
+`GzipStreamDecoder` is now confirmed on real GCS at 102 blocks and 1.6 GB of output, not
+only in the fake — which matters, because the single-member version of that decoder would
+have silently produced one fifth of the file and reported success.
+
+#### The answer is the opposite of the relay's
+
+§13.58 was written expecting this might look like the relay: one stage dominant, ceiling
+near 1.0, don't build it. It does not. At 852 MB the split is **write 45% / read 40% /
+inflate 16%** — balanced, with a **2.25×** ceiling against the relay's 1.05×. Pipelining
+has something real to work with here.
+
+`pipe2` — one thread reading and inflating, another uploading — is **1.80×**, so the cheap
+two-thread version captures **80%** of the available win (65.3 s → 36.3 s, against 29.0 s
+for a full three-way split). At 170 MB `pipe2 == ceiling`, because `read + inflate` (4.5 s)
+is still under `write` (6.1 s) and a third thread would simply idle. The third thread only
+begins to pay once `read + inflate` overtakes `write`, which happens somewhere between
+these two sizes.
+
+**So: build the two-thread split first, re-measure, and only add the third if the table
+still says so at the size that matters.** And treat 2.25× as an experiment worth running,
+not a forecast — §13.53 records the ceiling overstating when the stages are not
+independent, and read and write here are both network on one NIC, contending in a way the
+arithmetic does not model. That is precisely how the relay's predicted win became −6.2%.
+
+#### 5.0× was one point on a rising curve
+
+§13.57 reported the decode at "5.0× the relay" from a single measurement and I wrote it
+into the runbook as a sizing rule. It is **4.2× at 170 MB and 7.9× at 852 MB**, and it
+will keep climbing: the relay is 16-way and scales with the object, while the decode is
+one sequential stream that cannot. Quoting a single ratio as guidance was the same error
+as §6.5c–§6.5f — a number measured at one size applied to another.
+
+The decode itself scales close to linearly: 5.0× the bytes for 6.2× the time.
+
+This also sharpens §13.58's deferral of the resume manifest rather than reversing it. The
+manifest still buys only the upload third, which is **45%** of the decode at the larger
+size — but pipelining attacks the whole 65 s for every run, while a manifest attacks a
+fraction of it only when a preemption lands. Pipelining first remains right, and by a
+wider margin than the earlier arithmetic suggested.

@@ -44,6 +44,8 @@ on `slurm_gcp_docker:v0.18.3`. Source is a 170401724-byte gzip uploaded with
 | `gunzip-rerun.json` | same command again | **1.25 s**, `already complete per ...`, no transfer — `stored_size` works on real GCS |
 | `gunzip-keep-as-is.json` | `.gz` name, singly compressed | 0.3 s decode phase, bytes kept, `gzip -t` valid, `cmp` byte-identical to the upload |
 | `gunzip-nofallbackheader.json` | **the trap** — `Accept-Encoding: gzip` omitted | `fell_back: true`, **rc=0 in 8.76 s**, verified nothing, decoded nothing |
+| `gunzip-split-170m.json` | decode stage split, 1 member | read 2.420 / inflate 2.047 / write 6.145 s, ceiling 1.73×, pipe2 1.73× |
+| `gunzip-split-852m-5member.json` | decode stage split, **5 members**, 852012410 → 1644444450 | read 26.080 / inflate 10.135 / write 29.077 s, ceiling 2.25×, pipe2 1.80× |
 
 The two that carry the argument:
 
@@ -60,3 +62,25 @@ The two that carry the argument:
 
 `phases` does not sum to `seconds` here: the md5 read-back is not wrapped in a `phase()`
 on this route, which is the missing ~5.8 s.
+
+### The stage split (`gunzip-split-*.json`)
+
+Added after the first §6.6b run, which measured the decode at 5× the relay but could not
+say which stage to attack. Two sizes, because the answer turned out to depend on size:
+
+| | read | inflate | write | ceiling | pipe2 | decode/relay |
+|---|---|---|---|---|---|---|
+| 170 MB, 1 member | 2.420 s (23%) | 2.047 s (19%) | 6.145 s (58%) | 1.73× | 1.73× | 4.2× |
+| 852 MB, 5 members | 26.080 s (40%) | 10.135 s (16%) | 29.077 s (45%) | 2.25× | 1.80× | 7.9× |
+
+**Not the relay's shape.** The relay was 95% write-bound with a 1.05× ceiling, which is
+why its prefetch was reverted at −6.2%. This loop is balanced, so pipelining has real
+headroom — and `pipe2` (one thread reading and inflating, another uploading) captures 80%
+of it at the larger size and *all* of it at the smaller, where `read + inflate` is still
+under `write`.
+
+Both ceilings are upper bounds on non-independent stages: read and write share one NIC.
+
+The decode/relay ratio **widens with size** — 4.2× to 7.9× — because the relay is 16-way
+and scales while the decode is one sequential stream. §13.57's "5.0×" was one point on a
+rising curve, not a constant.
