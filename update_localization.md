@@ -4812,3 +4812,46 @@ Worth noting what the three changes have in common: none of them made a request 
 They removed serialisation -- a read waiting on the previous read, a write waiting on the
 previous write, a hash waiting on a fetch. The transport was never the problem, which is
 the same conclusion §6.5i reached about the relay by a different route.
+
+### 13.64 The inflate/write split: built, measured, reverted
+
+The last structural win §13.63 identified was a 2-thread split of the decode's inflater
+from its uploader -- the shape proposed as "thread 2 decompresses, thread 3 writes".
+Built behind `--decode-queue` (a bounded queue and a writer thread), measured against the
+ra4 baseline, and **reverted**.
+
+| queue | total | decode | inflate | write |
+|---|---|---|---|---|
+| 0 | 36.31 / 36.57 s | 21.3 / 21.2 s | 11.3 / 11.9 | 9.7 / 9.0 |
+| 2 | 33.81 / 36.57 s | 20.2 / 20.6 s | 16.2 / 16.5 | 3.7 / 3.7 |
+| 4 | 35.31 s | 20.2 s | 16.2 | 3.8 |
+
+Predicted 21.4 s -> ~12 s from the 1.8x ceiling. Measured **21.25 -> 20.4 s, ~4%** on the
+decode phase and nothing at all in total: queue 2's two reps were 33.81 and 36.57, a
+2.76 s spread that swamps the effect, and the second tied the queue-0 rep exactly.
+
+**The mechanism is in the stage split.** Write collapsed 9.7 -> 3.7 s exactly as designed
+-- the inflater really did stop waiting on upload slots. But inflate rose **11.3 -> 16.2 s,
+43% slower**. Once the uploads genuinely overlap inflation they contend: `zlib` releases
+the GIL, but the upload threads do their HTTP and TLS work in Python and hold it. The work
+moved instead of disappearing.
+
+This is the third time on this route that the overlap ceiling has overestimated, and the
+reason is the same each time: `total / max(stage)` assumes the stages are independent, and
+on a single interpreter driving a single NIC they are not. §13.53 recorded it for the
+relay's prefetch (-6.2%, reverted), §13.60 for isolated reads measuring 87 MB/s against
+30-51 in the loop, and §13.62 for a width-4 upload measuring 301 MB/s standalone and
+~170 in situ. **The ceiling is a bound on the prize, never an estimate of it.**
+
+Reverted rather than shipped off-by-default, on the §13.53 precedent: a thread, a bounded
+queue, cross-thread error propagation and a deadlock hazard is real complexity in code
+that runs at scale, and it buys nothing measurable. The measurement is kept
+(`benchmark-results/gunzip-split-attempt-q*.json`) so nobody has to build it twice to find
+that out.
+
+**What this settles.** The decode is inflate-bound at ~11.4 s for 1.64 GB, and single-
+threaded `zlib` is the floor. Nothing in the remaining ~36 s of a `--gunzip` run is worth
+attacking with more concurrency: relay 5.4, verify 6.1, decode 21.4, other 2.8, and the
+two big ones are already at their measured ceilings. Further gains would have to come from
+doing less work -- a faster inflater, or not decompressing at all -- not from doing the
+same work in more places at once.

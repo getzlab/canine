@@ -187,3 +187,18 @@ and had never been inside a `phase()`.
 
 Verify 3.8x (~35 -> ~133 MB/s, against a measured depth-4 ceiling of 140.3). Whole run
 55.2 -> 36.1 s; cumulative with the read-ahead and sliced upload, **102.9 -> 36.1 s, 2.85x**.
+
+### The inflate/write split that did not work (`gunzip-split-attempt-q*.json`)
+
+A bounded queue and a writer thread between the inflater and the uploader, measured
+against the ra4 baseline and then reverted.
+
+| queue | total | decode | inflate | write |
+|---|---|---|---|---|
+| 0 | 36.31 / 36.57 s | 21.3 / 21.2 s | 11.3 / 11.9 | 9.7 / 9.0 |
+| 2 | 33.81 / 36.57 s | 20.2 / 20.6 s | 16.2 / 16.5 | 3.7 / 3.7 |
+| 4 | 35.31 s | 20.2 s | 16.2 | 3.8 |
+
+~4% on the decode phase, nothing in total. Write fell as designed; inflate rose 43%,
+because the upload threads hold the GIL for their HTTP/TLS work. Kept so nobody has to
+build it twice to learn that.
