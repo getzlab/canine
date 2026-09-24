@@ -177,6 +177,12 @@ anything is decoded, and the decompressed output consequently has no digest of i
 stage-publish copies its staged bytes through unchanged and refuses `--gunzip` outright
 rather than storing a gzip stream under a name promising plain content.
 
+A `gs://` object stored with `Content-Encoding: gzip` goes through this too when it is headed
+for a localization bucket (`--gs-source`, read over the JSON API). The server-side copy every
+other `gs://` input gets cannot decode. When GCS will not honor ranges on such an object (it
+won't if it is typed `application/gzip`), the log says `only whole` and the download is a
+single chunk.
+
 Two log lines mean the decode was deliberately skipped and the stored bytes kept, both
 because the server's metadata was wrong rather than the data: `is not gzip` (the object is
 not a gzip stream at all) and `singly-compressed` (the name promises `.gz` and decoding

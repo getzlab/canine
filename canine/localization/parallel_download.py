@@ -1394,6 +1394,137 @@ class S3ApiSource:
         return _ProcessStream(process)
 
 
+class GcsObjectSource:
+    """
+    Read a gs:// object's STORED bytes through the GCS JSON API.
+
+    For a gzip-encoded gs:// source that has to be decoded rather than copied
+    server-side. A server-side rewrite copies stored bytes and metadata verbatim, so it
+    cannot decode -- which is how a gzip-encoded reference .dict reached gcsfuse as raw
+    gzip. Decoding needs the bytes on a node, and this lets them go through the same
+    verified, streaming, keep-as-is decode as every other compressed source, instead of a
+    gunzip into a temp file on the boot disk.
+
+    Why not a URL plus an Authorization header: there is no signed URL on this path, and a
+    bearer token in a static header expires after about an hour -- mid-transfer on a large
+    object. `GcsClient.token()` refreshes, so every request carries a live one.
+
+    Measured on the JSON media endpoint (§13.71), deterministic, the same as the XML
+    endpoint signed URLs use:
+
+      * without `Accept-Encoding: gzip` -- and urllib sends `identity` by default -- an
+        ordinary gzip-encoded object comes back DECODED with the Range ignored. So every
+        request here asks for gzip;
+      * with it, ordinary and no-transform objects return the stored bytes and honour
+        Range (206);
+      * typed application/gzip, the stored bytes come back only as the WHOLE object (200,
+        Range ignored). `whole_object_only` records that, the caller plans a single
+        chunk, and a resume re-reads from zero and discards up to the offset -- the only
+        way to resume against a server that will not range.
+    """
+
+    def __init__(self, bucket, name, user_project=None, timeout=DEFAULT_TIMEOUT):
+        self.client = GcsClient(timeout=timeout)
+        self.url = "{}/b/{}/o/{}?alt=media".format(
+            GCS_API_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(name, safe=""))
+        if user_project:
+            # requester-pays: the bill goes to the job's project, as `cp
+            # --billing-project` does on the server-side path
+            self.url += "&userProject=" + urllib.parse.quote(user_project, safe="")
+        self.timeout = timeout
+        self.whole_object_only = False
+
+    def refresh_url(self):
+        return False            # nothing to re-mint: the token refreshes per request
+
+    def _open(self, start, end=None):
+        request = urllib.request.Request(self.url, headers={
+            "Authorization": "Bearer " + self.client.token(),
+            "Accept-Encoding": "gzip",
+            "Range": "bytes={}-{}".format(start, "" if end is None else end - 1),
+        })
+        try:
+            return urllib.request.urlopen(request, timeout=self.timeout)
+        except urllib.error.HTTPError as e:
+            if e.code in (403, 404):
+                raise PermanentError("GET gs source -> HTTP {}".format(e.code))
+            if e.code == 416:
+                raise PermanentError("GET gs source -> HTTP 416: range not satisfiable")
+            # 401 included: a token expiring between refresh and use is transient, and
+            # the next request mints a fresh one
+            raise TransientError("GET gs source -> HTTP {}".format(e.code))
+        except (urllib.error.URLError, OSError) as e:
+            raise TransientError("GET gs source -> {}".format(e))
+
+    @staticmethod
+    def _stored(response, size):
+        """Whether a 200 carries the whole STORED object (not a decoded rendition)."""
+        encoded = "gzip" in (response.headers.get("Content-Encoding") or "").lower()
+        length = response.headers.get("Content-Length")
+        return encoded and (length is None or size is None or int(length) == size)
+
+    def probe_range(self, size):
+        response = self._open(0, 1)
+        try:
+            if response.status == 206:
+                declared = (response.headers.get("Content-Range") or "").rsplit("/", 1)[-1]
+                if declared != "*" and size is not None and int(declared) != size:
+                    raise RangeNotSupported(
+                        "server reports size {} but {} was expected".format(declared, size))
+                return
+            if response.status == 200 and self._stored(response, size):
+                self.whole_object_only = True
+                log("the gs source serves its stored bytes only whole (Range ignored); "
+                    "reading it as a single stream")
+                return
+            # A decoded rendition: the stored bytes are not on offer, so neither the
+            # digest nor the decode can be done here. Hand over to the fallback.
+            raise RangeNotSupported(
+                "gs source served a decoded rendition (HTTP {})".format(response.status))
+        finally:
+            response.close()        # abort rather than drain
+
+    def open_range(self, start, end):
+        response = self._open(start, end)
+        if response.status == 206:
+            content_range = (response.headers.get("Content-Range") or "").strip()
+            match = re.match(r"^bytes (\d+)-(\d+)/", content_range)
+            if not match or int(match.group(1)) != start or int(match.group(2)) != end - 1:
+                response.close()
+                raise TransientError("Content-Range {!r} does not match requested "
+                                     "{}-{}".format(content_range, start, end - 1))
+            return response
+        if response.status == 200 and self.whole_object_only and self._stored(response, None):
+            return _SkippingStream(response, skip=start, limit=end - start)
+        response.close()
+        raise RangeNotSupported(
+            "gs source returned HTTP {} to a ranged request".format(response.status))
+
+
+class _SkippingStream:
+    """A whole-object response presented as the range [skip, skip + limit)."""
+
+    def __init__(self, response, skip, limit):
+        self.response = response
+        self.remaining = limit
+        while skip > 0:
+            discarded = response.read(min(skip, READ_BUFFER))
+            if not discarded:
+                raise TransientError("short read skipping to the resume offset")
+            skip -= len(discarded)
+
+    def read(self, n):
+        if self.remaining <= 0:
+            return b""
+        buf = self.response.read(min(n, self.remaining))
+        self.remaining -= len(buf)
+        return buf
+
+    def close(self):
+        self.response.close()
+
+
 class _ProcessStream:
     def __init__(self, process):
         self.process = process
@@ -4499,9 +4630,14 @@ def run(options):
 
     chunks = plan_chunks(size, options.connections, options.min_chunk,
                          options.part_length)
+    if getattr(source, "whole_object_only", False):
+        # The source cannot range, so N chunks would be N whole-object reads -- each
+        # billed as the whole object. One chunk, one stream.
+        chunks = [(0, size)] if size else []
     chunk_size = (chunks[0][1] - chunks[0][0]) if chunks else size
     plan_id = compute_plan_id(
-        options.url or "", size, options.check_etag or options.check_md5, chunk_size
+        options.url or getattr(options, "gs_source", None) or "", size,
+        options.check_etag or options.check_md5, chunk_size
     )
 
     # Decompression can never happen in flight on ANY route: **gzip is a sequential
@@ -4697,6 +4833,10 @@ def build_source(options):
     exotic endpoint): the emitted command passes an empty --url in that case, so an empty
     string here means "presign produced nothing", not "no source given".
     """
+    if getattr(options, "gs_source", None):
+        bucket, name = split_gs_url(options.gs_source)
+        return GcsObjectSource(bucket, name, getattr(options, "user_project", None),
+                               timeout=options.timeout)
     if not (options.url or "").strip() and options.s3_bucket and options.s3_key:
         return S3ApiSource(
             options.s3_bucket, options.s3_key, options.s3_extra_args or "",
@@ -4761,6 +4901,13 @@ def build_parser():
                              "memory is (width + this) times the slice size")
     parser.add_argument("--header", action="append", default=[],
                         help="extra request header, 'Name: value' (repeatable)")
+    parser.add_argument("--gs-source", dest="gs_source",
+                        help="read the STORED bytes of gs://bucket/object through the GCS "
+                             "JSON API with a refreshing token. For a gzip-encoded object "
+                             "that must be decoded rather than copied server-side; pair "
+                             "with --gunzip")
+    parser.add_argument("--user-project", dest="user_project",
+                        help="billing project for a requester-pays --gs-source")
     parser.add_argument("--s3-bucket", dest="s3_bucket")
     parser.add_argument("--s3-key", dest="s3_key")
     parser.add_argument("--s3-extra-args", dest="s3_extra_args", default="")
@@ -4811,8 +4958,9 @@ def main(argv=None):
         except ValueError:
             log("ignoring unparseable CANINE_DOWNLOAD_CONNECTIONS={!r}".format(override))
 
-    if not (options.url or "").strip() and not (options.s3_bucket and options.s3_key):
-        parser.error("one of --url or --s3-bucket/--s3-key is required")
+    if (not (options.url or "").strip() and not (options.s3_bucket and options.s3_key)
+            and not getattr(options, "gs_source", None)):
+        parser.error("one of --url, --s3-bucket/--s3-key or --gs-source is required")
 
     try:
         return run(options)

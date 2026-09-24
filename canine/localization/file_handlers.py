@@ -240,6 +240,8 @@ def _pdl_command(
     url_expr=None,
     env_prefix="",
     gunzip=False,
+    gs_source=None,
+    user_project=None,
 ):
     """
     Emit the lines that download one object with the parallel downloader, falling back
@@ -289,6 +291,11 @@ def _pdl_command(
         # impossible -- the same reason the chunked writer cannot consume a decoded stream.
         arguments += ["--header", shlex.quote("Accept-Encoding: gzip")]
         arguments += ["--gunzip"]
+
+    if gs_source:
+        arguments += ["--gs-source", shlex.quote(str(gs_source))]
+        if user_project:
+            arguments += ["--user-project", shlex.quote(str(user_project))]
 
     if s3:
         arguments += ["--s3-bucket", shlex.quote(str(s3["bucket"]))]
@@ -998,7 +1005,87 @@ class HandleGSURL(FileType):
         total = 0
         for blob in self.blob():
             total += self._blob_localized_size(blob)
+            if not self.is_dir:
+                # Kept from the one metadata fetch planning already pays for, so the
+                # transport_gzip check below costs no further requests -- blob() is not
+                # cached, and the planner visits every gs:// input.
+                self._stored_meta = {
+                    "encoding": (getattr(blob, "content_encoding", None) or "").strip().lower(),
+                    "md5_b64": getattr(blob, "md5_hash", None),
+                    "size": blob.size,
+                }
         return total
+
+    @property
+    def transport_gzip(self):
+        """
+        Whether this single object carries `Content-Encoding: gzip`, and so cannot take
+        the server-side copy into a localization bucket.
+
+        A server-side rewrite copies the stored bytes and their metadata verbatim; it
+        cannot decode. Every reader of a bucket-mount then gets the gzip stream -- a
+        reference .dict came back as `1f 8b` and GATK reported "Failed to load reference
+        dictionary". Decoding needs the bytes on a node, so the bucket planner routes such
+        an object to the `mount` kind and `downloader_command` below.
+
+        Directories are not classified: that would mean inspecting every object under the
+        prefix, and no gzip-encoded directory tree has turned up. They keep the plain copy.
+        """
+        self.size                                  # populates _stored_meta, once
+        meta = getattr(self, "_stored_meta", None)
+        if meta is None and not self.is_dir:
+            # A size cached before the metadata was kept (or assigned from outside)
+            # must not read as "not encoded": that is the plain copy, and the bug.
+            self._size = self._get_size()
+            meta = getattr(self, "_stored_meta", None)
+        return bool(meta) and meta["encoding"] == "gzip"      # never kept for a directory
+
+    def downloader_command(self, dest):
+        """
+        Localize a transport_gzip object through the parallel downloader's decode.
+
+        The stored bytes are read over the JSON API (`--gs-source`, refreshing token,
+        `userProject` for requester-pays), verified against the object's stored md5 (always,
+        as `gcloud storage cp` does; a composite object has none), and
+        decoded on the way into `dest` -- which in the bucket planner is a path on the
+        read-write gcsfuse mount, so nothing is staged on local disk. A name promising
+        gzip (.vcf.gz, .bam, ...) whose decoded bytes are not gzip keeps its stored bytes:
+        the encoding was set by mistake on a singly compressed file.
+
+        The fallback, for when the downloader is unavailable or declines, is this
+        handler's ordinary `gcloud storage cp`, which also decodes.
+        """
+        legacy = self.localization_command(dest)       # also sets self.localized_path
+        # Populates _stored_meta. The downloader must be given the STORED length and
+        # md5: self.size is the decoded estimate the disk is sized from, and a plan
+        # over that length would never match what the server sends.
+        if not self.transport_gzip:
+            raise ValueError("{} is not gzip-encoded; it has no decode to route "
+                             "through".format(self.path))
+        meta = self._stored_meta
+        # Verified whenever the object has an md5, regardless of check_hash: the digest
+        # came with metadata already fetched, and `gcloud storage cp` -- the copy this
+        # replaces -- always validates. Opting out here would be a silent regression.
+        md5 = None
+        if meta.get("md5_b64"):
+            md5 = binascii.hexlify(base64.b64decode(meta["md5_b64"])).decode()
+        elif self.check_hash:
+            canine_logging.warning(
+              "check_hash was requested for {}, but it is a composite object with no "
+              "md5, so the decode cannot be verified".format(self.path))
+        dest_dir = os.path.dirname(self.localized_path)
+        lines = ["[ ! -d {d} ] && mkdir -p {d} || :".format(d = dest_dir)]
+        lines += _pdl_command(
+            None, self.localized_path, meta["size"],
+            md5 = md5,
+            gs_source = self.path,
+            user_project = self.extra_args.get("project") if self.rp_string else None,
+            legacy_cmd = legacy,
+            connections = self.download_connections,
+            min_chunk = self.download_min_chunk,
+            gunzip = True,
+        )
+        return "\n".join(lines)
 
     def _blob_localized_size(self, blob):
         """

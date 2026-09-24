@@ -1368,7 +1368,13 @@ class AbstractLocalizer(abc.ABC):
             fh = r.fh,
             dest = "gs://{}/{}".format(bucket, r.object_path),
             kind = (
-              "server_side" if isinstance(r.fh, file_handlers.HandleGSURL)
+              # A gzip-encoded gs:// object cannot take the server-side copy: a rewrite
+              # copies the stored bytes and metadata verbatim and cannot decode, so every
+              # reader of the mount would get the gzip stream. It needs a node, and gets
+              # the downloader's streaming, verified decode (HandleGSURL.transport_gzip).
+              # Classified here from metadata planning already fetched -- no extra calls.
+              "mount" if isinstance(r.fh, file_handlers.HandleGSURL) and r.fh.transport_gzip
+              else "server_side" if isinstance(r.fh, file_handlers.HandleGSURL)
               else "copy" if r.fh.localization_mode == "local"
               else "mount"
             ),
@@ -1425,64 +1431,20 @@ class AbstractLocalizer(abc.ABC):
                 plain_cp = '    gcloud storage cp -r -n{rp} --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
                   rp = item.fh.rp_string, src = shlex.quote(item.fh.path), dst = shlex.quote(dest),
                 )
-                if is_dir:
-                    # Not handled below: checking/decompressing every object under
-                    # a directory source individually is real work with no known
-                    # need for it yet (every case found live has been a single
-                    # reference file, never a gzip-transport-encoded directory
-                    # tree) -- left as the original plain copy rather than a
-                    # speculative, unvalidated attempt at the recursive case.
-                    uploads.append(plain_cp)
-                else:
-                    # A gs:// source object can carry Content-Encoding: gzip as
-                    # transport metadata -- meaning it's meant to be served
-                    # transparently decompressed, the way a web server gzips an
-                    # HTML response in transit while the browser shows plain
-                    # text. `cp -r`'s server-side rewrite preserves that metadata
-                    # (and the still-compressed bytes) onto the destination
-                    # verbatim, unchanged.
-                    #
-                    # Every reader of this bucket -- gcsfuse's bucket-mount, and
-                    # confirmed live even `gcloud storage cat`/`gsutil cat`
-                    # directly -- gets the raw compressed bytes back rather than
-                    # the promised transparent decompression (GCS's own
-                    # decompressive transcoding does not reliably apply to these
-                    # client libraries' own downloads). A consumer with no
-                    # gzip-awareness of its own -- e.g. GATK opening a plain-text
-                    # reference .dict directly -- has no way to know it needs to
-                    # gunzip anything first. Confirmed live: exactly this,
-                    # reported by GATK as "Failed to load reference dictionary"
-                    # with nothing pointing at Content-Encoding as the cause.
-                    #
-                    # Merely clearing the Content-Encoding metadata afterward
-                    # (tried first, live) does not fix this -- it only removes
-                    # the tag that would have triggered transcoding for a
-                    # request that doesn't disable it, while the object's
-                    # physically stored bytes remain compressed regardless. The
-                    # only reliable fix is to materialize the actual decompressed
-                    # bytes here: download (always raw, per the above), gunzip,
-                    # and upload that as fresh content with no encoding tag at
-                    # all -- so nothing downstream has to guess.
-                    #
-                    # Cost: this trades a free server-side rewrite for a real
-                    # download+reupload through this VM, but only for the rare
-                    # object that actually carries this tag -- every ordinary
-                    # gs:// source (no Content-Encoding) still gets the fast
-                    # path below untouched.
-                    # rp_string on describe/cat too -- the source may be
-                    # requester-pays regardless of which branch is taken.
-                    uploads += [
-                      '    if [ "$(gcloud storage objects describe{rp} {src} --format="value(content_encoding)" 2>/dev/null)" == "gzip" ]; then'.format(
-                        rp = item.fh.rp_string, src = shlex.quote(item.fh.path)),
-                      '      CANINE_DECOMP_TMP=$(mktemp)',
-                      '      gcloud storage cat{rp} {src} | gunzip > "$CANINE_DECOMP_TMP"'.format(
-                        rp = item.fh.rp_string, src = shlex.quote(item.fh.path)),
-                      '      gcloud storage cp -n --custom-time="$CANINE_BUCKET_CT" "$CANINE_DECOMP_TMP" {dst}'.format(dst = shlex.quote(dest)),
-                      '      rm -f "$CANINE_DECOMP_TMP"',
-                      '    else',
-                      plain_cp,
-                      '    fi',
-                    ]
+                # Plain server-side copy, always. A gzip-ENCODED single object never
+                # reaches this branch: the planner routes it to the "mount" kind, where the
+                # downloader streams the stored bytes through a verified decode
+                # (HandleGSURL.transport_gzip). That replaced a runtime `describe` +
+                # `gcloud storage cat | gunzip > $(mktemp)` + re-upload here, which staged
+                # the whole decompressed object on the boot disk (ENOSPC at gnomAD scale),
+                # decoded mislabelled .vcf.gz files into plain text, fell through to this
+                # plain copy -- reproducing the bug -- whenever the describe call failed,
+                # and relied on `gcloud storage cat` never transcoding.
+                #
+                # Directories still take this copy unclassified: no gzip-encoded
+                # directory tree has been seen, and classifying one means inspecting every
+                # object under the prefix.
+                uploads.append(plain_cp)
             elif item.kind == "copy":
                 # Already a file on the shared mount -- typically an upstream
                 # task's output. The worker uploads it from where it already
@@ -1529,10 +1491,13 @@ class AbstractLocalizer(abc.ABC):
             ]
             for item in indirect:
                 in_mount = os.path.join(mount_dir, item.dest[len("gs://" + bucket + "/"):])
-                uploads += [
-                  "    " + line
-                  for line in item.fh.localization_command(in_mount).split("\n")
-                ]
+                # A gs:// input only lands here when it is gzip-encoded; its ordinary
+                # localization_command is a `gcloud storage cp`, whose sliced download
+                # is not sequential and would stage the whole object on local disk.
+                command = (item.fh.downloader_command(in_mount)
+                           if isinstance(item.fh, file_handlers.HandleGSURL)
+                           else item.fh.localization_command(in_mount))
+                uploads += ["    " + line for line in command.split("\n")]
             uploads += [
               # unmount before anything else runs: finalizes every object, and
               # leaves no writable mount exposed to the task script

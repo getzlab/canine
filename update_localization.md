@@ -5263,3 +5263,102 @@ backed out as going too far for now. It is no worse than before this work.
 
 Still open: `HandleDRSURI` and `HandleGDCHTTPURL` never probe at all, so a DRS input
 resolving to a gzip-encoded GCS object gets none of this.
+
+### 13.71 Gzip-encoded gs:// objects go through the downloader, not a rewrite
+
+The fuse-localize merge brought a fix for gzip-encoded `gs://` sources on the bucket route.
+A server-side `gcloud storage cp` copies the stored bytes and metadata verbatim, and gcsfuse
+does not decode, so a reference `.dict` reached GATK as `1f 8b`. That fix was a runtime branch
+in the `server_side` upload: `objects describe`, then `gcloud storage cat | gunzip > $(mktemp)`,
+then a re-upload. It had four problems:
+
+- It staged the whole decompressed object on the boot disk. A gnomAD-scale VCF runs that out
+  of space.
+- It had no keep-as-is check, so it decoded mislabelled `.vcf.gz` files into plain text under
+  a `.gz` name (§13.70).
+- It failed open. If `describe` failed, the branch fell through to the plain copy, which is
+  the original bug.
+- It depended on `gcloud storage cat` never transcoding, and any hiccup exited 1 rather than
+  requeueing.
+
+Decoding needs the bytes on a node, so these objects already paid for a node transfer. The
+change gives them the downloader's version of that transfer.
+
+#### The routing
+
+* **Classified at plan time, at no cost.** `HandleGSURL._get_size` already fetches the blob
+  to size the disk (`_blob_localized_size` reads `content_encoding` from it). It now keeps the
+  encoding, the md5 and the stored size, and `transport_gzip` reads them back without a
+  second request. A size that was cached without the metadata triggers a refetch rather than
+  reading as "not encoded", because that reading would mean the plain copy, and the bug.
+* **Routed to `mount`.** An encoded single object is planned onto the read-write gcsfuse
+  mount, and the mount loop calls `HandleGSURL.downloader_command`. It does not call
+  `localization_command`, whose sliced `gcloud storage cp` writes out of order. Every
+  unencoded object keeps the free server-side copy, and the `server_side` branch is a plain
+  copy again.
+* **Read over the JSON API**, through a new `--gs-source` source (`GcsObjectSource`). There is
+  no signed URL on this path, and a bearer token pasted into a header would expire mid-transfer
+  on a large file, so the source reads through `GcsClient`, which refreshes its token.
+  Requester-pays sources get `userProject` (`--user-project`), and only when the bucket asks
+  for it.
+* **Verified whenever the object has an md5, whatever `check_hash` says.** `gcloud storage
+  cp`, the copy this replaces, always validates, so gating verification on an off-by-default
+  flag would have been a silent regression. The downloader is given the **stored** length.
+  `self.size` is the decoded estimate the disk is sized from, and a plan built over that length
+  never matches what the server sends. The first draft had exactly that bug, and the tests
+  caught it.
+* **Keep-as-is is unchanged.** A name promising gzip content whose decoded bytes are not gzip
+  keeps its stored bytes.
+* **The fallback is the handler's `gcloud storage cp`**, used when the downloader is not
+  found. It also decodes. It leaves `.gcloud_tracker_dir/` and `.gcloud_manifest` beside the
+  object on the mount, and therefore in the bucket. That is untidy but harmless, and only on
+  the fallback.
+
+#### The JSON-API measurement
+
+All earlier measurements (§13.70) used the XML API that signed URLs take. `GcsClient` uses
+`/storage/v1/b/B/o/N?alt=media`, so the same objects were re-measured there. Every cell was
+run three times, and all three agreed every time. Stored/decoded sizes are 98104/528901 bytes.
+`urllib` sends `Accept-Encoding: identity` by default, so that column is what `GcsClient`
+sent before this change.
+
+| object | AE none / identity, no Range | AE gzip, no Range | AE none / identity, Range 0-99 | AE gzip, Range 0-99 |
+|---|---|---|---|---|
+| ordinary (text type) | 200 decoded | 200 raw | 200 decoded, Range ignored | **206 raw** |
+| `no-transform` | 200 raw | 200 raw | 206 raw | 206 raw |
+| `application/gzip`-typed | 200 decoded | **200 decoded** | 200 decoded | **200 raw, whole object** |
+| `application/octet-stream` | 200 decoded | 200 raw | 200 decoded | 206 raw |
+
+This is the same matrix as the XML API. `GcsObjectSource` therefore always sends
+`Accept-Encoding: gzip` and a Range (`bytes=start-`, even for the whole object), and decides
+what arrived from the response rather than predicting it:
+
+* **206** is checked against the `Content-Range` total.
+* **200 carrying the stored bytes** (`Content-Encoding: gzip`, and a length that is absent or
+  equal to the stored size) means ranges are not honored for this object. The source switches
+  to `whole_object_only`, the plan collapses to a single chunk, and a resume skips the
+  already-held prefix of a full-object stream (`_SkippingStream`). This is the
+  `application/gzip` case, and it is logged as `only whole`.
+* **Anything else was decoded server-side** and raises `RangeNotSupported`, which falls back
+  to the legacy command.
+
+#### Acceptance, real GCS, the downloader's `--gs-source`
+
+| object | chunks | outcome |
+|---|---|---|
+| ordinary `.dict` | 1 | decoded 98104 → 528901, verified |
+| `no-transform` `.dict` | 1 | decoded, verified |
+| `application/gzip` `.dict` | 1 (`only whole`) | decoded, verified |
+| ordinary `variants.vcf` | **6, parallel** | decoded 5730289 → 37033840, verified |
+| mislabelled `.vcf.gz` | 1 | kept as-is, verified |
+| mislabelled `application/gzip` `.vcf.gz` | 1 (`only whole`) | kept as-is, verified |
+
+All six were correct and verified. The emitted `downloader_command` has not yet been run end to
+end on a node. The bucket-compose half of it is covered by the fake-GCS test `into a bucket
+through compose`, and by the §13.63 node runs of that route.
+
+#### Still open
+
+* **Directories** are not classified, and still take the plain `cp -r`. Classifying one means
+  inspecting every object under the prefix, and no gzip-encoded directory tree has turned up.
+* **DRS/GDC** (§13.70) still never probe.

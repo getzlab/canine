@@ -1017,6 +1017,133 @@ class TestGSURLTuning:
         assert "K9_PDL" not in script
 
 
+class _Blob:
+    def __init__(self, size, content_encoding=None, md5_hash=None, crc32c="AAAAAA=="):
+        self.size = size
+        self.content_encoding = content_encoding
+        self.md5_hash = md5_hash
+        self.crc32c = crc32c
+        self.name = "ref/genome.dict"
+        # declared, so sizing never reaches for the ISIZE trailer over the network
+        self.metadata = {"uncompressed_size": str(size * 4)}
+
+
+def encoded_gs_handler(blobs, is_dir=False, **kwargs):
+    handler = gs_handler(is_dir=is_dir, **kwargs)
+    handler.path = "gs://bkt/ref/genome.dict"
+    handler._size = None
+    handler.blob = lambda: (handler.blob_calls.append(1), blobs)[1]
+    handler.blob_calls = []
+    return handler
+
+
+GZ_MD5 = hashlib.md5(b"stored gzip bytes").digest()
+
+
+class TestAGzipEncodedGsObject:
+    """
+    `Content-Encoding: gzip` on a gs:// object cannot survive the bucket route's
+    server-side copy, which carries the stored bytes verbatim. The handler classifies it
+    from the metadata planning already fetched and localizes it through the downloader's
+    verified, streaming decode.
+    """
+
+    def test_an_encoded_object_is_transport_gzip(self):
+        assert encoded_gs_handler([_Blob(100, "gzip")]).transport_gzip
+
+    @pytest.mark.parametrize("encoding", [None, "", "identity", "br"])
+    def test_other_encodings_are_not(self, encoding):
+        assert not encoded_gs_handler([_Blob(100, encoding)]).transport_gzip
+
+    def test_the_encoding_is_compared_case_and_space_insensitively(self):
+        assert encoded_gs_handler([_Blob(100, " GZIP ")]).transport_gzip
+
+    def test_a_directory_is_never_classified(self):
+        h = encoded_gs_handler([_Blob(100, "gzip"), _Blob(50, "gzip")], is_dir=True)
+        assert not h.transport_gzip
+
+    def test_classification_costs_no_extra_metadata_fetch(self):
+        """blob() is not cached, and the planner visits every gs:// input."""
+        h = encoded_gs_handler([_Blob(100, "gzip")])
+        h.size
+        h.transport_gzip
+        h.transport_gzip
+        assert len(h.blob_calls) == 1
+
+    def test_a_size_cached_without_the_metadata_is_refetched(self):
+        """Reading that as "not encoded" would be the plain copy, and the original bug."""
+        h = encoded_gs_handler([_Blob(100, "gzip")])
+        h._size = 12345
+        assert h.transport_gzip
+        assert len(h.blob_calls) == 1
+
+    def _command(self, blob=None, **kwargs):
+        h = encoded_gs_handler([blob or _Blob(777, "gzip", base64.b64encode(GZ_MD5).decode())],
+                               **kwargs)
+        return h, h.downloader_command(DEST)
+
+    def test_reads_the_object_over_the_json_api_and_decodes(self):
+        _, script = self._command()
+        assert "--gs-source gs://bkt/ref/genome.dict" in script
+        assert "--gunzip" in script
+        assert "--url" not in script
+
+    def test_transfers_the_stored_length(self):
+        """The plan is over the stored bytes; the decoded length is not what crosses the wire."""
+        _, script = self._command()
+        assert "--size 777 " in script
+
+    def test_verifies_the_stored_md5(self):
+        _, script = self._command()
+        assert "--check-md5 " + GZ_MD5.hex() in script
+
+    def test_a_composite_object_is_decoded_unverified(self):
+        _, script = self._command(_Blob(777, "gzip", md5_hash=None))
+        assert "--gs-source" in script
+        assert "--check-md5" not in script
+
+    @pytest.mark.parametrize("check_hash", [True, False])
+    def test_verifies_whatever_check_hash_says(self, check_hash):
+        """gcloud storage cp, which this replaces, always validates; so does this."""
+        _, script = self._command(check_hash=check_hash)
+        assert "--check-md5 " + GZ_MD5.hex() in script
+
+    def test_requester_pays_bills_the_user_project(self):
+        h = encoded_gs_handler([_Blob(777, "gzip")], project="my-proj")
+        h.rp_string = " --billing-project=my-proj"
+        assert "--user-project my-proj" in h.downloader_command(DEST)
+
+    def test_no_user_project_otherwise(self):
+        """Billing a project the object does not ask for would be a charge nobody chose."""
+        h = encoded_gs_handler([_Blob(777, "gzip")], project="my-proj")
+        assert "--user-project" not in h.downloader_command(DEST)
+
+    def test_falls_back_to_gcloud_storage_cp(self):
+        """Which also decodes, so the fallback cannot reintroduce the gzip stream."""
+        _, script = self._command()
+        assert "--legacy-cmd" in script
+        assert "gcloud storage cp" in script
+
+    def test_an_unencoded_object_is_refused(self):
+        """--gunzip would decode a plain object's bytes -- or fail on them."""
+        h = encoded_gs_handler([_Blob(777, None)])
+        with pytest.raises(ValueError):
+            h.downloader_command(DEST)
+
+    def test_targets_the_given_destination(self):
+        h, script = self._command()
+        assert h.localized_path == DEST
+        assert "--dest " + DEST in script
+
+    @pytest.mark.parametrize("kwargs", [dict(), dict(check_hash=False), dict(project="p")])
+    def test_is_valid_bash(self, kwargs):
+        h = encoded_gs_handler([_Blob(777, "gzip", base64.b64encode(GZ_MD5).decode())], **kwargs)
+        if "project" in kwargs:
+            h.rp_string = " --billing-project=p"
+        result = bash_ok(h.downloader_command(DEST))
+        assert result.returncode == 0, result.stderr
+
+
 class TestTheSignedUrlOutlivesTheTransfer:
     """
     The presigned URL was minted with the AWS CLI default window of one hour and never

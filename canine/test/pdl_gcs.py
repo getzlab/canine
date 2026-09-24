@@ -71,6 +71,18 @@ class FakeGcs:
         # Objects to remove the first time a media GET touches them, before serving.
         # Models another writer cleaning up a sidecar or part mid-read.
         self.vanish_on_read = set()
+        # name -> (shape, decoded bytes) for a gzip-encoded object, whose STORED bytes
+        # are state.objects[name]. Shapes follow the matrix measured on the real JSON
+        # media endpoint (§13.71), deterministic in every cell:
+        #   "no-transform": stored bytes always, ranges honoured;
+        #   "ordinary":     stored + ranged with Accept-Encoding: gzip, else decoded
+        #                   with the Range ignored;
+        #   "typed-gzip":   (Content-Type application/gzip) stored bytes only with
+        #                   Accept-Encoding: gzip AND a Range, and then whole (200,
+        #                   Range ignored); decoded otherwise.
+        self.encoded = {}
+        # One entry per media GET: headers and query that matter to the decode.
+        self.media_requests = []
 
     def new_session(self, name, custom_time=None):
         with self.lock:
@@ -361,14 +373,37 @@ def make_handler(state):
 
             if query.get("alt") == ["media"]:
                 header_range = self.headers.get("Range")
+                accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "")
+                with state.lock:
+                    state.media_requests.append({
+                        "name": name, "range": header_range, "accepts_gzip": accepts_gzip,
+                        "user_project": (query.get("userProject") or [None])[0],
+                        "authorized": bool(self.headers.get("Authorization")),
+                    })
+                if name in state.encoded:
+                    shape, decoded = state.encoded[name]
+                    stored_ok = (shape == "no-transform"
+                                 or (shape == "ordinary" and accepts_gzip)
+                                 or (shape == "typed-gzip" and accepts_gzip
+                                     and header_range))
+                    if not stored_ok:
+                        self._send(200, decoded)            # decoded, Range ignored
+                        return
+                    if shape == "typed-gzip":
+                        self._send(200, data, {"Content-Encoding": "gzip"})
+                        return
+                    if not header_range:
+                        self._send(200, data, {"Content-Encoding": "gzip"})
+                        return
                 if header_range:
                     spec = header_range.split("=", 1)[1]
                     first, _, last = spec.partition("-")
                     start = int(first)
                     end = min(int(last), len(data) - 1) if last else len(data) - 1
-                    self._send(206, data[start:end + 1], {
-                        "Content-Range": "bytes {}-{}/{}".format(start, end, len(data))
-                    })
+                    extra = {"Content-Range": "bytes {}-{}/{}".format(start, end, len(data))}
+                    if name in state.encoded:
+                        extra["Content-Encoding"] = "gzip"
+                    self._send(206, data[start:end + 1], extra)
                 else:
                     self._send(200, data)
                 return

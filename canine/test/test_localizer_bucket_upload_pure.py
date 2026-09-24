@@ -17,6 +17,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from canine.localization.base import UploadItem
+from canine.localization.file_handlers import HandleGSURL
 from canine.localization.local import BatchedLocalizer
 
 
@@ -54,10 +55,8 @@ class TestNoNFSInvolvement:
 
     def test_copy_is_gs_to_gs(self):
         """
-        Both endpoints are GCS, so the copy is a server-side rewrite -- this is
-        the plain-copy branch specifically (identified by referencing the real
-        source path), not the sibling gzip-decompression branch alongside it
-        (see TestContentEncoding), which copies from a local temp file instead.
+        Both endpoints are GCS, so the copy is a server-side rewrite, identified
+        by referencing the real source path.
         """
         script = script_for([gs_item()])
         cp = [l for l in script.splitlines() if "storage cp" in l and "gs://src-bucket/reads.bam" in l]
@@ -71,9 +70,7 @@ class TestNoNFSInvolvement:
             gs_item(path="gs://s/c.bam", dest="gs://b/i/c.bam"),
         ]
         script = script_for(items)
-        # one plain-copy line reading from each real source path -- separate
-        # from the sibling gzip-decompression branch each item also gets
-        # (see TestContentEncoding), which never mentions the source path.
+        # one plain-copy line reading from each real source path
         assert len([l for l in script.splitlines() if "storage cp" in l and "gs://s/" in l]) == 3
 
 
@@ -91,16 +88,8 @@ class TestCopyFlags:
         assert "--custom-time=" in cp
 
     def test_requester_pays_source_carries_billing_project(self):
-        """
-        Every command that reads from the source (the content-encoding check,
-        the gzip-branch's own cat, and the plain-copy branch) needs the flag --
-        the source may be requester-pays regardless of which branch runs. The
-        decompress branch's own upload-from-tempfile line correctly has no use
-        for it (that command never touches the source, only a local tempfile).
-        """
+        """The source may be requester-pays even though the localization bucket is not."""
         script = script_for([gs_item(rp_string=" --billing-project=proj")])
-        assert "gcloud storage objects describe --billing-project=proj" in script
-        assert "gcloud storage cat --billing-project=proj" in script
         assert any("--billing-project=proj" in l and "gs://src-bucket/reads.bam" in l for l in script.splitlines())
 
     def test_non_requester_pays_has_no_billing_project(self):
@@ -119,52 +108,34 @@ class TestCopyFlags:
 
 class TestContentEncoding:
     """
-    A gs:// source object can carry Content-Encoding: gzip as transport
-    metadata (meant to be served transparently decompressed, like a web
-    server gzipping an HTML response in transit). `cp -r`'s server-side
-    rewrite preserves that metadata -- and the still-compressed bytes --
-    verbatim. gcsfuse's bucket-mount, and confirmed live even `gcloud
-    storage cat` directly, both get the raw compressed bytes back instead of
-    the promised decompression. A consumer with no gzip-awareness of its own
-    (GATK opening a plain-text reference .dict directly) has no way to know
-    it needs to gunzip anything -- confirmed live, reported as "Failed to
-    load reference dictionary" with nothing pointing at Content-Encoding.
+    A gs:// source object can carry Content-Encoding: gzip as transport metadata. A
+    server-side rewrite preserves that metadata -- and the still-compressed bytes --
+    verbatim, so every reader of the bucket-mount gets the gzip stream. A consumer with
+    no gzip-awareness of its own has no way to know: GATK opening a plain-text reference
+    .dict reported "Failed to load reference dictionary", with nothing pointing at
+    Content-Encoding. Clearing the metadata afterward does not help either; the stored
+    bytes stay compressed regardless of the tag.
 
-    Merely clearing the Content-Encoding metadata afterward (tried first,
-    live) does not fix this: the object's physically stored bytes stay
-    compressed regardless of the tag. These tests are against the real fix --
-    materializing decompressed bytes via download+gunzip+reupload -- not the
-    metadata-only one.
+    Such an object is classified at plan time from metadata already fetched and routed
+    to the "mount" kind, where the downloader streams the stored bytes through a
+    verified decode onto the read-write mount. It replaced a runtime `describe` +
+    `gcloud storage cat | gunzip > $(mktemp)` + re-upload in the server-side branch,
+    which staged the whole decompressed object on the boot disk, decoded mislabelled
+    .vcf.gz files, and fell through to the plain copy whenever `describe` failed.
     """
 
-    def test_checks_source_content_encoding_before_copying(self):
+    def test_the_server_side_branch_is_a_plain_copy(self):
         script = script_for([gs_item()])
-        assert 'gcloud storage objects describe gs://src-bucket/reads.bam --format="value(content_encoding)"' in script
-        assert '== "gzip" ]; then' in script
+        for absent in ("objects describe", "gunzip", "storage cat", "CANINE_DECOMP_TMP"):
+            assert absent not in script, absent
+        cp = [l for l in script.splitlines() if "storage cp" in l]
+        assert len(cp) == 1
+        assert "gs://src-bucket/reads.bam" in cp[0] and "-r -n" in cp[0]
 
-    def test_gzip_branch_downloads_and_decompresses_then_uploads_with_no_encoding(self):
-        script = script_for([gs_item()])
-        assert "gunzip" in script
-        # the decompressed content is uploaded fresh, from a local tempfile --
-        # not a server-side rewrite of the still-compressed source object
-        upload_line = [l for l in script.splitlines() if "storage cp" in l and "CANINE_DECOMP_TMP" in l][0]
-        assert "gs://src-bucket/reads.bam" not in upload_line
-        assert "gs://wolf-1-us-central1-abc/inp/reads.bam" in upload_line
-
-    def test_non_gzip_case_untouched_fast_path_still_present(self):
-        """The ordinary (no Content-Encoding) case still gets ITS OWN plain
-        server-side rewrite -- this feature only adds a conditional detour,
-        it doesn't remove the fast path for the common case."""
-        script = script_for([gs_item()])
-        plain_cp = [l for l in script.splitlines() if "storage cp" in l and "gs://src-bucket/reads.bam" in l]
-        assert len(plain_cp) == 1
-        assert "-r -n" in plain_cp[0]
-
-    def test_directory_sources_are_not_decompression_checked(self):
+    def test_directory_sources_take_the_plain_copy(self):
         """
-        No known live case of a gzip-transport-encoded directory tree --
-        checking/decompressing every object under a prefix individually is
-        unvalidated, real complexity with nothing to justify it yet.
+        No gzip-encoded directory tree has been seen, and classifying one means
+        inspecting every object under the prefix.
         """
         script = script_for([gs_item(path="gs://src/dir", dest="gs://b/inp/dir", is_dir=True)])
         assert "objects describe" not in script
@@ -183,6 +154,57 @@ class TestContentEncoding:
         script = "\n".join(make_localizer().bucket_upload_script([item], "gs://b", "us-central1"))
         assert "objects describe" not in script
         assert "gunzip" not in script
+
+    @staticmethod
+    def _gs_fh(transport_gzip):
+        fh = MagicMock(spec=HandleGSURL)
+        fh.path = "gs://src-bucket/ref.dict"
+        fh.rp_string = ""
+        fh.is_dir = False
+        fh.transport_gzip = transport_gzip
+        fh.hash = "deadbeef"
+        fh.size = 1234
+        fh.localization_mode = "url"
+        fh.downloader_command = MagicMock(return_value="K9_DECODE_MARKER --gs-source x --gunzip")
+        return fh
+
+    def _plan(self, fh):
+        loc = make_localizer()
+        loc.staging_dir = "/mnt/nfs/workspace"
+        loc.backend.config = {"zone": "us-central1-c"}
+        loc.project = "proj"
+        with patch("canine.localization.base.get_project_number", return_value="406002258908"):
+            _, _, _, plan = loc.create_bucket_mount({"reference": [fh]}, dry_run=False)
+        return plan
+
+    def test_an_encoded_object_is_planned_onto_the_mount(self):
+        plan = self._plan(self._gs_fh(transport_gzip=True))
+        assert [item.kind for item in plan] == ["mount"]
+
+    def test_an_unencoded_object_keeps_the_server_side_copy(self):
+        plan = self._plan(self._gs_fh(transport_gzip=False))
+        assert [item.kind for item in plan] == ["server_side"]
+
+    def test_the_mount_loop_uses_the_decoding_downloader(self):
+        """
+        Not localization_command: for a gs:// source that is a `gcloud storage cp`,
+        whose sliced download writes out of order and stages on local disk.
+        """
+        fh = self._gs_fh(transport_gzip=True)
+        item = UploadItem(fh=fh, dest="gs://wolf-1-us-central1-abc/reference/ref.dict", kind="mount")
+        script = script_for([item])
+        fh.downloader_command.assert_called_once_with(
+            "/mnt/localize/wolf-1-us-central1-abc/reference/ref.dict")
+        fh.localization_command.assert_not_called()
+        assert "K9_DECODE_MARKER" in script
+        assert "gcsfuse" in script
+        assert script.index("K9_DECODE_MARKER") < script.index("fusermount -u")
+
+    def test_a_non_gs_mount_source_still_uses_its_own_command(self):
+        item = s3_item()
+        script = script_for([item])
+        item.fh.localization_command.assert_called_once()
+        assert "aws s3api" in script
 
 
 class TestBucketLifecycle:

@@ -3086,6 +3086,138 @@ class TestEverythingWrittenCanExpire:
         assert gcs.state.objects[PLAIN_OBJECT] == plain_text
 
 
+class TestAGzipEncodedGsSource:
+    """
+    A server-side rewrite copies stored bytes and metadata verbatim, so a gzip-encoded
+    gs:// source cannot be decoded on the server_side path -- it reached gcsfuse as raw
+    gzip. `--gs-source` reads its STORED bytes on a node through the JSON API, so it gets
+    the same verified, streaming, keep-as-is decode as every other compressed source.
+
+    The fake's shapes follow the matrix measured on the real JSON media endpoint.
+    """
+
+    SRC = "src/ref.dict"
+
+    def _stage(self, gcs, plain, shape, name=None):
+        import gzip as gziplib
+        stored = gziplib.compress(plain)
+        name = name or self.SRC
+        gcs.state.objects[name] = stored
+        gcs.state.created[name] = time.time()
+        gcs.state.encoded[name] = (shape, plain)
+        return stored
+
+    def _run(self, tmp_path, gcs, stored, dest_name="ref.dict", name=None, **overrides):
+        dest = str(tmp_path / dest_name)
+        argv = options_for(dest, "", len(stored),
+                           gs_source="gs://{}/{}".format(BUCKET, name or self.SRC),
+                           check_md5=hashlib.md5(stored).hexdigest(), **overrides)
+        argv.gunzip = True
+        return pdl.run(argv), dest
+
+    def _data_requests(self, gcs):
+        # everything after the one-byte probe
+        return [r for r in gcs.state.media_requests if r["range"] != "bytes=0-0"]
+
+    def test_an_ordinary_object_is_ranged_verified_and_decoded(self, tmp_path,
+                                                               monkeypatch, gcs):
+        # Several MiB compressed: chunks align up to 1 MiB (CHUNK_ALIGN), so the shared
+        # plain_text fixture -- 155 KB compressed -- can only ever be one chunk, and the
+        # parallel assertion below would be unreachable.
+        plain = b"".join(os.urandom(48).hex().encode() + b"\n" for _ in range(60000))
+        stored = self._stage(gcs, plain, "ordinary")
+        assert len(stored) > 3 * MIB
+        rc, dest = self._run(tmp_path, gcs, stored, min_chunk=MIB, connections=4)
+        assert rc == pdl.EXIT_OK
+        assert open(dest, "rb").read() == plain
+        assert len(self._data_requests(gcs)) > 1, "never split into parallel chunks"
+        assert all(r["accepts_gzip"] for r in gcs.state.media_requests), (
+            "a request went out without Accept-Encoding: gzip; GCS decodes those and "
+            "ignores the Range")
+        assert all(r["authorized"] for r in gcs.state.media_requests)
+
+    def test_a_no_transform_object_decodes_the_same(self, tmp_path, gcs, plain_text):
+        stored = self._stage(gcs, plain_text, "no-transform")
+        rc, dest = self._run(tmp_path, gcs, stored)
+        assert rc == pdl.EXIT_OK
+        assert open(dest, "rb").read() == plain_text
+
+    def test_an_unrangeable_object_is_read_whole_exactly_once(self, tmp_path, gcs,
+                                                              plain_text, capsys):
+        """
+        Typed application/gzip: stored bytes only whole. Planned as usual it would be N
+        chunks, each re-reading -- and billed as -- the entire object.
+        """
+        plain = b"".join(os.urandom(48).hex().encode() + b"\n" for _ in range(60000))
+        stored = self._stage(gcs, plain, "typed-gzip")
+        assert len(stored) > 3 * MIB, "must plan several chunks to prove they collapse"
+        rc, dest = self._run(tmp_path, gcs, stored, min_chunk=MIB, connections=4)
+        assert rc == pdl.EXIT_OK
+        assert open(dest, "rb").read() == plain
+        assert len(self._data_requests(gcs)) == 1, (
+            "{} whole-object reads".format(len(self._data_requests(gcs))))
+        assert "only whole" in capsys.readouterr().err
+
+    def test_an_unrangeable_object_resumes_by_skipping(self, monkeypatch, gcs,
+                                                       plain_text):
+        """
+        A resume against a server that will not range: re-read and discard. The read
+        size is shrunk so the skip spans several reads -- at the real 8 MiB a 1000-byte
+        skip is one read, and a loop that stopped after one read passed this test.
+        """
+        monkeypatch.setattr(pdl, "READ_BUFFER", 300)
+        stored = self._stage(gcs, plain_text, "typed-gzip")
+        source = pdl.GcsObjectSource(BUCKET, self.SRC)
+        source.probe_range(len(stored))
+        assert source.whole_object_only
+        stream = source.open_range(1000, len(stored))
+        got = b""
+        while True:
+            buf = stream.read(4096)
+            if not buf:
+                break
+            got += buf
+        stream.close()
+        assert got == stored[1000:]
+
+    def test_a_decoded_only_rendition_hands_over_to_the_fallback(self, gcs, plain_text):
+        """
+        If the stored bytes are not on offer at all, neither the digest nor the decode
+        can be done here -- the source must decline, not stream decoded bytes into a
+        pipeline that will verify them against the stored digest.
+        """
+        stored = self._stage(gcs, plain_text, "edge-decoded")
+        source = pdl.GcsObjectSource(BUCKET, self.SRC)
+        with pytest.raises(pdl.RangeNotSupported, match="decoded rendition"):
+            source.probe_range(len(stored))
+
+    def test_a_mislabelled_gz_keeps_its_stored_bytes(self, tmp_path, gcs, plain_text):
+        import gzip as gziplib
+        vcfgz = gziplib.compress(plain_text)          # the .vcf.gz itself...
+        name = "src/sample.vcf.gz"
+        gcs.state.objects[name] = vcfgz                 # ...stored once, with
+        gcs.state.created[name] = time.time()           # Content-Encoding set by mistake
+        gcs.state.encoded[name] = ("ordinary", plain_text)
+        rc, dest = self._run(tmp_path, gcs, vcfgz, dest_name="sample.vcf.gz", name=name)
+        assert rc == pdl.EXIT_OK
+        assert open(dest, "rb").read() == vcfgz
+
+    def test_requester_pays_bills_the_user_project(self, tmp_path, gcs, plain_text):
+        stored = self._stage(gcs, plain_text, "ordinary")
+        rc, _ = self._run(tmp_path, gcs, stored, user_project="job-project")
+        assert rc == pdl.EXIT_OK
+        assert {r["user_project"] for r in gcs.state.media_requests} == {"job-project"}
+
+    def test_into_a_bucket_through_compose(self, tmp_path, monkeypatch, gcs, plain_text):
+        """The production route: kind=mount writes onto a gcsfuse mount."""
+        stored = self._stage(gcs, plain_text, "ordinary")
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        rc, _ = self._run(tmp_path, gcs, stored, dest_name="variants.tsv",
+                          min_chunk=64 * 1024, connections=4)
+        assert rc == pdl.EXIT_OK
+        assert gcs.state.objects[PLAIN_OBJECT] == plain_text
+
+
 class TestTheSlicedDecodeUpload:
     """
     A resumable session needs strictly advancing offsets, so one cannot be
