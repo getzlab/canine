@@ -178,6 +178,48 @@ A GCS rewrite: no bytes touch any VM at all. `-n` so a requeued shard does not r
 directory source is copied into its parent, or `cp -r gs://a/d gs://B/k/d` would produce
 `gs://B/k/d/d/...` (`base.py:1188`).
 
+**Content-Encoding: gzip sources are decompressed, not copied verbatim.** A `gs://` source
+object can carry `Content-Encoding: gzip` as transport metadata — meant to be served
+transparently decompressed, the way a web server gzips an HTML response in transit while the
+browser shows plain text. The plain `cp -r` above is a server-side rewrite that preserves that
+metadata (and the still-compressed bytes underneath) onto the destination verbatim. Every reader
+of the bucket-mounted destination — gcsfuse, and confirmed live even `gcloud storage
+cat`/`gsutil cat` used directly against it — gets the raw compressed bytes back rather than the
+promised transparent decompression; GCS's decompressive transcoding does not reliably apply to
+these clients' own downloads. A consumer with no gzip-awareness of its own has no way to know it
+needs to gunzip anything first — confirmed live as a GATK `.dict` reference input failing with
+"Failed to load reference dictionary", with nothing in that error pointing at Content-Encoding as
+the cause.
+
+Clearing the Content-Encoding metadata afterward (`objects update --clear-content-encoding`) was
+tried first, live, and does **not** fix this: it only removes the tag that would have triggered
+transcoding for a request that doesn't disable it, while the object's physically stored bytes
+remain compressed regardless — confirmed live via matching md5/crc32c before and after. The only
+reliable fix is to materialize the actual decompressed bytes: download (always raw, per above),
+`gunzip`, and upload that as fresh content with no encoding tag at all, so nothing downstream has
+to guess:
+
+```bash
+if [ "$(gcloud storage objects describe<rp> <src> --format="value(content_encoding)")" == "gzip" ]; then
+  CANINE_DECOMP_TMP=$(mktemp)
+  gcloud storage cat<rp> <src> | gunzip > "$CANINE_DECOMP_TMP"
+  gcloud storage cp -n --custom-time="$CANINE_BUCKET_CT" "$CANINE_DECOMP_TMP" <dst>
+  rm -f "$CANINE_DECOMP_TMP"
+else
+  gcloud storage cp -r -n<rp> --custom-time="$CANINE_BUCKET_CT" <src> <dst>   # unchanged fast path
+fi
+```
+
+This trades a free server-side rewrite for a real download+reupload through the worker VM, but
+only for the rare object that actually carries the tag — every ordinary `gs://` source (no
+Content-Encoding) still takes the original fast path untouched. `rp_string` is applied to the new
+`describe`/`cat` calls too, since the source may be requester-pays regardless of which branch is
+taken (`base.py:1202`).
+
+Not handled: directory sources (`is_dir`) are not decompression-checked object-by-object — real
+recursive-case work with no live need for it yet, every case found in production has been a
+single reference file — so a directory source still takes the plain, unconditional `cp -r`.
+
 ### b. `copy` — files already on the shared mount → `HandleRegularFile` (`localization_mode == "local"`)
 
 Typically an upstream task's output. The worker uploads it from where it already lives, adding
@@ -325,18 +367,48 @@ The mount block runs per bucket (`base.py:1885`), driven by these exports:
 
 Order matters, and each step exists because of a specific failure:
 
-1. **Clear a stale FUSE endpoint.** A job that finished on this node moments ago may have
+1. **Create both lock files, beside the mountpoint, before any locking.** `CANINE_BUCKETMOUNT_LOCK`
+   (the long-lived busy-lock, step 6 below) and `CANINE_BUCKETMOUNT_MOUNTLOCK` (the short-lived
+   setup-race lock, step 2) are two *separate* files, each created as root (the parent dir may
+   still be root-owned from a prior bucket's first `mkdir`) and immediately `chown`'d to the
+   invoking user, so later plain (non-`sudo`) opens can succeed. Both `mkdir -p` and repeated
+   `touch`/`chown`-to-the-same-owner are safe under unsynchronized concurrent execution, so this
+   step itself needs no lock (`base.py:1919-1923`).
+
+2. **Acquire the mount-setup lock** (`flock -x -w 300 200 ... ) 200>$CANINE_BUCKETMOUNT_MOUNTLOCK`,
+   wrapping steps 3-5 below). Shards of the same scatter job routinely start on the same node in
+   the same instant; without serialization, several independently see "not mounted yet" and race
+   to run `gcsfuse` on the identical path concurrently. Confirmed live: every racing shard failed,
+   with `fusermount3` reporting *"the user doesn't have write-access on the mount point: read-only
+   file system"* — a symptom of the race, not of the mountpoint's real permissions or a stale
+   mount. This must be a **separate** file from `CANINE_BUCKETMOUNT_LOCK`: that one is held shared
+   for a whole job's lifetime by every shard already using the mount (step 7), so an exclusive lock
+   on it would block a newly-arriving shard behind every already-running shard on the node for as
+   long as *their* jobs take, not just this brief setup race. No shard holds
+   `CANINE_BUCKETMOUNT_MOUNTLOCK` past this subshell, so contention is only ever with other shards
+   currently in this same race (`base.py:1949-1950,2006`).
+
+   `-w` is a defensive bound against a holder that's genuinely hung, not a way to cap normal
+   contention — the lock is scoped to the holder's own subshell fd, so it's released automatically
+   the instant that process exits for any reason, including a crash or preemption, meaning there's
+   no scenario where it's stuck held forever. It errs generous (300s) rather than tight: an earlier
+   90s bound was itself confirmed live to be too short — one shard among just 8 contenders on one
+   node still timed out, even though a sibling shard on the same node mounted the same bucket in
+   under a second moments earlier. `flock` gives no fairness guarantee among waiters, so real wait
+   times under ordinary contention can run well past what any single mount's own duration suggests.
+
+3. **Clear a stale FUSE endpoint.** A job that finished on this node moments ago may have
    unmounted this same path. Every subsequent operation on it — `stat`, `mkdir`, even `flock` —
    then fails with `ENOTCONN`/`EACCES` rather than `ENOENT`, so it has to be cleared before the
-   path is touched at all (`base.py:1918`).
+   path is touched at all (`base.py:1974`).
 
-2. **`mkdir` + `chown` to the invoking user.** The mountpoint must be writable by whoever runs
+4. **`mkdir` + `chown` to the invoking user.** The mountpoint must be writable by whoever runs
    gcsfuse; `fusermount3` refuses otherwise. Deliberately *not* fixed with `sudo gcsfuse`:
    mounting as the invoking user keeps it readable without `-o allow_other`, and podman maps the
    task container's root to this same UID (`wolf/task.py` `--uidmap`), so the task container can
    read it too.
 
-3. **Mount read-only**, if not already mounted:
+5. **Mount read-only**, if not already mounted:
 
    ```bash
    timeout -k 60 60 gcsfuse -o ro --implicit-dirs <bucket> /mnt/bucketmounts/<bucket>
@@ -344,31 +416,32 @@ Order matters, and each step exists because of a specific failure:
 
    The **whole bucket** is mounted; each input's object path lives in its symlink, so one gcsfuse
    process serves every input from that bucket. Unlike a RODISK there's no cross-node attach race
-   to guard — gcsfuse supports many concurrent read-only mounts — so it's a plain "mount if not
-   mounted" with no backoff. gcsfuse resolves credentials via ADC and does **not** read
-   `CLOUDSDK_CONFIG`, so `GOOGLE_APPLICATION_CREDENTIALS` is pointed explicitly at the
-   credentials the image stages (`base.py:1952`); without this the authenticating identity
+   to guard — gcsfuse supports many concurrent read-only mounts — so once mounted, every shard
+   reads from it fully concurrently for the rest of its run (step 2's lock only serializes getting
+   to that point, not any of the actual work). gcsfuse resolves credentials via ADC and does
+   **not** read `CLOUDSDK_CONFIG`, so `GOOGLE_APPLICATION_CREDENTIALS` is pointed explicitly at the
+   credentials the image stages (`base.py:2001`); without this the authenticating identity
    depends on whatever ADC happens to resolve to.
 
-4. **Reachability check** (`bucketmount_reachability_check()`, `base.py:1435`). Every input
+6. **Reachability check** (`bucketmount_reachability_check()`, `base.py:1435`). Every input
    symlink pointing into this mount must resolve, or `exit 5`. A mounted-but-empty bucket is
    gcsfuse's nastiest failure mode: the mount succeeds, `mountpoint -q` passes, and reads come
    back ENOENT far from the cause. Two ways to land there — the objects were never written, or
    this node already had the bucket mounted from *before* they were and its metadata cache is
    stale.
 
-5. **Take the busy-lock.** `flock -os <lock> sleep infinity &`, pid recorded. This is not a
+7. **Take the busy-lock.** `flock -os <lock> sleep infinity &`, pid recorded. This is not a
    cross-node attach race — it stops a concurrent job on the *same node* from having the mount
    pulled out from under it by another job's teardown. The lock file lives **beside** the
    mountpoint, not inside it: locking the mountpoint directory itself (as this once did) puts the
    lock inside the thing it protects, so after any unmount `flock` cannot even open the path and
-   the teardown guard silently stops guarding (`base.py:1928`).
+   the teardown guard silently stops guarding (`base.py:2015`).
 
-6. **Register the mount lease** (§7).
+8. **Register the mount lease** (§7).
 
-7. **Start the heartbeat** (§7).
+9. **Start the heartbeat** (§7).
 
-Steps 4–7 sit **outside** the "mount if not already mounted" conditional. A job landing on a node
+Steps 6–9 sit **outside** the "mount if not already mounted" conditional. A job landing on a node
 where the bucket is already mounted does no mounting itself, but is every bit as much a consumer.
 
 ---
@@ -516,5 +589,6 @@ Normally you don't need this task at all.
 give-up, because every cause here is transient or node-local.
 
 **Tests:** `canine/test/test_localizer_bucket_upload_pure.py` (bucket naming, layout, state
-machine, upload plan), `canine/test/test_localizer_reachability_pure.py` (reachability, leases,
-heartbeat), `canine/test/test_rapid_cache_pure.py`. All pure — no cluster, no GCP credentials.
+machine, upload plan, and `TestContentEncoding` for the gzip decompress-on-copy branch above),
+`canine/test/test_localizer_reachability_pure.py` (reachability, leases, heartbeat),
+`canine/test/test_rapid_cache_pure.py`. All pure — no cluster, no GCP credentials.

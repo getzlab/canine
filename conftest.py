@@ -30,12 +30,12 @@ for _mod in _STUB_MODULES:
     if _mod not in sys.modules:
         sys.modules[_mod] = MagicMock()
 
-# slurm_gcp_docker runs `docker pull` in its setup.py, so it can't just be pip
-# installed locally -- but it also needs to be a real (if empty) package, not a
-# bare MagicMock: canine.backends.dockerTransient does `from slurm_gcp_docker.
-# test_controller_environment import check_all`, and Python's import machinery
-# can't resolve a submodule import through a MagicMock stand-in -- it requires
-# an actual package with __path__.
+# slurm_gcp_docker needs to be a real (if empty) package, not a bare MagicMock:
+# canine.backends.dockerTransient does `from slurm_gcp_docker.test_controller_environment
+# import check_all`, and Python's import machinery can't resolve a submodule import
+# through a MagicMock stand-in -- it requires an actual package with __path__.
+# (slurm_gcp_docker also runs `docker pull` in its own setup.py, so it can't just be
+# pip-installed locally either.)
 if "slurm_gcp_docker" not in sys.modules:
     _slurm_gcp_docker = types.ModuleType("slurm_gcp_docker")
     _slurm_gcp_docker.__path__ = []

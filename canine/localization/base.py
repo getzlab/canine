@@ -1420,14 +1420,69 @@ class AbstractLocalizer(abc.ABC):
                 # *source* may be requester-pays even though our bucket is not.
                 # A directory source is copied into its parent: `cp -r gs://a/d
                 # gs://B/k/d` would otherwise produce gs://B/k/d/d/...
-                dest = os.path.dirname(item.dest) + "/" if getattr(item.fh, "is_dir", False) else item.dest
-                uploads.append(
-                  '    gcloud storage cp -r -n{rp} --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
-                    rp = item.fh.rp_string,
-                    src = shlex.quote(item.fh.path),
-                    dst = shlex.quote(dest),
-                  )
+                is_dir = getattr(item.fh, "is_dir", False)
+                dest = os.path.dirname(item.dest) + "/" if is_dir else item.dest
+                plain_cp = '    gcloud storage cp -r -n{rp} --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
+                  rp = item.fh.rp_string, src = shlex.quote(item.fh.path), dst = shlex.quote(dest),
                 )
+                if is_dir:
+                    # Not handled below: checking/decompressing every object under
+                    # a directory source individually is real work with no known
+                    # need for it yet (every case found live has been a single
+                    # reference file, never a gzip-transport-encoded directory
+                    # tree) -- left as the original plain copy rather than a
+                    # speculative, unvalidated attempt at the recursive case.
+                    uploads.append(plain_cp)
+                else:
+                    # A gs:// source object can carry Content-Encoding: gzip as
+                    # transport metadata -- meaning it's meant to be served
+                    # transparently decompressed, the way a web server gzips an
+                    # HTML response in transit while the browser shows plain
+                    # text. `cp -r`'s server-side rewrite preserves that metadata
+                    # (and the still-compressed bytes) onto the destination
+                    # verbatim, unchanged.
+                    #
+                    # Every reader of this bucket -- gcsfuse's bucket-mount, and
+                    # confirmed live even `gcloud storage cat`/`gsutil cat`
+                    # directly -- gets the raw compressed bytes back rather than
+                    # the promised transparent decompression (GCS's own
+                    # decompressive transcoding does not reliably apply to these
+                    # client libraries' own downloads). A consumer with no
+                    # gzip-awareness of its own -- e.g. GATK opening a plain-text
+                    # reference .dict directly -- has no way to know it needs to
+                    # gunzip anything first. Confirmed live: exactly this,
+                    # reported by GATK as "Failed to load reference dictionary"
+                    # with nothing pointing at Content-Encoding as the cause.
+                    #
+                    # Merely clearing the Content-Encoding metadata afterward
+                    # (tried first, live) does not fix this -- it only removes
+                    # the tag that would have triggered transcoding for a
+                    # request that doesn't disable it, while the object's
+                    # physically stored bytes remain compressed regardless. The
+                    # only reliable fix is to materialize the actual decompressed
+                    # bytes here: download (always raw, per the above), gunzip,
+                    # and upload that as fresh content with no encoding tag at
+                    # all -- so nothing downstream has to guess.
+                    #
+                    # Cost: this trades a free server-side rewrite for a real
+                    # download+reupload through this VM, but only for the rare
+                    # object that actually carries this tag -- every ordinary
+                    # gs:// source (no Content-Encoding) still gets the fast
+                    # path below untouched.
+                    # rp_string on describe/cat too -- the source may be
+                    # requester-pays regardless of which branch is taken.
+                    uploads += [
+                      '    if [ "$(gcloud storage objects describe{rp} {src} --format="value(content_encoding)" 2>/dev/null)" == "gzip" ]; then'.format(
+                        rp = item.fh.rp_string, src = shlex.quote(item.fh.path)),
+                      '      CANINE_DECOMP_TMP=$(mktemp)',
+                      '      gcloud storage cat{rp} {src} | gunzip > "$CANINE_DECOMP_TMP"'.format(
+                        rp = item.fh.rp_string, src = shlex.quote(item.fh.path)),
+                      '      gcloud storage cp -n --custom-time="$CANINE_BUCKET_CT" "$CANINE_DECOMP_TMP" {dst}'.format(dst = shlex.quote(dest)),
+                      '      rm -f "$CANINE_DECOMP_TMP"',
+                      '    else',
+                      plain_cp,
+                      '    fi',
+                    ]
             elif item.kind == "copy":
                 # Already a file on the shared mount -- typically an upstream
                 # task's output. The worker uploads it from where it already
@@ -1441,6 +1496,11 @@ class AbstractLocalizer(abc.ABC):
                 # os.path.ismount says no). A worker that genuinely cannot read
                 # the file gets a precise "No such file or directory" from the
                 # cp below, which beats a heuristic that rejects valid inputs.
+                #
+                # No Content-Encoding concern here unlike "server_side" above:
+                # this uploads fresh bytes from a local/shared-mount file, not a
+                # server-side rewrite of an existing GCS object, so there's no
+                # pre-existing object metadata for `cp` to inherit.
                 dest = os.path.dirname(item.dest) + "/" if os.path.isdir(item.fh.path) else item.dest
                 uploads.append(
                   '    gcloud storage cp -r -n --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
@@ -2128,6 +2188,74 @@ class AbstractLocalizer(abc.ABC):
 
               'echo "INFO: Mounting bucket ${CANINE_BUCKETMOUNT} ..." >&2',
 
+              # The busy-lock lives OUTSIDE the mount, as a plain file beside it.
+              # Locking the mountpoint directory itself (as this used to) puts the
+              # lock inside the very thing it protects: once any job unmounts,
+              # the fd is invalid and flock cannot even open the path, so the
+              # teardown guard silently stops guarding.
+              #
+              # Created (as root, since the parent dir may still be root-owned
+              # from a prior bucket's first mkdir) and handed to the invoking
+              # user here, before any locking, since these two lines are
+              # themselves safe under unsynchronized concurrent execution:
+              # `mkdir -p`/repeated `touch`/`chown`-to-the-same-owner are all
+              # idempotent no-ops when raced by multiple shards on the same
+              # node, so nothing below needs a lock held for them.
+              #
+              # CANINE_BUCKETMOUNT_MOUNTLOCK is a SEPARATE file from
+              # CANINE_BUCKETMOUNT_LOCK (below), not just a differently-named
+              # handle on the same one: CANINE_BUCKETMOUNT_LOCK is held
+              # shared, for a whole job's lifetime, by every shard already
+              # using this mount (`flock -os ... sleep infinity &`, further
+              # down) -- an exclusive lock on that same file would block a
+              # newly-starting shard behind every already-running shard on
+              # this node for as long as THEIR jobs take, not just the brief
+              # mount-setup race this is actually meant to serialize.
+              "sudo mkdir -p $(dirname ${CANINE_BUCKETMOUNT_DIR})",
+              "CANINE_BUCKETMOUNT_LOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).lock",
+              "sudo touch ${CANINE_BUCKETMOUNT_LOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_LOCK}",
+              "CANINE_BUCKETMOUNT_MOUNTLOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).mountlock",
+              "sudo touch ${CANINE_BUCKETMOUNT_MOUNTLOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_MOUNTLOCK}",
+
+              # Multiple shards of the same scatter job routinely start on the
+              # same node in the same instant, and each independently checks
+              # "is this already mounted?" -- everything from here through the
+              # gcsfuse invocation must run under this lock so only one shard
+              # ever actually mounts; every other shard just waits briefly here,
+              # then finds mountpoint -q already true once it gets the lock.
+              # This only serializes that brief setup race, not any actual job
+              # work -- once mounted, every shard reads from the same mount
+              # fully concurrently for the rest of its run. No shard ever
+              # holds CANINE_BUCKETMOUNT_MOUNTLOCK past this subshell, so a
+              # fresh shard's exclusive acquisition here only ever contends
+              # with other shards currently IN this same setup race, never
+              # with ones already past it and running their own job -- and
+              # since the lock is scoped to this subshell's own fd, it's
+              # released automatically the instant the holder exits for any
+              # reason, including a crash or preemption, so there's no
+              # scenario where it's held forever by a dead process. -w is
+              # purely a defensive bound against a holder that's genuinely
+              # still alive but hung; it is NOT there to bound normal
+              # contention, so it errs generous rather than tight.
+              #
+              # Confirmed live: without this lock, several shards starting
+              # together on one node raced to run gcsfuse on the identical
+              # path concurrently, and every one of them failed --
+              # fusermount3 reported "the user doesn't have write-access on
+              # the mount point: read-only file system" for all of them,
+              # which has nothing to do with the mountpoint's real permissions
+              # or a stale mount; it's what a racing concurrent mount attempt
+              # looks like from the losing side. Also confirmed live: an
+              # earlier, tighter 90s bound was itself too tight -- one shard
+              # among just 8 contenders on one node still timed out waiting,
+              # even though another shard on the same node mounted the same
+              # bucket in under a second, moments earlier. flock gives no
+              # fairness guarantee among waiters, so real wait times under
+              # ordinary contention can run well past what a single mount's
+              # own duration would suggest.
+              "(",
+              'flock -x -w 300 200 || { echo "ERROR: timed out waiting for bucketmount lock" >&2; exit 1; }',
+
               # The mountpoint must be WRITABLE BY THE USER THAT RUNS gcsfuse.
               # fusermount3 refuses otherwise ("the user doesn't have
               # write-access on the mount point: permission denied"), and
@@ -2160,14 +2288,6 @@ class AbstractLocalizer(abc.ABC):
               "fi",
               "sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_DIR}",
 
-              # The busy-lock lives OUTSIDE the mount, as a plain file beside it.
-              # Locking the mountpoint directory itself (as this used to) puts the
-              # lock inside the very thing it protects: once any job unmounts,
-              # the fd is invalid and flock cannot even open the path, so the
-              # teardown guard silently stops guarding.
-              "CANINE_BUCKETMOUNT_LOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).lock",
-              "sudo touch ${CANINE_BUCKETMOUNT_LOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_LOCK}",
-
               # unlike RODISK, mounting has no cross-node attach race to
               # protect against: gcsfuse supports many concurrent read-only
               # mounts of the same bucket/prefix, so we can just mount if
@@ -2183,12 +2303,14 @@ class AbstractLocalizer(abc.ABC):
               # depends on whatever ADC happens to resolve to (metadata-server
               # SA vs. the copied user credentials), which silently works in
               # one project and fails in another. Mirrors the rclone path in
-              # backends/dockerTransient.py.
+              # backends/dockerTransient.py. Scoped to this subshell only --
+              # nothing else in this script reads GOOGLE_APPLICATION_CREDENTIALS.
               'if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${CLOUDSDK_CONFIG}/application_default_credentials.json" ]; then export GOOGLE_APPLICATION_CREDENTIALS=${CLOUDSDK_CONFIG}/application_default_credentials.json; fi',
               "timeout -k 60 60 gcsfuse -o ro --implicit-dirs ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
               "fi",
 
               'mountpoint -q ${CANINE_BUCKETMOUNT_DIR} || { echo "ERROR: Bucket mount did not appear!" >&2; exit 1; }',
+              ") 200>${CANINE_BUCKETMOUNT_MOUNTLOCK} || exit 1",
 
             ] + self.bucketmount_reachability_check() + [
 
