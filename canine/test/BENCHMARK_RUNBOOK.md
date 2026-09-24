@@ -1876,12 +1876,14 @@ pdl sweep --url "$GDC_URL" --size $GDC_SIZE --md5 "$GDC_MD5" \
           --dest-dir /mnt/rwdisks/$DISK --connections 8 --json /tmp/gdc.json
 ```
 
-> **This sweep has never been run.** The GDC numbers elsewhere in this runbook (13.85× at
-> 16 connections) are the GDC *S3* endpoint through presigned URLs. The GDC API itself
-> differs in two ways, measured in update_localization.md §13.72. It answers HEAD with 400,
-> and its 206s carry `Content-Range: 0-0/N` with no `bytes ` unit. Before that section's
-> fix, the second one sent every GDC-API download down the single stream. Check the
-> `k9pdl-streams` line to confirm the sweep is actually parallel.
+> The GDC numbers elsewhere in this runbook (13.85× at 16 connections) are the GDC *S3*
+> endpoint through presigned URLs. The GDC API itself differs in two ways, measured in
+> update_localization.md §13.72. It answers HEAD with 400, and its 206s carry
+> `Content-Range: 0-0/N` with no `bytes ` unit. Before that section's fix, the second one
+> sent every GDC-API download down the single stream. **Measured since** (§13.73, 12 GiB
+> prefix to tmpfs): 16.0 MiB/s single-stream, 145 MiB/s at 16 connections (9.24×), held back
+> by a 1.1-1.7 s time to first byte on every request. Check the `streams` line to confirm a
+> sweep is actually parallel.
 
 `hash = ok` is the whole result. A `BAD` here is a release blocker. A `-` means nothing was
 verified — check the `verify:` line at the top of the output, because an unverified pass

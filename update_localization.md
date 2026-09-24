@@ -5439,3 +5439,54 @@ the position; it now checks both, like `HttpSource`. Against the real GDC API af
 probe passes, a 16-byte mid-object range reads correctly, and a wrong expected size is still
 rejected. A parallel throughput run is left for a node: the data is controlled access, and a
 laptop is not the place for it.
+
+### 13.73 Throughput from the GDC API and from DRS, measured
+
+§13.72 fixed the GDC API's unit-less `Content-Range`, and checked the DRS route only at plan
+time. Both sources were then swept on a node. The object is the same 324.75 GiB TCGA WGS BAM,
+the node is n1-standard-8 in us-east1-b, and each run fetches a 12 GiB prefix to a tmpfs, so
+no disk is in the path (the runbook's §6.1 method). A throughput-only run, so no md5.
+
+| connections | GDC API | streams | DRS → AWS S3 (presigned) | streams |
+|---|---|---|---|---|
+| 1 (curl) | 16.01 MiB/s | — | 67.70 MiB/s | — |
+| 4 | 38.23 | 2.75 of 4 | 206.21 | 3.24 of 4 |
+| 8 | 72.72 | 5.27 of 8 | 415.98 | 6.45 of 8 |
+| 12 | 111.81 | 8.03 of 12 | 467.40 | 10.12 of 12 |
+| 16 | **145.04** | 11.40 of 16 | **490.73** | 14.06 of 16 |
+| speedup | **9.24×**, no knee | | **7.43×**, knee at 12 | |
+
+`wire` was 1.00-1.05× on every row, so nothing was fetched twice.
+
+Time to first byte, from eight 1-byte ranged GETs at spread offsets:
+
+| | connect | TLS done | first byte |
+|---|---|---|---|
+| GDC API | 0.027 s | 0.14 s | **1.1-1.7 s** |
+| S3 presigned | 0.024 s | 0.09 s | 0.27-0.38 s |
+
+**Why the GDC API is known as the slow source.** Its per-stream rate is not the cause: 16 MiB/s
+is what GDC's own S3 endpoint gave per stream as well (the runbook's 16.42 MiB/s).
+
+* **The per-request wait.** The API spends 1.2-1.5 s on each request before sending anything,
+  presumably authorization. At ~14 MiB/s a 64 MiB chunk streams in ~4.6 s, so ~23% of every
+  request is dead time. That predicts an effective concurrency of ~0.77; the sweep measured
+  0.71. S3's ~0.2 s wait costs it far less (0.88).
+* **Every download used to be a single stream.** Before §13.72 the downloader fell back to one
+  stream for every GDC API download. That meant 16 MiB/s against AWS S3's 68 MiB/s, and
+  against sources that were getting their parallel speedup.
+
+Fixed, the GDC API reaches 145 MiB/s, and was still climbing at `MAX_CONNECTIONS`.
+
+**Larger chunks would help it most, not tested.** At 256 MiB the dead time would fall to ~7%.
+`download_min_chunk` is global and feeds `plan_id`, so this is not a per-source switch. It
+would need measuring before any default changed.
+
+**DRS through DCF is AWS S3, and it is fast.** 67.7 MiB/s on a single stream already exceeds
+the pd-standard localization disk's sustained 44-88 MiB/s. For `LocalizeToDisk` from this
+source, then, parallelism buys little. For fast destinations (the bucket route, NFS) it rises
+to ~490 MiB/s, flattening past 12 connections at an aggregate ceiling not investigated here.
+
+**Credentials.** The GDC token and the presigned URL lived on the node only as 0600 files, read
+at run time and deleted afterwards. Every result file was checked for them before leaving the
+node.
