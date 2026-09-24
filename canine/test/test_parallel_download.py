@@ -2707,3 +2707,76 @@ class TestAContentRangeWithoutItsUnit:
             stream = source.open_range(MIB, MIB + 16)
             assert stream.read(16) == payload[MIB:MIB + 16]
             stream.close()
+
+
+class TestSizeScaledChunks:
+    """
+    size / TARGET_CHUNKS, clamped to [min_chunk, MAX_CHUNK] (§13.75). Measured on the GDC
+    API, whose per-request wait makes 64 MiB chunks cost 28% at 16 connections and 57% at 8.
+    """
+
+    GIB = 1024 * MIB
+
+    @pytest.mark.parametrize("size, chunk", [
+        (100 * MIB, 64 * MIB),            # the floor
+        (2 * 1024 * MIB, 64 * MIB),       # 2 GiB / 32 = 64 MiB exactly
+        (8 * 1024 * MIB, 256 * MIB),
+        (32 * 1024 * MIB, 1024 * MIB),    # the cap is reached at 32 GiB
+        (348693812393, 1024 * MIB),       # the 324.75 GiB BAM: 325 chunks, not 32
+    ])
+    def test_the_chunk_scales_with_the_object(self, size, chunk):
+        chunks = pdl.plan_chunks(size, 16, pdl.DEFAULT_MIN_CHUNK)
+        assert chunks[0][1] - chunks[0][0] == chunk
+        assert chunks[-1][1] == size
+
+    def test_above_the_cap_the_count_grows_instead(self):
+        assert len(pdl.plan_chunks(348693812393, 16, pdl.DEFAULT_MIN_CHUNK)) == 325
+
+    def test_the_layout_ignores_connections(self):
+        """plan_id is derived from it, and a requeue may land on a different node."""
+        size = 100 * self.GIB + 12345
+        layouts = {tuple(pdl.plan_chunks(size, k, pdl.DEFAULT_MIN_CHUNK)) for k in (1, 4, 8, 16)}
+        assert len(layouts) == 1
+
+    def test_a_larger_min_chunk_still_wins(self):
+        assert pdl.chunk_size_for(4 * self.GIB, 2 * self.GIB) == 2 * self.GIB
+
+    def test_max_equal_to_min_pins_the_old_fixed_layout(self):
+        chunks = pdl.plan_chunks(100 * self.GIB, 16, 64 * MIB, max_chunk=64 * MIB)
+        assert chunks[0][1] == 64 * MIB and len(chunks) == 1600
+
+    def test_chunks_still_snap_to_whole_multipart_parts(self):
+        part = 29 * MIB
+        chunks = pdl.plan_chunks(100 * self.GIB, 16, pdl.DEFAULT_MIN_CHUNK, part_length=part)
+        width = chunks[0][1] - chunks[0][0]
+        assert width % part == 0 and width >= pdl.MAX_CHUNK
+        assert width - part < pdl.MAX_CHUNK, "snapped up by less than one part"
+
+    def test_the_cap_changes_the_plan_id(self):
+        """A different layout must never resume against another's manifest."""
+        size = 100 * self.GIB
+        ids = {pdl.compute_plan_id("u", size, None,
+                                   pdl.plan_chunks(size, 16, 64 * MIB, max_chunk=m)[0][1])
+               for m in (64 * MIB, pdl.MAX_CHUNK)}
+        assert len(ids) == 2
+
+    def test_max_chunk_reaches_the_downloader(self, tmp_path):
+        """64 MiB with a 1 MiB floor: the rule plans 32 x 2 MiB; a 1 MiB cap plans 64."""
+        payload = os.urandom(64 * MIB)
+        counts = {}
+        for cap in (None, MIB):
+            dest = str(tmp_path / "o{}.bin".format(cap))
+            extra = ["--connections", 8, "--min-chunk", MIB]
+            if cap:
+                extra += ["--max-chunk", cap]
+            with Server(payload) as server:
+                proc = run_downloader(server.url(), dest, len(payload), *extra)
+            assert proc.returncode == 0, proc.stderr
+            assert open(dest, "rb").read() == payload
+            counts[cap] = int(re.search(r"\((\d+) chunks, ", proc.stderr).group(1))
+        assert counts == {None: 32, MIB: 64}
+
+    def test_the_benchmark_passes_the_cap_through(self):
+        import inspect
+        import benchmark_localization as bench
+        assert "--max-chunk" in inspect.getsource(bench.run_download)

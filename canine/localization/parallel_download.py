@@ -161,6 +161,21 @@ DECODE_SLICE_BYTES = 32 * 1024 * 1024
 DEFAULT_DECODE_QUEUE_SLICES = 8
 DEFAULT_MIN_CHUNK = 64 * 1024 * 1024
 
+# The chunk size scales with the object: size / TARGET_CHUNKS, clamped to
+# [min_chunk, MAX_CHUNK]. Every request pays a fixed cost before its first byte -- measured
+# at 1.1-1.7 s on the GDC API idle and ~2.6 s under load, 0.3 s on S3 -- so fewer, larger
+# requests win on a large object, while a small one still needs enough chunks to keep every
+# connection busy. Fixed at 64 MiB the GDC API ran at 67% of its best on a 325 GiB object;
+# this rule stays within 88% at every size from 1 to 325 GiB on both sources (§13.75).
+#
+# 32 is nearly gcloud's composite-UPLOAD rule (50 MiB components, at most 32 of them). The
+# cap is what differs, and what matters: a large object stays a QUEUE of many chunks (325
+# for a 325 GiB BAM, not 32 of 10 GiB), and the queue is what absorbs a straggling
+# connection. gcloud's download shape -- one slice per thread -- has no queue at all.
+#
+# Chunk size may depend on the object's size and nothing else; see plan_chunks.
+TARGET_CHUNKS = 32
+MAX_CHUNK = 1024 * 1024 * 1024
 
 # Chunk boundaries are aligned to this so that every chunk start is also block-aligned
 # on any plausible filesystem. Without it, adjacent chunks share a partial block and
@@ -309,12 +324,28 @@ def align_up(value, alignment):
     return ((value + alignment - 1) // alignment) * alignment
 
 
-def plan_chunks(size, connections, min_chunk, part_length=None):
+def chunk_size_for(size, min_chunk=DEFAULT_MIN_CHUNK, max_chunk=MAX_CHUNK):
+    """
+    The size-scaled chunk: size / TARGET_CHUNKS, clamped to [min_chunk, max_chunk].
+
+    `min_chunk` wins if the two bounds cross, so a caller asking for bigger chunks than the
+    cap still gets them. `max_chunk == min_chunk` pins a fixed size, which is how the old
+    fixed-64 MiB layout is reproduced for comparison.
+    """
+    target = -(-int(size) // TARGET_CHUNKS) if size > 0 else 0
+    return max(max(1, int(min_chunk)), min(int(max_chunk), target))
+
+
+def plan_chunks(size, connections, min_chunk, part_length=None, max_chunk=MAX_CHUNK):
     """
     Split `size` into even-sized chunks (with a possibly-shorter tail).
 
+    The chunk size scales with the object (chunk_size_for): size / TARGET_CHUNKS, clamped
+    to [min_chunk, max_chunk]. So an object under 2 GiB keeps 64 MiB chunks, and larger
+    ones grow toward 1 GiB.
+
     `connections` is accepted but deliberately IGNORED for the layout, which depends
-    only on `size`, `min_chunk` and `part_length`. This is a hard requirement, not a
+    only on `size`, `min_chunk`, `max_chunk` and `part_length`. This is a hard requirement, not a
     simplification: `plan_id` is derived from the chunk size, so if the layout moved
     with the connection count then a requeued task landing on a differently-configured
     node would compute a different `plan_id`, discard a perfectly good partial file,
@@ -324,11 +355,12 @@ def plan_chunks(size, connections, min_chunk, part_length=None):
     This diverges from the original design sketch, which had
     `n_chunks = clamp(ceil(size / min_chunk), 1, connections)` -- that formula makes the
     layout connection-dependent and contradicts the resumability requirement it appears
-    alongside. Fixing the chunk size at `min_chunk` instead yields more, smaller chunks
-    for a large object (a 50 GB object becomes 800 x 64 MiB rather than 8 x 6.4 GB),
-    which is also better in its own right: finer resume granularity, and the worker pool
-    load-balances over a queue instead of each thread owning one huge range. The extra
-    per-request overhead is why `min_chunk` is 64 MiB to begin with.
+    alongside. Scaling with the SIZE instead keeps the layout stable and still yields a
+    queue much longer than the connection count (a 50 GB object becomes 47 x 1 GiB rather
+    than 8 x 6.4 GB), so the worker pool load-balances instead of each thread owning one
+    huge range. Resume granularity does not depend on the chunk size at all: both routes
+    resume inside a chunk. What larger chunks buy is fewer requests, each paying a fixed
+    wait before its first byte; that is the whole reason they grow (see TARGET_CHUNKS).
 
     When `part_length` is given (an S3 multipart object whose ETag is an md5-of-md5s),
     boundaries snap to whole parts so the ETag can be computed incrementally during the
@@ -339,13 +371,13 @@ def plan_chunks(size, connections, min_chunk, part_length=None):
     if size == 0:
         return [(0, 0)]
 
-    min_chunk = max(1, int(min_chunk))
+    target = chunk_size_for(size, min_chunk, max_chunk)
 
     if part_length:
         # every chunk must span whole parts, so snap up to a multiple of part_length
-        chunk_size = max(part_length, align_up(min_chunk, part_length))
+        chunk_size = max(part_length, align_up(target, part_length))
     else:
-        chunk_size = align_up(min_chunk, CHUNK_ALIGN)
+        chunk_size = align_up(target, CHUNK_ALIGN)
 
     chunk_size = max(1, min(chunk_size, size))
 
@@ -4682,7 +4714,8 @@ def run(options):
     log("route {}: {}".format(decision.route, decision.reason))
 
     chunks = plan_chunks(size, options.connections, options.min_chunk,
-                         options.part_length)
+                         options.part_length,
+                         max_chunk=getattr(options, "max_chunk", None) or MAX_CHUNK)
     if getattr(source, "whole_object_only", False):
         # The source cannot range, so N chunks would be N whole-object reads -- each
         # billed as the whole object. One chunk, one stream.
@@ -4919,6 +4952,9 @@ def build_parser():
                         help="simultaneous ranged GETs (0/1 = single stream)")
     parser.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK,
                         dest="min_chunk", help="smallest chunk worth its own request")
+    parser.add_argument("--max-chunk", type=int, default=MAX_CHUNK, dest="max_chunk",
+                        help="largest chunk the size-scaled layout may choose; equal to "
+                             "--min-chunk pins a fixed size")
     parser.add_argument("--commit-linger", dest="commit_linger", type=float,
                         default=COMMIT_LINGER_SECONDS,
                         help="seconds the manifest writer waits for more chunk "

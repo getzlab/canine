@@ -1036,7 +1036,7 @@ def _drain_stderr(stream, sink, echo_every=HEARTBEAT_INTERVAL, out=None,
 
 
 def run_download(source, dest, size, connections, min_chunk, extra=(), verification=None,
-                 kill_after_bytes=None):
+                 kill_after_bytes=None, max_chunk=None):
     """
     One download, measured. Returns a dict of results.
 
@@ -1049,6 +1049,9 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     command = [sys.executable, DOWNLOADER] + list(source) + [
         "--dest", dest, "--size", str(size),
         "--connections", str(connections), "--min-chunk", str(min_chunk)]
+    if max_chunk:
+        # the size-scaled layout's cap; equal to min_chunk pins the old fixed size
+        command += ["--max-chunk", str(max_chunk)]
     if verification is not None:
         command += verification.downloader_args
     command += list(extra)
@@ -1732,7 +1735,8 @@ def command_sweep(args):
 
         outcome = run_download(source_args(args, dest, args.size), dest, args.size,
                                connections, args.min_chunk,
-                               verification=verification)
+                               verification=verification,
+                               max_chunk=getattr(args, "max_chunk", None))
         if outcome["returncode"] == 0 and os.path.exists(dest):
             outcome["verified"], outcome["reread_seconds"] = announce_verification(
                 verification, dest, workers=getattr(args, "verify_workers",
@@ -2700,6 +2704,9 @@ def build_parser():
                        help="where to write; use the localization disk to measure the "
                             "path that matters (default: %(default)s)")
         p.add_argument("--min-chunk", type=int, default=DEFAULT_MIN_CHUNK)
+        p.add_argument("--max-chunk", type=int, default=None,
+                       help="cap on the size-scaled chunk (downloader default 1 GiB); "
+                            "set equal to --min-chunk to reproduce the old fixed layout")
         p.add_argument("--verify-workers", type=int, default=VERIFY_READ_WORKERS,
                        help="readers for the benchmark's own ETag re-read "
                             "(default: %(default)s). More is not better: on a 316 GB "
