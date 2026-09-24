@@ -5070,3 +5070,119 @@ assert-every-anchor lesson into this file earlier in the same session.
 `test_slicing_is_single_copy` asserted on a list appended from the upload threads, so it
 captured *completion* order rather than slice order. It passed by luck at first and
 failed once timing shifted. Rewritten to key by slice name.
+
+### 13.69 Exit-code audit of the bucket route: an infinite requeue, a truncation, and my own race fix
+
+Prompted by the compose race (§13.62): if one GCS call on the two-writer path turned a
+lost race into do-not-retry, the others probably did too. They did, and the audit found
+worse things than exit codes.
+
+Two facts set the terms. **`GcsClient.request` never retries** -- one 5xx, 429 or reset
+raises on the spot -- and **`main` catches `PermanentError` but not `TransientError`**, so
+anything transient that escapes lands in the generic handler and exits 1. And **canine
+requeues a localization exit 5 with no cap**: `orchestrator.py` increments
+`.localization_failure_count` only to subtract it from the preemption limit. So the fix
+could not be a blanket "requeue on any transient" in `main` -- that trades do-not-retry
+for retry-forever. Each site had to be fixed on its own terms.
+
+#### What was wrong, in order of how bad
+
+1. **A deterministic infinite requeue.** A crash after the parts are deleted but before the
+   done marker leaves a manifest claiming every chunk complete. The next attempt skips the
+   relay, finds a part missing, and requeued -- manifest untouched -- so the attempt after
+   saw the identical state, forever, with no cap to stop it. The compose race can produce
+   the same state, since a loser's manifest writer can re-create the manifest after the
+   winner unlinked it. Now the manifest is dropped before that requeue, which converges in
+   one re-download.
+2. **The decoder silently accepted truncated gzip.** `decompressobj` returns what it has
+   and leaves `eof` false rather than raising; `GzipStreamDecoder` never checked. Measured:
+   2615 of 3923 compressed bytes decoded to 1.33 MB of 2 MB with no error, where stdlib
+   `gzip` raises `EOFError`. With an advertised digest the md5 on the compressed sidecar
+   catches it first, which is why nothing noticed; without one, an upstream file cut short
+   by an interrupted upload was published short and exited 0. The in-place route was never
+   affected -- `gzip.open` raises. Now an `IntegrityError`, and a truncated *second*
+   member (a cut-off bgzip file) is caught too.
+3. **My compose-race fix accepted stale objects.** It took any object of the right size as
+   the winner's. An object that predates the attempt is not a race winner's -- a writer
+   finishing earlier would also have deleted the manifest -- so accepting it could report
+   success over whatever an earlier localization left there. Now the object must have been
+   created during this attempt (`timeCreated`, 5 s skew allowance).
+4. **And, found while fixing 3, presence after one's own compose proves nothing.** Without
+   `--gunzip` the compose target is the destination, so post-compose the object there may
+   be this attempt's own unverified compose. Accepting it skipped verification; in the
+   interleaving where a winner's integrity cleanup deletes the object, this attempt
+   re-composes it from still-present parts, and the parts then vanish, it would have
+   reported EXIT_OK on bytes already known to be corrupt. Post-compose lost races now
+   requeue unless `--gunzip`, where the destination is only written after a passing verify.
+5. **Integrity cleanup deleted parts before the corrupt object**, opening a window where a
+   racing writer's compose fails, finds the fresh right-sized corrupt object, and exits 0
+   for it. Reversed. ETag mismatch previously left the corrupt object readable at the
+   destination; it is now cleaned up the same way.
+6. **Verify and decode conflated "wrong bytes" with "gone".** A 404 on a sidecar removed by
+   the winner was reported as corruption and failed the job. `IntegrityError` now carries
+   the distinction: wrong bytes fail, a vanished object goes through the lost-race check.
+7. **Every cleanup delete after success.** A single 503 on deleting part 17 of a composed,
+   verified object exited 1 with no marker. Now best-effort with one retry, orphans logged.
+   A done-marker `OSError` (it is on the gcsfuse mount) likewise no longer fails a finished
+   object.
+8. **A failing writer's `abandon()` deleted the shared slice names** out from under a live
+   writer's compose -- one worker's transient error failing two decodes. It now deletes
+   only on integrity failures; on a retry the next attempt rewrites the same names and
+   removes them itself.
+
+#### Tests
+
+Fifteen new tests, each pinning one site. All ten decisions were mutation-checked, and the
+first pass found one untested: flipping `abandon(delete=False)` at the call site survived
+every test, because the only coverage was a unit test of `abandon` itself. Added an
+end-to-end test; it now fails.
+
+Two of my own test mistakes, recorded because they are the same mistake as §13.61 and
+§13.68: a helper forwarded `check_md5=None`, which `options_for` stringified to
+`--check-md5 None`, so both ETag tests ran the md5 path and one passed for the wrong
+reason. And the fake GCS had no `timeCreated`, so it could not have caught item 3 -- it
+now stamps every write, and an injected object without a stamp reads as stale by default,
+so a test has to opt in to "this just landed".
+
+#### Orphans: first "accepted", then fixed properly
+
+The first draft of this section closed with orphaned slices as "known and accepted, bounded
+by `(width + queue_slices) * 32 MiB`": in the race-won-by-another-writer path,
+`decompress_object` has already given up before the caller learns the race was lost, so the
+caller never sees the slice names. "Bounded" was the wrong test. It is bounded per event and
+unbounded in aggregate -- and `LOCALIZATION.md` makes it worse: the bucket's only deletion
+mechanism is a `daysSinceCustomTime` lifecycle rule, an object with no customTime is
+"invisible to this rule and would never expire" (§3), and "nothing deletes the bucket" (§8).
+**`parallel_download.py` set customTime on nothing it wrote.** Every orphan from any path --
+this one, a cleanup delete that 503'd twice, parts left by a job that hit its retry limit
+mid-relay, extra part indices after a layout change -- was stored and billed forever, removed
+only if some later heartbeat's bucket-wide `objects update` happened to stamp it.
+
+Two fixes:
+
+- **Structural: every object this module creates now carries customTime** -- resumable
+  uploads (parts, slices) in the session-initiation metadata, compose destinations (sidecar,
+  tree intermediates, the final object) in `destination`, and the manifest, which had to move
+  from `uploadType=media` (which cannot carry metadata) to `uploadType=multipart` (still one
+  request, still atomic). The lifecycle rule that already exists is now the backstop for every
+  orphan path, including ones not enumerated here. The final object also no longer depends
+  solely on canine's post-unmount stamp.
+- **Narrow: the slice names travel with the error** (`exc.k9pdl_orphans`), so the lost-race
+  path deletes them immediately instead of leaving them for the lifecycle rule.
+
+Verified against **real GCS**, not just the fake -- the fake only proves the field is sent:
+customTime is present as stored on a resumable-uploaded part, a composed object, and a
+multipart-written manifest, and the manifest body round-trips. Multipart costs **208.6 ms
+median against 205.9 ms** for media on a 22 KB manifest (40 each, interleaved, p90 253 vs
+246 ms) -- inside the noise, and manifest writes are batched on a 2 s linger anyway.
+
+One deliberate behavior change, accepted: a job requeued more than
+`localization_expiry_days` after its last write now finds its parts expired and re-downloads
+(the stale-manifest handling above drops the manifest when parts are missing), where it used
+to reuse them. That is the bound the lifecycle rule already puts on idle storage for
+everything else in the bucket.
+
+Mutation-checked: removing the stamp from any one of the three write paths fails a test, as
+does dropping the orphan hand-off. The multipart boundary's collision check initially
+survived, because a random boundary never collides; a test now forces the first draw to
+equal a boundary present in the body.

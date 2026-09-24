@@ -2301,7 +2301,10 @@ class TestTheBucketRouteDecompresses:
                            gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
 
         def die(*args, **kwargs):
-            raise pdl.PermanentError("test: truncated gzip stream")
+            # IntegrityError, which is what the real decode raises on a corrupt or
+            # truncated stream. A bare PermanentError now means "something this attempt
+            # created has vanished" and takes the lost-race path instead.
+            raise pdl.IntegrityError("test: truncated gzip stream")
 
         monkeypatch.setattr(pdl, "decompress_object", die)
         with Server(body) as source:
@@ -2653,6 +2656,7 @@ class TestLosingTheComposeRace:
         force_bucket_route(monkeypatch)
         gcs.state.objects[OBJECT] = payload          # the winner's completed object
         gcs.state.composite[OBJECT] = 4
+        gcs.state.created[OBJECT] = time.time()      # ...finished during this attempt
         self._lose_the_race(monkeypatch)
         with Server(payload) as source:
             rc = pdl.run(options_for(str(tmp_path / "sample.bam"), source.url(),
@@ -2661,7 +2665,7 @@ class TestLosingTheComposeRace:
         assert rc == pdl.EXIT_OK, (
             "the loser of a compose race returned {}; EXIT_FAIL here is do-not-retry "
             "on a job whose object already exists".format(rc))
-        assert "another writer completed it" in capsys.readouterr().err
+        assert "completed by another writer" in capsys.readouterr().err
         assert gcs.state.objects[OBJECT] == payload, "the loser damaged the winner's object"
 
     def test_the_loser_requeues_when_no_object_landed(self, tmp_path, monkeypatch, gcs,
@@ -2714,6 +2718,372 @@ class TestLosingTheComposeRace:
                                      len(payload), check_md5=payload_md5,
                                      upload_block=pdl.GCS_UPLOAD_GRANULARITY))
         assert rc == pdl.EXIT_REQUEUE, "transient compose failure returned {}".format(rc)
+
+
+class TestRaceAndCleanupExitCodes:
+    """
+    The audit that followed the compose race. `GcsClient.request` does not retry, and
+    `main` catches PermanentError but not TransientError, so any error escaping
+    `run_bucket_route` exits 1 -- do not retry. canine requeues exit 5 with no cap, so the
+    inverse mistake is just as bad: a requeue that sees the same state every time loops
+    forever. Each test here pins one site to the only correct answer.
+    """
+
+    def _run(self, tmp_path, payload, check_md5, **overrides):
+        # check_md5 is only passed when set: options_for stringifies every override, so
+        # None became `--check-md5 None` and the "ETag" tests below ran the md5 path --
+        # one of them passing for the wrong reason, since an md5 mismatch also deletes
+        # the object.
+        if check_md5 is not None:
+            overrides["check_md5"] = check_md5
+        with Server(payload) as source:
+            argv = options_for(str(tmp_path / "sample.bam"), source.url(), len(payload),
+                               upload_block=pdl.GCS_UPLOAD_GRANULARITY, **overrides)
+            assert (argv.check_md5 is None) == (check_md5 is None)
+            return pdl.run(argv)
+
+    def test_a_stale_object_is_not_mistaken_for_a_winner(self, tmp_path, monkeypatch,
+                                                         gcs, payload, payload_md5):
+        """
+        Right size, wrong provenance. An object that existed before this attempt began
+        is not a race winner's -- a winner finishing earlier would have removed the
+        manifest, and this attempt would have composed its own parts. Accepting it
+        would report success over whatever an earlier localization left there.
+        """
+        force_bucket_route(monkeypatch)
+        gcs.state.objects[OBJECT] = b"s" * len(payload)
+        gcs.state.created[OBJECT] = time.time() - 3600
+
+        def gone(*a, **kw):
+            raise pdl.PermanentError("POST .../compose -> HTTP 404")
+
+        monkeypatch.setattr(pdl, "compose_tree", gone)
+        assert self._run(tmp_path, payload, payload_md5) == pdl.EXIT_REQUEUE
+
+    def test_missing_parts_do_not_requeue_forever(self, tmp_path, monkeypatch, gcs,
+                                                  payload, payload_md5):
+        """
+        A crash after the parts are deleted but before the marker leaves a manifest
+        claiming every chunk complete. The next attempt skips the relay, finds a part
+        missing, and requeued with the manifest untouched -- which the attempt after it
+        would see identically, and so on for as long as SLURM keeps scheduling it.
+        Recovery must converge: one requeue that drops the stale manifest, then a clean
+        transfer.
+        """
+        force_bucket_route(monkeypatch)
+        with Server(payload) as source:
+            dest = str(tmp_path / "sample.bam")
+            argv = options_for(dest, source.url(), len(payload), check_md5=payload_md5,
+                               upload_block=pdl.GCS_UPLOAD_GRANULARITY)
+
+            def crash(*a, **kw):
+                raise KeyboardInterrupt("preempted after cleanup, before the marker")
+
+            monkeypatch.setattr(pdl, "write_done_marker", crash)
+            with pytest.raises(KeyboardInterrupt):
+                pdl.run(argv)
+            monkeypatch.undo()
+            patch_client_endpoints(monkeypatch, pdl, gcs)
+            force_bucket_route(monkeypatch)
+            assert MANIFEST_OBJECT in gcs.state.objects, "the crash left no manifest"
+            assert not [n for n in gcs.state.object_names() if ".k9pdl.parts" in n]
+            # Age the object past the race window so it cannot be taken as a winner:
+            # this is the "restarted much later" case, the one that looped.
+            gcs.state.created[OBJECT] = time.time() - 3600
+
+            assert pdl.run(argv) == pdl.EXIT_REQUEUE
+            assert MANIFEST_OBJECT not in gcs.state.objects, (
+                "the stale manifest survived, so every later attempt repeats this one")
+            assert pdl.run(argv) == pdl.EXIT_OK
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+
+    def test_a_failed_cleanup_delete_does_not_fail_a_finished_job(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        """
+        The object is composed and verified; a 503 while deleting a part used to escape
+        as TransientError and exit 1 with no done marker. Leave the orphan instead.
+        """
+        force_bucket_route(monkeypatch)
+        gcs.state.fail_deletes_matching = (".k9pdl.parts",)
+        gcs.state.fail_deletes_remaining = 1000
+        assert self._run(tmp_path, payload, payload_md5) == pdl.EXIT_OK
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+        assert pdl.read_done_marker(pdl.sidecar_paths(str(tmp_path / "sample.bam"))[1])
+
+    def test_a_marker_write_failure_does_not_fail_a_finished_job(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5, capsys):
+        """The marker is on the gcsfuse mount and is an optimisation, not the result."""
+        force_bucket_route(monkeypatch)
+
+        def enospc(*a, **kw):
+            raise OSError(28, "No space left on device")
+
+        monkeypatch.setattr(pdl, "write_done_marker", enospc)
+        assert self._run(tmp_path, payload, payload_md5) == pdl.EXIT_OK
+        assert "the object is complete" in capsys.readouterr().err
+
+    def test_a_transient_verify_failure_requeues(self, tmp_path, monkeypatch, gcs,
+                                                 payload, payload_md5):
+        force_bucket_route(monkeypatch)
+
+        def flaky(*a, **kw):
+            raise pdl.TransientError("GET ... -> HTTP 503")
+
+        monkeypatch.setattr(pdl, "verify_bucket_object", flaky)
+        assert self._run(tmp_path, payload, payload_md5) == pdl.EXIT_REQUEUE
+
+    def test_an_md5_mismatch_deletes_the_object_before_the_parts(
+            self, tmp_path, monkeypatch, gcs, payload):
+        """
+        Parts first opened a window where a racing writer's compose fails, it finds
+        this fresh, right-sized, known-corrupt object, and reports EXIT_OK for it.
+        """
+        force_bucket_route(monkeypatch)
+        assert self._run(tmp_path, payload,
+                         hashlib.md5(b"wrong").hexdigest()) == pdl.EXIT_FAIL
+        order = gcs.state.deleted
+        assert OBJECT in order, "the corrupt object was left at the destination"
+        first_part = min(i for i, n in enumerate(order) if ".k9pdl.parts" in n)
+        assert order.index(OBJECT) < first_part, (
+            "parts were deleted before the corrupt object: {}".format(order[:5]))
+
+    def test_an_etag_mismatch_is_cleaned_up_like_an_md5_one(
+            self, tmp_path, monkeypatch, gcs, payload):
+        """It used to return EXIT_FAIL with the corrupt object readable on the mount."""
+        force_bucket_route(monkeypatch)
+        calls = []
+        monkeypatch.setattr(pdl, "multipart_etag_from_gcs",
+                            lambda *a, **kw: calls.append(1) or ("0" * 32 + "-2", 0))
+        monkeypatch.setattr(pdl, "verify_bucket_object",
+                            lambda *a, **kw: pytest.fail("took the md5 path"))
+        rc = self._run(tmp_path, payload, None, check_etag="f" * 32 + "-2",
+                       part_length=4 * MIB)
+        assert calls, "the ETag path never ran"
+        assert rc == pdl.EXIT_FAIL
+        assert OBJECT not in gcs.state.objects
+
+    def test_an_etag_re_read_of_a_vanished_part_is_a_lost_race(
+            self, tmp_path, monkeypatch, gcs, payload):
+        """Only parts missing a recorded digest are re-read; a gone one was cleaned up."""
+        force_bucket_route(monkeypatch)
+
+        def gone(*a, **kw):
+            raise pdl.PermanentError("GET .../parts/00001 -> HTTP 404")
+
+        monkeypatch.setattr(pdl, "multipart_etag_from_gcs", gone)
+        rc = self._run(tmp_path, payload, None, check_etag="f" * 32 + "-2",
+                       part_length=4 * MIB)
+        assert rc == pdl.EXIT_REQUEUE
+
+    def test_our_own_unverified_compose_is_never_taken_for_a_winner(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        """
+        Without --gunzip the compose target is the destination, so after this attempt
+        composes, a fresh right-sized object is sitting there whoever else exists.
+        Treating it as a winner's would skip verification -- and in the interleaving
+        where a winner's integrity cleanup deletes the object, this attempt re-composes
+        it from still-present parts, and the parts then vanish, it would report EXIT_OK
+        on bytes already known to be corrupt.
+        """
+        force_bucket_route(monkeypatch)
+
+        def vanished(*a, **kw):
+            raise pdl.PermanentError("GET ... -> HTTP 404")
+
+        monkeypatch.setattr(pdl, "verify_bucket_object", vanished)
+        assert self._run(tmp_path, payload, payload_md5) == pdl.EXIT_REQUEUE
+
+    def test_a_quick_restart_does_not_mistake_its_own_last_attempt_for_a_winner(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        """
+        Pins the clock-skew margin. It was five minutes at first, which let an attempt
+        restarted a minute after a requeue accept its own predecessor's object as a
+        racing writer's -- an object whose provenance it cannot check.
+        """
+        force_bucket_route(monkeypatch)
+        gcs.state.objects[OBJECT] = payload
+        gcs.state.created[OBJECT] = time.time() - 60
+
+        def gone(*a, **kw):
+            raise pdl.PermanentError("POST .../compose -> HTTP 404")
+
+        monkeypatch.setattr(pdl, "compose_tree", gone)
+        assert self._run(tmp_path, payload, payload_md5) == pdl.EXIT_REQUEUE
+
+    def test_a_retryable_decode_failure_leaves_the_slices_for_the_next_attempt(
+            self, tmp_path, monkeypatch, gcs, plain_text):
+        """
+        The call-site half of `abandon(delete=...)`, which a unit test of abandon()
+        alone does not reach (a mutation flipping it survived every other test).
+        Deleting shared slice names on a transient failure pulls them out from under a
+        concurrent writer's compose.
+        """
+        real = pdl.compose_tree
+
+        def slices_flaky(client, bucket, destination, parts, **kw):
+            if any(".k9pdl.slice." in n for n in parts):
+                raise pdl.TransientError("compose -> HTTP 503")
+            return real(client, bucket, destination, parts, **kw)
+
+        monkeypatch.setattr(pdl, "compose_tree", slices_flaky)
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        assert self._gunzip(tmp_path, gcs, plain_text) == pdl.EXIT_REQUEUE
+        assert [n for n in gcs.state.object_names() if ".k9pdl.slice." in n], (
+            "a retryable failure deleted the shared slices")
+
+    def _gunzip(self, tmp_path, gcs, plain_text):
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        with Server(body) as source:
+            return pdl.run(gunzip_options(tmp_path, source.url(), body))
+
+    def test_a_sidecar_vanishing_under_verify_is_a_lost_race(
+            self, tmp_path, monkeypatch, gcs, plain_text):
+        """
+        Under --gunzip the winner deletes the sidecar after decoding. A loser verifying
+        it got a 404, called that corruption, and failed the job while the winner's
+        decoded object sat in the bucket.
+        """
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        gcs.state.vanish_on_read = {GZ_SIDECAR}
+        gcs.state.objects[PLAIN_OBJECT] = plain_text
+        gcs.state.created[PLAIN_OBJECT] = time.time()
+        assert self._gunzip(tmp_path, gcs, plain_text) == pdl.EXIT_OK
+        assert gcs.state.objects[PLAIN_OBJECT] == plain_text
+
+    def test_a_sidecar_vanishing_with_no_winner_requeues(
+            self, tmp_path, monkeypatch, gcs, plain_text):
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        gcs.state.vanish_on_read = {GZ_SIDECAR}
+        assert self._gunzip(tmp_path, gcs, plain_text) == pdl.EXIT_REQUEUE
+
+    def test_a_truncated_source_fails_instead_of_publishing_a_short_file(
+            self, tmp_path, monkeypatch, gcs, plain_text, capsys):
+        """
+        End to end, no stubs. `decompressobj` returns what it has and does not raise on
+        truncation, so without an explicit check this decoded two thirds of the file,
+        published it, and exited 0. No digest here on purpose: with one, the md5 check
+        on the compressed bytes would catch it first, which is why it went unnoticed.
+        """
+        import gzip as gziplib
+        full = gziplib.compress(plain_text)
+        body = full[: len(full) * 2 // 3]
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            argv = options_for(str(tmp_path / "variants.tsv"), source.url(), len(body))
+            argv.gunzip = True
+            rc = pdl.run(argv)
+        assert rc == pdl.EXIT_FAIL
+        assert "truncated" in capsys.readouterr().err
+        assert PLAIN_OBJECT not in gcs.state.objects, "a short file was published"
+        assert not [n for n in gcs.state.object_names() if ".k9pdl." in n
+                    and not n.endswith(".done")], gcs.state.object_names()
+
+
+class TestEverythingWrittenCanExpire:
+    """
+    The localization bucket's only deletion mechanism is a `daysSinceCustomTime`
+    lifecycle rule, an object with no customTime is invisible to it, and nothing deletes
+    the bucket (LOCALIZATION.md §3, §8). This module set customTime on nothing, so every
+    intermediate that escaped cleanup was kept and billed forever. Stamping every write
+    makes the existing rule the backstop for every orphan path at once.
+    """
+
+    def _assert_all_stamped(self, gcs, expect_kinds):
+        assert gcs.state.writes, "nothing was written"
+        unstamped = [n for n, t in gcs.state.writes if not t]
+        assert unstamped == [], "written with no customTime: {}".format(unstamped[:5])
+        for _name, stamp in gcs.state.writes:
+            when = pdl._gcs_timestamp(stamp)
+            assert when is not None, "unparseable customTime {!r}".format(stamp)
+            assert abs(when - time.time()) < 600, "customTime {} is not now".format(stamp)
+        written = " ".join(n for n, _t in gcs.state.writes)
+        for kind in expect_kinds:
+            # Proves each write path was actually exercised, so an unstamped one could
+            # not hide by simply not running.
+            assert kind in written, "no {} write happened".format(kind)
+
+    def test_every_write_on_the_plain_route_is_stamped(self, tmp_path, monkeypatch, gcs,
+                                                      payload, payload_md5):
+        force_bucket_route(monkeypatch)
+        with Server(payload) as source:
+            assert pdl.run(options_for(
+                str(tmp_path / "sample.bam"), source.url(), len(payload),
+                check_md5=payload_md5,
+                upload_block=pdl.GCS_UPLOAD_GRANULARITY)) == pdl.EXIT_OK
+        # parts (resumable), the manifest (multipart), the object (compose)
+        self._assert_all_stamped(gcs, [".k9pdl.parts", ".k9pdl.json", OBJECT])
+        assert gcs.state.custom_time.get(OBJECT), "the final object has no customTime"
+
+    def test_every_write_on_the_gunzip_route_is_stamped(self, tmp_path, monkeypatch, gcs,
+                                                       plain_text):
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        real = pdl.DecodeSliceUploader
+        monkeypatch.setattr(pdl, "DecodeSliceUploader",
+                            lambda *a, **kw: real(*a, **dict(kw, slice_bytes=64 * 1024)))
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+        # sidecar and slice-compose intermediates, slices themselves, the final object
+        self._assert_all_stamped(gcs, [".k9pdl.gz", ".k9pdl.slice.", PLAIN_OBJECT])
+
+    def test_a_body_containing_the_boundary_forces_a_new_one(self, monkeypatch, gcs):
+        """
+        A random boundary essentially never collides, which is also why the collision
+        check survived mutation until this test forced one: the first draw is made to
+        equal a boundary that appears verbatim in the body.
+        """
+        draws = iter([0, 1])
+        monkeypatch.setattr(pdl.random, "getrandbits", lambda bits: next(draws))
+        collides = b"prefix --k9pdl" + b"0" * 32 + b" suffix"
+        client = pdl.GcsClient(timeout=30)
+        client.put_object(BUCKET, "collide.bin", collides)
+        assert client.read_object(BUCKET, "collide.bin") == collides
+
+    def test_the_multipart_manifest_round_trips_arbitrary_bytes(self, gcs):
+        """
+        The manifest moved from a media upload, which cannot carry metadata, to a
+        multipart one. Multipart frames the body with a boundary, so a body containing
+        boundary-like bytes or bare CRLFs is exactly what would corrupt it.
+        """
+        client = pdl.GcsClient(timeout=30)
+        hostile = (b"--k9pdl" + b"0" * 32 + b"\r\n\r\n--\r\n" + bytes(range(256)) * 4
+                   + b"\r\n")
+        client.put_object(BUCKET, "hostile.bin", hostile)
+        assert client.read_object(BUCKET, "hostile.bin") == hostile
+        assert gcs.state.custom_time.get("hostile.bin")
+
+    def test_a_lost_race_deletes_the_slices_it_wrote(self, tmp_path, monkeypatch, gcs,
+                                                    plain_text):
+        """
+        The narrow half of the fix. The decode has already given up by the time the
+        caller learns another writer finished, so the slice names now travel with the
+        error. Before, these waited a day for the lifecycle rule -- and before THAT fix,
+        forever.
+        """
+        real_compose = pdl.compose_tree
+
+        def slices_gone(client, bucket, destination, parts, **kw):
+            if any(".k9pdl.slice." in n for n in parts):
+                # the winner composed and removed the shared slice names first
+                gcs.state.objects[PLAIN_OBJECT] = plain_text
+                gcs.state.created[PLAIN_OBJECT] = time.time()
+                raise pdl.PermanentError("POST .../compose -> HTTP 404")
+            return real_compose(client, bucket, destination, parts, **kw)
+
+        monkeypatch.setattr(pdl, "compose_tree", slices_gone)
+        real = pdl.DecodeSliceUploader
+        monkeypatch.setattr(pdl, "DecodeSliceUploader",
+                            lambda *a, **kw: real(*a, **dict(kw, slice_bytes=64 * 1024)))
+        import gzip as gziplib
+        body = gziplib.compress(plain_text)
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        with Server(body) as source:
+            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+        left = [n for n in gcs.state.object_names() if ".k9pdl.slice." in n]
+        assert left == [], "the losing writer orphaned its slices: {}".format(left[:3])
+        assert gcs.state.objects[PLAIN_OBJECT] == plain_text
 
 
 class TestTheSlicedDecodeUpload:
@@ -2926,8 +3296,24 @@ class TestTheSlicedDecodeUpload:
         uploader.feed(b"y" * 4096)
         uploader.finish()
         assert [n for n in gcs.state.object_names() if "boom" in n]
-        uploader.abandon()
+        uploader.abandon(delete=True)
         assert [n for n in gcs.state.object_names() if "boom" in n] == []
+
+    def test_a_retryable_failure_keeps_the_slices(self, gcs):
+        """
+        Slice names are deterministic, so a concurrent writer decoding the same object
+        uses the same ones. Deleting them on a retryable failure let one writer's
+        transient error break another writer's compose. The next attempt rewrites the
+        same names and deletes them on its way out, so keeping them costs nothing.
+        """
+        client = pdl.GcsClient(timeout=30)
+        uploader = pdl.DecodeSliceUploader(client, BUCKET, "keep.k9pdl.slice", 2,
+                                           slice_bytes=1024)
+        uploader.feed(b"y" * 4096)
+        uploader.finish()
+        before = [n for n in gcs.state.object_names() if "keep" in n]
+        uploader.abandon(delete=False)
+        assert before and [n for n in gcs.state.object_names() if "keep" in n] == before
 
     def test_width_one_still_produces_a_plain_object_with_an_md5(
             self, tmp_path, monkeypatch, gcs, plain_text):

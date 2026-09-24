@@ -1200,6 +1200,22 @@ class TransientError(Exception):
     """Reset, 5xx, 429, short read: worth another attempt."""
 
 
+class IntegrityError(PermanentError):
+    """
+    The bytes are WRONG -- a digest mismatch, a corrupt gzip stream -- as opposed to
+    missing or unreachable.
+
+    A subclass rather than a message convention because the bucket route has to tell
+    the two apart and act oppositely on them. Wrong bytes mean the source itself is bad:
+    every writer is doomed alike, so clean up and stop (EXIT_FAIL). A 404 on an object
+    this attempt created means another writer cleaned it up, which is the signature of
+    losing a race: the right answer is to check whether that writer's object landed. The
+    verify and decode handlers used to catch bare PermanentError and treat a 404 on a
+    vanished sidecar as corruption -- failing, do-not-retry, a job whose output another
+    writer had just produced.
+    """
+
+
 class HttpSource:
     def __init__(self, url, headers=None, timeout=DEFAULT_TIMEOUT, url_refresh_cmd=None):
         self.url = url
@@ -1402,6 +1418,28 @@ class _ProcessStream:
 
 GCS_API_ROOT = "https://storage.googleapis.com/storage/v1"
 GCS_UPLOAD_ROOT = "https://storage.googleapis.com/upload/storage/v1"
+
+
+def gcs_custom_time():
+    """
+    Now, as the RFC 3339 string GCS takes for an object's customTime.
+
+    Stamped on EVERY object this module creates -- parts, slices, sidecars, compose
+    intermediates, the manifest, and the final object. The localization bucket's only
+    deletion mechanism is a `daysSinceCustomTime` lifecycle rule (LOCALIZATION.md §3,
+    and "nothing deletes the bucket", §8), and an object with no customTime is invisible
+    to that rule and never expires. Nothing here set it, so every intermediate that
+    escaped cleanup -- a lost race, a delete that 503'd twice, a job that hit its retry
+    limit mid-relay -- was stored and billed forever. With the stamp, the rule that
+    already exists is the backstop for every orphan path, including ones nobody has
+    enumerated.
+
+    The cost: a job requeued more than `localization_expiry_days` after its last write
+    finds its parts expired and re-downloads, since the stale-manifest handling in
+    run_bucket_route drops the manifest when parts are missing. That is the same bound
+    the lifecycle rule already puts on idle storage for everything else in the bucket.
+    """
+    return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 METADATA_TOKEN_URL = (
     "http://metadata.google.internal/computeMetadata/v1/"
     "instance/service-accounts/default/token"
@@ -1638,7 +1676,9 @@ class GcsClient:
             urllib.parse.quote(name, safe=""),
         )
         status, headers, _ = self.request(
-            "POST", url, body=json.dumps({"name": name}).encode("utf-8"),
+            "POST", url,
+            body=json.dumps({"name": name,
+                             "customTime": gcs_custom_time()}).encode("utf-8"),
             headers={"Content-Type": "application/json; charset=UTF-8"},
         )
         session = headers.get("Location") or headers.get("location")
@@ -1712,20 +1752,34 @@ class GcsClient:
 
     def put_object(self, bucket, name, body):
         """
-        Write a small object in one request.
+        Write a small object, with metadata, in one request.
 
-        A single media upload is atomic: the object either appears whole or not at all,
-        with no intermediate state a reader could see. That is the property the manifest
-        needs on a bucket, where the tmp-plus-rename commit used on a POSIX filesystem
-        does not work -- rename is a server-side copy and delete on a flat-namespace
-        bucket, so it is not atomic there.
+        A single upload request is atomic: the object either appears whole or not at
+        all, with no intermediate state a reader could see. That is the property the
+        manifest needs on a bucket, where the tmp-plus-rename commit used on a POSIX
+        filesystem does not work -- rename is a server-side copy and delete on a
+        flat-namespace bucket, so it is not atomic there.
+
+        `uploadType=multipart`, not `media`: a media upload carries no metadata, so it
+        could not set customTime (see gcs_custom_time). Still one request, so still
+        atomic.
         """
-        url = "{}/b/{}/o?uploadType=media&name={}".format(
-            GCS_UPLOAD_ROOT, urllib.parse.quote(bucket, safe=""),
-            urllib.parse.quote(name, safe=""),
-        )
-        self.request("POST", url, body=body,
-                     headers={"Content-Type": "application/json"})
+        url = "{}/b/{}/o?uploadType=multipart".format(
+            GCS_UPLOAD_ROOT, urllib.parse.quote(bucket, safe=""))
+        metadata = json.dumps({"name": name, "customTime": gcs_custom_time()}).encode()
+        boundary = "k9pdl{:032x}".format(random.getrandbits(128))
+        while boundary.encode() in body:            # vanishingly unlikely, never wrong
+            boundary = "k9pdl{:032x}".format(random.getrandbits(128))
+        dash = b"--" + boundary.encode()
+        payload = b"".join([
+            dash, b"\r\nContent-Type: application/json; charset=UTF-8\r\n\r\n",
+            metadata, b"\r\n",
+            dash, b"\r\nContent-Type: application/octet-stream\r\n\r\n",
+            body, b"\r\n",
+            dash, b"--\r\n",
+        ])
+        self.request("POST", url, body=payload, headers={
+            "Content-Type": "multipart/related; boundary=" + boundary})
 
     def read_object(self, bucket, name):
         """Full contents of an object, or None when it does not exist."""
@@ -1771,7 +1825,7 @@ class GcsClient:
         )
         body = json.dumps({
             "sourceObjects": [{"name": name} for name in sources],
-            "destination": {"name": destination},
+            "destination": {"name": destination, "customTime": gcs_custom_time()},
         }).encode("utf-8")
         _, _, payload = self.request(
             "POST", url, body=body,
@@ -3009,11 +3063,22 @@ class GzipStreamDecoder:
     Trailing NUL padding after the last member is ignored, matching the reference
     implementation: some writers pad to a block boundary, and those zeros are not a
     malformed member.
+
+    **A stream that ends mid-member is an error.** `decompressobj` does not raise on
+    truncation -- it returns whatever it decoded and leaves `eof` false -- so the first
+    version of this class decoded two thirds of a truncated file and returned it as the
+    whole thing. `gzip.open`, which the in-place route uses, raises EOFError on the same
+    bytes, so the bucket route was strictly weaker. It matters exactly when there is no
+    advertised digest: with one, the md5 check on the compressed sidecar catches the
+    truncation first; without one, an upstream file cut short by an interrupted upload
+    decoded into a short destination and exited 0.
     """
 
     def __init__(self):
         self._decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
         self.produced = 0
+        # True while the current member has consumed input but not reached its end.
+        self._mid_member = False
 
     def feed(self, payload):
         out = bytearray()
@@ -3021,7 +3086,9 @@ class GzipStreamDecoder:
         while data:
             out += self._decoder.decompress(data)
             if not self._decoder.eof:
+                self._mid_member = True
                 break
+            self._mid_member = False
             data = self._decoder.unused_data
             self._decoder = zlib.decompressobj(16 + zlib.MAX_WBITS)
             if not data.strip(b"\x00"):
@@ -3032,6 +3099,10 @@ class GzipStreamDecoder:
     def flush(self):
         tail = self._decoder.flush()
         self.produced += len(tail)
+        if self._mid_member:
+            raise IntegrityError(
+                "gzip stream ended before the end-of-stream marker was reached "
+                "({} bytes decoded); the object is truncated".format(self.produced))
         return tail
 
 
@@ -3142,14 +3213,29 @@ class DecodeSliceUploader:
             self._pool.shutdown(wait=True)
         return list(self._names), self.total
 
-    def abandon(self):
-        """Best-effort cleanup of slices already written, after a failure."""
-        self._pool.shutdown(wait=True)
-        for name in self._names:
-            try:
-                self.client.delete_object(self.bucket, name)
-            except (PermanentError, TransientError):
-                pass
+    @property
+    def names(self):
+        """Every slice name this uploader has issued, uploaded or not."""
+        return list(self._names)
+
+    def abandon(self, delete):
+        """
+        Stop after a failure, and remove the slices already written only if `delete`.
+
+        No default, so every caller has to decide. Slice names are deterministic, so
+        two writers decoding the same object share them. Deleting on a RETRYABLE
+        failure therefore let one writer's transient error pull slices out from under
+        another writer's compose -- one hiccup failing two decodes. On a retry the next
+        attempt rewrites the same names and deletes them on its way out, so keeping them
+        costs nothing. Delete only when the failure is an integrity failure, where the
+        source bytes are wrong and every writer fails alike.
+
+        Queued-but-unstarted uploads are cancelled either way; they would otherwise keep
+        running on pool threads after the decode had already given up.
+        """
+        self._pool.shutdown(wait=True, cancel_futures=True)
+        if delete:
+            best_effort_delete(self.client, self.bucket, self._names)
 
 
 def ranged_blocks(client, bucket, name, size, block, depth):
@@ -3290,7 +3376,7 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
                 if session is not None or decoder.produced:
                     # Past the header and part-way through a stream: this is corruption,
                     # not mislabelled metadata, and the caller must not publish a truncation.
-                    raise PermanentError(
+                    raise IntegrityError(
                         "could not decompress gs://{}/{}: {}".format(bucket, source, e))
                 # The server advertised Content-Encoding: gzip over bytes that are not
                 # gzip. Keep them rather than failing the localization over the server's
@@ -3349,12 +3435,26 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
                     pending[:0] = chunk[committed - offset:]
                 offset = committed
 
+    except BaseException as exc:
+        # Stop the uploader, or its pool keeps writing slices after the decode has
+        # already failed. Only a corrupt stream justifies deleting what it wrote.
+        if uploader is not None:
+            uploader.abandon(delete=isinstance(exc, IntegrityError))
+            exc.k9pdl_orphans = uploader.names
+        raise
     finally:
         # Shuts the pool down; at most `readahead` blocks are still in flight,
         # which matters on the keep-as-is paths that return from inside the loop.
         stream.close()
     mark = time.monotonic()
-    pending += decoder.flush()
+    try:
+        pending += decoder.flush()
+    except IntegrityError:
+        # Outside the loop's handler, so it has to stop the uploader itself -- and a
+        # truncated stream is corrupt, so what it wrote goes too.
+        if uploader is not None:
+            uploader.abandon(delete=True)
+        raise
     stage["inflate"] += time.monotonic() - mark
     if not checked and not decide():
         return size, False
@@ -3365,11 +3465,14 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
             uploader.feed(bytes(pending))
             names, total = uploader.finish()
             composed = compose_tree(client, bucket, dest, names)
-        except BaseException:
-            uploader.abandon()
+        except BaseException as exc:
+            uploader.abandon(delete=False)
+            # Kept for a retry, but the caller may discover it lost the race to a
+            # writer that already finished -- in which case nobody will retry and these
+            # are orphans. Only the caller can tell, so the names travel with the error.
+            exc.k9pdl_orphans = uploader.names
             raise
-        for name in names:
-            client.delete_object(bucket, name)
+        best_effort_delete(client, bucket, names)
         stage["write"] += time.monotonic() - mark
         if int(composed.get("size", -1)) != total:
             raise TransientError("decoded object is {} bytes, expected {}".format(
@@ -3477,10 +3580,93 @@ def verify_bucket_object(client, bucket, name, size, options, block=READ_BUFFER)
     actual = digest.hexdigest()
     expected = normalize_expected_md5(options.check_md5)
     if actual != expected:
-        raise PermanentError(
+        raise IntegrityError(
             "md5 mismatch after compose: expected {}, got {}".format(expected, actual)
         )
     return actual
+
+
+# How far GCS's timeCreated may trail this node's clock and still count as "during this
+# attempt". GCE clocks are NTP-synced to Google's own time source, so the real skew is
+# well under a second.
+#
+# Deliberately small. The first value was five minutes, "as margin", and a generous
+# margin is not free: it lets THIS job's own previous attempt -- restarted quickly after
+# a requeue -- pass for a racing winner, and that attempt's object may be a compose that
+# was never verified. A requeue cycle takes far longer than five seconds.
+LANDED_CLOCK_SKEW = 5
+
+
+def _gcs_timestamp(value):
+    """GCS RFC 3339 timestamp -> epoch seconds, or None if absent or unparseable."""
+    import datetime
+    if not value:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
+        try:
+            return datetime.datetime.strptime(value, fmt).replace(
+                tzinfo=datetime.timezone.utc).timestamp()
+        except ValueError:
+            continue
+    return None
+
+
+def landed_during(client, bucket, name, expected_size, since):
+    """
+    The destination another writer completed while this attempt was running, or None.
+
+    Presence is not enough, and the first version of the compose-race fix accepted it:
+    an object at the destination may be a stale one from an earlier localization of a
+    different source, and returning EXIT_OK over it reports success for the wrong bytes
+    with nothing downstream able to tell. So the object must also have been CREATED
+    after this attempt started. That is exactly the race window -- a writer that
+    finished before this attempt began also deleted the manifest, so this attempt would
+    have started fresh and composed its own parts rather than lose a race.
+
+    `expected_size` is checked when known; with --gunzip the decoded length is not, and
+    the creation time is then the only evidence.
+
+    Callers must not use this once they have composed the destination themselves: the
+    object is then their own, and this function cannot tell it from a winner's. See
+    `lost_race` in run_bucket_route.
+    """
+    try:
+        metadata = client.get_object(bucket, name)
+    except (PermanentError, TransientError):
+        return None
+    if expected_size is not None and int(metadata.get("size", -1)) != expected_size:
+        return None
+    created = _gcs_timestamp(metadata.get("timeCreated"))
+    if created is None or created < since - LANDED_CLOCK_SKEW:
+        return None
+    return metadata
+
+
+def best_effort_delete(client, bucket, names):
+    """
+    Delete cleanup objects without letting a transient error fail the job.
+
+    Every one of these calls runs after the work is done. `GcsClient.request` does not
+    retry, so a single 503 on part 17 of a composed, verified object used to escape as
+    TransientError, which `main` does not catch -- the generic handler turned a finished
+    localization into EXIT_FAIL, with no done marker written. One retry, then leave the
+    orphan (it is under a dotted prefix nothing globs) and say so.
+    """
+    orphaned = []
+    for name in names:
+        for attempt in range(2):
+            try:
+                client.delete_object(bucket, name)
+                break
+            except TransientError:
+                if attempt:
+                    orphaned.append(name)
+                else:
+                    time.sleep(0.5)
+    if orphaned:
+        log("could not delete {} cleanup object(s), left in place: {}{}".format(
+            len(orphaned), ", ".join(orphaned[:3]), " ..." if len(orphaned) > 3 else ""))
+    return orphaned
 
 
 def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_path,
@@ -3496,6 +3682,8 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     bucket, object_name = split_gs_url(decision.gs_url)
     client = GcsClient(timeout=options.timeout)
     parts_prefix = "{}.k9pdl.parts".format(object_name)
+    # Anchors "did another writer finish during this attempt?" -- see landed_during().
+    attempt_started = time.time()
 
     # With --gunzip the parts compose into a compressed sidecar, not into the destination:
     # the advertised checksum covers the compressed bytes, so they have to be verified
@@ -3543,6 +3731,57 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
         log("no forward progress this attempt: {}".format(e))
         return EXIT_FAIL
 
+    # Where a writer's cleanup can race another writer's work, the loser sees an object
+    # it expected vanish. Every such site funnels through here rather than deciding for
+    # itself, because all of them used to decide wrong: a vanished part, sidecar or
+    # part-under-re-read surfaced as PermanentError, and `main` turns that into
+    # EXIT_FAIL -- do not retry -- on a job whose output another writer had just
+    # produced. Two workers on one object is designed for (LOCALIZATION.md §3), and a
+    # node dying mid-upload produces the same overlap with no timeout involved.
+    def lost_race(what, manifest_is_stale, after_own_compose=False, orphans=()):
+        log("{}; checking whether another writer finished during this attempt".format(what))
+        # Without --gunzip the compose target IS the destination, so once this attempt
+        # has composed, the object there may be its own unverified compose -- and
+        # accepting it would skip verification outright. Worse, a winner's integrity
+        # cleanup deletes the object and then the parts; a compose landing between the
+        # two re-creates the corrupt object, and the vanished parts then look like a
+        # lost race won by someone else. Presence proves nothing in that state, so it is
+        # not consulted. With --gunzip the destination is only ever written at the end
+        # of a decode that followed a passing verify, so presence is still evidence.
+        can_trust = options.gunzip or not after_own_compose
+        landed = (landed_during(client, bucket, object_name,
+                                None if options.gunzip else size, attempt_started)
+                  if can_trust else None)
+        if landed is not None:
+            log("{} was completed by another writer ({} bytes); nothing to do".format(
+                decision.gs_url, landed.get("size")))
+            # Anything this writer re-uploaded after the winner's cleanup is an orphan.
+            # Never the destination itself, which is the winner's.
+            best_effort_delete(client, bucket, [n for n in part_names + [compose_target]
+                                                + list(orphans) if n != object_name])
+            manifest.unlink()
+            return EXIT_OK
+        if manifest_is_stale:
+            # The manifest now records completions for bytes that no longer exist.
+            # Kept, it would send every later attempt down this same path -- skip the
+            # relay, find the part missing, requeue -- forever: canine requeues exit 5
+            # with no cap (orchestrator.py counts localization failures only to exclude
+            # them from the preemption limit). Dropping it costs one re-download.
+            manifest.unlink()
+        log("no completed object landed during this attempt; requesting requeue")
+        return EXIT_REQUEUE
+
+    def integrity_failure(reason):
+        # The object goes FIRST, then the parts. Deleting parts first opened a window
+        # in which a racing writer's compose fails, lost_race() finds a fresh object of
+        # exactly the right size -- this known-corrupt one -- and reports EXIT_OK for it
+        # moments before it is deleted.
+        log(reason)
+        best_effort_delete(client, bucket, [compose_target])
+        best_effort_delete(client, bucket, part_names)
+        manifest.unlink()
+        return EXIT_FAIL
+
     # Every part must exist at exactly its planned length before anything is composed.
     # An incomplete resumable upload is invisible in the bucket, so a missing part here
     # means that part never finished rather than that it is partially there.
@@ -3552,7 +3791,11 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
         try:
             metadata = client.get_object(bucket, name)
         except PermanentError:
-            log("part {} is missing after upload; requesting requeue".format(index))
+            return lost_race("part {} is missing after upload".format(index),
+                             manifest_is_stale=True)
+        except TransientError as e:
+            log("transient failure checking part {}; requesting requeue: {}".format(
+                index, e))
             return EXIT_REQUEUE
         if int(metadata.get("size", -1)) != expected:
             log("part {} is {} bytes, expected {}".format(
@@ -3569,35 +3812,7 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
         with phase("compose"):
             composed = compose_tree(client, bucket, compose_target, part_names)
     except PermanentError as e:
-        # Sources that have vanished are the signature of LOSING A RACE, not of a
-        # defect: another writer composed these same deterministically-named parts and
-        # deleted them, which is exactly what this code does on its own way out.
-        #
-        # This reached `main`, which turns PermanentError into EXIT_FAIL -- do not
-        # retry. So the loser of a race killed the job while the object it wanted sat
-        # complete and correct in the bucket. Found as a 1-in-4 intermittent failure of
-        # TestTwoWritersOnOneObject; two workers on one object is a designed-for state
-        # (LOCALIZATION.md §3, and a node dying mid-upload produces it with no timeout
-        # involved at all), so at scale this is not rare.
-        #
-        # The part-existence check immediately above already requeues for the same
-        # reason. compose was simply never given the same treatment.
-        log("compose failed ({}); checking whether another writer got there first".format(e))
-        try:
-            landed = client.get_object(bucket, object_name)
-        except (PermanentError, TransientError):
-            landed = None
-        if landed is not None and (options.gunzip
-                                   or int(landed.get("size", -1)) == size):
-            # With --gunzip the decoded length is not knowable here, so presence is all
-            # there is to go on. A composed object appears atomically and an unfinished
-            # resumable upload is invisible, so presence does mean some writer finished.
-            log("{} already exists ({} bytes); another writer completed it".format(
-                decision.gs_url, landed.get("size")))
-            manifest.unlink()
-            return EXIT_OK
-        log("no completed object at {}; requesting requeue".format(decision.gs_url))
-        return EXIT_REQUEUE
+        return lost_race("compose failed ({})".format(e), manifest_is_stale=True)
     except TransientError as e:
         log("transient failure composing; requesting requeue: {}".format(e))
         return EXIT_REQUEUE
@@ -3611,23 +3826,34 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
             with phase("verify", size):
                 digest = verify_bucket_object(
                     client, bucket, compose_target, size, options)
+        except IntegrityError as e:
+            return integrity_failure("verification failed: {}".format(e))
         except PermanentError as e:
-            log("verification failed: {}".format(e))
-            for name in part_names:
-                client.delete_object(bucket, name)
-            client.delete_object(bucket, compose_target)
-            manifest.unlink()
-            return EXIT_FAIL
+            return lost_race("verify read-back failed ({})".format(e),
+                             manifest_is_stale=False, after_own_compose=True)
+        except TransientError as e:
+            log("transient failure verifying; requesting requeue: {}".format(e))
+            return EXIT_REQUEUE
     elif options.check_etag and options.part_length:
-        actual, reread = multipart_etag_from_gcs(
-            client, bucket, compose_target, options.part_length, size, manifest)
+        try:
+            actual, reread = multipart_etag_from_gcs(
+                client, bucket, compose_target, options.part_length, size, manifest)
+        except PermanentError as e:
+            # Only a part missing its recorded digest is re-read, and a part that is
+            # gone was deleted by another writer.
+            return lost_race("ETag re-read failed ({})".format(e),
+                             manifest_is_stale=True, after_own_compose=True)
+        except TransientError as e:
+            log("transient failure computing the ETag; requesting requeue: {}".format(e))
+            return EXIT_REQUEUE
         log("etag from {} recorded part digests, {} re-read".format(
             (size + options.part_length - 1) // options.part_length - reread, reread))
         expected = options.check_etag.strip().strip('"')
         if actual != expected:
-            log("ETag mismatch after compose: expected {}, got {}".format(
-                expected, actual))
-            return EXIT_FAIL
+            # Cleaned up like an md5 mismatch. It used to return with the corrupt
+            # composed object left at the destination, readable through the mount.
+            return integrity_failure("ETag mismatch after compose: expected {}, got {}"
+                                     .format(expected, actual))
         digest = actual
     elif options.check_etag:
         # An ETag without a part length is an opaque string, not an md5-of-md5s, so
@@ -3652,38 +3878,41 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
                                          DEFAULT_DECODE_UPLOAD_WIDTH),
                     queue_slices=getattr(options, "decode_queue_slices",
                                          DEFAULT_DECODE_QUEUE_SLICES))
+        except IntegrityError as e:
+            # The compressed bytes matched the advertised digest and still do not
+            # decode, so the source object itself is broken and no retry can help.
+            return integrity_failure("{}".format(e))
         except PermanentError as e:
-            # The compressed bytes already matched the advertised digest, so a
-            # mid-stream decode failure means the source object itself is broken and
-            # no retry can help. Clean up for the same reason the verification failure
-            # above does: nothing is coming back for these.
-            log("{}".format(e))
-            for name in part_names:
-                client.delete_object(bucket, name)
-            client.delete_object(bucket, compose_target)
-            manifest.unlink()
-            return EXIT_FAIL
+            # A 404 here is the sidecar or a slice removed by another writer's cleanup,
+            # not corruption -- it used to be reported as "the source is broken".
+            return lost_race("decode failed ({})".format(e), manifest_is_stale=False,
+                             after_own_compose=True,
+                             orphans=getattr(e, "k9pdl_orphans", ()))
         except TransientError as e:
             # Requeue, and deliberately leave the parts, the sidecar and the manifest
-            # in place: the retry then pays only for the decode. Letting this escape
-            # would leave the shell with an uncaught traceback and an exit code SLURM
-            # reads as do-not-retry, which is the one outcome the exit codes exist to
-            # prevent.
+            # in place: the retry then pays only for the decode.
             log("transient failure decompressing; requesting requeue: {}".format(e))
             return EXIT_REQUEUE
         if decoded:
             log("decompressed {} bytes into {} bytes".format(size, stored_size))
-        client.delete_object(bucket, compose_target)
+        best_effort_delete(client, bucket, [compose_target])
 
     # Parts are deleted explicitly. The GCS JSON API's objects.compose has no
     # deleteSourceObjects parameter (contrary to the design note), so a crash between
-    # compose and here leaves orphaned parts; the next run's cleanup below removes them,
-    # and they are under a dotted prefix so nothing globs them up meanwhile.
-    for name in part_names:
-        client.delete_object(bucket, name)
+    # compose and here leaves orphaned parts; they are under a dotted prefix so nothing
+    # globs them up. Best-effort: the object is finished, and a cleanup hiccup must not
+    # turn that into a failure.
+    best_effort_delete(client, bucket, part_names)
 
-    write_done_marker(marker_path, size, plan_id, digest, route=ROUTE_BUCKET,
-                      gs_url=decision.gs_url, stored_size=stored_size)
+    try:
+        write_done_marker(marker_path, size, plan_id, digest, route=ROUTE_BUCKET,
+                          gs_url=decision.gs_url, stored_size=stored_size)
+    except OSError as e:
+        # The marker lives on the gcsfuse mount, and it is an optimisation -- it lets a
+        # re-run skip the transfer. The object is complete and verified; losing the
+        # marker costs a redundant transfer if this localization is ever re-run, and
+        # failing the job over it would cost the whole localization now.
+        log("could not write the done marker ({}); the object is complete".format(e))
     manifest.unlink()
     log("complete: {} bytes composed from {} parts{}".format(
         size, len(part_names), " (verified)" if digest else ""))

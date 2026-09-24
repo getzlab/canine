@@ -208,6 +208,23 @@ again", and because those requeues do not count against the preemption limit, it
 be returned when nothing was accomplished — a server that will never answer would
 otherwise loop forever. No forward progress therefore exits 1.
 
+The same rule has a second edge: a requeue must not be able to see the **same state**
+next time, or it loops just as surely. That is why a missing part drops the manifest
+before requeueing rather than leaving it to claim completions for bytes that are gone.
+
+On the bucket-compose route, two situations resolve to `0` or `5` rather than `1`, and
+both show up in the log:
+
+* **`... was completed by another writer`** — this worker lost a race with another
+  worker on the same object, whose finished object landed *during this attempt*. That's
+  `0`, and it isn't a failure. An object that existed before the attempt started isn't
+  accepted as a winner's; the run requeues instead.
+* **`could not delete N cleanup object(s), left in place`** — a transient error while
+  removing parts or slices after the object was already complete and verified. That's
+  still `0`. The orphans sit under a dotted prefix, and like everything this downloader
+  writes they carry a customTime, so the bucket's `daysSinceCustomTime` lifecycle rule
+  removes them on the normal schedule.
+
 ---
 
 ## What it leaves behind

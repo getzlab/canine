@@ -19,6 +19,7 @@ import http.server
 import json
 import re
 import threading
+import time
 import urllib.parse
 
 GRANULARITY = 256 * 1024
@@ -30,6 +31,19 @@ class FakeGcs:
     def __init__(self):
         self.objects = {}            # name -> bytes
         self.composite = {}          # name -> component count
+        # name -> creation time (epoch s). Real GCS reports timeCreated per generation,
+        # and the race handling uses it to tell a winner's fresh object from a stale
+        # one. Objects injected by a test without an entry read as epoch 0 -- stale --
+        # which is the safe default: a test must opt in to "this just landed".
+        self.created = {}
+        # name -> the customTime the writer set, or absent if it set none. Recorded so
+        # tests can prove every write path stamps it: an object without one is invisible
+        # to the bucket's daysSinceCustomTime lifecycle rule and is never deleted.
+        self.custom_time = {}
+        # Every object write, in order, with the customTime it carried (None if none).
+        # Most of what this module writes -- parts, slices, sidecars, intermediates -- is
+        # deleted before a test can look at it, so the stamp is checked here, at write.
+        self.writes = []
         self.sessions = {}           # id -> {"name", "buf", "committed", "expired"}
         self.compose_calls = []      # [(destination, [sources])]
         self.deleted = []
@@ -49,13 +63,22 @@ class FakeGcs:
         # PUTs that declared their total as "*". Counted so a test can prove the
         # unknown-total path was actually taken rather than assuming it.
         self.unknown_total_puts = 0
+        # DELETE of a name matching any of these substrings returns 503 until the
+        # count runs out. Models a cleanup request hitting a transient GCS error
+        # AFTER the object is complete -- which used to fail the whole job.
+        self.fail_deletes_matching = ()
+        self.fail_deletes_remaining = 0
+        # Objects to remove the first time a media GET touches them, before serving.
+        # Models another writer cleaning up a sidecar or part mid-read.
+        self.vanish_on_read = set()
 
-    def new_session(self, name):
+    def new_session(self, name, custom_time=None):
         with self.lock:
             session_id = str(self._next_session)
             self._next_session += 1
             self.sessions[session_id] = {
                 "name": name, "buf": bytearray(), "committed": 0, "expired": False,
+                "custom_time": custom_time,
             }
             return session_id
 
@@ -97,14 +120,29 @@ def make_handler(state):
             return self.rfile.read(length) if length else b""
 
         @staticmethod
+        def _stamp(name, custom_time):
+            # A new generation has only the metadata its own write supplied.
+            state.writes.append((name, custom_time))
+            if custom_time:
+                state.custom_time[name] = custom_time
+            else:
+                state.custom_time.pop(name, None)
+
+        @staticmethod
         def _object_metadata(name, data, components=None):
             import base64
+            import datetime
             import hashlib
+            created = datetime.datetime.fromtimestamp(
+                state.created.get(name, 0), tz=datetime.timezone.utc)
             payload = {
                 "name": name,
                 "size": str(len(data)),
                 "crc32c": "AAAAAA==",
+                "timeCreated": created.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             }
+            if name in state.custom_time:
+                payload["customTime"] = state.custom_time[name]
             if components:
                 payload["componentCount"] = components
             else:
@@ -126,13 +164,36 @@ def make_handler(state):
                 with state.lock:
                     state.objects[name] = body
                     state.composite[name] = 1
+                    state.created[name] = time.time()
+                self._json(200, self._object_metadata(name, body))
+                return
+
+            if query.get("uploadType") == ["multipart"]:
+                # metadata part + media part, one request, atomic like media
+                boundary = re.search(r"boundary=([^;]+)",
+                                     self.headers.get("Content-Type", "")).group(1)
+                raw = self._body()
+                pieces = raw.split(b"--" + boundary.encode())
+                meta_part, media_part = pieces[1], pieces[2]
+                meta = json.loads(meta_part.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n", 1)[0])
+                body = media_part.split(b"\r\n\r\n", 1)[1][:-2]   # strip trailing CRLF
+                name = meta["name"]
+                with state.lock:
+                    state.objects[name] = body
+                    state.composite[name] = 1
+                    state.created[name] = time.time()
+                    self._stamp(name, meta.get("customTime"))
                 self._json(200, self._object_metadata(name, body))
                 return
 
             if query.get("uploadType") == ["resumable"]:
-                self._body()
+                raw = self._body()
                 name = query.get("name", [""])[0]
-                session_id = state.new_session(name)
+                try:
+                    init = json.loads(raw.decode("utf-8")) if raw else {}
+                except ValueError:
+                    init = {}
+                session_id = state.new_session(name, init.get("customTime"))
                 self._send(200, b"", {
                     "Location": "http://{}/upload/session/{}".format(
                         self.headers.get("Host"), session_id)
@@ -156,6 +217,9 @@ def make_handler(state):
                     )
                     state.objects[destination] = data
                     state.composite[destination] = components
+                    self._stamp(destination,
+                                (payload.get("destination") or {}).get("customTime"))
+                    state.created[destination] = time.time()
                 self._json(200, self._object_metadata(destination, data, components))
                 return
 
@@ -193,6 +257,8 @@ def make_handler(state):
                         data = bytes(session["buf"][:total])
                         state.objects[session["name"]] = data
                         state.composite[session["name"]] = 1
+                        self._stamp(session["name"], session.get("custom_time"))
+                        state.created[session["name"]] = time.time()
                         del state.sessions[session_id]
                         self._json(200, self._object_metadata(session["name"], data))
                         return
@@ -264,6 +330,8 @@ def make_handler(state):
                     data = bytes(buf[:total])
                     state.objects[session["name"]] = data
                     state.composite[session["name"]] = 1
+                    self._stamp(session["name"], session.get("custom_time"))
+                    state.created[session["name"]] = time.time()
                     del state.sessions[session_id]
                     self._json(200, self._object_metadata(session["name"], data))
                     return
@@ -281,6 +349,10 @@ def make_handler(state):
             name = urllib.parse.unquote(match.group(2))
 
             with state.lock:
+                if query.get("alt") == ["media"] and name in state.vanish_on_read:
+                    state.vanish_on_read.discard(name)
+                    state.objects.pop(name, None)
+                    state.composite.pop(name, None)
                 if name not in state.objects:
                     self._json(404, {"error": {"message": "no such object"}})
                     return
@@ -312,9 +384,15 @@ def make_handler(state):
                 return
             name = urllib.parse.unquote(match.group(2))
             with state.lock:
+                if (state.fail_deletes_remaining > 0
+                        and any(m in name for m in state.fail_deletes_matching)):
+                    state.fail_deletes_remaining -= 1
+                    self._send(503)
+                    return
                 state.deleted.append(name)
                 state.objects.pop(name, None)
                 state.composite.pop(name, None)
+                state.custom_time.pop(name, None)
             self._send(204)
 
     return Handler
