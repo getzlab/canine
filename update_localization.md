@@ -4956,3 +4956,57 @@ degrading stages are precisely the ones that would dominate there. Nothing here 
 relay's 110 MB/s is a floor rather than another point on a descending curve -- the honest
 statement is that per-byte cost is **not** constant on this route, and any figure quoted
 from a single size should say which size.
+
+### 13.67 At a VCF compression ratio the decode is 91% of the run, and the split is worth 1.78x
+
+§13.66 chased object size. The variable that actually matters is the **compression
+ratio**, because relay and verify scale with the compressed size while inflate and write
+scale with the decompressed size. Every measurement to this point used a fixture that
+compresses **1.93:1**, which is nothing like the realistic input.
+
+A transport-gzipped BAM -- what §13.66 worried about -- is close to impossible: BAM is
+already BGZF, nobody re-encodes it, and a mislabelled one aborts in 0.3 s through the
+keep-as-is branch. The real case is a large VCF, gnomAD-shaped.
+
+Re-measured with VCF-like text, ratio **16.49:1**, 552331810 -> 9110203400, two reps that
+came out identical to 0.05 s:
+
+| | 1.93:1 (10x, §13.66) | **16.49:1 (VCF-like)** |
+|---|---|---|
+| total | 361.1 s | 126.0 s |
+| relay | 78.0 s | 5.3 s |
+| verify | 75.8 s | 3.1 s |
+| **decode** | 194 s (54%) | **114.1 s (91%)** |
+| inflate | 116.4 s | 58.8 s |
+| write | 77.8 s | 55.1 s |
+| ceiling / pipe2 | 1.81x / 1.77x | **1.94x / 1.94x** |
+
+**The decode is 91% of the run**, and the relay and verify work -- the read-ahead, the
+sliced upload, most of §13.61 through §13.63 -- barely registers, because at 16:1 there
+are almost no compressed bytes to move. Those changes still stand on their own
+measurements; they are simply not what decides a VCF localization.
+
+**Inflate and write are within 6% of each other**, which is the best possible shape for a
+two-stage split: ceiling 1.94x against a theoretical maximum of 2.0. A working split puts
+the decode at ~58.5 s and the whole run at **~71 s, 1.78x**.
+
+#### This reopens §13.64
+
+The split was shelved after measuring ~4% on the 1.93:1 fixture, where write was a
+smaller share and the ceiling was 1.81x. On the workload that actually reaches this code
+the ceiling is 1.94x and the prize is 55 seconds of a 126 second run. Two other things
+now point the same way: §13.65 measured concurrent uploads costing inflate only **4%**,
+not the 43% the split reported, and processes matched threads exactly -- so the slowdown
+was the implementation's copying, not contention.
+
+The retry has to be genuinely zero-copy: hand the uploader a `memoryview` of the decoded
+buffer rather than re-materialising it through `bytes(pending)` -> queue -> `_buffer +=`
+-> `bytes(_buffer[:n])`, and bound the queue in bytes rather than chunks.
+
+#### The lesson, which is the same one twice
+
+§13.66 tested 10x the size and found the total linear. It was the wrong axis. Size was
+easy to vary and the ratio was baked into a fixture I had chosen for an unrelated reason
+-- it was built in §6.6b to produce enough granule-aligned PUTs, and 1.93:1 was a
+side effect of making the data incompressible enough to control PUT count. That choice
+then silently set the relay/decode balance for every decode measurement that followed.

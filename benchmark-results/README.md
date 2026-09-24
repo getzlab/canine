@@ -238,3 +238,22 @@ single-object writes to ~1/sec. The production uploader gives every slice its ow
 Relay loses 29% per byte and verify 15% -- sustained-throughput effects a 36 s run cannot
 show. Write gains 18% as session setup amortizes over 490 slices. 491 components, both
 reps identical by crc32c.
+
+### VCF-like compression ratio (`gunzip-e2e-vcf-ratio-*.json`)
+
+The ratio matters more than the size: relay and verify scale with the compressed bytes,
+inflate and write with the decompressed ones. Every other fixture here is 1.93:1, chosen
+in §6.6b to control PUT count. Real VCF is ~10-20:1.
+
+At 16.49:1 (552331810 -> 9110203400), two reps identical to 0.05 s:
+
+| | 1.93:1 (10x) | 16.49:1 |
+|---|---|---|
+| total | 361.1 s | 126.0 s |
+| relay / verify | 78.0 / 75.8 s | 5.3 / 3.1 s |
+| decode | 194 s (54%) | 114.1 s (91%) |
+| inflate / write | 116.4 / 77.8 s | 58.8 / 55.1 s |
+| ceiling | 1.81x | 1.94x |
+
+The decode is 91% of the run and inflate and write are within 6% of each other -- the
+best case for a 2-stage split, worth ~71 s against 126 s.
