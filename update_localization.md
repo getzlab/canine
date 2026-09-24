@@ -5759,3 +5759,63 @@ An attempt from the GDC API was stopped a minute in, in favor of DRS. Its trap e
 bucket (leaving 6 in-flight parts, removed immediately after) and shredded the token. The
 node suspended itself after each run through a watcher; its service account was given
 `compute.instanceAdmin.v1` on that instance alone, which went away with the instance.
+
+### 13.78 The bucket route's md5 read-back: bigger blocks, not more readers
+
+§13.77 left the md5 read-back as the bucket route's bottleneck: 47 minutes at 117 MiB/s for
+the 324.75 GiB BAM, against a 14-minute relay. `verify_bucket_object` reads through
+`ranged_blocks`: up to `decode_readahead` (default 4) ranged GETs of READ_BUFFER (8 MiB) in
+flight, consumed in order by one md5.
+
+**Method.** n1-standard-8 in us-east1-b, private bucket in us-east1, the worker image and the
+committed downloader (`cfac695`). Unique AES-CTR data was uploaded as 1 GiB parts and composed
+into two composites (128 GiB and 64 GiB). The parts were uploaded as `gcloud` parallel
+composites, so the objects have 2,816 and 1,408 components rather than one per part. Every
+trial read its own never-read 8 GiB window, because a just-composed object's cold read is
+what production pays. The loop is `ranged_blocks`' own: `GcsClient.download_range` feeding
+one md5 in order. On this node md5 alone runs at **511 MiB/s**, so that is the ceiling.
+
+| depth × block | MiB/s |
+|---|---|
+| **4 × 8 MiB (today)** | 118.2, 125.8 (production measured 117) |
+| 8 × 8 | 169.1, 179.9 |
+| 16 × 8 | 141.9, 154.3 |
+| 32 × 8 | 153.0, 150.4 |
+| 2 × 32 | 150.2 |
+| **4 × 32** | 211.6, 229.7, 232.4 |
+| 6 × 32 | 207.6 |
+| 8 × 32 | 151.6, 172.3 |
+| 16 × 32 | 165.4, 170.7 |
+| 32 × 32 | 171.2, 169.1 |
+| 2 × 64 | 168.5 |
+| **4 × 64** | **275.6, 234.4** |
+| 6 × 64 | 227.3 |
+| **4 × 128** | **298.7** |
+
+The first round's two repetitions ran the grid in opposite orders, and each cell agreed
+within ~10%.
+
+**More readers do not help: depth 4 is best at every block size, and beyond it the rate
+falls to a ~150-175 MiB/s plateau.** That is the same non-monotonic shape as the decode's
+read-ahead sweep (§13.54). **Bigger blocks do help**, and were still helping at 128 MiB.
+
+**The cause is a fixed cost per request, not a single CPU core.** The harness used a median
+2.04 cores and at most 2.8. `urllib` sends `Connection: close`, so every ranged GET pays a new
+TLS handshake and a fresh TCP ramp-up. The three depth-4 points fit about **0.15 s per
+request plus ~75 MiB/s per stream**, which caps depth 4 near 300 MiB/s. A deeper queue adds
+more ramp-ups competing for the same path, not more throughput.
+
+**What it is worth, for the 324.75 GiB read-back:**
+
+| | read-back | memory in flight |
+|---|---|---|
+| 4 × 8 MiB (today) | 47 min | 32 MiB |
+| 4 × 64 MiB | ~22 min (2.1×) | 256 MiB |
+| 4 × 128 MiB | ~19 min (2.4×, one rep) | 512 MiB |
+
+**Recommended:** read back in 64 MiB blocks at depth 4, which only needs a different `block`
+in `verify_bucket_object`. The decode path's 8 MiB block should stay: its consumer is a gzip
+inflater, and its sweep was measured separately. 128 MiB is 15% better again, but rests on one
+repetition and doubles the memory. Persistent connections (one per reader) would attack the
+0.15 s directly, and are the larger lever if the read-back is still the bottleneck after this.
+None of this is implemented yet.
