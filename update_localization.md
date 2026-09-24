@@ -5652,3 +5652,44 @@ against 218 MiB/s at 325 GiB).
   of parts.
 * **The model has not been checked past 12 GiB,** and ±30% jitter is an assumption about
   stragglers. A full-size run on a fast destination should come before a default change.
+
+### 13.76 Size-scaled chunks at full size: +38.5% on the GDC API
+
+§13.75's rule (size/32, clamped to [64 MiB, 1 GiB], committed as `7ad0eb8`) was checked on the
+whole 324.75 GiB BAM from the GDC API. Both runs used 16 connections on n1-standard-8 in
+us-east1-b, back to back, and both were md5-verified against the drshub digest. The baseline
+pins the old layout with `--max-chunk 67108864`.
+
+| | fixed 64 MiB (old) | size-scaled, 1 GiB (new) |
+|---|---|---|
+| chunks | 5,196 | 325 |
+| download | 1,915.7 s, **173.6 MiB/s** | 1,382.7 s, **240.5 MiB/s** |
+| streams | 12.00 of 16 | 15.15 of 16 |
+| md5 | ok (857 s read-back) | ok (835 s) |
+| wire | 1.01× | 1.01× |
+| GDC resets retried | 36 | 12 |
+| manifest commits | 404 s, 720 batches (21% of wall) | 136 s, 122 batches (10%) |
+| model (§13.75) | 149 | 218 |
+
+**+38.5% throughput, and 8.9 minutes less download time on this object.** The gain is the one
+§13.73 attributed to per-request waits. With 16× fewer requests, the average number of
+streams actually receiving bytes rose from 12.0 to 15.15 of 16.
+
+**The model was low on both runs, by 16% and 10%,** and predicted a slightly larger gain
+(+46%) than was measured. It got the direction and most of the size of the gain from 12 GiB
+prefixes alone. That supported the change; it did not substitute for this run.
+
+**Resets fell with the request count:** 36 over 5,196 chunks against 12 over 325. So they
+track connections more than bytes. Each one is retried from the chunk's frontier, so none of
+them cost a re-fetch.
+
+**The destination was deliberately not production's.** Two local NVMe SSDs striped (737 GB,
+758-819 MB/s by `dd`) were used so the disk could not cap either run: peak writes of 822
+and 500 MiB/s show it never did. Production does not use local SSD. There, this gain appears
+on fast destinations (the bucket route, NFS). `LocalizeToDisk` to pd-standard is still bound
+by its 44-88 MiB/s, where the rule changes little beyond needing fewer connections to reach
+that ceiling.
+
+The BAM existed only on the node's local SSDs and was destroyed with the node. The GDC token
+was a 0600 file, shredded by the run script's exit trap, and every result file was scanned for
+it before leaving the node.
