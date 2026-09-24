@@ -2534,6 +2534,8 @@ def command_routeb(args):
         extra += ["--decode-readahead", str(args.decode_readahead)]
     if getattr(args, "decode_upload_width", None):
         extra += ["--decode-upload-width", str(args.decode_upload_width)]
+    if getattr(args, "decode_queue_slices", None) is not None:
+        extra += ["--decode-queue-slices", str(args.decode_queue_slices)]
     if getattr(args, "gunzip", False):
         extra.append("--gunzip")
         say("gunzip       : on -- parts compose into <object>.k9pdl.gz, that sidecar is")
@@ -2756,6 +2758,9 @@ def build_parser():
     routeb.add_argument("--decode-upload-width", dest="decode_upload_width", type=int,
                         help="concurrent resumable sessions for the decoded object; "
                              "1 restores the single-session write")
+    routeb.add_argument("--decode-queue-slices", dest="decode_queue_slices", type=int,
+                        help="assembled slices allowed to wait in the upload queue "
+                             "beyond those actively uploading")
     routeb.add_argument("--gunzip", action="store_true",
                         help="exercise the post-compose decompress pass. The source must "
                              "be served Content-Encoding: gzip, and --md5 must be the "

@@ -2829,6 +2829,92 @@ class TestTheSlicedDecodeUpload:
         assert live["peak"] <= width, "peak {} slices in flight exceeded width {}".format(
             live["peak"], width)
 
+    def test_extra_queue_slots_let_the_producer_run_ahead(self):
+        """
+        The whole point of `queue_slices`. With slots == width the producer blocks on
+        every slice past the first `width`, which is why the decode measured as
+        inflate + write with no overlap. Extra slots let assembled slices wait in the
+        pool's queue instead.
+        """
+        started = threading.Event()
+        hold = threading.Event()
+
+        class SlowClient:
+            def start_resumable_upload(self, bucket, name):
+                started.set()
+                hold.wait(5)
+                return "s/" + name
+
+            def upload_range(self, session, body, offset, total):
+                return {"n": session}, total
+
+        def emitted(queue_slices):
+            up = pdl.DecodeSliceUploader(SlowClient(), "b", "p", 1,
+                                         slice_bytes=100, queue_slices=queue_slices)
+            started.clear(); hold.clear()
+            done = threading.Event()
+
+            def produce():
+                for _ in range(10):
+                    up.feed(b"x" * 100)
+                done.set()
+
+            threading.Thread(target=produce, daemon=True).start()
+            started.wait(5)
+            time.sleep(0.3)
+            ran_ahead = done.is_set()
+            hold.set()
+            return ran_ahead
+
+        assert not emitted(0), (
+            "with no spare slots the producer should have blocked behind the upload")
+        assert emitted(16), (
+            "with spare slots the producer should have finished without waiting")
+
+    def test_slicing_is_single_copy(self):
+        """
+        Each byte should be copied once, when its slice is assembled -- not three times
+        (into a bytearray, out of it, and again at the call site), which at a VCF ratio
+        was 27 GB of memcpy for a 9 GB object on the inflater's own thread.
+        """
+        # Keyed by slice name, not append order: with width > 1 the uploads finish on
+        # different threads, so a list captures COMPLETION order. The first version of
+        # this assertion did exactly that and passed by luck.
+        captured = {}
+
+        class Capture:
+            def start_resumable_upload(self, bucket, name):
+                return name
+
+            def upload_range(self, session, body, offset, total):
+                captured[session] = bytes(body)
+                return {"n": 1}, total
+
+        up = pdl.DecodeSliceUploader(Capture(), "b", "p", 2, slice_bytes=64,
+                                     queue_slices=8)
+        chunks = [bytes([i]) * 30 for i in range(10)]
+        for chunk in chunks:
+            up.feed(chunk)
+        names, total = up.finish()
+        assert b"".join(captured[n] for n in names) == b"".join(chunks), (
+            "slicing lost or reordered bytes")
+        assert total == sum(len(c) for c in chunks)
+        # A chunk handed over whole must be passed through, not rebuilt.
+        solo = []
+
+        class Ident(Capture):
+            def upload_range(self, session, body, offset, total):
+                solo.append(body)
+                return {"n": 1}, total
+
+        up2 = pdl.DecodeSliceUploader(Ident(), "b", "p", 1, slice_bytes=10,
+                                      queue_slices=4)
+        exact = b"q" * 10
+        up2.feed(exact)
+        up2.finish()
+        assert solo and solo[0] is exact, (
+            "a chunk that exactly fills a slice was copied instead of passed through")
+
     def test_a_failed_slice_does_not_leave_the_others_behind(self, gcs):
         """
         A do-not-retry failure must not strand slices: they are under a dotted prefix

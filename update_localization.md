@@ -5010,3 +5010,63 @@ easy to vary and the ratio was baked into a fixture I had chosen for an unrelate
 -- it was built in §6.6b to produce enough granule-aligned PUTs, and 1.93:1 was a
 side effect of making the data incompressible enough to control PUT count. That choice
 then silently set the relay/decode balance for every decode measurement that followed.
+
+### 13.68 The zero-copy retry: 1.28x, and the split was never the point
+
+§13.67 reopened the split on the grounds that at a VCF ratio inflate and write are within
+6% of each other and the overlap ceiling is 1.94x. Rebuilt, measured on the VCF fixture
+(552331810 -> 9110203400, 16.49:1), all outputs identical by crc32c.
+
+Two changes, measured separately:
+
+**Zero-copy slicing.** The uploader now holds a list of decoded chunks and joins once per
+slice, and `decompress_object` hands the decoder's output straight over instead of
+round-tripping it through `bytes(pending)`. Three copies per byte became one -- at this
+ratio, 27 GB of memcpy became 9 GB, on the inflater's own thread.
+
+**Extra queue slots.** `queue_slices` lets assembled slices wait in the upload pool's
+queue beyond the `width` actively uploading. No feeder thread: the pool already has a
+queue, which is what §13.64's `PipelinedFeeder` was reinventing.
+
+| configuration | total | inflate | write |
+|---|---|---|---|
+| baseline (§13.67) | 126.0 / 126.0 s | 58.4 / 59.2 | 55.1 / 55.1 |
+| zero-copy, queue 0 | 102.2 / 102.9 s | 49.8 / 49.8 | 40.0 / 40.7 |
+| zero-copy, queue 8 | 99.2 / 97.2 s | 49.7 / 49.3 | 38.0 / 36.8 |
+| zero-copy, queue 16 | 98.7 s | 49.8 | 37.0 |
+| queue 16, width 8 | 94.2 / 98.4 s | 48.9 / 50.1 | 33.8 / 36.5 |
+| queue 16, width 16 | 100.2 s | 49.9 | 38.3 |
+
+**126.0 -> ~98 s, 1.28x.** The zero-copy rewrite is almost all of it (1.23x on its own)
+and it made *both* stages faster -- inflate 58.8 -> 49.8 (15%) and write 55.1 -> 40.3
+(27%) -- which is the clearest possible confirmation that the copies, not contention,
+were what §13.64 measured. Extra queue slots add a consistent 4% (the three groups do not
+overlap). Width 8 is inside the noise (94.2 and 98.4 straddle width 4's 98.7-101.4) and
+width 16 is worse; width stays 4.
+
+Defaults: `queue_slices` 8 rather than 16, because memory is
+`(width + queue_slices) * 32 MiB` -- 384 MiB against 640 MiB for the same 4%. That is
+arithmetic on buffer sizes, not a measured RSS.
+
+#### The ceiling was wrong again, and this time the reason is clean
+
+1.94x predicted 71 s. We got 98 s, and inflate + write still sums to the decode total, so
+there is *still* no overlap -- but it is no longer serialisation. Uploads run at
+**~104 MB/s in situ against inflation's 183 MB/s**, so the queue drains slower than it
+fills and the inflater is genuinely upload-bound. Adding slots cannot fix a rate mismatch,
+and adding width does not raise the rate.
+
+That is now four times the overlap ceiling has overestimated on this route (§13.53,
+§13.60, §13.62, and here). The pattern is consistent enough to state as a rule: **on this
+route the ceiling has never once predicted the outcome, and the stage that looks hideable
+has always turned out to be rate-limited by something the arithmetic does not model.**
+
+#### Two test defects found while doing it
+
+A `replace()` without an assert silently no-opped, so `--decode-queue-slices` never
+reached the downloader's parser and five runs died at argparse. I had written the
+assert-every-anchor lesson into this file earlier in the same session.
+
+`test_slicing_is_single_copy` asserted on a list appended from the upload threads, so it
+captured *completion* order rather than slice order. It passed by luck at first and
+failed once timing shifted. Rewritten to key by slice name.

@@ -141,6 +141,24 @@ DEFAULT_DECODE_UPLOAD_WIDTH = 4
 # 1.6 GB object at 51, and a multiple of the commit granularity keeps the arithmetic
 # honest if a slice ever has to be sent in pieces.
 DECODE_SLICE_BYTES = 32 * 1024 * 1024
+
+# Assembled slices allowed to wait in the upload pool's queue beyond the `width` that
+# are actively uploading. This is what decouples the inflater from the uploader: with
+# none, it blocks on every slice past the first `width` and the decode measures as
+# inflate plus write with no overlap -- 58.8s + 55.1s against a 114.1s decode at a VCF
+# compression ratio, where the two stages are within 6% of each other and the overlap
+# ceiling is 1.94x.
+#
+# Measured at a VCF ratio: queue 0 gives 102.2/102.9 s, queue 8 gives 99.2/97.2, queue 16
+# gives 98.7 -- a consistent ~4% with no overlap between the groups. Small, but real and
+# cheap.
+#
+# 8 rather than 16 because memory is (width + this) * DECODE_SLICE_BYTES, so 8 costs
+# 384 MiB against 16's 640 MiB for the same 4%. That is arithmetic on the buffer sizes,
+# not a measured RSS. Localization runs on n1-standard-8 (wolF's LocalizeToDisk asks for
+# it explicitly), where 384 MiB is unremarkable next to the relay's measured 397 MiB
+# peak; set it to 0 on anything smaller.
+DEFAULT_DECODE_QUEUE_SLICES = 8
 DEFAULT_MIN_CHUNK = 64 * 1024 * 1024
 
 # Chunk boundaries are aligned to this so that every chunk start is also block-aligned
@@ -3037,13 +3055,20 @@ class DecodeSliceUploader:
     the metadata, and `--decode-upload-width 1` is the way back.
     """
 
-    def __init__(self, client, bucket, prefix, width, slice_bytes=DECODE_SLICE_BYTES):
+    def __init__(self, client, bucket, prefix, width, slice_bytes=DECODE_SLICE_BYTES,
+                 queue_slices=DEFAULT_DECODE_QUEUE_SLICES):
         self.client = client
         self.bucket = bucket
         self.prefix = prefix
         self.slice_bytes = slice_bytes
         self.total = 0
-        self._buffer = bytearray()
+        # A list of decoded chunks, joined exactly once per slice. The first version
+        # accumulated into a bytearray and then re-materialised the slice out of it,
+        # which copied every byte three times over -- into the bytearray, out of it, and
+        # once more at the call site. At a VCF ratio that is 27 GB of memcpy for a 9 GB
+        # object, on the same thread as the inflater.
+        self._parts = []
+        self._pending = 0
         self._names = []
         self._futures = []
         self._pool = ThreadPoolExecutor(max_workers=width,
@@ -3051,7 +3076,13 @@ class DecodeSliceUploader:
         # Backpressure. Without it, submitting every slice to the pool queues them all
         # WITH their payloads attached and the whole object ends up resident -- the pool
         # bounds concurrency, never memory. The read-ahead had the same trap.
-        self._slots = threading.Semaphore(width)
+        # MORE SLOTS THAN WORKERS. This is what lets the inflater run ahead: extra
+        # slices sit in the pool's queue, already assembled, while `width` of them
+        # upload. With slots == width the inflater blocked on every slice after the
+        # first `width`, which is why the decode measured as inflate + write with no
+        # overlap at all. A separate feeder thread was the first attempt at this and
+        # was not needed -- the pool already has a queue.
+        self._slots = threading.Semaphore(width + queue_slices)
 
     def _send(self, name, body):
         session = self.client.start_resumable_upload(self.bucket, name)
@@ -3066,9 +3097,24 @@ class DecodeSliceUploader:
                     "slice {} stalled at {}/{}".format(name, offset, len(body)))
             offset = committed
 
+    def _take(self, count):
+        """Pull exactly `count` bytes off the front of the chunk list, one join."""
+        taken, got = [], 0
+        while got < count:
+            chunk = self._parts.pop(0)
+            need = count - got
+            if len(chunk) > need:
+                taken.append(chunk[:need])
+                self._parts.insert(0, chunk[need:])   # one small copy, once per slice
+                got += need
+            else:
+                taken.append(chunk)
+                got += len(chunk)
+        self._pending -= count
+        return taken[0] if len(taken) == 1 else b"".join(taken)
+
     def _emit(self, count):
-        body = bytes(self._buffer[:count])
-        del self._buffer[:count]
+        body = self._take(count)
         name = "{}.{:05d}".format(self.prefix, len(self._names))
         self._names.append(name)
         self.total += len(body)
@@ -3078,14 +3124,17 @@ class DecodeSliceUploader:
         self._futures.append(future)
 
     def feed(self, data):
-        self._buffer += data
-        while len(self._buffer) >= self.slice_bytes:
+        if not data:
+            return
+        self._parts.append(data)
+        self._pending += len(data)
+        while self._pending >= self.slice_bytes:
             self._emit(self.slice_bytes)
 
     def finish(self):
         """Flush the tail, wait for every slice, and return their names in order."""
-        if self._buffer:
-            self._emit(len(self._buffer))
+        if self._pending:
+            self._emit(self._pending)
         try:
             for future in self._futures:
                 future.result()             # re-raises the first upload failure
@@ -3144,7 +3193,8 @@ def ranged_blocks(client, bucket, name, size, block, depth):
 def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
                       granularity=GCS_UPLOAD_GRANULARITY,
                       readahead=DEFAULT_DECODE_READAHEAD,
-                      upload_width=DEFAULT_DECODE_UPLOAD_WIDTH):
+                      upload_width=DEFAULT_DECODE_UPLOAD_WIDTH,
+                      queue_slices=DEFAULT_DECODE_QUEUE_SLICES):
     """
     Stream `source` through gunzip into a new object `dest`, entirely in the bucket.
 
@@ -3176,7 +3226,8 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
     decoder = GzipStreamDecoder()
 
     session = None
-    uploader = (DecodeSliceUploader(client, bucket, dest + ".k9pdl.slice", upload_width)
+    uploader = (DecodeSliceUploader(client, bucket, dest + ".k9pdl.slice", upload_width,
+                                    queue_slices=queue_slices)
                 if upload_width > 1 else None)
     pending = bytearray()
     offset = 0
@@ -3225,10 +3276,16 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
                 raise TransientError("read-back returned nothing at {}".format(read_at))
             read_at += len(payload)
 
+            produced = b""
+            buffered = False
             try:
                 mark = time.monotonic()
-                pending += decoder.feed(payload)
+                produced = decoder.feed(payload)
                 stage["inflate"] += time.monotonic() - mark
+                if uploader is None or not checked:
+                    # Still deciding the magic question, so it has to be inspectable.
+                    pending += produced
+                    buffered = True
             except zlib.error as e:
                 if session is not None or decoder.produced:
                     # Past the header and part-way through a stream: this is corruption,
@@ -3251,13 +3308,21 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
                 continue
 
             if uploader is not None:
-                # The slicer takes everything; it decides where the cuts fall, and
-                # every PUT it makes carries a real total, so the granule rule below
-                # does not apply to it.
+                # `pending` is a bytearray only because the magic check needs to look at
+                # the first bytes. Once that is settled the decoder's own output goes
+                # straight to the slicer -- `bytes(pending)` here copied every byte of a
+                # 9 GB object for nothing, on the inflater's thread.
                 mark = time.monotonic()
-                uploader.feed(bytes(pending))
+                if pending:
+                    uploader.feed(bytes(pending))
+                    del pending[:]
+                if not buffered:
+                    # `buffered` guards the hand-off iteration: when `checked` flips
+                    # true on THIS pass, `produced` is already inside `pending` and
+                    # feeding it again duplicates a block. Only the magic-check family
+                    # reaches that state, which is why it showed up on .bam/.bgz alone.
+                    uploader.feed(produced)
                 stage["write"] += time.monotonic() - mark
-                del pending[:]
                 continue
 
             # Only whole granules may be sent while the total is still unknown.
@@ -3584,7 +3649,9 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
                     readahead=getattr(options, "decode_readahead",
                                       DEFAULT_DECODE_READAHEAD),
                     upload_width=getattr(options, "decode_upload_width",
-                                         DEFAULT_DECODE_UPLOAD_WIDTH))
+                                         DEFAULT_DECODE_UPLOAD_WIDTH),
+                    queue_slices=getattr(options, "decode_queue_slices",
+                                         DEFAULT_DECODE_QUEUE_SLICES))
         except PermanentError as e:
             # The compressed bytes already matched the advertised digest, so a
             # mid-stream decode failure means the source object itself is broken and
@@ -4457,6 +4524,12 @@ def build_parser():
                              "1 uses a single session, which is ~4x slower but leaves a "
                              "plain object carrying an md5Hash instead of a composite "
                              "that does not")
+    parser.add_argument("--decode-queue-slices", dest="decode_queue_slices", type=int,
+                        default=DEFAULT_DECODE_QUEUE_SLICES,
+                        help="assembled slices allowed to wait in the upload queue "
+                             "beyond those actively uploading (default: %(default)s). "
+                             "This is what lets the inflater run ahead of the upload; "
+                             "memory is (width + this) times the slice size")
     parser.add_argument("--header", action="append", default=[],
                         help="extra request header, 'Name: value' (repeatable)")
     parser.add_argument("--s3-bucket", dest="s3_bucket")
