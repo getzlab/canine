@@ -202,3 +202,21 @@ against the ra4 baseline and then reverted.
 ~4% on the decode phase, nothing in total. Write fell as designed; inflate rose 43%,
 because the upload threads hold the GIL for their HTTP/TLS work. Kept so nobody has to
 build it twice to learn that.
+
+### Was it the GIL? (`gilprobe.py`)
+
+Run after §13.64 blamed the split's inflate slowdown on the GIL without measuring it.
+Same inflate, three ways:
+
+| arm | inflate | vs solo |
+|---|---|---|
+| solo | 12.21 s | 1.00x |
+| threads | 12.74 s | 1.04x |
+| procs | 12.67 s | 1.04x |
+
+Threads and processes identical: not the GIL, and multiprocessing would buy nothing.
+Uploads cost inflate 4%, not the 43% the split measured -- so that slowdown came from the
+split's own buffering, and the idea is unproven rather than disproven.
+
+The probe's first run 429'd: it rewrote one object name in a loop, and GCS rate-limits
+single-object writes to ~1/sec. The production uploader gives every slice its own name.

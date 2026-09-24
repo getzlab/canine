@@ -4855,3 +4855,52 @@ attacking with more concurrency: relay 5.4, verify 6.1, decode 21.4, other 2.8, 
 two big ones are already at their measured ceilings. Further gains would have to come from
 doing less work -- a faster inflater, or not decompressing at all -- not from doing the
 same work in more places at once.
+
+### 13.65 The GIL claim in §13.64 was wrong, and multiprocessing is not the answer
+
+§13.64 blamed the split's inflate slowdown on the upload threads holding the GIL. That was
+an inference, not a measurement, and it is **wrong**. Tested directly
+(`benchmark-results/gilprobe.py`): inflate the same 852 MB object three ways -- alone,
+with 4 upload workers in THREADS, and with the identical load in 4 PROCESSES.
+
+| arm | inflate | vs solo |
+|---|---|---|
+| solo | 12.21 s | 1.00x |
+| threads | 12.74 s | **1.04x** |
+| procs | 12.67 s | **1.04x** |
+
+Threads and processes are indistinguishable, so the GIL is not the mechanism and
+**multiprocessing would buy nothing** -- the question that prompted this. It would also
+have to move 1.64 GB across a process boundary to do it.
+
+The arithmetic should have warned me off the GIL claim before I wrote it: the upload side
+is ~50 HTTP requests for 1.64 GB, and both `sendall` and OpenSSL's AES release the GIL, so
+there was never five seconds of held-GIL work to find.
+
+#### What it means for the split
+
+Concurrent uploads cost inflate **4%**, not the 43% §13.64 measured. So that 43% was not
+caused by overlap at all -- it came from inside the implementation. The likely cause is
+allocation and cache pressure: `PipelinedFeeder` keeps several 15-32 MiB buffers alive in
+a queue and copies every byte through `bytes(pending)` -> queue -> `_buffer +=` ->
+`bytes(_buffer[:n])`, where the probe's inflate allocates each decoded chunk and frees it
+immediately.
+
+**So the split is not disproven, only my version of it.** If inflate held near 11.4 s
+while write stayed at the 3.7 s the split achieved, the decode would be ~15 s against
+today's 21.4 -- about 1.4x, and worth roughly 6 s of a 36 s run. A second attempt would
+have to be genuinely zero-copy: hand the uploader a `memoryview` of the slice rather than
+re-materialising it, and size the queue in bytes rather than chunks.
+
+Recorded as open rather than attempted. The prize is smaller than anything already taken,
+the first attempt cost real effort for nothing, and the cause above is still a hypothesis
+-- it has not been measured, and this section exists precisely because I stated an
+unmeasured mechanism as fact one round ago.
+
+#### A note on the probe itself
+
+The first run died with **HTTP 429**: the load generator rewrote one object name per
+worker in a loop, and GCS rate-limits writes to a single object at roughly one per second.
+The production uploader never does this -- every slice already gets its own name -- so it
+was purely a probe bug. Worth recording anyway, because it is a limit that would bite hard
+if the slice naming were ever made non-unique.
