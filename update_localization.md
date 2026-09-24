@@ -5374,8 +5374,22 @@ unrelated defect that does matter.
 **A real GDC-backed DRS URI**, a 348.7 GB TCGA WGS BAM (controlled access). drshub resolves
 its metadata (size, md5, `bondProvider: dcf_fence`, no `gsUri`, `fileName` = the bare UUID).
 The access step goes to CRDC DCF's `access/s3` endpoint, so the storage is AWS S3 and the
-`accessUrl` is a presigned URL. It came back 401 here, because the account has no Fence link
-with TCGA authorization.
+`accessUrl` is a presigned URL. At first it came back 401 (no read-storage on
+`phs000178.c1`), even though the Terra `dcf-fence` link was valid. That turned out to be a
+transient Terra-side problem, and a retry later the same day returned the URL.
+
+**The presigned S3 URL** (`tcga-2-controlled`):
+
+| request | response |
+|---|---|
+| HEAD | **403**: the URL is signed for GET only |
+| GET, `Range: bytes=0-0`, AE identity or gzip | 206, `Content-Range: bytes 0-0/348693812393`, **no Content-Encoding**, multipart ETag (`…-5196`, so not an md5), SSE AES256 |
+
+The downloader's real `probe_range`, and a 16-byte read at 1 GiB, both succeed, so the DRS
+route runs in parallel. The real `HandleDRSURI` plan step resolves size and md5, and recovers
+the real filename from the `accessUrl` path (drshub's `fileName` is the bare UUID). It emits the
+downloader with `--url "$signed_url"`, `--url-refresh-cmd`, the drshub md5 and 16 connections;
+the host-side URL never appears in the script.
 
 **The GDC API, with a user token**, on the same object:
 
