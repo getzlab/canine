@@ -161,6 +161,7 @@ DECODE_SLICE_BYTES = 32 * 1024 * 1024
 DEFAULT_DECODE_QUEUE_SLICES = 8
 DEFAULT_MIN_CHUNK = 64 * 1024 * 1024
 
+
 # Chunk boundaries are aligned to this so that every chunk start is also block-aligned
 # on any plausible filesystem. Without it, adjacent chunks share a partial block and
 # the frontier arithmetic at chunk boundaries stops being sound.
@@ -244,6 +245,30 @@ SHELL = "/bin/bash"
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_REQUEUE = 5
+
+def fetch_or_exit(fetch):
+    """
+    Wrap a single-stream fetch so that any failure exits localization explicitly, with a
+    code canine reads as an ordinary failure.
+
+    An ordinary failure is the right outcome even for a transient drop: wolF retries a
+    failed task (`retry`, 3 by default), and the retry resumes from the partial file
+    (`curl -C -`, the append-resume), so it is a bounded retry that loses nothing. Exit 5
+    would instead be an UNCAPPED requeue, safe only behind a forward-progress gate.
+
+    Explicit, because `set -e` does not apply inside an `&&` list: a failed fetch in
+    `FETCH && verify && decode` let localization.sh carry on, and the task ran without its
+    input (measured). Normalized, because canine reads 5 as requeue and 15 as SKIP, and
+    curl uses both (5 couldn't resolve proxy, 15 an FTP host failure): passed through, one
+    could requeue forever and the other would mark a job done without running it.
+
+    One line, so it can travel in --legacy-cmd.
+    """
+    return (
+        "{{ _k9r=0; {{ {fetch}; }} || _k9r=$?; if [ $_k9r -ne 0 ]; then "
+        "echo \"download failed (exit $_k9r); the partial file is kept for the retry to "
+        "resume\" >&2; case $_k9r in {requeue}|15) exit {fail};; *) exit $_k9r;; esac; fi; }}"
+    ).format(fetch=fetch, requeue=EXIT_REQUEUE, fail=EXIT_FAIL)
 
 
 # --------------------------------------------------------------------------------
@@ -4332,12 +4357,15 @@ def single_stream_fallback(options, reason):
         # With check_hash on, verification catches that as a mismatch; with it off the
         # error page would be accepted as the file. A clean nonzero exit is strictly
         # better than relying on a hash that may not be configured.
-        command = "curl --fail -C - -sSL{headers} -o {dest} {url}".format(
-            headers="".join(
-                " --header {}".format(shlex.quote(h)) for h in (options.header or [])
-            ),
-            dest=shlex.quote(options.dest),
-            url=shlex.quote(options.url),
+        # --retry: see CURL_FETCH in file_handlers.py, which measured it safe with -C -
+        command = fetch_or_exit(
+            "curl --fail --retry 5 -C - -sSL{headers} -o {dest} {url}".format(
+                headers="".join(
+                    " --header {}".format(shlex.quote(h)) for h in (options.header or [])
+                ),
+                dest=shlex.quote(options.dest),
+                url=shlex.quote(options.url),
+            )
         )
     with phase("download", options.size if (options.size or 0) > 0 else None):
         result = subprocess.run(command, shell=True, executable=SHELL)

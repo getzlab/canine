@@ -5490,3 +5490,165 @@ to ~490 MiB/s, flattening past 12 connections at an aggregate ceiling not invest
 **Credentials.** The GDC token and the presigned URL lived on the node only as 0600 files, read
 at run time and deleted afterwards. Every result file was checked for them before leaving the
 node.
+
+### 13.74 Legacy curl saved HTTP error bodies as the download
+
+Reported from production: GDC API error output sometimes ended up *inside* the downloaded
+file. Reproduced in the worker image (curl 7.81) against the real GDC API with a bogus token.
+`curl -C - -o f URL` exits **0** and `f` contains `{"message":"Not authorized to download:
+…"}`, 80 bytes. The same happens with a GCS 403 (757 bytes of XML), and two 500s left an empty
+file, also exit 0. None of the eight handler legacy curls (GDC, DRS, signed-GCS, other-URL,
+and their streaming variants) passed `--fail`. The downloader's own synthesized fallback did,
+with a comment explaining why. But a handler's `--legacy-cmd` takes precedence over it, so the
+unprotected command is what ran. That includes every GDC API download before §13.72, all of
+which fell back.
+
+What an error body did next:
+
+* **No hash check:** it was accepted as the file.
+* **Hash check:** md5 mismatch; the file was deleted, exit 1.
+* **The compressed pipeline:** the wrong size read as "decoded by the server", and the error
+  body was moved into place with a warning.
+* **Stream handlers:** the error text was fed into the FIFO as data.
+
+A partial file was never at risk, because `-C -` refuses to append a non-206.
+
+**Fix: `CURL_FETCH = "curl --fail --retry 5"`**, the start of every curl that writes a localized
+file, and the same flags on the downloader's fallback. Measured on curl 7.81, against the fake
+server:
+
+| case | before | after |
+|---|---|---|
+| fresh fetch, 403 | exit 0, error body saved as the file | exit 22/56, no file |
+| fresh fetch, two 500s | exit 0, empty file | retried, exit 0, byte-identical |
+| complete file, re-run (`-C -` → 416) | exit 0 | exit 0, unchanged |
+| partial file, 403, then success | — | partial untouched, then resumed to byte-identical |
+| connection dropped mid-body | exit 18, valid partial | same: plain `--retry` doesn't retry a drop |
+
+The last row explains why it is **not `--retry-all-errors`**. With `-C -`, curl 7.81 re-requests
+a retry from the *original* offset and rewinds the file to it. That is safe (no duplicated
+bytes), but it makes no progress past a drop, and it would spend the retries on a 403. A drop
+exits nonzero with a valid partial, which the next attempt resumes.
+
+Tests run each handler's real emitted legacy command with bash against the fake server
+(`TestLegacyCurlRefusesErrorBodies`). Removing `--fail`, removing `--retry`, and reverting to
+the old command are each caught; the old command fails 7 of them.
+
+#### A transient drop fails the attempt, and wolF's retry resumes it
+
+A mid-body drop (exit 18/56; the GDC API resets connections routinely) could have been sent
+to canine as exit 5, requeue-and-resume. It deliberately is not. canine requeues 5 **with no
+cap**, so it is only safe behind a forward-progress gate, and a gate only mitigates the loop
+risk. An ordinary failure is already the right retry: wolF retries a failed task (`retry`, 3
+by default, `retry_delay` 1 minute), and the retry resumes from the partial file with `-C -`.
+That is bounded and loses nothing; a test runs the same legacy command over its own partial
+until it finishes byte-identical. The downloader's own chunk path still exits 5 on transient
+errors after progress, as before.
+
+What does matter is that a failure *reaches* canine as a failure. Wiring this up turned up
+three ways it did not, all fixed by `fetch_or_exit`, which wraps every legacy fetch and the
+downloader's fallback:
+
+* **`set -e` does not apply inside an `&&` list.** In the compressed pipeline
+  (`FETCH && verify && decode`), a failed fetch *or a failed gunzip* let localization.sh carry
+  on to the next input. The task then ran without its input (measured: `set -e; false &&
+  decode; echo next` prints `next`). Every failure now exits explicitly, and the compressed
+  pipeline ends `|| exit 1`.
+* **curl's exit codes collide with canine's.** curl exits 5 for "couldn't resolve proxy" and 15
+  for an FTP host failure; canine reads 5 as requeue (uncapped) and 15 as **skip the job**,
+  i.e. done. A raw pass-through could loop forever, or report a task that never ran as
+  finished. Both now exit 1.
+* **The exit-33 handler discarded the real code.** `{ rc=$?; [ $rc -eq 33 ] && … }` turned
+  every other failure into a plain 1; it now passes it through.
+
+#### Found by the tests: a truncated compressed body was placed as the file
+
+For a compressed object without Content-Length (a body delimited by the connection closing),
+a dropped connection looks complete to curl: exit 0, and a short body. The detect-don't-
+predict check (§13.70) saw a size mismatch, called it "decoded by the server", and moved the
+**truncated gzip stream into place** with a warning. That is the same failure as an error body
+saved as the file.
+
+Size cannot separate the two cases: a server-decoded mislabelled `.gz` is *also* shorter
+than the stored bytes. Content can. A truncated stored body still starts `1f 8b` and fails
+`gzip -t`; a decoded one is either not gzip at all or a complete inner stream, which passes.
+A truncated stream now fails, and the sidecar is kept for the retry to resume. On real GCS
+this needs the response to lack Content-Length, which the 206s the pipeline requests carry
+(measured). So it is a guard for other servers, not a known GCS failure.
+
+All six pieces are mutation-checked against the behavioral tests
+(`TestLegacyFailuresExitExplicitly`).
+
+### 13.75 Chunk size: measured on the GDC API, and a size-scaled rule
+
+12 GiB prefix of the same 324.75 GiB BAM from the GDC API to tmpfs, n1-standard-8 in us-east1-b.
+16 connections ran twice at each size:
+
+| chunk | run 1 | run 2 | mean | vs 64 MiB | streams (of 16) |
+|---|---|---|---|---|---|
+| 64 MiB | 156.32 | 156.30 | 156.3 MiB/s | — | 11.2 |
+| 128 MiB | 181.80 | 191.70 | 186.8 | +19% | 12.3-13.1 |
+| 256 MiB | 201.15 | 198.64 | 199.9 | **+28%** | 13.2-13.4 |
+| 512 MiB | 167.53 | 170.98 | 169.3 | +8% | 11.0-11.4 |
+
+At 8 connections: 70.20 MiB/s at 64 MiB, 110.03 at 256 MiB (**+57%**), with 7.21 of 8 streams
+active against 5.10. One first attempt at that row failed on a GDC connection reset (the
+benchmark's size probe and then the curl baseline both got `Connection reset by peer`); the
+re-run was clean. 512 MiB dips only because of this test's size: 12 GiB is 24 chunks, or 1.5
+rounds of 16, so the last round leaves most connections idle.
+
+**A queue model fits these to 4.2% RMS across five configurations.** Each chunk costs a
+per-request overhead t₀ plus chunk/b of streaming; k workers pull from a queue, with per-stream
+rate jitter of ±30%. The fit is b = 15 MiB/s and **t₀ ≈ 2.6 s**, higher than the 1.1-1.7 s an
+idle 1-byte probe showed, so the GDC API's per-request wait grows under load. Extrapolated to
+the full 325 GiB object: 149 MiB/s at 64 MiB, 208 at 256 MiB, 218 at 1 GiB (**+46%**). This is
+untested at full size.
+
+**No fixed size is right, because the best one grows with the object.** In the model the GDC
+API's best chunk is 128 MiB at 2 GiB, 256 MiB at 8 GiB, and 1 GiB at 325 GiB; today's 64 MiB
+reaches 67-88% of the best. An S3-like source (t₀ 0.35 s, ~35 MiB/s per stream, the ~500 MiB/s
+aggregate ceiling measured in §13.73) is far less sensitive: 64 MiB is within 91%. Candidate
+rules, each scored by its worst case across object sizes from 1 to 325 GiB:
+
+| rule | GDC worst | S3 worst |
+|---|---|---|
+| fixed 64 MiB (today) | 67% | 91% |
+| size/16, clamped to [64 MiB, 1 GiB] | 96% | 88% (one round of big chunks; stragglers) |
+| **size/32, clamped to [64 MiB, 1 GiB]** | **88%** | **91%** |
+| size/64 | 82% | 93% |
+| size/128 / size/256 | 81% / 79% | 97% / 95% |
+
+`size/32` is nearly gcloud's *upload* rule (`parallel_composite_upload_component_size` 50M,
+at most 32 components). The 1 GiB cap is the difference that matters: a large object stays a
+queue of many chunks (325 for this BAM, rather than 32 of 10 GiB), and the queue is what
+protects against stragglers. gcloud's *download* rule is the other shape: a 5 MiB target, but
+at most 8 or 16 slices, so one slice per thread, which the model penalizes at large sizes (176
+against 218 MiB/s at 325 GiB).
+
+**Pros of a size-scaled chunk:**
+
+* **Fewer per-request waits,** the dominant cost on the GDC API. S3 and GCS gain a little, and
+  lose nothing measurable.
+* **Nothing lost on preemption or retry.** Both routes resume inside a chunk: the in-place route
+  byte-exactly from the frontier, the bucket route from the upload session's 256 KiB-granular
+  Range.
+* **Memory unchanged.** The read and upload buffers are 8 MiB per connection whatever the chunk.
+* **Fewer objects on the bucket route:** fewer parts, compose calls and deletes.
+* **Fewer processes on the S3 API route,** one `aws` process per chunk.
+* **The plan stays stable.** Chunk size depends on object size alone, so `plan_id` stays stable
+  across requeues onto differently-configured nodes, which is the hard requirement in
+  `plan_chunks`.
+
+**Cons, and what bounds them:**
+
+* **Fewer chunks means less parallelism on small objects, and longer tails.** The floor keeps
+  every object under 2 GiB exactly as today, and the cap bounds any single straggler at 1 GiB.
+* **Rollout restarts large downloads once.** `plan_id` changes for objects over 2 GiB, so a
+  partial download in flight across the upgrade restarts once.
+* **Little gain on the common destination.** `LocalizeToDisk` to pd-standard (44-88 MiB/s) is
+  disk-bound either way. The gain is on fast destinations (the bucket route, NFS), and in
+  reaching the disk's ceiling with fewer connections.
+* **S3 multipart objects are unaffected in principle.** Chunks still snap up to a whole number
+  of parts.
+* **The model has not been checked past 12 GiB,** and ±30% jitter is an assumption about
+  stragglers. A full-size run on a fast destination should come before a default change.

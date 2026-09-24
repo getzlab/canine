@@ -100,7 +100,7 @@ class TestSurroundingShellUnchanged:
                 "mkdir -p /mnt/rwdisks/canine-abc/inputs || :; "
         assert legacy[0].startswith(guard) and parallel[0].startswith(guard)
         # everything after the guard is the download, and only that changed
-        assert legacy[0][len(guard):].startswith("curl -C - -o")
+        assert legacy[0][len(guard):].startswith(fh.fetch_or_exit(fh.CURL_FETCH + " -C - -o")[:40])
         assert parallel[0][len(guard):].startswith("K9_PDL=")
 
     @ALL_URLS
@@ -154,8 +154,9 @@ class TestSurroundingShellUnchanged:
         assert legacy == (
             "[ ! -d /mnt/rwdisks/canine-abc/inputs ] && "
             "mkdir -p /mnt/rwdisks/canine-abc/inputs || :; "
-            "curl -C - -o /mnt/rwdisks/canine-abc/inputs/sample.bam '{}'".format(
-                URLS[kind])
+            + fh.fetch_or_exit(
+                fh.CURL_FETCH + " -C - -o /mnt/rwdisks/canine-abc/inputs/sample.bam '{}'".format(
+                    URLS[kind]))
         )
 
 
@@ -173,13 +174,13 @@ class TestParallelDownloadIsDeclined:
         """
         script = emit(URLS["other"], download_connections=connections, check_md5=False)
         assert "K9_PDL" not in script
-        assert "curl -C - -o" in script
+        assert fh.CURL_FETCH + " -C - -o" in script
 
     def test_ftp_uses_the_legacy_command(self):
         """ftp is not rangeable, so the fallback is a foregone conclusion."""
         script = emit("ftp://ftp.example.org/data/sample.bam", check_md5=False)
         assert "K9_PDL" not in script
-        assert "curl -C - -o" in script
+        assert fh.CURL_FETCH + " -C - -o" in script
 
     def test_explicit_opt_out(self):
         script = emit(URLS["other"], parallel_download=False, check_md5=False)
@@ -482,8 +483,9 @@ class TestGDCConversion:
         assert script == (
             "[ ! -d /mnt/rwdisks/canine-abc/inputs ] && "
             "mkdir -p /mnt/rwdisks/canine-abc/inputs || :; "
-            'curl -C - -o /mnt/rwdisks/canine-abc/inputs/sample.bam '
-            '--header  "X-Auth-Token: t" \'{}\''.format(GDC_URL)
+            + fh.fetch_or_exit(
+                fh.CURL_FETCH + ' -C - -o /mnt/rwdisks/canine-abc/inputs/sample.bam '
+                '--header  "X-Auth-Token: t" \'{}\''.format(GDC_URL))
         )
 
     @pytest.mark.parametrize("kwargs", [
@@ -569,7 +571,8 @@ class TestDRSConversion:
         assert lines[1] == (
             "[ ! -d /mnt/rwdisks/canine-abc/inputs ] && "
             "mkdir -p /mnt/rwdisks/canine-abc/inputs || :; "
-            'curl -C - -o /mnt/rwdisks/canine-abc/inputs/sample.bam "$signed_url"'
+            + fh.fetch_or_exit(
+                fh.CURL_FETCH + ' -C - -o /mnt/rwdisks/canine-abc/inputs/sample.bam "$signed_url"')
         )
 
     @pytest.mark.parametrize("kwargs", [
@@ -634,6 +637,237 @@ class TestDRSEndToEnd:
                                     text=True, timeout=300)
         assert result.returncode == 0, result.stdout + result.stderr
         assert open(dest, "rb").read() == payload
+
+
+class TestLegacyCurlRefusesErrorBodies:
+    """
+    Every legacy curl carries `--fail --retry 5` (CURL_FETCH). Without --fail an HTTP error
+    body is written AS the file and curl exits 0 -- measured on the worker image's curl
+    7.81 against the real GDC API, whose 80-byte "Not authorized" JSON became the
+    "download". These run each handler's real emitted legacy command with bash, with no
+    hash check: the unprotected case, where the error body used to be accepted.
+    """
+
+    PAYLOAD = os.urandom(2 * MIB + 4321)
+
+    def _run(self, command, tmp_path):
+        script = "#!/bin/bash\nset -e\n" + command + "\n"
+        return subprocess.run(["bash", "-e", "-c", script], capture_output=True, text=True,
+                              timeout=120)
+
+    def _handlers(self, server):
+        other = fh.get_file_handler(server.url("sample.bam"), parallel_download=False,
+                                    check_md5=False)
+        gdc = gdc_handler(token="t", check_md5=False, parallel_download=False)
+        gdc.url = server.url("sample.bam")
+        drs = drs_handler(access_url=server.url("sample.bam"), check_md5=False,
+                          parallel_download=False)
+        return {"other": other, "gdc": gdc, "drs": drs}
+
+    def _command(self, kind, handler, dest, server):
+        command = handler.localization_command(dest)
+        if kind == "drs":
+            # swap the drshub call for a local stand-in, as TestDRSEndToEnd does
+            first, rest = command.split("\n", 1)
+            assert first.startswith("export signed_url=$(")
+            command = "export signed_url=$(printf '%s' {})\n{}".format(
+                server.url("sample.bam"), rest)
+        return command
+
+    @pytest.mark.parametrize("kind", ["other", "gdc", "drs"])
+    def test_an_error_response_fails_and_writes_nothing(self, tmp_path, kind):
+        dest = str(tmp_path / "sample.bam")
+        with Server(self.PAYLOAD) as server:
+            handler = self._handlers(server)[kind]
+            server.state.force_status = 403
+            result = self._run(self._command(kind, handler, dest, server), tmp_path)
+        assert result.returncode != 0, "an error body was accepted as the download"
+        assert not os.path.exists(dest) or b"AccessDenied" not in open(dest, "rb").read()
+
+    @pytest.mark.parametrize("kind", ["other", "gdc", "drs"])
+    def test_transient_server_errors_are_retried(self, tmp_path, kind):
+        dest = str(tmp_path / "sample.bam")
+        with Server(self.PAYLOAD) as server:
+            handler = self._handlers(server)[kind]
+            server.state.fail_next = 2
+            result = self._run(self._command(kind, handler, dest, server), tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert open(dest, "rb").read() == self.PAYLOAD
+
+    def test_a_partial_file_survives_an_error_and_then_resumes(self, tmp_path):
+        dest = str(tmp_path / "sample.bam")
+        with Server(self.PAYLOAD) as server:
+            handler = self._handlers(server)["other"]
+            open(dest, "wb").write(self.PAYLOAD[:MIB])
+            server.state.force_status = 403
+            assert self._run(handler.localization_command(dest), tmp_path).returncode != 0
+            assert open(dest, "rb").read() == self.PAYLOAD[:MIB]
+            server.state.force_status = None
+            result = self._run(handler.localization_command(dest), tmp_path)
+        assert result.returncode == 0, result.stderr
+        assert open(dest, "rb").read() == self.PAYLOAD
+
+    def test_the_compressed_pipeline_does_not_place_an_error_body(self, tmp_path):
+        """
+        The worst case before: a wrong-sized arrival reads as "decoded by the server", and
+        was moved into place with a warning.
+        """
+        import gzip
+        blob = gzip.compress(os.urandom(MIB).hex().encode())
+        dest = str(tmp_path / "o.txt")
+        with Server(blob) as server:
+            server.state.stored_gzip = True
+            handler = fh.get_file_handler(server.url("o.txt"), parallel_download=False,
+                                          check_md5=False)
+            assert handler.body_is_compressed
+            server.state.force_status = 403
+            result = self._run(handler.localization_command(dest), tmp_path)
+        assert result.returncode != 0
+        assert not os.path.exists(dest)
+
+    def test_the_downloaders_own_fallback_matches(self):
+        """Its synthesized curl is used when a handler passes no --legacy-cmd."""
+        import inspect
+        from canine.localization import parallel_download as pdl
+        assert '"curl --fail --retry 5 -C - ' in inspect.getsource(pdl)
+        source = inspect.getsource(pdl.single_stream_fallback)
+        assert "fetch_or_exit(" in source, "the synthesized fallback must exit explicitly too"
+        assert fh.CURL_FETCH == "curl --fail --retry 5"
+
+
+class TestLegacyFailuresExitExplicitly:
+    """
+    A failed legacy download must stop localization.sh with an ordinary failure. wolF then
+    retries the task (3 times by default), and the retry resumes from the partial file.
+
+    Three ways that went wrong before, each tested here:
+
+    * **`set -e` does not apply inside an `&&` list.** A failed fetch or decode in
+      `FETCH && verify && decode` let the script carry on, and the task ran without its
+      input.
+    * **Two curl exit codes collide with canine's special codes.** curl's 5 and 15 read
+      as requeue (forever) and SKIP.
+    * **The exit-33 handler discarded the real code.** Any other failure came out as 1.
+    """
+
+    PAYLOAD = os.urandom(2 * MIB + 777)
+
+    @staticmethod
+    def _script(command):
+        # the shape of localization.sh: set -e, then the next input's line
+        return "#!/bin/bash\nset -e\n" + command + "\necho NEXT_INPUT_REACHED\n"
+
+    def _bash(self, command):
+        return subprocess.run(["bash", "-c", self._script(command)], capture_output=True,
+                              text=True, timeout=120)
+
+    @pytest.mark.parametrize("code, expected", [(0, 0), (56, 56), (22, 22), (5, 1), (15, 1)])
+    def test_exit_codes_are_passed_through_except_canines_special_ones(self, code, expected):
+        result = self._bash(fh.fetch_or_exit("(exit {})".format(code)))
+        assert result.returncode == expected
+        assert ("NEXT_INPUT_REACHED" in result.stdout) == (expected == 0)
+
+    def test_a_failure_inside_an_and_list_still_stops_the_script(self):
+        """The shape of the compressed pipeline: FETCH && verify && decode."""
+        result = self._bash(fh.fetch_or_exit("false") + " && echo DECODED")
+        assert result.returncode != 0
+        assert "NEXT_INPUT_REACHED" not in result.stdout
+
+    def test_a_dropped_connection_fails_keeps_the_partial_and_the_retries_finish(self, tmp_path):
+        """
+        Each attempt is what a wolF retry runs: the same command, over the partial the
+        last one left. It must fail as an ordinary failure (never 5 or 15), and the
+        attempts together must produce the object exactly.
+        """
+        dest = str(tmp_path / "sample.bam")
+        with Server(self.PAYLOAD) as server:
+            server.state.drop_after = 300 * 1024
+            handler = fh.get_file_handler(server.url("sample.bam"), parallel_download=False,
+                                          check_md5=False)
+            codes = []
+            for _ in range(20):
+                result = self._bash(handler.localization_command(dest))
+                codes.append(result.returncode)
+                if result.returncode == 0:
+                    break
+        assert codes[-1] == 0, codes
+        assert all(c not in (5, 15) for c in codes), codes
+        assert len(codes) > 2, "the drop never happened, so this tested nothing"
+        assert open(dest, "rb").read() == self.PAYLOAD
+
+    def _compressed(self, server, dest, **kwargs):
+        handler = fh.get_file_handler(server.url("o.txt"), parallel_download=False,
+                                      check_md5=False, **kwargs)
+        assert handler.body_is_compressed
+        return handler.localization_command(dest)
+
+    def test_a_failed_decode_stops_the_script(self, tmp_path):
+        """The object claims gzip and is not; gunzip fails in the middle of an && list."""
+        dest = str(tmp_path / "o.txt")
+        with Server(os.urandom(64 * 1024)) as server:
+            server.state.stored_gzip = True
+            result = self._bash(self._compressed(server, dest))
+        assert result.returncode != 0
+        assert "NEXT_INPUT_REACHED" not in result.stdout
+
+    def test_a_failed_compressed_fetch_stops_the_script(self, tmp_path):
+        import gzip
+        dest = str(tmp_path / "o.txt")
+        with Server(gzip.compress(os.urandom(MIB).hex().encode())) as server:
+            server.state.stored_gzip = True
+            command = self._compressed(server, dest)
+            server.state.force_status = 403
+            result = self._bash(command)
+        assert result.returncode != 0
+        assert "NEXT_INPUT_REACHED" not in result.stdout
+
+    def test_the_exit_33_handler_keeps_the_real_exit_code(self, tmp_path):
+        """A 403 while resuming a sidecar is curl's own failure code, not a plain 1."""
+        import gzip
+        blob = gzip.compress(os.urandom(MIB).hex().encode())
+        dest = str(tmp_path / "o.txt")
+        with Server(blob) as server:
+            server.state.stored_gzip = True
+            command = self._compressed(server, dest)
+            open(dest + ".k9pdl.gz", "wb").write(blob[:1000])
+            server.state.force_status = 403
+            result = self._bash(command)
+        assert result.returncode not in (0, 1, 5, 15), (result.returncode, result.stderr[-300:])
+        assert os.path.getsize(dest + ".k9pdl.gz") == 1000, "the partial must survive"
+
+    def test_a_truncated_compressed_body_is_not_placed_as_the_file(self, tmp_path):
+        """
+        No Content-Length and a dropped connection: curl exits 0 with a short body. It must
+        not be taken for a server-decoded one and moved into place.
+        """
+        import gzip
+        blob = gzip.compress(os.urandom(MIB).hex().encode())
+        dest = str(tmp_path / "o.txt")
+        with Server(blob) as server:
+            server.state.stored_gzip = True          # which, in the fake, omits Content-Length
+            command = self._compressed(server, dest)
+            server.state.drop_after = 50 * 1024
+            result = self._bash(command)
+        assert result.returncode != 0
+        assert "NEXT_INPUT_REACHED" not in result.stdout
+        assert not os.path.exists(dest), "a truncated gzip stream was placed as the file"
+        assert "truncated gzip stream" in result.stderr
+        assert os.path.getsize(dest + ".k9pdl.gz") == 50 * 1024, "kept for the retry to resume"
+
+    def test_a_server_decoded_body_is_still_placed(self, tmp_path):
+        """The case the size check exists for must be unaffected."""
+        import gzip
+        plain = os.urandom(MIB).hex().encode()
+        dest = str(tmp_path / "o.txt")
+        with Server(gzip.compress(plain)) as server:
+            server.state.stored_gzip = True
+            server.state.decoded_payload = plain
+            command = self._compressed(server, dest)
+            server.state.always_decode = True
+            result = self._bash(command)
+        assert result.returncode == 0, result.stderr[-300:]
+        assert open(dest, "rb").read() == plain
+        assert "arrived already decoded" in result.stderr
 
 
 # ---------------------------------------------------------------------------

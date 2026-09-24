@@ -22,6 +22,8 @@ from ..utils import sha1_base32, canine_logging, gcloud_storage_client
 # The two DEFAULT_* names differ only because "download_connections" is the handler-level
 # option name; the values are the same objects.
 from .parallel_download import (
+    EXIT_FAIL,
+    fetch_or_exit,
     NAMED_FORMAT_MAGIC,
     expected_magic,
     DEFAULT_CONNECTIONS as DEFAULT_DOWNLOAD_CONNECTIONS,
@@ -40,6 +42,23 @@ _CHECKSUM_COREUTILS = {"md5": "md5sum", "sha1": "sha1sum", "sha256": "sha256sum"
 # rather than coreutils — but it is not optional, since a GCS composite object
 # advertises *only* crc32c.
 _CHECKSUM_PREFERENCE = ("md5", "sha256", "sha1", "crc32c")
+
+
+# The start of every curl that writes a localized file.
+#
+# --fail, because without it an HTTP error body is written AS the file and curl exits 0.
+# Measured on the worker image's curl 7.81: the GDC API's 80-byte `{"message":"Not
+# authorized to download: ..."}` saved as the "download", and a GCS 403's 757-byte XML
+# likewise; two 500s left an empty file, also exit 0. A pipeline without a hash check then
+# accepted it, and the compressed pipeline placed it with a "decoded by the server"
+# warning. A partial file is not at risk: `-C -` refuses to append a non-206.
+#
+# --retry, for the transient 408/429/5xx and timeouts. Measured safe with `-C -`: curl 7.81
+# re-requests a retry from the ORIGINAL offset and rewinds the file to it, so it cannot
+# duplicate bytes. Deliberately not --retry-all-errors. A dropped connection gains nothing
+# from it (each retry restarts at the same offset), and it would spend the retries on a 403.
+# A drop instead exits nonzero with a valid partial, which the next attempt resumes.
+CURL_FETCH = "curl --fail --retry 5"
 
 
 def parse_header_block(raw):
@@ -618,7 +637,8 @@ class FileType(abc.ABC):
         # pipeline can retarget the download at a sidecar. Rewriting the string instead
         # was actively wrong: replacing the destination path also hit the same substring
         # inside the URL, producing `-o /d/o.vcf.k9pdl.gz 'https://h/d/o.vcf.k9pdl.gz'`.
-        legacy_cmd = build_legacy(self.localized_path)
+        # Wrapped so every failure exits explicitly and never as 5 or 15 (see fetch_or_exit).
+        legacy_cmd = fetch_or_exit(build_legacy(self.localized_path))
 
         if gunzip:
             # The fallback has to produce the same file as the primary path, or which one
@@ -655,9 +675,12 @@ class FileType(abc.ABC):
             # it survives by design, so every later attempt would hit the same partial
             # and fail the same way, forever. GCS does exactly this for the case above.
             # Restart from zero instead.
-            fetch = ("{{ {{ if [ -s {sc} ]; then {dl}; else {fresh}; fi; }} || "
-                     "{{ rc=$?; [ $rc -eq 33 ] && rm -f {sc} && {fresh}; }}; }}"
-                     .format(dl = download, fresh = fresh, sc = sidecar))
+            # The exit code is preserved when it is not 33: `[ $rc -eq 33 ] && ...` alone
+            # turned every other failure, a connection reset (56) included, into a plain 1.
+            fetch = fetch_or_exit(
+                ("{{ if [ -s {sc} ]; then {dl}; else {fresh}; fi; }} || "
+                 "{{ rc=$?; if [ $rc -eq 33 ]; then rm -f {sc} && {fresh}; "
+                 "else (exit $rc); fi; }}").format(dl = download, fresh = fresh, sc = sidecar))
             stages = self._hash_check_command(checksum, path = sidecar)
 
             magic = expected_magic(self.path or "")
@@ -702,17 +725,34 @@ class FileType(abc.ABC):
             # bytes that never arrived -- so it is placed as-is with a loud warning, which
             # is exactly the outcome it would have had before this pipeline existed. The
             # warning names the file, never the URL: a signed URL is a credential.
+            #
+            # A size mismatch is not always decoding, though: a body delimited by the
+            # connection closing (no Content-Length) that is cut off looks complete to curl,
+            # exits 0, and is short. Size cannot tell the two apart -- a server-decoded
+            # mislabelled .gz is ALSO shorter than the stored bytes -- but content can. A
+            # truncated stored body still starts 1f 8b and fails `gzip -t`; a decoded body
+            # either is not gzip at all or is a complete inner stream that passes. Placing
+            # the truncated one was the same failure as an error body saved as the file,
+            # so it fails instead, keeping the sidecar for the retry to resume.
             decoded = (
+                "if [ \"$(od -An -N2 -tx1 {sc} | tr -d ' \\n')\" = 1f8b ] && "
+                "! gzip -t {sc} 2>/dev/null; then "
+                "printf 'ERROR: %s arrived as a truncated gzip stream; kept for the retry to "
+                "resume\\n' {name} >&2; exit {fail}; fi; "
                 "printf 'WARNING: %s arrived already decoded by the server; the advertised "
                 "digest covers the stored bytes, so it cannot be verified\\n' {name} >&2"
                 " && mv {sc} {dest}"
             ).format(name = shlex.quote(os.path.basename(self.localized_path)),
-                     sc = sidecar, dest = self.localized_path)
+                     sc = sidecar, dest = self.localized_path, fail = EXIT_FAIL)
+            # `|| exit`: a failed stage (a gunzip that finds the stream corrupt, say) sits in
+            # an && list, where `set -e` does not apply -- so localization.sh carried on and
+            # the task ran without its input.
             legacy_cmd = (
-                "{fetch} && if [ \"$(wc -c < {sc} | tr -d ' ')\" = {size} ]; "
-                "then {verify_and_decode}; else {decoded}; fi"
+                "{{ {fetch} && if [ \"$(wc -c < {sc} | tr -d ' ')\" = {size} ]; "
+                "then {verify_and_decode}; else {decoded}; fi; }} || exit {fail}"
             ).format(fetch = fetch, sc = sidecar, size = int(self._size),
-                     verify_and_decode = " && ".join(stages), decoded = decoded)
+                     verify_and_decode = " && ".join(stages), decoded = decoded,
+                     fail = EXIT_FAIL)
 
         if not self._use_parallel_download(url if url_expr is None else None):
             # The compressed pipeline verifies the sidecar itself, so a trailing gate here
@@ -1570,10 +1610,11 @@ class HandleGDCHTTPURL(FileType):
         cmd = []
         def legacy(target):
             if self.token is not None:
-                return "curl -C - -o {path} {token} '{url}'".format(
-                    path = target, token = self.token_flag, url = self.url
+                return "{curl} -C - -o {path} {token} '{url}'".format(
+                    curl = CURL_FETCH, path = target, token = self.token_flag, url = self.url
                 )
-            return "curl -C - -o {path} '{url}'".format(path = target, url = self.url)
+            return "{curl} -C - -o {path} '{url}'".format(
+                curl = CURL_FETCH, path = target, url = self.url)
 
         # self.hash is the content md5 for this handler (from the DRS record, or from the
         # Content-MD5 header when falling back to the GDC API) -- unlike a plain URL
@@ -1618,9 +1659,9 @@ class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
         
         #stream into fifo object
         if self.token is not None:
-            cmd += ["curl -C - -o {path} {token} '{url}' &".format(path = self.localized_path, token = self.token_flag, url = self.url)]
+            cmd += ["{curl} -C - -o {path} {token} '{url}' &".format(curl = CURL_FETCH, path = self.localized_path, token = self.token_flag, url = self.url)]
         else:
-            cmd += ["curl -C - -o {path} '{url}' &".format(dest_dir = dest_dir, path = self.localized_path, url = self.url)]
+            cmd += ["{curl} -C - -o {path} '{url}' &".format(curl = CURL_FETCH, dest_dir = dest_dir, path = self.localized_path, url = self.url)]
 
         return "\n".join(cmd)
 
@@ -1741,7 +1782,7 @@ class HandleDRSURI(FileType):
         cmd = [f'export signed_url=$({resolver})']
 
         def legacy(target):
-            return f'curl -C - -o {target} "$signed_url"'
+            return f'{CURL_FETCH} -C - -o {target} "$signed_url"'
         # The URL is not known host-side, so it is passed as a shell expression that the
         # node evaluates. self.hash is the content md5 from the DRS record.
         cmd += self._download_and_verify_lines(
@@ -1781,7 +1822,7 @@ class HandleDRSURIStream(HandleDRSURI):
         cmd += [f'signed_url={signed_url}']
 
         # stream into fifo object
-        cmd += ['curl -C - -o {path} "$signed_url" &'.format(path=self.localized_path)]
+        cmd += ['{curl} -C - -o {path} "$signed_url" &'.format(curl=CURL_FETCH, path=self.localized_path)]
 
         return "\n".join(cmd)
 
@@ -1821,8 +1862,8 @@ class HandleGCSSignedURL(FileType):
         # the legacy single-stream command, kept verbatim: it is both the
         # parallel_download=False opt-out and the in-script no-range fallback
         cmd += self._download_and_verify_lines(
-            lambda target: "curl -C - -o {path}{enc} '{url}'".format(
-                path = target, url = self.url, enc = self._accept_encoding_flag()
+            lambda target: "{curl} -C - -o {path}{enc} '{url}'".format(
+                curl = CURL_FETCH, path = target, url = self.url, enc = self._accept_encoding_flag()
             ),
             prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
                 dest_dir = dest_dir
@@ -1871,8 +1912,8 @@ class HandleOtherURL(FileType):
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
         cmd += self._download_and_verify_lines(
-            lambda target: "curl -C - -o {path}{enc} '{url}'".format(
-                path = target, url = self.url, enc = self._accept_encoding_flag()
+            lambda target: "{curl} -C - -o {path}{enc} '{url}'".format(
+                curl = CURL_FETCH, path = target, url = self.url, enc = self._accept_encoding_flag()
             ),
             prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
                 dest_dir = dest_dir
