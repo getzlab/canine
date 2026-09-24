@@ -121,6 +121,26 @@ MAX_CONNECTIONS = 16
 # gives no choice -- which is the same observation that made the post-compose design
 # possible at all, applied one layer down.
 DEFAULT_DECODE_READAHEAD = 4
+
+# Concurrent resumable sessions used to write the decoded object back, and the slice
+# each one carries.
+#
+# 4, and deliberately not 8. Measured on 1.64 GB: one session 81.3 MB/s, width 2 159.4,
+# width 4 301.6, width 8 541.6 -- near-linear, no ceiling in sight. But width 4 already
+# puts the upload (301 MB/s) well under the inflater's 155 MB/s, and gzip inflation
+# cannot be parallelised, so past 4 the decode stops getting faster and only gets
+# hungrier. Peak buffered bytes are (width + 1) * DECODE_SLICE_BYTES = 160 MiB.
+#
+# The measurement that matters for the default is which stage is slowest, not which
+# number is biggest.
+DEFAULT_DECODE_UPLOAD_WIDTH = 4
+
+# A slice is buffered whole before it is sent, which is what lets every PUT in it carry
+# a real total -- the unknown-total protocol is only needed when the length is not known
+# in advance, and by the time a slice is cut it is. 32 MiB keeps the slice count for a
+# 1.6 GB object at 51, and a multiple of the commit granularity keeps the arithmetic
+# honest if a slice ever has to be sent in pieces.
+DECODE_SLICE_BYTES = 32 * 1024 * 1024
 DEFAULT_MIN_CHUNK = 64 * 1024 * 1024
 
 # Chunk boundaries are aligned to this so that every chunk start is also block-aligned
@@ -2997,6 +3017,92 @@ class GzipStreamDecoder:
         return tail
 
 
+class DecodeSliceUploader:
+    """
+    Write the decoded stream through `width` concurrent resumable sessions.
+
+    A resumable session requires strictly advancing offsets, so one session cannot be
+    parallelised at all -- measured at 81.3 MB/s against 541.6 for eight. The way past
+    that is the way the relay already goes: cut the stream into slices, give each slice
+    its own session, and compose them at the end.
+
+    Slices are buffered whole, which is what makes every PUT carry a real total. The
+    `total=None` protocol exists for a length that is not known in advance; a slice's
+    length is known the moment it is cut.
+
+    **The output is a composite and therefore has no md5Hash**, where the single-session
+    path produces a plain object that does. Nothing on this route verifies that digest
+    -- the advertised one covers the compressed bytes, so the decoded object has never
+    had a checkable hash -- but it is a real difference in what a consumer can read off
+    the metadata, and `--decode-upload-width 1` is the way back.
+    """
+
+    def __init__(self, client, bucket, prefix, width, slice_bytes=DECODE_SLICE_BYTES):
+        self.client = client
+        self.bucket = bucket
+        self.prefix = prefix
+        self.slice_bytes = slice_bytes
+        self.total = 0
+        self._buffer = bytearray()
+        self._names = []
+        self._futures = []
+        self._pool = ThreadPoolExecutor(max_workers=width,
+                                        thread_name_prefix="k9pdl-decode-write")
+        # Backpressure. Without it, submitting every slice to the pool queues them all
+        # WITH their payloads attached and the whole object ends up resident -- the pool
+        # bounds concurrency, never memory. The read-ahead had the same trap.
+        self._slots = threading.Semaphore(width)
+
+    def _send(self, name, body):
+        session = self.client.start_resumable_upload(self.bucket, name)
+        offset = 0
+        while offset < len(body):
+            metadata, committed = self.client.upload_range(
+                session, body[offset:], offset, len(body))
+            if metadata is not None:
+                return
+            if committed is None or committed <= offset:
+                raise TransientError(
+                    "slice {} stalled at {}/{}".format(name, offset, len(body)))
+            offset = committed
+
+    def _emit(self, count):
+        body = bytes(self._buffer[:count])
+        del self._buffer[:count]
+        name = "{}.{:05d}".format(self.prefix, len(self._names))
+        self._names.append(name)
+        self.total += len(body)
+        self._slots.acquire()               # blocks the inflater once `width` are busy
+        future = self._pool.submit(self._send, name, body)
+        future.add_done_callback(lambda _f: self._slots.release())
+        self._futures.append(future)
+
+    def feed(self, data):
+        self._buffer += data
+        while len(self._buffer) >= self.slice_bytes:
+            self._emit(self.slice_bytes)
+
+    def finish(self):
+        """Flush the tail, wait for every slice, and return their names in order."""
+        if self._buffer:
+            self._emit(len(self._buffer))
+        try:
+            for future in self._futures:
+                future.result()             # re-raises the first upload failure
+        finally:
+            self._pool.shutdown(wait=True)
+        return list(self._names), self.total
+
+    def abandon(self):
+        """Best-effort cleanup of slices already written, after a failure."""
+        self._pool.shutdown(wait=True)
+        for name in self._names:
+            try:
+                self.client.delete_object(self.bucket, name)
+            except (PermanentError, TransientError):
+                pass
+
+
 def ranged_blocks(client, bucket, name, size, block, depth):
     """
     Yield an object's blocks in order, with up to `depth` ranged GETs in flight.
@@ -3037,7 +3143,8 @@ def ranged_blocks(client, bucket, name, size, block, depth):
 
 def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
                       granularity=GCS_UPLOAD_GRANULARITY,
-                      readahead=DEFAULT_DECODE_READAHEAD):
+                      readahead=DEFAULT_DECODE_READAHEAD,
+                      upload_width=DEFAULT_DECODE_UPLOAD_WIDTH):
     """
     Stream `source` through gunzip into a new object `dest`, entirely in the bucket.
 
@@ -3069,6 +3176,8 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
     decoder = GzipStreamDecoder()
 
     session = None
+    uploader = (DecodeSliceUploader(client, bucket, dest + ".k9pdl.slice", upload_width)
+                if upload_width > 1 else None)
     pending = bytearray()
     offset = 0
     read_at = 0
@@ -3141,6 +3250,16 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
             if not checked:
                 continue
 
+            if uploader is not None:
+                # The slicer takes everything; it decides where the cuts fall, and
+                # every PUT it makes carries a real total, so the granule rule below
+                # does not apply to it.
+                mark = time.monotonic()
+                uploader.feed(bytes(pending))
+                stage["write"] += time.monotonic() - mark
+                del pending[:]
+                continue
+
             # Only whole granules may be sent while the total is still unknown.
             sendable = (len(pending) // granularity) * granularity
             if sendable:
@@ -3175,6 +3294,25 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
     if not checked and not decide():
         return size, False
 
+    if uploader is not None:
+        mark = time.monotonic()
+        try:
+            uploader.feed(bytes(pending))
+            names, total = uploader.finish()
+            composed = compose_tree(client, bucket, dest, names)
+        except BaseException:
+            uploader.abandon()
+            raise
+        for name in names:
+            client.delete_object(bucket, name)
+        stage["write"] += time.monotonic() - mark
+        if int(composed.get("size", -1)) != total:
+            raise TransientError("decoded object is {} bytes, expected {}".format(
+                composed.get("size"), total))
+        report_decode_stages(stage, blocks, size, total, readahead, upload_width,
+                             len(names))
+        return total, True
+
     total = offset + len(pending)
     mark = time.monotonic()
     if session is None:
@@ -3200,7 +3338,8 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
     return total, True
 
 
-def report_decode_stages(stage, blocks, compressed, decompressed, readahead=1):
+def report_decode_stages(stage, blocks, compressed, decompressed,
+                         readahead=1, upload_width=1, slices=0):
     """
     Emit the decode's read/inflate/write split, in the shape `k9pdl-io` uses.
 
@@ -3225,8 +3364,10 @@ def report_decode_stages(stage, blocks, compressed, decompressed, readahead=1):
     slowest = max(stage.values())
     two_stage = max(stage["read"] + stage["inflate"], stage["write"])
     log("k9pdl-gunzip read {:.3f}s inflate {:.3f}s write {:.3f}s over {} blocks "
-        "(readahead {}, {} -> {} bytes, ceiling {:.2f}x, pipe2 {:.2f}x)".format(
+        "(readahead {}, width {}, slices {}, {} -> {} bytes, "
+        "ceiling {:.2f}x, pipe2 {:.2f}x)".format(
             stage["read"], stage["inflate"], stage["write"], blocks, readahead,
+            upload_width, slices,
             compressed, decompressed,
             total / slowest if slowest > 0 else 1.0,
             total / two_stage if two_stage > 0 else 1.0))
@@ -3345,8 +3486,42 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
                 index, recorded, stored))
             return EXIT_FAIL
 
-    with phase("compose"):
-        composed = compose_tree(client, bucket, compose_target, part_names)
+    try:
+        with phase("compose"):
+            composed = compose_tree(client, bucket, compose_target, part_names)
+    except PermanentError as e:
+        # Sources that have vanished are the signature of LOSING A RACE, not of a
+        # defect: another writer composed these same deterministically-named parts and
+        # deleted them, which is exactly what this code does on its own way out.
+        #
+        # This reached `main`, which turns PermanentError into EXIT_FAIL -- do not
+        # retry. So the loser of a race killed the job while the object it wanted sat
+        # complete and correct in the bucket. Found as a 1-in-4 intermittent failure of
+        # TestTwoWritersOnOneObject; two workers on one object is a designed-for state
+        # (LOCALIZATION.md §3, and a node dying mid-upload produces it with no timeout
+        # involved at all), so at scale this is not rare.
+        #
+        # The part-existence check immediately above already requeues for the same
+        # reason. compose was simply never given the same treatment.
+        log("compose failed ({}); checking whether another writer got there first".format(e))
+        try:
+            landed = client.get_object(bucket, object_name)
+        except (PermanentError, TransientError):
+            landed = None
+        if landed is not None and (options.gunzip
+                                   or int(landed.get("size", -1)) == size):
+            # With --gunzip the decoded length is not knowable here, so presence is all
+            # there is to go on. A composed object appears atomically and an unfinished
+            # resumable upload is invisible, so presence does mean some writer finished.
+            log("{} already exists ({} bytes); another writer completed it".format(
+                decision.gs_url, landed.get("size")))
+            manifest.unlink()
+            return EXIT_OK
+        log("no completed object at {}; requesting requeue".format(decision.gs_url))
+        return EXIT_REQUEUE
+    except TransientError as e:
+        log("transient failure composing; requesting requeue: {}".format(e))
+        return EXIT_REQUEUE
     if int(composed.get("size", -1)) != size:
         log("composed object is {} bytes, expected {}".format(composed.get("size"), size))
         return EXIT_FAIL
@@ -3391,7 +3566,9 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
                 stored_size, decoded = decompress_object(
                     client, bucket, compose_target, object_name,
                     readahead=getattr(options, "decode_readahead",
-                                      DEFAULT_DECODE_READAHEAD))
+                                      DEFAULT_DECODE_READAHEAD),
+                    upload_width=getattr(options, "decode_upload_width",
+                                         DEFAULT_DECODE_UPLOAD_WIDTH))
         except PermanentError as e:
             # The compressed bytes already matched the advertised digest, so a
             # mid-stream decode failure means the source object itself is broken and
@@ -4256,6 +4433,13 @@ def build_parser():
                              "the fetch is parallel; inflation stays sequential. 1 "
                              "restores the old single-stream read. Peak extra memory "
                              "is this times {} bytes".format(READ_BUFFER))
+    parser.add_argument("--decode-upload-width", dest="decode_upload_width", type=int,
+                        default=DEFAULT_DECODE_UPLOAD_WIDTH,
+                        help="concurrent resumable sessions used to write the decoded "
+                             "object back, composed at the end (default: %(default)s). "
+                             "1 uses a single session, which is ~4x slower but leaves a "
+                             "plain object carrying an md5Hash instead of a composite "
+                             "that does not")
     parser.add_argument("--header", action="append", default=[],
                         help="extra request header, 'Name: value' (repeatable)")
     parser.add_argument("--s3-bucket", dest="s3_bucket")

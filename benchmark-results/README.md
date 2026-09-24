@@ -152,3 +152,23 @@ End to end at 852013000 -> 1644444450, depths alternated, all outputs byte-ident
 1.41x whole-run, 1.70x on the decode, 108x less time blocked on reads. Afterwards the
 write is 72% of the decode and the 3-stage ceiling drops 2.23-2.35x -> 1.36-1.39x, so
 this supersedes the pipelining case rather than adding to it.
+
+### Sliced upload (`gunzip-upload-width-sweep.json`, `gunzip-e2e-w*.json`)
+
+Standalone, 1.64 GB through K resumable sessions + compose, widths rotated:
+one session **81.3 MB/s**, width 2 159.4, width 4 301.6, width 8 541.6.
+
+End to end, widths alternated, all outputs the same length and the width-1 runs matching
+the known md5:
+
+| width | total | write stage | output |
+|---|---|---|---|
+| 1 | 73.63 / 74.38 s | 31.08 / 30.60 s | plain, md5Hash present |
+| 4 | 56.10 / 54.35 s | 9.99 / 9.11 s | 50 components, no md5Hash |
+| 8 | 53.85 s | 9.48 s | 50 components, no md5Hash |
+
+Default is 4: at width 4 the upload is already faster than the inflater (155 MB/s), which
+cannot be parallelised, so width 8 measures 1.5% better for twice the memory.
+
+Note the in-situ upload runs ~170 MB/s against 301 standalone -- interleaving with the
+inflater costs ~40%, the same gap isolated-vs-in-loop that the read grid showed.

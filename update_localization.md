@@ -4696,3 +4696,79 @@ object is resident. Same error as the relay's prefetch tests (§13.53) and the s
 as counting executing reads at `connections=1`. Rewritten to measure how far the fetches
 run ahead of the consumer: it now fails with "966 of 1000 fetches started while the
 consumer took one block".
+
+### 13.62 Sliced upload, and a do-not-retry bug found hiding as a flaky test
+
+#### The sliced upload
+
+A resumable session requires strictly advancing offsets, so one session cannot be
+parallelised. Measured standalone on 1.64 GB: one session **81.3 MB/s**, width 2 159.4,
+width 4 301.6, width 8 541.6 -- near-linear, widths rotated, non-overlapping ranges.
+
+Built as `DecodeSliceUploader`: cut the inflater's output into 32 MiB slices, give each
+its own session, compose at the end. Because a slice's length is known the moment it is
+cut, every PUT carries a real total and the `total=None` protocol is not needed at all on
+this path -- it now lives only at width 1.
+
+End to end, 852013000 -> 1644444450, widths alternated:
+
+| width | total | write stage | output |
+|---|---|---|---|
+| 1 | 73.63 / 74.38 s | 31.08 / 30.60 s | plain object, **md5Hash present** |
+| **4** | **56.10 / 54.35 s** | **9.99 / 9.11 s** | 50 components, no md5Hash |
+| 8 | 53.85 s | 9.48 s | 50 components, no md5Hash |
+
+**Default 4, not 8.** At width 4 the upload (301 MB/s standalone) is already under the
+inflater's 155 MB/s, and gzip inflation cannot be parallelised, so 8 measures 1.5% better
+and doubles peak memory. The number to pick from is which stage is slowest, not which is
+biggest.
+
+One prediction missed: from the standalone 301 MB/s I expected ~5.5 s for the width-4
+upload; it measured 9.1-10.0 s, about 170 MB/s. Interleaving with the inflater costs ~40%
+that an isolated benchmark does not show -- the same lesson as §13.60, where isolated
+reads ran at 87 MB/s and in-loop reads at 30-51.
+
+**Cost:** the output is a composite and carries no `md5Hash`, where the single-session
+path produced a plain object that did. Nothing on this route verifies that digest (the
+advertised one covers the compressed bytes), but it is a real loss of observability, and
+`--decode-upload-width 1` is the documented way back.
+
+Cumulative for the decode work: `routeb` on this object went **102.9 s -> 54.4 s, 1.89x**,
+across the read-ahead (§13.61) and this.
+
+#### The bug the flaky test was reporting
+
+`TestTwoWritersOnOneObject` had been failing about one full-suite run in four. I recorded
+it as a rare pre-existing flake and moved on. That was wrong, and the reason it was wrong
+is that a test named "two writers on one object" failing intermittently is a description
+of the defect, not noise around it.
+
+Two writers share deterministic part names, and each deletes the parts after composing.
+So the loser can reach `compose` after the winner has consumed and removed its sources.
+`compose_tree` had **no exception handling in `run_bucket_route`**, so the 404 surfaced as
+`PermanentError`, which `main` turns into **EXIT_FAIL -- do not retry**.
+
+The loser of the race therefore killed the job while the object it wanted sat complete and
+correct in the bucket, where a retry would have returned EXIT_OK in milliseconds off the
+marker check. Two workers on one object is a designed-for state (`LOCALIZATION.md` §3),
+and a node dying mid-upload produces the same overlap with no timeout involved, so this is
+not rare at scale.
+
+The part-existence check immediately above compose already requeues for exactly this
+reason. compose was simply never given the same treatment.
+
+Fixed: a vanished-source compose now checks whether the destination landed. Present and
+the right size -> EXIT_OK with a log line naming the other writer; otherwise EXIT_REQUEUE.
+A wrong-sized object is never accepted as a winner's work, because that is the case where
+declaring success loses data silently. A `TransientError` from compose requeues too -- it
+was previously falling to `main`'s generic handler, which logs a traceback and returns 1,
+the same do-not-retry outcome from a GCS hiccup.
+
+Four tests force the interleaving rather than waiting for it, and all four fail against
+the shipped code with the escaping exception. Ten consecutive full-suite runs clean
+afterwards, against roughly one in four before.
+
+**The lesson is about triage, not concurrency.** "Rare, pre-existing, not reproducible in
+isolation" described the symptom accurately and was still the wrong conclusion: the test
+only fails under load because that is when the interleaving happens, which is also the
+condition production runs in.

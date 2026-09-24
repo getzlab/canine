@@ -2328,7 +2328,12 @@ class TestTheBucketRouteDecompresses:
         force_bucket_route(monkeypatch,
                            gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
         with Server(body) as source:
-            assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
+            argv = gunzip_options(tmp_path, source.url(), body)
+            # Width 1 on purpose: the sliced writer knows each slice's length before it
+            # sends it, so it never needs an unknown total. total=None now lives only
+            # on the single-session path, and this is the test that keeps it honest.
+            argv.decode_upload_width = 1
+            assert pdl.run(argv) == pdl.EXIT_OK
 
         assert gcs.state.unknown_total_puts >= 1, (
             "the decode finished in one PUT, so total=None was never exercised")
@@ -2354,7 +2359,8 @@ class TestTheBucketRouteDecompresses:
 
         line = re.search(
             r"k9pdl-gunzip read ([\d.]+)s inflate ([\d.]+)s write ([\d.]+)s "
-            r"over (\d+) blocks \(readahead \d+, (\d+) -> (\d+) bytes, "
+            r"over (\d+) blocks \(readahead \d+, width \d+, slices \d+, "
+            r"(\d+) -> (\d+) bytes, "
             r"ceiling ([\d.]+)x, pipe2 ([\d.]+)x\)", capsys.readouterr().err)
         assert line, "the decode ran but reported no stage split"
 
@@ -2416,8 +2422,10 @@ class TestTheBucketRouteDecompresses:
         client.put_object(BUCKET, "misaligned.gz", body)
 
         with pytest.raises((pdl.PermanentError, pdl.TransientError)):
+            # width 1: the granule rule only binds the unknown-total path.
             pdl.decompress_object(client, BUCKET, "misaligned.gz", "misaligned",
-                                  granularity=pdl.GCS_UPLOAD_GRANULARITY + 1)
+                                  granularity=pdl.GCS_UPLOAD_GRANULARITY + 1,
+                                  upload_width=1)
 
 
 class TestTheDecodeReadAhead:
@@ -2542,6 +2550,241 @@ class TestTheDecodeReadAhead:
                 assert pdl.run(argv) == pdl.EXIT_OK
             assert gcs.state.objects[PLAIN_OBJECT] == plain_text, (
                 "depth {} changed the output".format(depth))
+
+
+class TestLosingTheComposeRace:
+    """
+    Two writers share deterministic part names, and each deletes the parts after
+    composing. So the loser can reach `compose` after the winner has already consumed
+    and removed its sources.
+
+    That raised `PermanentError` out of `run_bucket_route`, which `main` turns into
+    **EXIT_FAIL -- do not retry**. The loser therefore killed the job while the object
+    it wanted sat complete and correct in the bucket, and a retry would have returned
+    EXIT_OK in milliseconds off the marker check.
+
+    Found as a 1-in-4 intermittent failure of TestTwoWritersOnOneObject and initially
+    written off as test noise. It is not: two workers on one object is designed for
+    (`LOCALIZATION.md` §3), and a node dying mid-upload produces the same overlap with
+    no timeout involved. These tests force the interleaving instead of waiting for it.
+    """
+
+    def _lose_the_race(self, monkeypatch, sources_vanish=True):
+        """Make compose behave as it does when the winner has cleaned up."""
+        def gone(client, bucket, destination, parts, **kw):
+            raise pdl.PermanentError(
+                "POST .../compose -> HTTP 404" if sources_vanish else "boom")
+        monkeypatch.setattr(pdl, "compose_tree", gone)
+
+    def test_the_loser_exits_ok_when_the_winner_finished(self, tmp_path, monkeypatch,
+                                                         gcs, payload, payload_md5,
+                                                         capsys):
+        """The object is correct and present. Failing the job over it is indefensible."""
+        force_bucket_route(monkeypatch)
+        gcs.state.objects[OBJECT] = payload          # the winner's completed object
+        gcs.state.composite[OBJECT] = 4
+        self._lose_the_race(monkeypatch)
+        with Server(payload) as source:
+            rc = pdl.run(options_for(str(tmp_path / "sample.bam"), source.url(),
+                                     len(payload), check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
+        assert rc == pdl.EXIT_OK, (
+            "the loser of a compose race returned {}; EXIT_FAIL here is do-not-retry "
+            "on a job whose object already exists".format(rc))
+        assert "another writer completed it" in capsys.readouterr().err
+        assert gcs.state.objects[OBJECT] == payload, "the loser damaged the winner's object"
+
+    def test_the_loser_requeues_when_no_object_landed(self, tmp_path, monkeypatch, gcs,
+                                                      payload, payload_md5):
+        """
+        Sources gone and no destination: genuinely broken, but still recoverable by
+        retrying. Anything other than 5 tells SLURM to give up.
+        """
+        force_bucket_route(monkeypatch)
+        self._lose_the_race(monkeypatch)
+        with Server(payload) as source:
+            rc = pdl.run(options_for(str(tmp_path / "sample.bam"), source.url(),
+                                     len(payload), check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
+        assert rc == pdl.EXIT_REQUEUE, (
+            "expected requeue, got {}".format(rc))
+
+    def test_a_wrong_sized_object_is_not_mistaken_for_a_winner(self, tmp_path,
+                                                               monkeypatch, gcs,
+                                                               payload, payload_md5):
+        """
+        Presence alone must not be accepted: a truncated or stale object at the
+        destination is the case where declaring success loses data silently.
+        """
+        force_bucket_route(monkeypatch)
+        gcs.state.objects[OBJECT] = payload[:len(payload) // 2]
+        self._lose_the_race(monkeypatch)
+        with Server(payload) as source:
+            rc = pdl.run(options_for(str(tmp_path / "sample.bam"), source.url(),
+                                     len(payload), check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
+        assert rc == pdl.EXIT_REQUEUE, (
+            "a half-sized object was accepted as another writer's work (rc={})".format(rc))
+
+    def test_a_transient_compose_failure_requeues(self, tmp_path, monkeypatch, gcs,
+                                                  payload, payload_md5):
+        """
+        TransientError is not caught by `main` either -- it falls to the generic
+        handler, which logs a traceback and returns 1. Same do-not-retry outcome, from
+        a GCS hiccup.
+        """
+        force_bucket_route(monkeypatch)
+
+        def flaky(client, bucket, destination, parts, **kw):
+            raise pdl.TransientError("compose -> HTTP 503")
+
+        monkeypatch.setattr(pdl, "compose_tree", flaky)
+        with Server(payload) as source:
+            rc = pdl.run(options_for(str(tmp_path / "sample.bam"), source.url(),
+                                     len(payload), check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
+        assert rc == pdl.EXIT_REQUEUE, "transient compose failure returned {}".format(rc)
+
+
+class TestTheSlicedDecodeUpload:
+    """
+    A resumable session needs strictly advancing offsets, so one cannot be
+    parallelised: measured at 81.3 MB/s against 541.6 for eight. The decode therefore
+    cuts its output into slices, gives each its own session, and composes at the end --
+    structurally what the relay's part sink already does.
+
+    Width 4 rather than 8 by default: at 301 MB/s the upload drops below the inflater's
+    155 MB/s, and gzip inflation cannot be parallelised, so wider only costs memory.
+    """
+
+    def _decoded(self, tmp_path, monkeypatch, gcs, body, width, dest="variants.tsv",
+                 slice_bytes=None):
+        if slice_bytes is not None:
+            # The default slice is 32 MiB and the fixture decodes to 1.19 MB, so a
+            # normal run makes exactly ONE slice -- against which every ordering
+            # assertion is vacuously true. Shrinking the slice is the only way to reach
+            # the multi-slice path at test scale.
+            real = pdl.DecodeSliceUploader
+            monkeypatch.setattr(pdl, "DecodeSliceUploader",
+                                lambda *a, **kw: real(*a, **dict(kw,
+                                                                 slice_bytes=slice_bytes)))
+        force_bucket_route(monkeypatch,
+                           gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+        marker = pdl.sidecar_paths(str(tmp_path / dest))[1]
+        if os.path.exists(marker):
+            os.unlink(marker)
+        with Server(body) as source:
+            argv = gunzip_options(tmp_path, source.url(), body)
+            argv.decode_upload_width = width
+            assert pdl.run(argv) == pdl.EXIT_OK
+        return gcs.state.objects[PLAIN_OBJECT]
+
+    @pytest.mark.parametrize("width", [1, 2, 4, 8])
+    def test_the_bytes_are_identical_at_every_width(self, tmp_path, monkeypatch, gcs,
+                                                    plain_text, width):
+        """Width may change throughput. It must never change the object."""
+        import gzip as gziplib
+        gcs.state.objects.clear()
+        assert self._decoded(tmp_path, monkeypatch, gcs,
+                             gziplib.compress(plain_text), width) == plain_text
+
+    def test_slices_are_composed_in_order(self, tmp_path, monkeypatch, gcs, plain_text):
+        """
+        The one way slicing can corrupt an object that no size check would catch:
+        compose takes its sources in list order, so a shuffled list yields a
+        right-length, wrong-content file.
+        """
+        import gzip as gziplib
+        gcs.state.objects.clear()
+        got = self._decoded(tmp_path, monkeypatch, gcs, gziplib.compress(plain_text), 4,
+                            slice_bytes=64 * 1024)
+        sliced = [(dest, sources) for dest, sources in gcs.state.compose_calls
+                  if any(".k9pdl.slice." in s for s in sources)]
+        assert sliced, "nothing was composed from slices, so width 4 did not slice"
+        assert max(len(sources) for _d, sources in sliced) >= 3, (
+            "only {} slice(s): a single source is in order whatever the code does, "
+            "which is how the first version of this test passed against a reversed "
+            "compose".format(max(len(s) for _d, s in sliced)))
+        for _dest, sources in sliced:
+            assert sources == sorted(sources), (
+                "slices composed out of order: {}".format(sources))
+        assert got == plain_text, "order was right but the bytes were not"
+
+    def test_the_slices_are_cleaned_up(self, tmp_path, monkeypatch, gcs, plain_text):
+        """Each slice is a full copy of part of the object; leaving them doubles cost."""
+        import gzip as gziplib
+        gcs.state.objects.clear()
+        self._decoded(tmp_path, monkeypatch, gcs, gziplib.compress(plain_text), 4,
+                      slice_bytes=64 * 1024)
+        leftover = [n for n in gcs.state.object_names() if ".k9pdl.slice." in n]
+        assert leftover == [], "slices survived: {}".format(leftover)
+
+    def test_buffered_slices_are_bounded_by_the_width(self):
+        """
+        Peak memory is (width + 1) * slice. A pool bounds concurrency, never memory:
+        submitting every slice queues them WITH their payloads. Exactly the trap the
+        read-ahead's first bound test fell into, so this one watches live payload bytes
+        rather than live threads.
+        """
+        width, slice_bytes = 2, 1024
+        live = {"now": 0, "peak": 0}
+        lock = threading.Lock()
+        release = threading.Event()
+
+        class SlowClient:
+            def start_resumable_upload(self, bucket, name):
+                with lock:
+                    live["now"] += 1
+                    live["peak"] = max(live["peak"], live["now"])
+                release.wait(5)
+                return "sess/" + name
+
+            def upload_range(self, session, body, offset, total):
+                with lock:
+                    live["now"] -= 1
+                return {"name": session}, total
+
+        uploader = pdl.DecodeSliceUploader(SlowClient(), "b", "p", width,
+                                           slice_bytes=slice_bytes)
+        feeder = threading.Thread(
+            target=lambda: uploader.feed(b"x" * (slice_bytes * 20)), daemon=True)
+        feeder.start()
+        time.sleep(0.4)
+        blocked = feeder.is_alive()
+        release.set()
+        feeder.join(10)
+        assert blocked, (
+            "the feeder never blocked, so all 20 slices were queued and the object "
+            "would buffer whole")
+        assert live["peak"] <= width, "peak {} slices in flight exceeded width {}".format(
+            live["peak"], width)
+
+    def test_a_failed_slice_does_not_leave_the_others_behind(self, gcs):
+        """
+        A do-not-retry failure must not strand slices: they are under a dotted prefix
+        nothing else sweeps, and together they are a whole extra copy of the object.
+        """
+        client = pdl.GcsClient(timeout=30)
+        uploader = pdl.DecodeSliceUploader(client, BUCKET, "boom.k9pdl.slice", 2,
+                                           slice_bytes=1024)
+        uploader.feed(b"y" * 4096)
+        uploader.finish()
+        assert [n for n in gcs.state.object_names() if "boom" in n]
+        uploader.abandon()
+        assert [n for n in gcs.state.object_names() if "boom" in n] == []
+
+    def test_width_one_still_produces_a_plain_object_with_an_md5(
+            self, tmp_path, monkeypatch, gcs, plain_text):
+        """
+        The reason width 1 is kept rather than deleted. Slicing publishes by compose,
+        and a composite carries no md5Hash -- so `--decode-upload-width 1` is the way
+        to a decoded object a consumer can read a digest off.
+        """
+        import gzip as gziplib
+        gcs.state.objects.clear()
+        self._decoded(tmp_path, monkeypatch, gcs, gziplib.compress(plain_text), 1)
+        assert gcs.state.composite.get(PLAIN_OBJECT) == 1, (
+            "width 1 produced a composite; the md5Hash guarantee is gone")
 
 
 class TestTheGzipDecoderSpansMembers:

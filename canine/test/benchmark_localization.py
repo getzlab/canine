@@ -1141,7 +1141,8 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
     # answered from the phase total alone -- the relay looked pipelineable by the same
     # reasoning and turned out 95% write-bound.
     decode = re.search(r"k9pdl-gunzip read ([\d.]+)s inflate ([\d.]+)s write ([\d.]+)s "
-                       r"over (\d+) blocks \(readahead (\d+), (\d+) -> (\d+) bytes, "
+                       r"over (\d+) blocks \(readahead (\d+), width (\d+), "
+                       r"slices (\d+), (\d+) -> (\d+) bytes, "
                        r"ceiling ([\d.]+)x, pipe2 ([\d.]+)x\)", stderr)
 
     # Per-chunk bookkeeping, the only cost that grows with chunk count rather than bytes.
@@ -1172,8 +1173,10 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
         "decode_write_seconds": float(decode.group(3)) if decode else None,
         "decode_blocks": int(decode.group(4)) if decode else None,
         "decode_readahead": int(decode.group(5)) if decode else None,
-        "decode_ceiling": float(decode.group(8)) if decode else None,
-        "decode_pipe2_ceiling": float(decode.group(9)) if decode else None,
+        "decode_upload_width": int(decode.group(6)) if decode else None,
+        "decode_slices": int(decode.group(7)) if decode else None,
+        "decode_ceiling": float(decode.group(10)) if decode else None,
+        "decode_pipe2_ceiling": float(decode.group(11)) if decode else None,
         "fell_back": fell_back.group(1).strip() if fell_back else None,
         "bookkeeping_seconds": float(book.group(1)) if book else None,
         "bookkeeping_calls": int(book.group(2)) if book else None,
@@ -2529,6 +2532,8 @@ def command_routeb(args):
     extra = []
     if getattr(args, "decode_readahead", None):
         extra += ["--decode-readahead", str(args.decode_readahead)]
+    if getattr(args, "decode_upload_width", None):
+        extra += ["--decode-upload-width", str(args.decode_upload_width)]
     if getattr(args, "gunzip", False):
         extra.append("--gunzip")
         say("gunzip       : on -- parts compose into <object>.k9pdl.gz, that sidecar is")
@@ -2567,6 +2572,8 @@ def command_routeb(args):
                 "write_seconds": outcome["decode_write_seconds"],
                 "blocks": outcome["decode_blocks"],
                 "readahead": outcome["decode_readahead"],
+                "upload_width": outcome["decode_upload_width"],
+                "slices": outcome["decode_slices"],
                 "ceiling": outcome["decode_ceiling"],
                 "pipe2_ceiling": outcome["decode_pipe2_ceiling"],
             })
@@ -2746,6 +2753,9 @@ def build_parser():
                         help="ranged GETs in flight while reading the compressed "
                              "sidecar back during --gunzip. Passed straight through to "
                              "the downloader; 1 restores the old sequential read")
+    routeb.add_argument("--decode-upload-width", dest="decode_upload_width", type=int,
+                        help="concurrent resumable sessions for the decoded object; "
+                             "1 restores the single-session write")
     routeb.add_argument("--gunzip", action="store_true",
                         help="exercise the post-compose decompress pass. The source must "
                              "be served Content-Encoding: gzip, and --md5 must be the "
