@@ -5693,3 +5693,69 @@ that ceiling.
 The BAM existed only on the node's local SSDs and was destroyed with the node. The GDC token
 was a 0600 file, shredded by the run script's exit trap, and every result file was scanned for
 it before leaving the node.
+
+### 13.77 The bucket route at full size, and a token that expired mid-run
+
+The same 324.75 GiB BAM, now from DRS (DCF → AWS S3, presigned) into a gcsfuse-mounted
+localization bucket: the bucket-compose route. 16 connections, n1-standard-8 in us-east1-b.
+The bucket was private (public access prevention enforced), and the run script emptied it
+between runs and on exit. DRS was chosen over the GDC API because §13.76 had already
+settled the GDC API's per-request cost, and S3 is fast enough to load the route itself.
+
+| | fixed 64 MiB (5,196 parts) | size-scaled 1 GiB (325 parts) |
+|---|---|---|
+| relay | 1,348.8 s, **246.5 MiB/s** | 845.6 s, **393.3 MiB/s**; 813.0 s (409.0) on the first attempt |
+| compose | 55.6 s | **16.2 s** |
+| streams | 13.44 of 16 | 15.34 of 16 |
+| io | 14% read / 86% write | 25% read / 75% write |
+| md5 | not run | **ok**, 2,835.5 s read-back |
+
+**+60-66% on the relay, and compose 3.4× faster.** The mechanism differs from the GDC API's.
+The route is upload-bound (86% write), and every part is its own resumable upload session,
+with a start POST and a finalizing request. 325 sessions spend far less of the upload on
+per-part overhead than 5,196.
+
+#### The md5 read-back is now the bottleneck: 117 MiB/s
+
+47 minutes to re-read what took 14 to relay, the same ~111 MiB/s measured in §13.54. A
+composite object has no md5, so a whole-file md5 source (DRS, the GDC API) can only be
+verified by reading it back. The reader count, VERIFY_READ_WORKERS = 2, is tuned for
+pd-standard, not for GCS ranged reads. **Worth measuring more readers here**; not attempted.
+
+#### Found: a GCS token trusted for 55 minutes, dead after ~23 (fixed in `cfac695`)
+
+The first size-scaled attempt relayed and composed, then failed its read-back with `HTTP 401:
+Invalid Credentials`. `_fetch_token` takes `gcloud … print-access-token`, which returns
+gcloud's *cached* token. That token may be minutes from expiry, and the command reports no
+lifetime. The code assumed 3600 s and cached it for 55 minutes. Nothing refreshed on a 401,
+so every later request reused the dead token until the read-back gave up; with the
+requeue-then-retry path that would have been a lost 9-minute read-back. A production relay
+lasting hours takes the same path.
+
+The fix has two parts:
+
+* A 401 drops the cached token and resends the request once. It drops the token only if it
+  is still the one rejected, so 16 workers do not throw away each other's refresh. This
+  applies in `GcsClient.request` and `GcsObjectSource._open`; a second 401 is an error.
+* Tokens from a subprocess are cached for 3 minutes, inside gcloud's own ~3m45s refresh
+  margin.
+
+Every other bucket test stubbed `token()` out, which is why none could see this. The new
+tests run the real cache against a fake GCS that rejects expired tokens; the fix's six
+mutations are all caught. The re-run above is on the fix, and its read-back completed.
+
+#### `wire` counts the read-back
+
+The benchmark counts NIC bytes for the whole downloader process. On this route that includes
+the md5 read-back from GCS, so a verified run reads **2.02×** and is flagged `DUPLICATE
+FETCHING`. That is a false alarm: nothing was fetched from the source twice. The failed
+attempt's 1.21× was the ~68 GiB it read back (~9 minutes at ~128 MiB/s) before the 401. Its
+logged "642 MB/s" was the full size divided by elapsed time, not a rate. **The ratio should
+exclude the verify phase on this route.** That is a benchmark reporting fix, not done here.
+
+#### Also recorded
+
+An attempt from the GDC API was stopped a minute in, in favor of DRS. Its trap emptied the
+bucket (leaving 6 in-flight parts, removed immediately after) and shredded the token. The
+node suspended itself after each run through a watcher; its service account was given
+`compute.instanceAdmin.v1` on that instance alone, which went away with the instance.
