@@ -57,6 +57,22 @@ class ServerState:
         # that requests do not share a socket, rather than asserting it from the docs.
         self.client_ports = set()
 
+        # Server-side decoding the client did not ask for, both measured on real GCS
+        # signed URLs (§13.70). `decoded_payload` is what such a response carries.
+        self.decoded_payload = None
+        # A gzip-encoded object with Content-Type application/gzip: a request WITHOUT a
+        # Range header is served decoded even when it asks for gzip, while any Range gets
+        # the stored bytes -- whole, with 200, the Range itself ignored.
+        self.decode_unless_ranged = False
+        # GCS's anonymous/edge path: decoded no matter what was asked for.
+        self.always_decode = False
+        # An ordinary gzip-encoded object (the common case): decoded -- Range ignored --
+        # for any request that does not carry Accept-Encoding: gzip; stored bytes,
+        # ranges honoured, for one that does.
+        self.decode_unless_accepts_gzip = False
+        # The Range header of every request, in order (None when absent).
+        self.seen_ranges = []
+
     def snapshot(self):
         with self.lock:
             return {"sent": self.sent, "requests": self.requests,
@@ -106,7 +122,24 @@ def make_handler(state):
 
             total = len(state.payload)
             header_range = self.headers.get("Range")
-            ranged = header_range is not None and state.support_range
+            with state.lock:
+                state.seen_ranges.append(header_range)
+            ranged = (header_range is not None and state.support_range
+                      and not state.decode_unless_ranged)
+
+            accepts_gzip = "gzip" in (self.headers.get("Accept-Encoding") or "")
+            if state.decoded_payload is not None and (
+                    state.always_decode
+                    or (state.decode_unless_ranged and header_range is None)
+                    or (state.decode_unless_accepts_gzip and not accepts_gzip)):
+                body = state.decoded_payload
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                if self.command != "HEAD":
+                    self.wfile.write(body)
+                self._count(len(body), False)
+                return
 
             if state.transcoding and "gzip" not in (
                 self.headers.get("Accept-Encoding") or ""

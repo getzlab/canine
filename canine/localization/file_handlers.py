@@ -476,18 +476,6 @@ class FileType(abc.ABC):
         )
         headers = parse_header_block(resp.stdout.decode(errors = "replace"))
 
-        # Whether to decompress after downloading is decided ONLY on positive,
-        # GCS-specific evidence that the stored object is gzip and the stored bytes are
-        # what is being served: `x-goog-stored-content-encoding`. That is the case
-        # measured against a real object, and the only one whose semantics we know.
-        #
-        # Deliberately NOT keyed on `Content-Encoding: gzip` alone. A generic server can
-        # send that alongside a normal Content-Length, and the historical behavior for
-        # such a URL is that `curl -C - -o` (no `--compressed`) writes the bytes as
-        # received -- so the localized file has always been the compressed one. Treating
-        # the header alone as a decompress signal would silently change what lands on
-        # disk for those inputs, which is exactly the kind of change that breaks a
-        # pipeline mysteriously. Widening this needs its own evidence.
         received_encoded = "gzip" in [
             part.strip() for part in headers.get("content-encoding", "").lower().split(",")
         ]
@@ -498,32 +486,42 @@ class FileType(abc.ABC):
 
         # `Content-Encoding: gzip` means the body is a transport-encoded representation of
         # the file, so the localized file must be the DECODED content: a task reading it
-        # expects the actual data, not a gzip stream. This matches RFC 9110 (a
-        # content-coding is a property of the representation and the recipient decodes it)
-        # and it matches what `gs://` inputs already get, since `gcloud storage cp`
-        # decompresses locally -- previously the same object arrived decompressed via
-        # gs:// but compressed via a signed URL.
+        # expects the actual data, not a gzip stream (RFC 9110; and it matches what gs://
+        # inputs get). Either signal below means "the bytes on offer are gzip".
         #
-        # Note this changes what lands on disk for such URLs: the old
-        # `curl -C - -o` command wrote the bytes as received, i.e. still compressed.
-        self.body_is_compressed = received_encoded
+        # The GCS signal is `x-goog-stored-content-encoding`, NOT `Content-Encoding`.
+        # Measured (§13.70): for an object uploaded the ordinary way -- content-encoding
+        # set, no `Cache-Control: no-transform` -- a HEAD returns NO Content-Encoding at
+        # all, whether it asks for identity, gzip, or nothing. Only the stored-encoding
+        # header is present. §13.5 measured a `no-transform` object, which does send
+        # Content-Encoding, and explicitly left this case unverified; keying on
+        # Content-Encoding alone then made every transcoding-eligible object look plain.
+        # Those reached the downloader without --gunzip, GCS transcoded and ignored the
+        # Range, and it fell back to one unverified single-stream curl -- so the
+        # parallel, verified, magic-checked decode existed and never ran for them.
+        #
+        # GCS serves the stored bytes to any request carrying `Accept-Encoding: gzip`,
+        # ranges included (§6.6b: 206, compressed Content-Range). So stored-encoded is not
+        # "served decoded, nothing to do" -- it is "ask for the stored bytes", and every
+        # download command for a compressed body does exactly that (_pdl_command, and the
+        # handlers' legacy curl).
+        self.body_is_compressed = received_encoded or stored_encoded
 
-        # Stored compressed but served decompressed -- the digest covers bytes we never
-        # see, so it cannot be used. This is the only case where a digest must be refused.
-        transcoded = stored_encoded and not received_encoded
+        # Because the stored bytes are always what is requested, nothing arriving here is
+        # a transcoded body, and the stored digest covers exactly what will be verified.
+        transcoded = False
 
-        # Content-Length first: it is the standard header and most servers send it, gzip
-        # or not (and per RFC 9110 it describes the encoded body, which is what crosses
-        # the wire -- exactly what the chunk plan needs). The x-goog- fallback exists
-        # because a gzip-stored GCS object sends no Content-Length at all, on either a
-        # plain request or one with `Accept-Encoding: gzip`. Requiring Content-Length
-        # made such objects unlocalizable through this handler. (The original
-        # pre-conversion code failed on them too: its `grep -i Content-Length` did match
-        # the x-goog- header, but the regex applied to it was anchored, so the match
-        # failed and the bare `except` turned it into this same error.)
-        size = headers.get("content-length")
-        if size is None:
+        # Size of the bytes that will cross the wire. For a stored-gzip object that is the
+        # STORED length: a Content-Length on a transcoded response would describe the
+        # decoded representation, which is not what the chunk plan will range over.
+        # Otherwise Content-Length, the standard header, with the x-goog- one as fallback
+        # (a gzip-stored GCS object may send no Content-Length at all).
+        if stored_encoded and headers.get("x-goog-stored-content-length") is not None:
             size = headers.get("x-goog-stored-content-length")
+        else:
+            size = headers.get("content-length")
+            if size is None:
+                size = headers.get("x-goog-stored-content-length")
         if size is None:
             raise ValueError("Could not get file header size")
         try:
@@ -531,9 +529,8 @@ class FileType(abc.ABC):
         except ValueError:
             raise ValueError("Could not get file header size")
 
-        # When the body is kept compressed until verified, the advertised digest covers
-        # exactly the bytes being checked, so it is usable. Verified on a real object: its
-        # x-goog-hash md5 equals its ETag, both over the stored bytes.
+        # The advertised digest covers the stored bytes (verified: x-goog-hash md5 equals
+        # the ETag, both over the stored bytes), which is exactly what is fetched.
         self.content_checksum = extract_content_checksum(headers, transcoded = transcoded)
 
         if self.check_hash and self.content_checksum[0] is None:
@@ -545,6 +542,19 @@ class FileType(abc.ABC):
             )
 
         return headers
+
+    def _accept_encoding_flag(self):
+        """
+        The curl flag that asks for a compressed body's STORED bytes, or "".
+
+        Needed on every legacy curl that can fetch a compressed body. Without it GCS
+        transcodes a gzip-stored object on the fly, so the sidecar receives decoded
+        bytes: they fail the digest check (which covers the stored ones), and gunzip then
+        rejects them as not gzip. `_pdl_command` sends the same header to the downloader.
+        Not `--compressed`: that would decode in flight and break `-C -` resumption.
+        """
+        return (" -H 'Accept-Encoding: gzip'"
+                if getattr(self, "body_is_compressed", False) else "")
 
     def _use_parallel_download(self, url=None):
         """
@@ -618,8 +628,30 @@ class FileType(abc.ABC):
             # Chained with && so a failed transfer never decompresses a partial file, and
             # a failed stage leaves the sidecar for the next attempt to resume from.
             sidecar = self.localized_path + ".k9pdl.gz"
-            stages = [build_legacy(sidecar)]
-            stages += self._hash_check_command(checksum, path = sidecar)
+            download = build_legacy(sidecar)
+            # A FRESH fetch also sends `Range: bytes=0-`. Measured on signed URLs
+            # (§13.70): for a gzip-encoded object whose Content-Type is application/gzip
+            # -- exactly what a mislabelled .gz upload usually carries -- GCS serves a
+            # request with no Range DECODED even when it asks for gzip, while any Range
+            # gets the stored bytes (200, the whole object). Without them the digest
+            # cannot be checked and the keep-as-is check for .gz/.bam names cannot run.
+            #
+            # Only on a fresh fetch, never a resume: a custom Range header REPLACES the
+            # one `curl -C -` computes (verified), so on a resume it would re-request from
+            # zero and append -- silently duplicating every byte already on disk.
+            if download.startswith("curl "):
+                fresh = "curl -H 'Range: bytes=0-' " + download[len("curl "):]
+            else:
+                fresh = download
+            # A server that does not honour Range makes `curl -C -` fail with exit 33
+            # ("cannot resume") whenever a partial sidecar survives a preemption -- and
+            # it survives by design, so every later attempt would hit the same partial
+            # and fail the same way, forever. GCS does exactly this for the case above.
+            # Restart from zero instead.
+            fetch = ("{{ {{ if [ -s {sc} ]; then {dl}; else {fresh}; fi; }} || "
+                     "{{ rc=$?; [ $rc -eq 33 ] && rm -f {sc} && {fresh}; }}; }}"
+                     .format(dl = download, fresh = fresh, sc = sidecar))
+            stages = self._hash_check_command(checksum, path = sidecar)
 
             magic = expected_magic(self.path or "")
             if magic is not None:
@@ -648,7 +680,32 @@ class FileType(abc.ABC):
                     sidecar = sidecar, dest = self.localized_path)]
 
             stages += ["rm -f {sidecar}".format(sidecar = sidecar)]
-            legacy_cmd = " && ".join(stages)
+
+            # Detect, don't predict. The request asks for the stored bytes, but what
+            # arrives is decided server-side, and it is not always what was asked for:
+            # measured (§13.70), GCS's anonymous/edge path served a decoded body to a
+            # request carrying Accept-Encoding: gzip. Verifying such a body against the
+            # stored digest fails, and the old pipeline then deleted a perfectly good
+            # file as "corrupted" -- a regression against the unverified download that
+            # would otherwise have succeeded.
+            #
+            # Size is the discriminator, not gzip magic: stored bytes are exactly the
+            # stored length, and a doubly-compressed object decoded once by the server
+            # still starts 1f 8b. A decoded body cannot be verified -- the digest covers
+            # bytes that never arrived -- so it is placed as-is with a loud warning, which
+            # is exactly the outcome it would have had before this pipeline existed. The
+            # warning names the file, never the URL: a signed URL is a credential.
+            decoded = (
+                "printf 'WARNING: %s arrived already decoded by the server; the advertised "
+                "digest covers the stored bytes, so it cannot be verified\\n' {name} >&2"
+                " && mv {sc} {dest}"
+            ).format(name = shlex.quote(os.path.basename(self.localized_path)),
+                     sc = sidecar, dest = self.localized_path)
+            legacy_cmd = (
+                "{fetch} && if [ \"$(wc -c < {sc} | tr -d ' ')\" = {size} ]; "
+                "then {verify_and_decode}; else {decoded}; fi"
+            ).format(fetch = fetch, sc = sidecar, size = int(self._size),
+                     verify_and_decode = " && ".join(stages), decoded = decoded)
 
         if not self._use_parallel_download(url if url_expr is None else None):
             # The compressed pipeline verifies the sidecar itself, so a trailing gate here
@@ -1677,8 +1734,8 @@ class HandleGCSSignedURL(FileType):
         # the legacy single-stream command, kept verbatim: it is both the
         # parallel_download=False opt-out and the in-script no-range fallback
         cmd += self._download_and_verify_lines(
-            lambda target: "curl -C - -o {path} '{url}'".format(
-                path = target, url = self.url
+            lambda target: "curl -C - -o {path}{enc} '{url}'".format(
+                path = target, url = self.url, enc = self._accept_encoding_flag()
             ),
             prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
                 dest_dir = dest_dir
@@ -1727,8 +1784,8 @@ class HandleOtherURL(FileType):
         self.localized_path = os.path.join(dest_dir, dest_file)
         cmd = []
         cmd += self._download_and_verify_lines(
-            lambda target: "curl -C - -o {path} '{url}'".format(
-                path = target, url = self.url
+            lambda target: "curl -C - -o {path}{enc} '{url}'".format(
+                path = target, url = self.url, enc = self._accept_encoding_flag()
             ),
             prefix = "[ ! -d {dest_dir} ] && mkdir -p {dest_dir} || :; ".format(
                 dest_dir = dest_dir

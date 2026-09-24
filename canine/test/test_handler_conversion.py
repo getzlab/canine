@@ -1504,19 +1504,42 @@ class TestS3SignedUrlVerification:
                 b"x-goog-stored-content-length: 999\r\n\r\n")
         assert self._handler(both).size == 111
 
-    def test_a_transcoded_response_refuses_the_digest(self):
+    def test_a_stored_gzip_object_is_fetched_as_stored_and_verified(self):
         """
-        The only case a digest must be refused: stored compressed but served decompressed,
-        so the digest covers bytes we never see. Detected by the stored-encoding header
-        being present while Content-Encoding is absent -- not by Content-Encoding alone,
-        which is absent precisely here.
+        This used to be "a transcoded response refuses the digest": stored-encoding
+        present, Content-Encoding absent, read as "served decoded, so the digest covers
+        bytes we never see". Measured (§13.70), that header shape is simply what a HEAD
+        returns for ANY transcoding-eligible GCS object -- no Content-Encoding whatever
+        Accept-Encoding asks for -- and GCS serves the stored bytes to any request that
+        sends `Accept-Encoding: gzip`, ranges included. So the right reading is: request
+        the stored bytes, and the stored digest covers exactly them.
+
+        Refusing it sent every such object down one unverified single-stream curl.
         """
-        transcoded = (b"HTTP/1.1 200 OK\r\ncontent-length: 20000000\r\n"
-                      b"x-goog-stored-content-encoding: gzip\r\n"
-                      b"x-goog-hash: md5=hT9M1UXc79mlN1Rvgr1tKg==\r\n\r\n")
-        handler = self._handler(transcoded, check_md5=True)
-        assert handler.content_checksum == (None, None)
-        assert "--check-md5" not in handler.localization_command(DEST)
+        stored = (b"HTTP/1.1 200 OK\r\nx-goog-stored-content-length: 20000000\r\n"
+                  b"x-goog-stored-content-encoding: gzip\r\n"
+                  b"x-goog-hash: md5=hT9M1UXc79mlN1Rvgr1tKg==\r\n\r\n")
+        handler = self._handler(stored, check_md5=True)
+        assert handler.body_is_compressed is True
+        assert handler.content_checksum == ("md5", "853f4cd545dcefd9a537546f82bd6d2a")
+        assert handler._size == 20000000
+        cmd = handler.localization_command(DEST)
+        assert "--check-md5 853f4cd545dcefd9a537546f82bd6d2a" in cmd
+        assert "--gunzip" in cmd
+        # both the downloader AND the legacy fallback must ask for the stored bytes,
+        # or GCS transcodes and the digest check fails on decoded bytes
+        assert cmd.count("Accept-Encoding: gzip") >= 2, cmd
+
+    def test_the_stored_length_wins_over_a_decoded_content_length(self):
+        """
+        The chunk plan ranges over the STORED bytes. A Content-Length alongside the
+        stored-encoding header would describe the decoded representation, and planning
+        chunks from it would request ranges past the end of the object.
+        """
+        both = (b"HTTP/1.1 200 OK\r\ncontent-length: 99999999\r\n"
+                b"x-goog-stored-content-length: 20000000\r\n"
+                b"x-goog-stored-content-encoding: gzip\r\n\r\n")
+        assert self._handler(both)._size == 20000000
 
     def test_multipart_etag_is_still_rejected(self):
         multipart = (b"HTTP/1.1 200 OK\r\ncontent-length: 500000\r\n"
@@ -1603,12 +1626,12 @@ class TestTransportCompressionIsNotRequested:
             with pytest.raises(ValueError, match="Could not get file header size"):
                 fh.get_file_handler("https://example.org/o.vcf")
 
-    def test_the_received_encoding_is_what_decides_decompression(self):
+    def test_either_encoding_signal_decides_decompression(self):
         """
-        The rule, stated once: the body arriving gzip-encoded is what triggers
-        decompression, regardless of provider. The stored-encoding header alone means the
-        opposite -- the object is stored compressed but was served decoded (transcoded),
-        so there is nothing to decompress and its digest is unusable.
+        The rule, stated once: a body arriving gzip-encoded, OR a GCS object stored
+        gzip-encoded, triggers decompression. The stored-only case used to mean "served
+        decoded, nothing to do" -- but it is how a HEAD reports every transcoding-eligible
+        GCS object (measured, §13.70), and the download asks for the stored bytes.
         """
         variants = {
             "neither": b"content-length: 10\r\n",
@@ -1630,7 +1653,150 @@ class TestTransportCompressionIsNotRequested:
             results[label] = handler.body_is_compressed
 
         assert results == {"neither": False, "received only": True,
-                           "stored only": False, "both": True}
+                           "stored only": True, "both": True}
+
+
+class TestTheFetchDetectsWhatArrived:
+    """
+    Behaviour measured on real GCS signed URLs (§13.70), modelled in the fake:
+
+      * a HEAD for an ordinary gzip-encoded object carries only
+        x-goog-stored-content-encoding -- no Content-Encoding -- so keying detection on
+        Content-Encoding missed every one of them;
+      * typed application/gzip, a request with no Range is served DECODED even when it
+        asks for gzip, while any Range gets the stored bytes (200, Range ignored);
+      * GCS's anonymous/edge path can serve decoded bytes whatever was asked for.
+
+    The pipeline asks for the stored bytes but decides from what actually arrived.
+    """
+
+    def _run(self, tmp_path, configure=None, partial=None, **kwargs):
+        import base64
+        import gzip
+        import hashlib
+
+        plain = b"@HD\tVN:1.6\n" + b"@SQ\tSN:chr1\tLN:248956422\n" * 3000
+        blob = gzip.compress(plain)
+        md5_b64 = base64.b64encode(hashlib.md5(blob).digest()).decode()
+        dest = str(tmp_path / "o.dict")
+        offset = None
+        if partial is not None:
+            # a fraction of the COMPRESSED length: this plaintext compresses to a few
+            # hundred bytes, so a fixed byte count can silently exceed the whole file
+            offset = int(len(blob) * partial)
+            assert 0 < offset < len(blob)
+            open(dest + ".k9pdl.gz", "wb").write(blob[:offset])
+
+        with Server(blob) as server:
+            server.state.stored_gzip = True
+            server.state.decoded_payload = plain
+            if configure:
+                configure(server.state)
+            # the HEAD a real transcoding-eligible object returns: no Content-Encoding
+            headers = ("HTTP/1.1 200 OK\r\n"
+                       "x-goog-stored-content-encoding: gzip\r\n"
+                       "x-goog-stored-content-length: {}\r\n"
+                       "x-goog-hash: md5={}\r\n\r\n").format(len(blob), md5_b64).encode()
+
+            class Fake:
+                stdout = headers
+
+            with patch("os.path.exists", return_value=False), \
+                 patch("canine.localization.file_handlers.subprocess.run",
+                       return_value=Fake()):
+                handler = fh.get_file_handler(server.url("o.dict"), check_hash=True,
+                                              **kwargs)
+            assert handler.body_is_compressed, "the probe missed a stored-gzip object"
+            script = "#!/bin/bash\nset -e\n" + handler.localization_command(dest) + "\n"
+            result = subprocess.run(["bash", "-e", "-c", script], capture_output=True,
+                                    text=True, timeout=300)
+            ranges = list(server.state.seen_ranges)
+        self.offset = offset
+        return result, dest, plain, ranges
+
+    def test_the_ordinary_case_is_verified_and_decoded(self, tmp_path):
+        """
+        Modelled on a real ordinary object: served decoded to any request that does not
+        ask for gzip. So this fails -- on the result, not on the command string -- if
+        the fetch stops asking for the stored bytes.
+        """
+        def ordinary(state):
+            state.decode_unless_accepts_gzip = True
+
+        result, dest, plain, _ = self._run(tmp_path, ordinary, parallel_download=False)
+        assert result.returncode == 0, result.stderr
+        assert open(dest, "rb").read() == plain
+        assert "arrived already decoded" not in result.stderr
+
+    def test_a_body_decoded_anyway_is_placed_not_deleted(self, tmp_path):
+        """
+        It cannot be verified -- the digest covers bytes that never arrived -- but it is
+        the right content, and the old pipeline deleted it as "corrupted", turning an
+        unverified success into a failure.
+        """
+        def edge(state):
+            state.always_decode = True
+
+        result, dest, plain, _ = self._run(tmp_path, edge, parallel_download=False)
+        assert result.returncode == 0, result.stderr
+        assert open(dest, "rb").read() == plain
+        assert "arrived already decoded" in result.stderr
+        assert "deleting corrupted" not in result.stdout + result.stderr
+        assert not os.path.exists(dest + ".k9pdl.gz")
+
+    def test_a_fresh_fetch_uses_a_range_to_get_the_stored_bytes(self, tmp_path):
+        """
+        application/gzip-typed objects are decoded unless the request has a Range. Those
+        are exactly the mislabelled .gz uploads the keep-as-is check exists for, and a
+        decoded arrival also skips verification.
+        """
+        def typed_gzip(state):
+            state.decode_unless_ranged = True
+
+        result, dest, plain, ranges = self._run(tmp_path, typed_gzip,
+                                                parallel_download=False)
+        assert result.returncode == 0, result.stderr
+        assert open(dest, "rb").read() == plain
+        assert "arrived already decoded" not in result.stderr, (
+            "the fresh fetch had no Range, so the server decoded it and it went unverified")
+        assert ranges == ["bytes=0-"], ranges
+
+    def test_the_downloader_path_reaches_the_same_result(self, tmp_path):
+        """Range ignored, so the downloader declines and hands over to the pipeline."""
+        def typed_gzip(state):
+            state.decode_unless_ranged = True
+
+        result, dest, plain, _ = self._run(tmp_path, typed_gzip,
+                                           download_min_chunk=MIB, download_connections=4)
+        assert result.returncode == 0, result.stderr
+        assert open(dest, "rb").read() == plain
+        assert "arrived already decoded" not in result.stderr
+
+    def test_a_resume_never_sends_the_fresh_range(self, tmp_path):
+        """
+        A custom Range header REPLACES the one `curl -C -` computes. Sent on a resume it
+        re-requests from zero and appends -- every byte already on disk duplicated.
+        """
+        result, dest, plain, ranges = self._run(tmp_path, partial=0.5,
+                                                parallel_download=False)
+        assert result.returncode == 0, result.stderr
+        assert open(dest, "rb").read() == plain
+        assert ranges == ["bytes={}-".format(self.offset)], ranges
+
+    def test_an_unresumable_partial_restarts_instead_of_failing_forever(self, tmp_path):
+        """
+        Against a server that ignores Range, `curl -C -` exits 33 on a surviving partial
+        -- and the partial survives by design, so without a restart every retry fails
+        identically.
+        """
+        def typed_gzip(state):
+            state.decode_unless_ranged = True
+
+        result, dest, plain, ranges = self._run(tmp_path, typed_gzip, partial=0.5,
+                                                parallel_download=False)
+        assert result.returncode == 0, result.stderr
+        assert open(dest, "rb").read() == plain
+        assert ranges == ["bytes={}-".format(self.offset), "bytes=0-"], ranges
 
 
 class TestAllPathsProduceTheSameFile:

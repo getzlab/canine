@@ -5186,3 +5186,80 @@ Mutation-checked: removing the stamp from any one of the three write paths fails
 does dropping the orphan hand-off. The multipart boundary's collision check initially
 survived, because a random boundary never collides; a test now forces the first draw to
 equal a boundary present in the body.
+
+### 13.70 The gzip probe missed every ordinary GCS object, and what GCS actually serves
+
+Found while reviewing the fuse-localize merge. `_probe_http_metadata` decided "the body is
+gzip" from `Content-Encoding` on a HEAD. **A HEAD for an ordinary gzip-encoded GCS object
+returns no `Content-Encoding` at all**, whatever `Accept-Encoding` it sends -- only
+`x-goog-stored-content-encoding: gzip`. §13.5 had measured a `Cache-Control: no-transform`
+object, which does send it, and explicitly left the transcoding-eligible case unverified; the
+code then keyed on `Content-Encoding` alone, and a stale comment above it still said to key on
+the stored header. So for signed URLs the whole decode of §13.55-§13.68 **never ran in
+production**: those objects reached the downloader without `--gunzip`, GCS decoded and ignored
+the Range, and they landed via one unverified single-stream curl. The §6.6b measurements only
+exercised it because the flags were passed by hand.
+
+#### Measured on real signed URLs
+
+Minted V4 through GCS's S3-compatible endpoint with an HMAC pair read from `~/.boto` at call
+time (never written anywhere; URLs kept in the session scratchpad, 15-minute expiry). Objects
+uploaded the ordinary way with an explicit Content-Type. Every cell repeated 3x; all
+deterministic:
+
+| object | HEAD sees | GET, no Accept-Encoding | GET, `Accept-Encoding: gzip` |
+|---|---|---|---|
+| `no-transform` | `Content-Encoding: gzip` | raw, ranges honoured | raw, ranges honoured |
+| ordinary, non-gzip Content-Type | **stored header only** | decoded, Range ignored | **raw, ranges honoured (206)** |
+| ordinary, `Content-Type: application/gzip` | stored header only | decoded, Range ignored | raw only **with a Range** (200, Range ignored); decoded without one |
+
+Two corrections to earlier sections follow. §13.57's "`Accept-Encoding: gzip` is what makes
+ranges work at all" holds for the ordinary case but not for `application/gzip`-typed objects,
+which never range. And the first round of these measurements, on **anonymous reads of a
+public object**, was not deterministic -- the same request changed answers minutes apart and
+decoded bodies arrived despite `Accept-Encoding: gzip`. That is Google's edge-cache path
+(`cache-control: public`, `age:` set). Signed URLs never touch it, but the handler's regex
+matches any `storage.googleapis.com` URL, including unsigned public ones.
+
+#### The fix
+
+* The probe keys on **either** header, and for a stored-gzip object takes its size from
+  `x-goog-stored-content-length` (a Content-Length on a transcoded response would describe the
+  decoded bytes). The stored digest then covers exactly what is fetched.
+* Every fetch asks for the stored bytes: `_pdl_command` already sent `Accept-Encoding: gzip`;
+  the legacy curl now does too.
+* A **fresh** legacy fetch also sends `Range: bytes=0-`, the only way to get raw bytes for an
+  `application/gzip`-typed object -- which is what a mislabelled `.gz` upload usually is. Never
+  on a resume: a custom Range header replaces the one `curl -C -` computes (verified), so it
+  would re-request from zero and append, duplicating every byte on disk.
+* **Detect, don't predict.** After the fetch, the pipeline checks what arrived. Stored bytes
+  are exactly the stored length; anything else was decoded server-side, cannot be verified
+  (the digest covers bytes that never arrived), and is placed with a loud warning -- where
+  the old pipeline deleted it as "corrupted". Size, not gzip magic: a doubly compressed object
+  decoded once still starts `1f 8b`.
+* `curl -C -` exit 33 (server ignores Range, so a surviving partial cannot resume) now
+  restarts from zero. The partial survives by design, so every retry used to fail identically.
+
+#### Acceptance, on the real signed URLs
+
+The handler's emitted command, both paths (downloader and legacy), six object shapes:
+
+| | before | after |
+|---|---|---|
+| ordinary / parallel-sized | correct, **unverified**, single stream | correct, **verified**, parallel |
+| `no-transform` | correct, verified | correct, verified |
+| `application/gzip`-typed | correct, **unverified** | correct, **verified** |
+| mislabelled `.vcf.gz` (singly compressed, both types) | **wrong** -- plain text under a `.gz` name | correct -- stored bytes kept |
+
+12/12 correct after, against 10/12 correct and 8 of those unverified before.
+
+#### Known limitation, by decision
+
+A mislabelled, singly compressed file with **no gzip-family name** -- a DRS object named by
+UUID, say -- is still decoded into plain bytes. Measured: `0f3c9a2e-sample`, typed
+`application/gzip`, came out decoded on both paths. Using the declared Content-Type as a
+second "what must the decoded file be" signal would catch it; that was built and deliberately
+backed out as going too far for now. It is no worse than before this work.
+
+Still open: `HandleDRSURI` and `HandleGDCHTTPURL` never probe at all, so a DRS input
+resolving to a gzip-encoded GCS object gets none of this.
