@@ -172,3 +172,18 @@ cannot be parallelised, so width 8 measures 1.5% better for twice the memory.
 
 Note the in-situ upload runs ~170 MB/s against 301 standalone -- interleaving with the
 inflater costs ~40%, the same gap isolated-vs-in-loop that the read grid showed.
+
+### Verify read-back (`gunzip-e2e-verify-*.json`)
+
+The same read-ahead applied to the md5 read-back, which was the largest single cost left
+and had never been inside a `phase()`.
+
+| run | readahead | total | relay | verify | gunzip |
+|---|---|---|---|---|---|
+| ra1 | 1 | 76.38 s | 6.5 | 22.0 | 44.4 |
+| ra4 | 4 | 35.81 s | 5.4 | 6.1 | 21.4 |
+| ra4b | 4 | 36.31 s | 5.6 | 6.7 | 21.2 |
+| ra1b | 1 | 81.90 s | 6.7 | 26.6 | 45.4 |
+
+Verify 3.8x (~35 -> ~133 MB/s, against a measured depth-4 ceiling of 140.3). Whole run
+55.2 -> 36.1 s; cumulative with the read-ahead and sliced upload, **102.9 -> 36.1 s, 2.85x**.

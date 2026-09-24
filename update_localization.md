@@ -4772,3 +4772,43 @@ afterwards, against roughly one in four before.
 isolation" described the symptom accurately and was still the wrong conclusion: the test
 only fails under load because that is when the interleaving happens, which is also the
 condition production runs in.
+
+### 13.63 The verify read-back, and where the time finally went
+
+§13.62 left the md5 read-back as the biggest single cost in a `--gunzip` run and noted
+the read-ahead had not been applied to it. Applied, and it was also not wrapped in a
+`phase()`, which is why it had been sitting in "unattributed" for three rounds.
+
+`verify_bucket_object` now reads through the same `ranged_blocks` the decode uses. md5 is
+order-dependent, which is precisely why this needed a test rather than an assumption: a
+read-ahead that delivered out of order would still produce a digest, just the wrong one,
+and the failure would read as "the source is corrupt" rather than "the reader is broken".
+
+| run | readahead | total | relay | verify | gunzip | other |
+|---|---|---|---|---|---|---|
+| ra1 | 1 | 76.38 s | 6.5 | 22.0 | 44.4 | 3.4 |
+| **ra4** | **4** | **35.81 s** | 5.4 | **6.1** | 21.4 | 2.8 |
+| ra4b | 4 | 36.31 s | 5.6 | 6.7 | 21.2 | 2.7 |
+| ra1b | 1 | 81.90 s | 6.7 | 26.6 | 45.4 | 3.1 |
+
+**Verify 22.0/26.6 s → 6.1/6.7 s, 3.8x** -- 852 MB at ~133 MB/s against ~35, which is
+essentially the 140.3 MB/s that the rotated depth sweep measured as the depth-4 ceiling.
+There is nothing further to get from that read.
+
+Against the previous best (read-ahead on the decode only, sequential verify, width 4):
+**55.2 s → 36.1 s, 1.53x.** Cumulative across the read-ahead, the sliced upload and this:
+**102.9 s → 36.1 s, 2.85x.**
+
+#### Where the remaining 36 s is
+
+relay 5.4, verify 6.1, decode 21.4, other 2.8. The decode is inflate 11.4 + upload 9.7,
+and both are close to their floors: gzip inflation cannot be parallelised at all, and
+widening the upload past 4 measured 1.5% (§13.62). The only structural win left is a
+2-thread inflate-against-upload split, worth roughly 21 s → 12 s if the two do not
+interfere -- and the interference question is exactly the one that turned the relay's
+prefetch into a -6.2% regression, so it needs measuring, not arguing.
+
+Worth noting what the three changes have in common: none of them made a request faster.
+They removed serialisation -- a read waiting on the previous read, a write waiting on the
+previous write, a hash waiting on a fetch. The transport was never the problem, which is
+the same conclusion §6.5i reached about the relay by a different route.

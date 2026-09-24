@@ -2552,6 +2552,76 @@ class TestTheDecodeReadAhead:
                 "depth {} changed the output".format(depth))
 
 
+class TestTheVerifyReadBackIsAlsoParallel:
+    """
+    The md5 read-back is the other full sequential read on this route, and it was the
+    larger one -- ~26 s of a 54 s `--gunzip` run, unattributed because it was not in a
+    phase. It reads a just-composed object, so it pays the cold-read penalty in full.
+
+    md5 is order-dependent, which is exactly why this needs testing rather than
+    assuming: a read-ahead that returned blocks out of order would still produce a
+    digest, just the wrong one, and the failure would read as "the source is corrupt".
+    """
+
+    def test_the_digest_is_correct_with_a_read_ahead(self, tmp_path, monkeypatch, gcs,
+                                                     payload, payload_md5):
+        force_bucket_route(monkeypatch)
+        with Server(payload) as source:
+            argv = options_for(str(tmp_path / "sample.bam"), source.url(), len(payload),
+                               check_md5=payload_md5,
+                               upload_block=pdl.GCS_UPLOAD_GRANULARITY)
+            argv.decode_readahead = 4
+            assert pdl.run(argv) == pdl.EXIT_OK
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+
+    def test_a_wrong_digest_is_still_caught(self, tmp_path, monkeypatch, gcs, payload,
+                                            capsys):
+        """The read-ahead must not turn verification into a formality."""
+        force_bucket_route(monkeypatch)
+        with Server(payload) as source:
+            argv = options_for(str(tmp_path / "sample.bam"), source.url(), len(payload),
+                               check_md5=hashlib.md5(b"wrong").hexdigest(),
+                               upload_block=pdl.GCS_UPLOAD_GRANULARITY)
+            argv.decode_readahead = 4
+            assert pdl.run(argv) == pdl.EXIT_FAIL
+        assert "md5 mismatch after compose" in capsys.readouterr().err
+
+    def test_verify_reads_concurrently(self, monkeypatch, gcs, payload, payload_md5):
+        """
+        Driven directly, because end-to-end cannot distinguish a parallel read-back
+        from a sequential one that happens to be fast -- which is how a read-ahead gets
+        "added" and never runs.
+        """
+        client = pdl.GcsClient(timeout=30)
+        client.put_object(BUCKET, "verify-me.bin", payload)
+
+        live = {"now": 0, "peak": 0}
+        lock = threading.Lock()
+        real = client.download_range
+
+        def watched(bucket, name, start, end):
+            with lock:
+                live["now"] += 1
+                live["peak"] = max(live["peak"], live["now"])
+            try:
+                time.sleep(0.01)
+                return real(bucket, name, start, end)
+            finally:
+                with lock:
+                    live["now"] -= 1
+
+        monkeypatch.setattr(client, "download_range", watched)
+        options = options_for("/tmp/unused", "http://x/y", len(payload),
+                              check_md5=payload_md5)
+        options.decode_readahead = 4
+        digest = pdl.verify_bucket_object(client, BUCKET, "verify-me.bin", len(payload),
+                                          options, block=256 * 1024)
+        assert digest == payload_md5
+        assert live["peak"] > 1, (
+            "the verify read-back never overlapped, so the read-ahead is not wired in")
+        assert live["peak"] <= 4
+
+
 class TestLosingTheComposeRace:
     """
     Two writers share deterministic part names, and each deletes the parts after

@@ -3384,16 +3384,30 @@ def verify_bucket_object(client, bucket, name, size, options, block=READ_BUFFER)
 
     A composite object has no md5Hash of its own, which is exactly why the stored
     metadata cannot be used here.
+
+    Read through the same bounded read-ahead the decode uses. This is the other full
+    sequential read-back on this route and it was the larger one -- roughly 26 s of a
+    54 s `--gunzip` run, unattributed because it was not wrapped in a phase. It reads a
+    just-composed object, so it pays the cold-read penalty in full: 33-40 MB/s
+    sequential against 88-96 warm, and 140 at depth 4.
+
+    md5 is order-dependent, which is fine: `ranged_blocks` yields strictly in order and
+    only the fetching overlaps.
     """
     digest = hashlib.md5()
     offset = 0
-    while offset < size:
-        end = min(offset + block, size)
-        payload = client.download_range(bucket, name, offset, end)
-        if not payload:
-            raise TransientError("read-back returned nothing at {}".format(offset))
-        digest.update(payload)
-        offset += len(payload)
+    stream = ranged_blocks(client, bucket, name, size, block,
+                           getattr(options, "decode_readahead",
+                                   DEFAULT_DECODE_READAHEAD))
+    try:
+        while offset < size:
+            payload = next(stream, None)
+            if not payload:
+                raise TransientError("read-back returned nothing at {}".format(offset))
+            digest.update(payload)
+            offset += len(payload)
+    finally:
+        stream.close()
 
     actual = digest.hexdigest()
     expected = normalize_expected_md5(options.check_md5)
@@ -3529,7 +3543,9 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     digest = None
     if options.check_md5:
         try:
-            digest = verify_bucket_object(client, bucket, compose_target, size, options)
+            with phase("verify", size):
+                digest = verify_bucket_object(
+                    client, bucket, compose_target, size, options)
         except PermanentError as e:
             log("verification failed: {}".format(e))
             for name in part_names:
@@ -4428,8 +4444,9 @@ def build_parser():
                                  GCS_UPLOAD_GRANULARITY))
     parser.add_argument("--decode-readahead", dest="decode_readahead", type=int,
                         default=DEFAULT_DECODE_READAHEAD,
-                        help="ranged GETs in flight while reading the compressed "
-                             "sidecar back for --gunzip (default: %(default)s). Only "
+                        help="ranged GETs in flight for the bucket route's full-object "
+                             "read-backs -- the md5 verification and, with --gunzip, "
+                             "the decode (default: %(default)s). Only "
                              "the fetch is parallel; inflation stays sequential. 1 "
                              "restores the old single-stream read. Peak extra memory "
                              "is this times {} bytes".format(READ_BUFFER))
