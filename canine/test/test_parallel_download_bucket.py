@@ -3653,3 +3653,41 @@ class TestAnExpiredTokenIsRefreshed:
         now[0] += 20                               # 190 s after the first fetch
         client.token()
         assert len(calls) == 2, "a gcloud token was trusted for more than 3 minutes"
+
+
+class TestTheReadBackUsesLargeBlocks:
+    """
+    §13.78: the md5 read-back reads 64 MiB blocks (VERIFY_READBACK_BLOCK), about twice as
+    fast as 8 MiB on cold composites, at the same depth. The gzip decode keeps its own
+    measured 8 MiB.
+    """
+
+    def _ranges(self, gcs, monkeypatch, fn):
+        seen = []
+        real = pdl.GcsClient.download_range
+
+        def watched(self, bucket, name, start, end):
+            seen.append(end - start)
+            return real(self, bucket, name, start, end)
+
+        monkeypatch.setattr(pdl.GcsClient, "download_range", watched)
+        fn()
+        return seen
+
+    def test_the_verify_reads_64_mib_blocks(self, gcs, monkeypatch):
+        payload = os.urandom(130 * MIB)
+        gcs.state.objects["v.bin"] = payload
+        gcs.state.created["v.bin"] = time.time()
+        options = options_for("/tmp/unused", "http://x/y", len(payload),
+                              check_md5=hashlib.md5(payload).hexdigest())
+        sizes = self._ranges(gcs, monkeypatch, lambda: pdl.verify_bucket_object(
+            pdl.GcsClient(), BUCKET, "v.bin", len(payload), options))
+        assert sizes == [64 * MIB, 64 * MIB, 2 * MIB]
+
+    def test_memory_in_flight_is_bounded_by_depth_times_block(self):
+        assert pdl.VERIFY_READBACK_BLOCK * pdl.DEFAULT_DECODE_READAHEAD <= 256 * MIB
+
+    def test_the_decode_keeps_its_own_block(self):
+        import inspect
+        signature = inspect.signature(pdl.decompress_object)
+        assert signature.parameters["block"].default == pdl.READ_BUFFER == 8 * MIB

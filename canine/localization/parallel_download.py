@@ -184,6 +184,18 @@ CHUNK_ALIGN = 1024 * 1024
 
 READ_BUFFER = 8 * 1024 * 1024
 
+# Block size for the bucket route's md5 read-back (verify_bucket_object), at the same
+# read-ahead depth as the decode. Measured on cold composites (§13.78): 8 MiB read at
+# 118-126 MiB/s, 64 MiB at 234-276. Every ranged GET opens a new TLS connection and ramps
+# TCP from zero, ~0.15 s whatever it carries, so a bigger block amortizes it; more depth
+# does not (beyond 4 the rate falls to a 150-175 MiB/s plateau).
+#
+# Fixed, not scaled with the object like the write chunks: the rate depends on the block,
+# not the object's size, and each block is held whole in memory, so peak memory is
+# depth x block (256 MiB here). Scaling to 1 GiB would buy ~15% for 4 GiB in flight.
+# The decode keeps READ_BUFFER: its consumer is a gzip inflater, measured separately.
+VERIFY_READBACK_BLOCK = 64 * 1024 * 1024
+
 # Readers used for the verification read-back.
 #
 # Two competing effects, both measured, and the optimum is where they cross:
@@ -3791,7 +3803,7 @@ def report_decode_stages(stage, blocks, compressed, decompressed,
             total / two_stage if two_stage > 0 else 1.0))
 
 
-def verify_bucket_object(client, bucket, name, size, options, block=READ_BUFFER):
+def verify_bucket_object(client, bucket, name, size, options, block=VERIFY_READBACK_BLOCK):
     """
     Verify a composed object against the source's declared hash by reading it back.
 
