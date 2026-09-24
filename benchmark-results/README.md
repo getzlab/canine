@@ -220,3 +220,21 @@ split's own buffering, and the idea is unproven rather than disproven.
 
 The probe's first run 429'd: it rewrote one object name in a loop, and GCS rate-limits
 single-object writes to ~1/sec. The production uploader gives every slice its own name.
+
+### 10x scale check (`gunzip-e2e-10x-*.json`)
+
+8520130000 -> 16444444500, a 50-member gzip, two reps. Total time scales linearly
+(10.01x) but the composition does not:
+
+| stage | 1x | 10x | scaling |
+|---|---|---|---|
+| total | 36.1 s | 361.1 s | 10.01x |
+| relay | 5.5 s | 78.0 s | 14.17x |
+| verify | 6.4 s | 75.8 s | 11.84x |
+| inflate | 11.4 s | 116.4 s | 10.19x |
+| write | 9.5 s | 77.8 s | 8.20x |
+| read | 0.30 s | 0.34 s | 1.17x |
+
+Relay loses 29% per byte and verify 15% -- sustained-throughput effects a 36 s run cannot
+show. Write gains 18% as session setup amortizes over 490 slices. 491 components, both
+reps identical by crc32c.

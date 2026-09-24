@@ -4904,3 +4904,55 @@ worker in a loop, and GCS rate-limits writes to a single object at roughly one p
 The production uploader never does this -- every slice already gets its own name -- so it
 was purely a probe bug. Worth recording anyway, because it is a limit that would bite hard
 if the slice naming were ever made non-unique.
+
+### 13.66 At 10x: total is linear, but the relay and verify degrade per byte
+
+Every decode number to this point came from one 852 MB -> 1.64 GB object and a ~36 s run.
+That is exactly the length `CLAUDE.md` warns about -- "when benchmarking this, measure past
+96 GiB" exists because four runbook sections concluded there was a defect by comparing a
+short measurement against a long one. Re-ran at **10x** (8520130000 -> 16444444500, a
+50-member gzip built by concatenation), two reps.
+
+| stage | 1x | 10x | scaling for 10x the bytes |
+|---|---|---|---|
+| total | 36.1 s | 361.1 s | **10.01x** |
+| relay | 5.5 s | 78.0 s | **14.17x** |
+| verify | 6.4 s | 75.8 s | **11.84x** |
+| inflate | 11.4 s | 116.4 s | 10.19x |
+| write | 9.5 s | 77.8 s | **8.20x** |
+| read | 0.30 s | 0.34 s | 1.17x |
+
+**The total is linear and the composition is not.** Three things follow.
+
+**The relay degrades 29% per byte** -- 155 MB/s at 852 MB against 110 MB/s at 8.5 GB --
+and goes from 15% of the run to 21%. The verify loses 15% the same way (133 -> 113 MB/s).
+Both are sustained-throughput effects invisible in a 36 s run, which is structurally the
+same trap as §6.5i's burst-versus-sustained disk: a short measurement reports the fast
+part of a curve and nothing warns you it is a curve.
+
+**The write improves 18% per byte** (8.20x), as per-slice session setup amortizes across
+490 slices instead of 50.
+
+**The read-ahead is a fixed cost**, 0.29-0.39 s at either size. It scales perfectly
+because it never becomes the constraint.
+
+#### What it means for the split
+
+The prize is **~78 s of 361 s, 21.6%** -- proportionally a little under the 26% at 1x, but
+**nine times larger in absolute terms**. "~6 s of a 36 s run" was a bad way to price it,
+and that framing is what made the split look not worth retrying. At BAM scale it would be
+minutes. The zero-copy retry proposed in §13.65 is worth more than §13.64 concluded.
+
+#### Correctness at scale
+
+491 components, both reps identical by crc32c, no leftover slices, `compose_tree` handling
+490 sources through its tree path without incident. The multi-member decoder handled 50
+concatenated members.
+
+#### Still unmeasured
+
+10x is 8.5 GB. A transport-gzipped BAM would be ~33x beyond that again, and the two
+degrading stages are precisely the ones that would dominate there. Nothing here says the
+relay's 110 MB/s is a floor rather than another point on a descending curve -- the honest
+statement is that per-byte cost is **not** constant on this route, and any figure quoted
+from a single size should say which size.
