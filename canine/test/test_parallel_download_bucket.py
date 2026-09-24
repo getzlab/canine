@@ -3119,6 +3119,22 @@ class TestAGzipEncodedGsSource:
         # everything after the one-byte probe
         return [r for r in gcs.state.media_requests if r["range"] != "bytes=0-0"]
 
+    def test_a_size_other_than_the_one_expected_is_refused(self, gcs):
+        stored = self._stage(gcs, os.urandom(2 * MIB).hex().encode(), "ordinary")
+        source = pdl.GcsObjectSource(BUCKET, self.SRC)
+        source.probe_range(len(stored))
+        with pytest.raises(pdl.RangeNotSupported):
+            source.probe_range(len(stored) - 1)
+
+    def test_a_range_other_than_the_one_asked_for_is_refused(self, gcs):
+        stored = self._stage(gcs, os.urandom(2 * MIB).hex().encode(), "ordinary")
+        gcs.state.shift_range = 7
+        source = pdl.GcsObjectSource(BUCKET, self.SRC)
+        with pytest.raises(pdl.RangeNotSupported):
+            source.probe_range(len(stored))
+        with pytest.raises(pdl.TransientError):
+            source.open_range(MIB, MIB + 16)
+
     def test_an_ordinary_object_is_ranged_verified_and_decoded(self, tmp_path,
                                                                monkeypatch, gcs):
         # Several MiB compressed: chunks align up to 1 MiB (CHUNK_ALIGN), so the shared

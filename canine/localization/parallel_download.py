@@ -1216,6 +1216,26 @@ class IntegrityError(PermanentError):
     """
 
 
+_CONTENT_RANGE = re.compile(r"^(?:bytes\s*[=:]?\s*)?(\d+)-(\d+)/(\d+|\*)$", re.IGNORECASE)
+
+
+def parse_content_range(value):
+    """
+    Parse a satisfied-range `Content-Range` into (first, last, total), or None.
+
+    `total` is None for `*`. The unit is optional. RFC 9110 requires `bytes 0-0/N`, but
+    the GDC API sends `0-0/348693812393`, with no unit, on every 206 (measured). The
+    range itself is exact, so rejecting it cost nothing in safety and everything in
+    speed: every chunk failed its check and the whole download fell to a single stream.
+    `bytes=` and `bytes:` are accepted for the same reason, and are no more ambiguous.
+    """
+    match = _CONTENT_RANGE.match((value or "").strip())
+    if not match:
+        return None
+    first, last, total = match.groups()
+    return int(first), int(last), (None if total == "*" else int(total))
+
+
 class HttpSource:
     def __init__(self, url, headers=None, timeout=DEFAULT_TIMEOUT, url_refresh_cmd=None):
         self.url = url
@@ -1282,12 +1302,13 @@ class HttpSource:
                     "server returned HTTP {} to a ranged request".format(response.status)
                 )
             content_range = response.headers.get("Content-Range", "")
-            if not re.match(r"^bytes 0-0/(\d+|\*)$", content_range.strip()):
+            parsed = parse_content_range(content_range)
+            if parsed is None or parsed[:2] != (0, 0):
                 raise RangeNotSupported(
                     "unexpected Content-Range {!r}".format(content_range)
                 )
-            declared = content_range.strip().rsplit("/", 1)[-1]
-            if declared != "*" and size is not None and int(declared) != size:
+            declared = parsed[2]
+            if declared is not None and size is not None and declared != size:
                 raise RangeNotSupported(
                     "server reports size {} but {} was expected".format(declared, size)
                 )
@@ -1320,8 +1341,8 @@ class HttpSource:
             )
 
         content_range = response.headers.get("Content-Range", "").strip()
-        match = re.match(r"^bytes (\d+)-(\d+)/", content_range)
-        if not match or int(match.group(1)) != start or int(match.group(2)) != end - 1:
+        parsed = parse_content_range(content_range)
+        if parsed is None or parsed[:2] != (start, end - 1):
             response.close()
             raise TransientError(
                 "Content-Range {!r} does not match requested {}-{}".format(
@@ -1468,8 +1489,12 @@ class GcsObjectSource:
         response = self._open(0, 1)
         try:
             if response.status == 206:
-                declared = (response.headers.get("Content-Range") or "").rsplit("/", 1)[-1]
-                if declared != "*" and size is not None and int(declared) != size:
+                parsed = parse_content_range(response.headers.get("Content-Range"))
+                if parsed is None or parsed[:2] != (0, 0):
+                    raise RangeNotSupported("unexpected Content-Range {!r}".format(
+                        response.headers.get("Content-Range")))
+                declared = parsed[2]
+                if declared is not None and size is not None and declared != size:
                     raise RangeNotSupported(
                         "server reports size {} but {} was expected".format(declared, size))
                 return
@@ -1489,8 +1514,8 @@ class GcsObjectSource:
         response = self._open(start, end)
         if response.status == 206:
             content_range = (response.headers.get("Content-Range") or "").strip()
-            match = re.match(r"^bytes (\d+)-(\d+)/", content_range)
-            if not match or int(match.group(1)) != start or int(match.group(2)) != end - 1:
+            parsed = parse_content_range(content_range)
+            if parsed is None or parsed[:2] != (start, end - 1):
                 response.close()
                 raise TransientError("Content-Range {!r} does not match requested "
                                      "{}-{}".format(content_range, start, end - 1))

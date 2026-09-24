@@ -5262,7 +5262,7 @@ second "what must the decoded file be" signal would catch it; that was built and
 backed out as going too far for now. It is no worse than before this work.
 
 Still open: `HandleDRSURI` and `HandleGDCHTTPURL` never probe at all, so a DRS input
-resolving to a gzip-encoded GCS object gets none of this.
+resolving to a gzip-encoded GCS object gets none of this. (Resolved in §13.72: not needed, since drshub's md5 would catch it.)
 
 ### 13.71 Gzip-encoded gs:// objects go through the downloader, not a rewrite
 
@@ -5361,4 +5361,67 @@ through compose`, and by the §13.63 node runs of that route.
 
 * **Directories** are not classified, and still take the plain `cp -r`. Classifying one means
   inspecting every object under the prefix, and no gzip-encoded directory tree has turned up.
-* **DRS/GDC** (§13.70) still never probe.
+* **DRS/GDC** (§13.70): no probe needed; see §13.72.
+
+### 13.72 DRS and GDC need no encoding probe, but the GDC API was never parallel
+
+Picked up from §13.70's open item: `HandleDRSURI` and `HandleGDCHTTPURL` never probe for a
+transport encoding. The conclusion is that they don't need to. Investigating it turned up an
+unrelated defect that does matter.
+
+#### Measured
+
+**A real GDC-backed DRS URI**, a 348.7 GB TCGA WGS BAM (controlled access). drshub resolves
+its metadata (size, md5, `bondProvider: dcf_fence`, no `gsUri`, `fileName` = the bare UUID).
+The access step goes to CRDC DCF's `access/s3` endpoint, so the storage is AWS S3 and the
+`accessUrl` is a presigned URL. It came back 401 here, because the account has no Fence link
+with TCGA authorization.
+
+**The GDC API, with a user token**, on the same object:
+
+| request | response |
+|---|---|
+| HEAD | **400 BAD REQUEST** |
+| GET, `Range: bytes=0-0`, AE identity or gzip | 206, `Content-Range: 0-0/348693812393` -- **no `bytes ` unit** -- `Content-MD5` in hex (equal to the DRS md5), no Content-Encoding |
+| GET, no Range (the handler's fallback request) | 200, full Content-Length, Content-Disposition carrying the real filename |
+
+The GDC API streams the bytes itself, with no redirect to storage.
+
+**GCS signed URLs, a GET aborted at the first body byte** (`-o /dev/full`) against a HEAD,
+for all six shapes of §13.70. The stored-encoding signals are identical on both, for every
+shape. That includes the decoded 200 an identity request gets, which carries no
+`Content-Encoding` but does carry `x-goog-stored-content-encoding` and
+`x-goog-stored-content-length`. `pdl_server`'s decoded responses now do the same.
+
+#### Decided: no encoding probe for DRS or GDC
+
+drshub supplies the md5, and in practice it matches the localized bytes. A transport-encoded
+object could not do that. The md5 covers the stored gzip bytes, and a download that doesn't
+ask for them gets decoded ones. So an encoded DRS object would **fail verification loudly**
+(`deleting corrupted file`, exit 1); it would not be silently wrong. The GDC API sent no
+encoding on any request. A probe was built for this (an aborted GET, since a HEAD fails on
+both the GDC API and a GET-presigned S3 URL), and it worked live against GCS and the GDC API.
+It was backed out: it costs one request per DRS input and a fail-open path, and it guards
+against a case that verification already catches. If an encoded DRS object ever turns up,
+the failure will say so, and the design above is the starting point.
+
+#### Fixed: the downloader could not parallelize the GDC API
+
+`HttpSource` matched `Content-Range` against `^bytes 0-0/…` in the probe and
+`^bytes (\d+)-(\d+)/` per chunk. Run against the real endpoint, the probe raised
+`RangeNotSupported: unexpected Content-Range '0-0/348693812393'`, and a mid-object chunk raised
+`TransientError`. The server had honored the range exactly; only the unit was missing. Nothing
+failed, which is why it went unnoticed: every GDC-API download silently took the single-stream
+fallback. The runbook's GDC-API sweep had never been run. The GDC numbers there (13.85×) come
+from the GDC S3 endpoint through presigned URLs, which sends the unit.
+
+The fix is `parse_content_range`, one parser for every server-sent `Content-Range`, with the
+unit optional (`bytes `, `bytes=`, `bytes:` or none). It is lenient about the unit only; the
+position must still match exactly. Nothing had tested that before, and mutating either
+position check out survived the whole downloader suite. A fake-server knob (`shift_range`, in
+both `pdl_server` and `pdl_gcs`) now serves a shifted range with a consistent header, and every
+source must refuse it. `GcsObjectSource.probe_range` had checked only the total on a 206, never
+the position; it now checks both, like `HttpSource`. Against the real GDC API afterwards, the
+probe passes, a 16-byte mid-object range reads correctly, and a wrong expected size is still
+rejected. A parallel throughput run is left for a node: the data is controlled access, and a
+laptop is not the place for it.

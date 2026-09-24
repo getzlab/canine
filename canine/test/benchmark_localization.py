@@ -1541,7 +1541,8 @@ def url_object_size(args):
         content_range = (response.headers.get("Content-Range") or "").strip()
     finally:
         response.close()
-    match = re.match(r"^bytes 0-0/(\d+)$", content_range)
+    # unit optional, as in parallel_download.parse_content_range: the GDC API omits it
+    match = re.match(r"^(?:bytes\s*[=:]?\s*)?0-0/(\d+)$", content_range, re.IGNORECASE)
     if not match:
         say("Content-Range was {!r}; --object-size unset".format(content_range))
         return None

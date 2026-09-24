@@ -83,6 +83,8 @@ class FakeGcs:
         self.encoded = {}
         # One entry per media GET: headers and query that matter to the decode.
         self.media_requests = []
+        # serve ranged media this many bytes later than asked, header matching the body
+        self.shift_range = 0
 
     def new_session(self, name, custom_time=None):
         with self.lock:
@@ -398,8 +400,9 @@ def make_handler(state):
                 if header_range:
                     spec = header_range.split("=", 1)[1]
                     first, _, last = spec.partition("-")
-                    start = int(first)
-                    end = min(int(last), len(data) - 1) if last else len(data) - 1
+                    start = int(first) + state.shift_range
+                    end = min(int(last) + state.shift_range, len(data) - 1) if last \
+                        else len(data) - 1
                     extra = {"Content-Range": "bytes {}-{}/{}".format(start, end, len(data))}
                     if name in state.encoded:
                         extra["Content-Encoding"] = "gzip"

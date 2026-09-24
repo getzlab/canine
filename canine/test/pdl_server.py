@@ -72,6 +72,15 @@ class ServerState:
         self.decode_unless_accepts_gzip = False
         # The Range header of every request, in order (None when absent).
         self.seen_ranges = []
+        # Both measured on the GDC API (§13.72): its 206s carry `Content-Range: 0-0/N`,
+        # with no `bytes ` unit, and it answers every HEAD with 400.
+        self.content_range_unit = "bytes "
+        self.reject_head = False
+        # Serve the range starting this many bytes later than asked, header and body
+        # consistent with each other -- so only a client comparing the reported range
+        # with the requested one can tell.
+        self.shift_range = 0
+        self.heads = 0
 
     def snapshot(self):
         with self.lock:
@@ -135,6 +144,11 @@ def make_handler(state):
                 body = state.decoded_payload
                 self.send_response(200)
                 self.send_header("Content-Length", str(len(body)))
+                if state.stored_gzip:
+                    # measured (§13.72): GCS describes the STORED object even on a
+                    # response it decoded -- no Content-Encoding, but these two
+                    self.send_header("x-goog-stored-content-length", str(total))
+                    self.send_header("x-goog-stored-content-encoding", "gzip")
                 self.end_headers()
                 if self.command != "HEAD":
                     self.wfile.write(body)
@@ -161,13 +175,13 @@ def make_handler(state):
             if ranged:
                 spec = header_range.split("=", 1)[1]
                 first, _, last = spec.partition("-")
-                start = int(first)
-                end = int(last) if last else total - 1
+                start = int(first) + state.shift_range
+                end = (int(last) if last else total - 1) + state.shift_range
                 end = min(end, total - 1)
                 body = state.payload[start:end + 1]
                 self.send_response(206)
-                self.send_header("Content-Range",
-                                 "bytes {}-{}/{}".format(start, end, total))
+                self.send_header("Content-Range", "{}{}-{}/{}".format(
+                    state.content_range_unit, start, end, total))
             else:
                 # A server that ignores Range returns the whole object with 200 -- the
                 # gzip-transcoded GCS case, which is billed per full object.
@@ -222,7 +236,15 @@ def make_handler(state):
                 except OSError:
                     pass
 
-        do_HEAD = do_GET
+        def do_HEAD(self):
+            with state.lock:
+                state.heads += 1
+            if state.reject_head:
+                self.send_response(400)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
+            self.do_GET()
 
     return Handler
 

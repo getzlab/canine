@@ -2647,3 +2647,63 @@ class TestTheReadLoopIsSplitIntoReadAndWrite:
         assert balance > 0.5, "halves not balanced enough to test the formula: {}".format(got)
         assert got["ceiling"] > 1.5, got
         assert got["ceiling"] <= 2.0, got
+
+
+class TestAContentRangeWithoutItsUnit:
+    """
+    Measured on the GDC API (§13.72): every 206 carries `Content-Range: 0-0/N`, with no
+    `bytes ` unit. The range itself is exact. The strict parse rejected it, so the probe
+    declared ranges unsupported and every GDC-API download ran as one stream -- nothing
+    failed, it was just never parallel.
+    """
+
+    @pytest.mark.parametrize("value, expected", [
+        ("bytes 0-0/348693812393", (0, 0, 348693812393)),
+        ("0-0/348693812393", (0, 0, 348693812393)),
+        ("bytes=10-19/100", (10, 19, 100)),
+        ("Bytes: 10-19/100", (10, 19, 100)),
+        ("  bytes 5-9/*  ", (5, 9, None)),
+    ])
+    def test_parses(self, value, expected):
+        assert pdl.parse_content_range(value) == expected
+
+    @pytest.mark.parametrize("value", [
+        None, "", "bytes */100", "bytes 0-/100", "items 0-0/1", "bytes 0-0", "0-0/1 trailing",
+    ])
+    def test_rejects(self, value):
+        assert pdl.parse_content_range(value) is None
+
+    def test_a_gdc_shaped_server_is_downloaded_in_parallel(self, tmp_path, payload, payload_md5):
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            server.state.content_range_unit = ""
+            proc = run_downloader(server.url(), dest, len(payload),
+                                  "--connections", 4, "--min-chunk", MIB,
+                                  "--check-md5", payload_md5)
+            ranged = server.state.snapshot()["range_requests"]
+        assert proc.returncode == 0, proc.stderr
+        assert "falling back" not in proc.stderr
+        assert ranged > 2, "fell back to a single stream"
+        assert hashlib.md5(open(dest, "rb").read()).hexdigest() == payload_md5
+
+    @pytest.mark.parametrize("unit", ["bytes ", ""])
+    def test_a_range_other_than_the_one_asked_for_is_refused(self, payload, unit):
+        """Leniency is about the unit only; the position must still match exactly."""
+        with Server(payload) as server:
+            server.state.content_range_unit = unit
+            server.state.shift_range = 7
+            source = pdl.HttpSource(server.url())
+            with pytest.raises(pdl.RangeNotSupported):
+                source.probe_range(len(payload))
+            with pytest.raises(pdl.TransientError):
+                source.open_range(MIB, MIB + 16)
+
+    def test_a_wrong_range_is_still_rejected(self, payload):
+        with Server(payload) as server:
+            server.state.content_range_unit = ""
+            source = pdl.HttpSource(server.url())
+            with pytest.raises(pdl.RangeNotSupported):
+                source.probe_range(len(payload) - 1)
+            stream = source.open_range(MIB, MIB + 16)
+            assert stream.read(16) == payload[MIB:MIB + 16]
+            stream.close()
