@@ -5818,4 +5818,23 @@ in `verify_bucket_object`. The decode path's 8 MiB block should stay: its consum
 inflater, and its sweep was measured separately. 128 MiB is 15% better again, but rests on one
 repetition and doubles the memory. Persistent connections (one per reader) would attack the
 0.15 s directly, and are the larger lever if the read-back is still the bottleneck after this.
-None of this is implemented yet.
+
+#### Implemented (`76451ea`) and verified
+
+`VERIFY_READBACK_BLOCK = 64 MiB` is now `verify_bucket_object`'s default. It is fixed rather
+than scaled like the write chunks: the rate depends on the block, not the object's size, and
+each block is held whole in memory, so a 1 GiB block would buy ~15% for 4 GiB in flight. The
+decode keeps READ_BUFFER.
+
+Verified with the **real `verify_bucket_object`** on three fresh, never-read 32 GiB composites
+of deterministic AES-CTR data. Their md5s were computed on the node by regenerating the
+keystream, so nothing was read back beforehand. The runs were ordered new, old, new:
+
+| object | block | read-back | md5 |
+|---|---|---|---|
+| C | 64 MiB (new default) | 131.1 s, **249.9 MiB/s** | ok |
+| A | 8 MiB (old, control) | 258.5 s, 126.8 MiB/s | ok |
+| B | 64 MiB (new default) | 136.3 s, **240.5 MiB/s** | ok |
+
+**1.93×**, with the two new runs 4% apart on either side of the control. For the 324.75 GiB
+BAM that is ~23 minutes of read-back instead of 47.
