@@ -24,6 +24,9 @@ from pdl_gcs import GcsServer, patch_client_endpoints
 from pdl_server import Server
 
 MIB = 1024 * 1024
+
+# Captured before any fixture stubs it: the expired-token tests need the real cache.
+_REAL_TOKEN = pdl.GcsClient.token
 BUCKET = "test-bucket"
 OBJECT = "inputs/sample.bam"
 
@@ -3553,3 +3556,100 @@ class TestTheGzipDecoderSpansMembers:
         assert decoder.produced > 0, (
             "a half stream must decode its prefix, or the mid-stream error case "
             "cannot be told apart from a bad header")
+
+
+
+class TestAnExpiredTokenIsRefreshed:
+    """
+    Measured on real GCS (§13.77): a full-size bucket-route run got `HTTP 401: Invalid
+    Credentials` 23 minutes in, and its md5 read-back failed. gcloud had handed back its
+    CACHED token, the downloader assumed it was good for an hour, and nothing refreshed on
+    a 401, so every request reused the dead one. Every other bucket test stubs token()
+    out entirely, which is why none of them could see this.
+    """
+
+    @pytest.fixture
+    def tokens(self, monkeypatch, gcs):
+        """The real token cache over a stubbed _fetch_token issuing t1, t2, ..."""
+        issued = []
+
+        def fetch(self):
+            issued.append("t{}".format(len(issued) + 1))
+            return issued[-1], 3600
+
+        monkeypatch.setattr(pdl.GcsClient, "token", _REAL_TOKEN)
+        monkeypatch.setattr(pdl.GcsClient, "_fetch_token", fetch)
+        return issued
+
+    def _object(self, gcs, data=b"x" * 4096, name="obj.bin"):
+        gcs.state.objects[name] = data
+        gcs.state.created[name] = time.time()
+        return name, data
+
+    def test_a_401_refreshes_the_token_and_the_request_succeeds(self, gcs, tokens):
+        name, data = self._object(gcs)
+        gcs.state.rejected_tokens = {"t1"}
+        assert pdl.GcsClient().download_range(BUCKET, name, 0, 100) == data[:100]
+        assert tokens == ["t1", "t2"]
+        assert gcs.state.rejections == {"t1": 1}
+
+    def test_a_second_401_is_an_error_not_a_loop(self, gcs, tokens):
+        name, _ = self._object(gcs)
+        gcs.state.rejected_tokens = {"t1", "t2", "t3"}
+        with pytest.raises(pdl.PermanentError):
+            pdl.GcsClient().download_range(BUCKET, name, 0, 100)
+        assert tokens == ["t1", "t2"], "exactly one refresh"
+
+    def test_a_fresh_token_is_not_discarded_by_a_late_401(self, gcs, tokens):
+        """16 workers can see the same expiry; the first refresh must survive the rest."""
+        client = pdl.GcsClient()
+        stale = client.token()
+        client.invalidate_token(stale)
+        fresh = client.token()
+        client.invalidate_token(stale)            # a second worker, late
+        assert client.token() == fresh
+        assert tokens == ["t1", "t2"]
+
+    def test_the_gs_source_refreshes_too(self, gcs, tokens):
+        name, data = self._object(gcs, os.urandom(3 * MIB))
+        gcs.state.rejected_tokens = {"t1"}
+        source = pdl.GcsObjectSource(BUCKET, name)
+        stream = source.open_range(MIB, MIB + 16)
+        assert stream.read(16) == data[MIB:MIB + 16]
+        stream.close()
+        assert tokens == ["t1", "t2"]
+
+    def test_a_token_expiring_mid_run_does_not_fail_the_bucket_route(
+            self, tmp_path, monkeypatch, gcs, tokens, payload, payload_md5):
+        """The failure measured: the relay, the compose and the md5 read-back all survive."""
+        force_bucket_route(monkeypatch)
+        gcs.state.rejected_tokens = {"t1"}
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
+        assert rc == pdl.EXIT_OK
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+        assert gcs.state.rejections.get("t1", 0) >= 1, "the stale token was never tried"
+
+    def test_a_gcloud_token_is_not_trusted_for_an_hour(self, monkeypatch):
+        """gcloud prints its cached token, which may be minutes from expiry."""
+        now = [1000.0]
+        calls = []
+        monkeypatch.setattr(pdl.time, "monotonic", lambda: now[0])
+        monkeypatch.setattr(pdl.GcsClient, "adc_file", staticmethod(lambda: None))
+
+        def run(command, **kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, b"tok\n", b"")
+
+        monkeypatch.setattr(pdl.subprocess, "run", run)
+        client = pdl.GcsClient()
+        client.token()
+        now[0] += 170
+        client.token()
+        assert len(calls) == 1, "refetched too early"
+        now[0] += 20                               # 190 s after the first fetch
+        client.token()
+        assert len(calls) == 2, "a gcloud token was trusted for more than 3 minutes"

@@ -1517,23 +1517,28 @@ class GcsObjectSource:
         return False            # nothing to re-mint: the token refreshes per request
 
     def _open(self, start, end=None):
-        request = urllib.request.Request(self.url, headers={
-            "Authorization": "Bearer " + self.client.token(),
-            "Accept-Encoding": "gzip",
-            "Range": "bytes={}-{}".format(start, "" if end is None else end - 1),
-        })
-        try:
-            return urllib.request.urlopen(request, timeout=self.timeout)
-        except urllib.error.HTTPError as e:
-            if e.code in (403, 404):
-                raise PermanentError("GET gs source -> HTTP {}".format(e.code))
-            if e.code == 416:
-                raise PermanentError("GET gs source -> HTTP 416: range not satisfiable")
-            # 401 included: a token expiring between refresh and use is transient, and
-            # the next request mints a fresh one
-            raise TransientError("GET gs source -> HTTP {}".format(e.code))
-        except (urllib.error.URLError, OSError) as e:
-            raise TransientError("GET gs source -> {}".format(e))
+        for attempt in (1, 2):
+            token = self.client.token()
+            request = urllib.request.Request(self.url, headers={
+                "Authorization": "Bearer " + token,
+                "Accept-Encoding": "gzip",
+                "Range": "bytes={}-{}".format(start, "" if end is None else end - 1),
+            })
+            try:
+                return urllib.request.urlopen(request, timeout=self.timeout)
+            except urllib.error.HTTPError as e:
+                if e.code == 401 and attempt == 1:
+                    # an expired token: drop it and resend once with a fresh one. The
+                    # cache would otherwise hand the same dead token to every retry.
+                    self.client.invalidate_token(token)
+                    continue
+                if e.code in (403, 404):
+                    raise PermanentError("GET gs source -> HTTP {}".format(e.code))
+                if e.code == 416:
+                    raise PermanentError("GET gs source -> HTTP 416: range not satisfiable")
+                raise TransientError("GET gs source -> HTTP {}".format(e.code))
+            except (urllib.error.URLError, OSError) as e:
+                raise TransientError("GET gs source -> {}".format(e))
 
     @staticmethod
     def _stored(response, size):
@@ -1732,6 +1737,28 @@ class GcsClient:
             self._token_expiry = time.monotonic() + max(60, lifetime - 300)
             return self._token
 
+    def invalidate_token(self, stale):
+        """
+        Drop the cached token after GCS rejected it (401), so the next token() fetches.
+
+        Only if it is still the one rejected: with 16 workers, several may see the same
+        expiry, and the first to refresh must not have its fresh token thrown away by the
+        rest.
+        """
+        with self._lock:
+            if self._token == stale:
+                self._token = None
+                self._token_expiry = 0.0
+
+    # How long a token from `gcloud ... print-access-token` is trusted. gcloud returns its
+    # CACHED token, which may be minutes from expiry -- it refreshes only inside ~3m45s --
+    # and the command reports no lifetime. It was assumed to be 3600 s and cached for 55
+    # minutes: a full-size bucket-route run then got `HTTP 401: Invalid Credentials` 23
+    # minutes in, and its md5 read-back failed (§13.77). 480 caches for 3 minutes (see
+    # token()), inside gcloud's own refresh margin; re-running gcloud costs about a second.
+    # A 401 also invalidates the cache (request), so this is the second line of defense.
+    SUBPROCESS_TOKEN_LIFETIME = 480
+
     # Application Default Credentials first, then the active gcloud account, and the
     # metadata server only as a last resort. Order matters more than any of the
     # individual entries.
@@ -1824,7 +1851,7 @@ class GcsClient:
                 if token:
                     log("k9pdl-auth using {}{}".format(
                         label, " ({})".format(adc) if label == "ADC" else ""))
-                    return token, 3600
+                    return token, self.SUBPROCESS_TOKEN_LIFETIME
 
         request = urllib.request.Request(
             METADATA_TOKEN_URL, headers={"Metadata-Flavor": "Google"}
@@ -1853,32 +1880,42 @@ class GcsClient:
         Unlike urlopen this does not raise for the status codes the resumable-upload
         protocol uses as ordinary signals -- notably 308, which means "session alive,
         here is how far I have persisted".
+
+        A 401 is an expired token, not a denial: the cached token is dropped and the
+        request resent once with a fresh one. Only a second 401 is an error. Resending is
+        safe: the body is in memory, and a resumable session ignores bytes it has already
+        persisted.
         """
-        all_headers = {"Authorization": "Bearer " + self.token()}
-        all_headers.update(headers or {})
-        request = urllib.request.Request(
-            url, data=body, headers=all_headers, method=method
-        )
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return response.status, dict(response.headers), response.read()
-        except urllib.error.HTTPError as e:
-            payload = b""
+        for attempt in (1, 2):
+            token = self.token()
+            all_headers = {"Authorization": "Bearer " + token}
+            all_headers.update(headers or {})
+            request = urllib.request.Request(
+                url, data=body, headers=all_headers, method=method
+            )
             try:
-                payload = e.read()
-            except Exception:
-                pass
-            status = e.code
-            if status in expect:
-                return status, dict(e.headers or {}), payload
-            if status in (401, 403, 404, 410):
-                raise PermanentError("{} {} -> HTTP {}: {}".format(
-                    method, _strip_query(url), status,
-                    payload[:200].decode("utf-8", "replace")))
-            raise TransientError("{} {} -> HTTP {}".format(
-                method, _strip_query(url), status))
-        except (urllib.error.URLError, OSError) as e:
-            raise TransientError("{} {} -> {}".format(method, _strip_query(url), e))
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return response.status, dict(response.headers), response.read()
+            except urllib.error.HTTPError as e:
+                payload = b""
+                try:
+                    payload = e.read()
+                except Exception:
+                    pass
+                status = e.code
+                if status in expect:
+                    return status, dict(e.headers or {}), payload
+                if status == 401 and attempt == 1:
+                    self.invalidate_token(token)
+                    continue
+                if status in (401, 403, 404, 410):
+                    raise PermanentError("{} {} -> HTTP {}: {}".format(
+                        method, _strip_query(url), status,
+                        payload[:200].decode("utf-8", "replace")))
+                raise TransientError("{} {} -> HTTP {}".format(
+                    method, _strip_query(url), status))
+            except (urllib.error.URLError, OSError) as e:
+                raise TransientError("{} {} -> {}".format(method, _strip_query(url), e))
 
     # -- objects ------------------------------------------------------------
 

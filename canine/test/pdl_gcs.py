@@ -85,6 +85,10 @@ class FakeGcs:
         self.media_requests = []
         # serve ranged media this many bytes later than asked, header matching the body
         self.shift_range = 0
+        # Tokens GCS no longer accepts: a request bearing one gets 401 Invalid Credentials,
+        # as an expired access token does (measured, §13.77). Counted per token.
+        self.rejected_tokens = set()
+        self.rejections = {}
 
     def new_session(self, name, custom_time=None):
         with self.lock:
@@ -125,6 +129,17 @@ def make_handler(state):
             self.end_headers()
             if body:
                 self.wfile.write(body)
+
+        def _rejected(self):
+            """401 for a token the state marks expired; True if the request was answered."""
+            auth = self.headers.get("Authorization") or ""
+            token = auth[len("Bearer "):] if auth.startswith("Bearer ") else None
+            if token is not None and token in state.rejected_tokens:
+                with state.lock:
+                    state.rejections[token] = state.rejections.get(token, 0) + 1
+                self._json(401, {"error": {"code": 401, "message": "Invalid Credentials"}})
+                return True
+            return False
 
         def _json(self, status, payload):
             self._send(status, json.dumps(payload), {"Content-Type": "application/json"})
@@ -167,6 +182,8 @@ def make_handler(state):
         # -- routing --------------------------------------------------------
 
         def do_POST(self):
+            if self._rejected():
+                return
             parsed = urllib.parse.urlsplit(self.path)
             query = urllib.parse.parse_qs(parsed.query)
 
@@ -240,6 +257,8 @@ def make_handler(state):
             self._json(404, {"error": {"message": "unhandled POST " + parsed.path}})
 
         def do_PUT(self):
+            if self._rejected():
+                return
             parsed = urllib.parse.urlsplit(self.path)
             match = re.match(r"^/upload/session/(\d+)$", parsed.path)
             if not match:
@@ -354,6 +373,8 @@ def make_handler(state):
                        if committed else {})
 
         def do_GET(self):
+            if self._rejected():
+                return
             parsed = urllib.parse.urlsplit(self.path)
             query = urllib.parse.parse_qs(parsed.query)
             match = re.match(r"^/storage/v1/b/([^/]+)/o/(.+)$", parsed.path)
@@ -415,6 +436,8 @@ def make_handler(state):
                 name, data, components if components > 1 else None))
 
         def do_DELETE(self):
+            if self._rejected():
+                return
             parsed = urllib.parse.urlsplit(self.path)
             match = re.match(r"^/storage/v1/b/([^/]+)/o/(.+)$", parsed.path)
             if not match:
