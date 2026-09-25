@@ -214,9 +214,23 @@ This replaced an earlier runtime branch here: `describe`, then
 
 See `update_localization.md` §13.71.
 
-Not handled: directory sources (`is_dir`) are not classified object by object, and still take
-the plain `cp -r`. No gzip-encoded directory tree has turned up; every production case has been
-a single reference file.
+**Directory sources** get the same treatment one object at a time. The Funcotator data sources
+directory has 35 of its 46 objects gzip-encoded, among them a GATK `.dict`.
+`HandleGSURL.gzip_members` names them from the listing that sizing already fetched, so it costs
+no extra request, and each one becomes its own `mount` item at its path within the directory.
+`cp` has no way to leave objects out, so the rest of the directory is copied with an rsync
+instead. Between buckets, rsync is also a server-side copy:
+
+```bash
+gcloud storage rsync -r -n<rp> --custom-time="$CANINE_BUCKET_CT" --exclude='^(?:<name>|...)$' <src> <dst>
+```
+
+`--exclude` is a Python regex over names relative to the source, anchored and escaped here, so
+it matches exactly the encoded names. The destination is the directory itself, because rsync
+copies a directory's contents. Everything lands under one prefix in one bucket, so consumers
+still mount a single path. A directory with no encoded objects keeps the plain `cp -r`. Copying
+the whole directory and then decoding over the top was rejected, because it leaves encoded
+objects readable until each decode lands.
 
 ### b. `copy` — files already on the shared mount → `HandleRegularFile` (`localization_mode == "local"`)
 

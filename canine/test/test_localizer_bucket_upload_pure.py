@@ -11,6 +11,8 @@ that localization "worked".
 """
 import io
 import json
+import re
+import shlex
 import shutil
 from unittest.mock import MagicMock, patch
 
@@ -205,6 +207,103 @@ class TestContentEncoding:
         script = script_for([item])
         item.fh.localization_command.assert_called_once()
         assert "aws s3api" in script
+
+
+DIR = "gs://src-bucket/funcotator"
+DIR_DEST = "gs://wolf-1-us-central1-abc/data_source_folder/funcotator"
+ENCODED = ("MANIFEST.txt", "gencode/hg38/gencode.v43.pc_transcripts.dict", "odd name+(1).txt")
+
+
+class TestAGzipEncodedObjectInADirectory:
+    """
+    funcotator_run's data sources directory has 35 of 46 objects gzip-encoded. Its
+    server-side copy leaves those out and each one takes the decode, at its own path
+    within the copy -- otherwise every reader of the mount gets the gzip stream.
+    """
+
+    @staticmethod
+    def _member(name):
+        m = TestContentEncoding._gs_fh(transport_gzip=True)
+        m.path = DIR + "/" + name
+        m.downloader_command = MagicMock(return_value="K9_DECODE " + shlex.quote(name))
+        return m
+
+    def _dir_fh(self, encoded=ENCODED):
+        fh = TestContentEncoding._gs_fh(transport_gzip=False)
+        fh.path = DIR
+        fh.is_dir = True
+        fh.gzip_members = [self._member(n) for n in encoded]
+        fh.relative_name = lambda m: m.path[len(DIR) + 1:]
+        return fh
+
+    def _plan(self, fh):
+        loc = make_localizer()
+        loc.staging_dir = "/mnt/nfs/workspace"
+        loc.backend.config = {"zone": "us-central1-c"}
+        loc.project = "proj"
+        with patch("canine.localization.base.get_project_number", return_value="406002258908"):
+            _, _, _, plan = loc.create_bucket_mount({"data_source_folder": [fh]}, dry_run=False)
+        return plan
+
+    def test_the_encoded_objects_are_excluded_from_the_copy(self):
+        plan = self._plan(self._dir_fh())
+        assert plan[0].kind == "server_side"
+        assert plan[0].exclude == ENCODED
+
+    def test_each_encoded_object_is_planned_onto_the_mount(self):
+        plan = self._plan(self._dir_fh())
+        assert [(i.kind, i.dest) for i in plan[1:]] == [
+            ("mount", plan[0].dest + "/" + name) for name in ENCODED]
+
+    def test_an_unencoded_directory_is_one_plain_copy(self):
+        plan = self._plan(self._dir_fh(encoded=()))
+        assert [(i.kind, i.exclude) for i in plan] == [("server_side", ())]
+
+    def _script(self, fh=None):
+        fh = fh or self._dir_fh()
+        items = [UploadItem(fh=fh, dest=DIR_DEST, kind="server_side", exclude=ENCODED)]
+        items += [UploadItem(fh=m, dest=DIR_DEST + "/" + n, kind="mount")
+                  for m, n in zip(fh.gzip_members, ENCODED)]
+        return script_for(items)
+
+    def _rsync(self):
+        [line] = [l for l in self._script().split("\n") if "gcloud storage rsync" in l]
+        return shlex.split(line)
+
+    def test_the_copy_is_an_rsync_into_the_directory_itself(self):
+        """rsync copies a directory's contents, so the destination is the directory."""
+        argv = self._rsync()
+        assert argv[-2:] == [DIR, DIR_DEST]
+        assert "-r" in argv and "-n" in argv
+        assert '--custom-time=$CANINE_BUCKET_CT' in argv
+        assert "gcloud storage cp -r -n --custom-time=\"$CANINE_BUCKET_CT\" " + DIR not in self._script()
+
+    def test_the_exclude_matches_exactly_the_encoded_names(self):
+        """gcloud applies it as a Python regex to names relative to the source."""
+        [pattern] = [a[len("--exclude="):] for a in self._rsync() if a.startswith("--exclude=")]
+        for name in ENCODED:
+            assert re.search(pattern, name)
+        for name in ("MANIFEST.txt.bak", "gencode/hg38/MANIFEST.txt", "odd name+(1)xtxt",
+                     "gnomAD_exome/hg38/gnomAD_exome.tar.gz"):
+            assert not re.search(pattern, name), name
+
+    def test_each_encoded_object_decodes_to_its_place_in_the_copy(self):
+        fh = self._dir_fh()
+        script = self._script(fh)
+        mount = "/mnt/localize/wolf-1-us-central1-abc/data_source_folder/funcotator/"
+        for member, name in zip(fh.gzip_members, ENCODED):
+            member.downloader_command.assert_called_once_with(mount + name)
+            assert "K9_DECODE " + shlex.quote(name) in script
+        assert script.index("gcloud storage rsync") < script.index("fusermount -u")
+
+    def test_requester_pays_bills_the_copy(self):
+        fh = self._dir_fh()
+        fh.rp_string = " --billing-project=proj"
+        script = script_for([UploadItem(fh=fh, dest=DIR_DEST, kind="server_side", exclude=ENCODED)])
+        assert "rsync -r -n --billing-project=proj " in script
+
+    def test_is_valid_bash(self):
+        TestGeneratedShellIsValid()._check("set -e\n" + self._script())
 
 
 class TestBucketLifecycle:

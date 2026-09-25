@@ -62,17 +62,27 @@ PathType = namedtuple(
     ['localpath', 'remotepath']
 )
 
-# One input to be placed in a localization bucket by the worker.
-#   fh   : the FileType handler for the source
-#   dest : full gs:// destination URL
-#   kind : how the bytes get there --
-#     "server_side" gs:// source; a GCS rewrite, no VM in the data path at all
-#     "mount"       remote non-gs:// source; downloaded through the worker's
-#                   read-write gcsfuse mount, never staged on local disk
-#     "copy"        source is already a file on the shared mount (a previous
-#                   task's output); uploaded straight from there, so this adds
-#                   no NFS traffic that the file's own existence did not
-UploadItem = namedtuple("UploadItem", ["fh", "dest", "kind"])
+class UploadItem(namedtuple("UploadItem", ["fh", "dest", "kind", "exclude"], defaults = ((),))):
+    """
+    One input to be placed in a localization bucket by the worker.
+
+    fh:      the FileType handler for the source.
+    dest:    the full gs:// destination URL.
+    kind:    how the bytes get there.
+
+             * "server_side": a gs:// source copied by a GCS rewrite, with no VM in the
+               data path at all.
+             * "mount": downloaded through the worker's read-write gcsfuse mount and
+               never staged on local disk. This covers remote non-gs:// sources and
+               gzip-encoded gs:// objects, which must be decoded.
+             * "copy": the source is already a file on the shared mount (a previous
+               task's output) and is uploaded straight from there, so this adds no NFS
+               traffic that the file's own existence did not.
+    exclude: for a "server_side" directory only, the names (relative to the directory)
+             left out of its copy because they are gzip-encoded. Each one has its own
+             "mount" item.
+    """
+    __slots__ = ()
 
 
 class OverrideValueError(ValueError):
@@ -1381,7 +1391,22 @@ class AbstractLocalizer(abc.ABC):
           )
           for r in F.loc[F["localize"], :].itertuples()
         ]
-        return "gs://{}".format(bucket), False, bucketmount_paths, upload_plan
+        # The same holds one level down: a directory's gzip-encoded objects are cut out of
+        # its server-side copy (`exclude`) and each takes the decode as its own item, at
+        # its path within the copy.
+        expanded = []
+        for item in upload_plan:
+            expanded.append(item)
+            if item.kind == "server_side" and item.fh.is_dir:
+                gzip_encoded = list(item.fh.gzip_members)
+                if gzip_encoded:
+                    names = tuple(item.fh.relative_name(m) for m in gzip_encoded)
+                    expanded[-1] = item._replace(exclude = names)
+                    expanded += [
+                      UploadItem(fh = m, dest = item.dest + "/" + name, kind = "mount")
+                      for m, name in zip(gzip_encoded, names)
+                    ]
+        return "gs://{}".format(bucket), False, bucketmount_paths, expanded
 
     def bucket_upload_script(self, upload_plan, bucket_prefix, region):
         """
@@ -1441,9 +1466,21 @@ class AbstractLocalizer(abc.ABC):
                 # plain copy -- reproducing the bug -- whenever the describe call failed,
                 # and relied on `gcloud storage cat` never transcoding.
                 #
-                # Directories still take this copy unclassified: no gzip-encoded
-                # directory tree has been seen, and classifying one means inspecting every
-                # object under the prefix.
+                # A directory's gzip-encoded objects arrive here as `exclude`, each with
+                # its own "mount" item (HandleGSURL.gzip_members). `cp` has no exclusion,
+                # so that copy is an rsync -- also server-side between buckets -- into the
+                # directory itself; its --exclude is a Python regex over names relative
+                # to the source. Copying everything and decoding over the top would
+                # instead leave encoded objects readable until the decode lands.
+                if item.exclude:
+                    pattern = "^(?:{})$".format("|".join(re.escape(n) for n in item.exclude))
+                    uploads.append(
+                      '    gcloud storage rsync -r -n{rp} --custom-time="$CANINE_BUCKET_CT" --exclude={pat} {src} {dst}'.format(
+                        rp = item.fh.rp_string, pat = shlex.quote(pattern),
+                        src = shlex.quote(item.fh.path), dst = shlex.quote(item.dest),
+                      )
+                    )
+                    continue
                 uploads.append(plain_cp)
             elif item.kind == "copy":
                 # Already a file on the shared mount -- typically an upstream

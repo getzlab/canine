@@ -5361,6 +5361,7 @@ through compose`, and by the §13.63 node runs of that route.
 
 * **Directories** are not classified, and still take the plain `cp -r`. Classifying one means
   inspecting every object under the prefix, and no gzip-encoded directory tree has turned up.
+  *(Superseded by §13.82: one turned up, and the listing was already being fetched.)*
 * **DRS/GDC** (§13.70): no probe needed; see §13.72.
 
 ### 13.72 DRS and GDC need no encoding probe, but the GDC API was never parallel
@@ -6008,3 +6009,70 @@ the in-flight slices (exactly 33554432 bytes; the new rule's were 268435456):
   inherits no host environment. The "baseline" runs would have measured the new rule against
   itself. It was caught before the first run, and fixed with an explicit `-e` that was
   checked inside the container.
+
+### 13.82 A directory with gzip-encoded objects: the Funcotator data sources
+
+§13.71 left directories unclassified on two grounds: no gzip-encoded directory tree had
+turned up, and classifying one would mean inspecting every object under the prefix. Both
+were wrong. `funcotator_run` (getzlab/GATK4_TOOL `wolF/tasks.py`) takes
+`data_source_folder`, which in production is
+`gs://getzlab-workflows-reference_files-oa/hg38/funcotator_dataSources.v1.8.hg38.20230908s/`.
+That folder has 46 objects, 48.8 GiB stored. **35 of them carry `Content-Encoding: gzip`**,
+0.13 GiB stored, all `text/plain`. They include `gencode.v43.pc_transcripts.dict`, the same
+kind of file as §13.71's GATK failure, and the gencode GTF and FASTA. The 11 objects that
+are not encoded are the large ones: the gnomAD and dbSNP `.vcf.gz` files with their `.tbi`
+indexes, ClinVar, and `Cosmic.db`. So the plain `cp -r` would have handed Funcotator a
+directory in which most of the small text files were gzip streams.
+
+The inspection cost nothing extra. Sizing already lists every object under the prefix
+(`HandleGSURL.blob()` for a directory is a `list_blobs`), and that listing carries each
+object's `content_encoding`, `md5_hash` and `size`. `_get_size` now keeps them for the
+encoded objects as well.
+
+#### Design
+
+* `HandleGSURL.gzip_members` returns one single-object handler per encoded object. Each is a
+  copy of the directory's handler with that object's stored metadata filled in. So its
+  `transport_gzip` is True and its `downloader_command` decodes over the stored length and
+  md5, and none of it costs a request. In particular it does not re-check requester pays,
+  which the constructor would do once per member. `extra_args` is copied rather than shared,
+  because `check_hash`'s setter writes into it.
+* The planner expands the directory's `server_side` item into two parts. One is the same
+  item with `exclude` set to the encoded names, relative to the directory. The other is one
+  `mount` item per encoded object, at `<directory dest>/<relative name>`. They share one
+  prefix in one bucket, so the consumer still mounts a single path, and the `wolf=success`
+  label still covers all of it.
+* `gcloud storage cp` cannot leave objects out, so an item with `exclude` is copied with
+  `gcloud storage rsync -r -n --exclude=<regex>`. Between buckets this is still a server-side
+  copy. `--exclude` is a Python regex over names relative to the source; the emitter anchors
+  and escapes it (`^(?:a|b)$`). rsync copies the directory's contents, so its destination is
+  the directory itself rather than its parent. A directory with no encoded objects keeps
+  the plain `cp -r`.
+* Rejected: copying the whole directory and decoding the encoded objects over the top. It
+  needs no exclusion, but encoded objects stay readable until each decode lands.
+
+#### Verified
+
+* Unit tests: `TestAGzipEncodedObjectInADirectory` in `test_handler_conversion.py` (11) and
+  in `test_localizer_bucket_upload_pure.py` (8). They check the membership, relative names,
+  each member's stored length and md5, that there are no extra listings or requester-pays
+  lookups, the planner's expansion, and the emitted rsync. The regex is applied the way
+  gcloud applies it, including names containing regex metacharacters, and the script is
+  checked with `bash -n`.
+* Against the real folder, read-only. The unmodified planner and emitter ran on a real
+  `HandleGSURL`, and the emitted rsync line ran with `--dry-run` into a local directory.
+  The planner produced one `server_side` item excluding 35 names, plus 35 `mount` items. The
+  rsync would copy exactly the 11 unencoded objects, the decodes cover the other 35, nothing
+  appears in both, and the `.dict` is among the decoded. `gcloud` was SDK 586.0.0; the
+  worker image's `gcloud` must also support `rsync --exclude`.
+
+#### Not yet established
+
+* No end-to-end run on a node, meaning a real rsync plus decodes into a bucket and
+  Funcotator reading the mounted directory.
+* Localization buckets already built for this input by the plain copy keep their encoded
+  objects under `wolf=success` until the lifecycle rule expires them. Bucket naming was not
+  changed to force a rebuild.
+* Each scatter shard still gets its own bucket and its own full copy of the directory,
+  because the bucket name hashes every input of the job. This is the per-shard FIXME in
+  `job_setup_teardown`, and it predates this change.

@@ -1292,7 +1292,8 @@ class TestAGzipEncodedGsObject:
     def test_the_encoding_is_compared_case_and_space_insensitively(self):
         assert encoded_gs_handler([_Blob(100, " GZIP ")]).transport_gzip
 
-    def test_a_directory_is_never_classified(self):
+    def test_a_directory_is_never_transport_gzip(self):
+        """Its encoded objects are gzip_members; the directory itself is not one."""
         h = encoded_gs_handler([_Blob(100, "gzip"), _Blob(50, "gzip")], is_dir=True)
         assert not h.transport_gzip
 
@@ -1376,6 +1377,102 @@ class TestAGzipEncodedGsObject:
             h.rp_string = " --billing-project=p"
         result = bash_ok(h.downloader_command(DEST))
         assert result.returncode == 0, result.stderr
+
+
+def _named(name, *args, **kwargs):
+    blob = _Blob(*args, **kwargs)
+    blob.name = name
+    return blob
+
+
+def encoded_gs_directory(blobs, **kwargs):
+    handler = encoded_gs_handler(blobs, is_dir=True, **kwargs)
+    handler.path = "gs://bkt/funcotator"
+    return handler
+
+
+FUNCOTATOR = [
+    _named("funcotator/MANIFEST.txt", 201, "gzip", base64.b64encode(GZ_MD5).decode()),
+    _named("funcotator/gencode/hg38/gencode.v43.pc_transcripts.dict", 6266373, "gzip"),
+    _named("funcotator/gnomAD_exome/hg38/gnomAD_exome.tar.gz", 900, None),
+    _named("funcotator/dbsnp/hg38/dbsnp.vcf.idx", 300, "identity"),
+]
+
+
+class TestAGzipEncodedObjectInADirectory:
+    """
+    The Funcotator data sources directory has 35 of its 46 objects stored with
+    `Content-Encoding: gzip`, among them a GATK `.dict`. The directory's server-side copy
+    would carry each one verbatim, just as for a single object, so the handler names them
+    from the listing sizing already fetched and each becomes a single-object handler for
+    the decode.
+    """
+
+    def test_only_the_encoded_objects_are_members(self):
+        members = encoded_gs_directory(FUNCOTATOR).gzip_members
+        assert [m.path for m in members] == [
+            "gs://bkt/funcotator/MANIFEST.txt",
+            "gs://bkt/funcotator/gencode/hg38/gencode.v43.pc_transcripts.dict",
+        ]
+
+    def test_each_member_is_a_gzip_encoded_single_object(self):
+        for member in encoded_gs_directory(FUNCOTATOR).gzip_members:
+            assert not member.is_dir
+            assert member.transport_gzip
+
+    def test_names_are_relative_to_the_directory(self):
+        h = encoded_gs_directory(FUNCOTATOR)
+        assert [h.relative_name(m) for m in h.gzip_members] == [
+            "MANIFEST.txt", "gencode/hg38/gencode.v43.pc_transcripts.dict"]
+
+    def test_a_member_decodes_its_own_stored_bytes(self):
+        """The stored length and md5 are the member's, not the directory's."""
+        member = encoded_gs_directory(FUNCOTATOR).gzip_members[0]
+        script = member.downloader_command("/mnt/localize/b/in/funcotator/MANIFEST.txt")
+        assert "--gs-source gs://bkt/funcotator/MANIFEST.txt" in script
+        assert "--size 201 " in script
+        assert "--check-md5 " + GZ_MD5.hex() in script
+
+    def test_a_member_is_sized_decoded(self):
+        """The directory's disk estimate already counted it that way; so does the member."""
+        member = encoded_gs_directory(FUNCOTATOR).gzip_members[0]
+        assert member.size == 201 * 4                 # _Blob declares uncompressed_size
+
+    def test_classification_costs_no_extra_listing(self):
+        h = encoded_gs_directory(FUNCOTATOR)
+        h.size
+        members = h.gzip_members
+        h.gzip_members
+        [(m.transport_gzip, m.size) for m in members]
+        assert len(h.blob_calls) == 1
+
+    def test_members_share_the_requester_pays_resolution(self):
+        """The constructor would re-check requester pays once per member."""
+        h = encoded_gs_directory(FUNCOTATOR, project="my-proj")
+        h.rp_string = " --billing-project=my-proj"
+        with patch.object(fh.HandleGSURL, "get_requester_pays",
+                          side_effect=AssertionError("re-resolved")):
+            members = h.gzip_members
+        assert {m.rp_string for m in members} == {" --billing-project=my-proj"}
+
+    def test_members_do_not_share_the_directorys_arguments(self):
+        """check_hash's setter writes into extra_args; a member must not reach back."""
+        h = encoded_gs_directory(FUNCOTATOR)
+        h.gzip_members[0].check_hash = True
+        assert h.extra_args.get("check_hash") in (None, False)
+
+    def test_a_size_cached_without_the_listing_is_relisted(self):
+        """Reading that as "nothing encoded" would be the plain copy, and the bug."""
+        h = encoded_gs_directory(FUNCOTATOR)
+        h._size = 12345
+        assert len(h.gzip_members) == 2
+
+    def test_an_unencoded_directory_has_none(self):
+        assert encoded_gs_directory(FUNCOTATOR[2:]).gzip_members == []
+
+    def test_a_single_object_has_none(self):
+        """Its own encoding is transport_gzip."""
+        assert encoded_gs_handler([_Blob(100, "gzip")]).gzip_members == []
 
 
 class TestTheSignedUrlOutlivesTheTransfer:

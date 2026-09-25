@@ -1,7 +1,7 @@
 import abc
 import google.cloud.storage
 import google.auth
-import glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading
+import copy, glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading
 import pandas as pd
 import urllib.parse
 
@@ -1043,17 +1043,25 @@ class HandleGSURL(FileType):
         resizes and a slow start.
         """
         total = 0
+        gzip_encoded = []
         for blob in self.blob():
-            total += self._blob_localized_size(blob)
+            size = self._blob_localized_size(blob)
+            total += size
+            # Kept from the one metadata fetch planning already pays for, so the
+            # transport_gzip and gzip_members checks below cost no further requests --
+            # blob() is not cached, and the planner visits every gs:// input. A
+            # directory's listing carries the same per-object metadata.
+            meta = {
+                "encoding": (getattr(blob, "content_encoding", None) or "").strip().lower(),
+                "md5_b64": getattr(blob, "md5_hash", None),
+                "size": blob.size,
+            }
             if not self.is_dir:
-                # Kept from the one metadata fetch planning already pays for, so the
-                # transport_gzip check below costs no further requests -- blob() is not
-                # cached, and the planner visits every gs:// input.
-                self._stored_meta = {
-                    "encoding": (getattr(blob, "content_encoding", None) or "").strip().lower(),
-                    "md5_b64": getattr(blob, "md5_hash", None),
-                    "size": blob.size,
-                }
+                self._stored_meta = meta
+            elif meta["encoding"] == "gzip":
+                gzip_encoded.append((blob.name, meta, size))
+        if self.is_dir:
+            self._gzip_encoded_meta = gzip_encoded
         return total
 
     @property
@@ -1068,8 +1076,7 @@ class HandleGSURL(FileType):
         dictionary". Decoding needs the bytes on a node, so the bucket planner routes such
         an object to the `mount` kind and `downloader_command` below.
 
-        Directories are not classified: that would mean inspecting every object under the
-        prefix, and no gzip-encoded directory tree has turned up. They keep the plain copy.
+        Always False for a directory: its encoded objects are `gzip_members`.
         """
         self.size                                  # populates _stored_meta, once
         meta = getattr(self, "_stored_meta", None)
@@ -1079,6 +1086,47 @@ class HandleGSURL(FileType):
             self._size = self._get_size()
             meta = getattr(self, "_stored_meta", None)
         return bool(meta) and meta["encoding"] == "gzip"      # never kept for a directory
+
+    @property
+    def gzip_members(self):
+        """
+        The objects under this directory that carry `Content-Encoding: gzip`, each as a
+        single-object handler whose `transport_gzip` is True; empty for a single object.
+
+        The same server-side-copy problem as `transport_gzip`, one level down: the
+        Funcotator data sources directory has 35 of its 46 objects gzip-encoded, among
+        them a GATK `.dict`. The bucket planner copies the rest of the directory
+        server-side and routes these through `downloader_command`.
+
+        Classified from the listing sizing already fetched, so it costs no requests, and
+        each member reuses this handler's requester-pays resolution rather than making
+        its own.
+        """
+        self.size                                  # blob() is what sets is_dir
+        if not self.is_dir:
+            return []
+        gzip_encoded = getattr(self, "_gzip_encoded_meta", None)
+        if gzip_encoded is None:
+            # As in transport_gzip: a size cached without the listing must not read as
+            # "nothing encoded".
+            self._size = self._get_size()
+            gzip_encoded = self._gzip_encoded_meta
+        bucket = re.match(r"^gs://([^/]+)/", self.path)[1]
+        handlers = []
+        for name, meta, size in gzip_encoded:
+            member = copy.copy(self)
+            member.extra_args = dict(self.extra_args)
+            member.path = member.localized_path = "gs://{}/{}".format(bucket, name)
+            member.is_dir = False
+            member._stored_meta = meta
+            member._size = size
+            member._hash = None
+            handlers.append(member)
+        return handlers
+
+    def relative_name(self, member):
+        """`member`'s object name relative to this directory: its path in the copy."""
+        return member.path[len(self.path) + 1:]
 
     def downloader_command(self, dest):
         """
