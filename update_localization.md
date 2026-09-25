@@ -5911,13 +5911,10 @@ from `/proc/diskstats`, sampled every 30 s, with ~6.8 GiB of formatting writes s
 The new layout shows only in the split: more streams active, with more of their time spent
 in writes, which is what a no-longer-binding source looks like.
 
-**The disk did not slow down after 96 GiB, which contradicts §6.5i.** There, a 316 GB
-pd-standard fell from ~92 to ~46 MB/s at around 56 GiB, and PARALLEL_DOWNLOAD.md tells
-operators the disk sustains 43.9 MiB/s. These 368 GB disks held 97-98 MiB/s for all 128 GiB.
-Either pd-standard behaves differently now, or its burst outlasts 128 GiB at this size.
-**Open:** a full-size run on a fresh disk would settle it, and the guide's 43.9 MiB/s figure
-should not be relied on until one does. The conclusion above does not depend on it: both
-rules ran on identical fresh disks.
+**Observed, not pursued: neither disk slowed after 96 GiB.** §6.5i's 316 GB pd-standard fell
+from ~92 to ~46 MB/s at around 56 GiB; these 368 GB disks held 97-98 MiB/s for all 128 GiB.
+Nothing here depends on the disk's burst or sustained rate: both rules ran on identical fresh
+disks, which is what the comparison needs.
 
 The BAM prefix existed only on the two disks. The run script's exit trap wiped both and
 shredded the GDC token, and the node and disks were then deleted.
