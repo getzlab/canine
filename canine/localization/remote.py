@@ -3,7 +3,7 @@ import subprocess
 import typing
 import shlex
 from contextlib import ExitStack
-from .base import AbstractLocalizer, PathType, Localization
+from .base import AbstractLocalizer, PathType, Localization, STAGED_SCRIPTS
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project, check_call

@@ -4,20 +4,27 @@ Tests for staging the scripts the compute node runs into CANINE_ROOT.
 They ride the shared staging directory rather than the worker image: baking them in
 would need a fleet-wide rebuild and would version-skew against the installed canine.
 
-The localizer-level assertions live in test_localizer_{nfs,local,remote,batched}.py, but
-those need a live cluster. These cover the part that can be checked locally, including
-the executable bit -- which is what actually broke.
+Each localizer's own staging step is exercised here too, over a real LocalTransport, not
+only in the cluster tests in test_localizer_{nfs,local,remote,batched}.py: the three that
+stage by their own loop shipped a NameError that only those tests could have caught,
+and they never run without the Docker cluster.
 """
 
 import os
 import shutil
 import stat
+from unittest.mock import MagicMock
 
 import pytest
 
+from canine.backends.local import LocalTransport
 from canine.localization.base import STAGED_SCRIPTS, AbstractLocalizer
+from canine.localization.local import BatchedLocalizer, LocalLocalizer
+from canine.localization.nfs import NFSLocalizer
+from canine.localization.remote import RemoteLocalizer
 
 EXECUTABLE = {"debug.sh", "parallel_download.py"}
+LOCALIZERS = (BatchedLocalizer, LocalLocalizer, NFSLocalizer, RemoteLocalizer)
 
 
 class TestStagedScriptSet:
@@ -144,6 +151,45 @@ class TestStagedCopyIsRunnable:
         AbstractLocalizer.copy_staged_scripts(str(tmp_path))
         with open(str(tmp_path / "parallel_download.py")) as fh:
             assert fh.read().rstrip().endswith("# k9pdl-eof")
+
+
+def local_backend():
+    """A backend whose transport is the local filesystem: no cluster, no Docker."""
+    backend = MagicMock()
+    backend.transport = LocalTransport
+    return backend
+
+
+@pytest.mark.parametrize("localizer_class", LOCALIZERS, ids=lambda c: c.__name__)
+class TestEveryLocalizerStagesTheScripts:
+    """
+    The three staging mechanisms differ: NFSLocalizer copies, BatchedLocalizer and
+    LocalLocalizer symlink and then send the tree, and RemoteLocalizer uses
+    transport.send. A shared script list does not make them agree unless each one runs.
+    """
+
+    @staticmethod
+    def _staging_dir(localizer_class, tmp_path):
+        localizer = localizer_class(local_backend(), staging_dir=str(tmp_path / "staging"))
+        with localizer:
+            return localizer.localize({"0": {"greeting": "hey"}}, {"stdout": "../stdout"})
+
+    def test_every_script_lands(self, localizer_class, tmp_path):
+        staging_dir = self._staging_dir(localizer_class, tmp_path)
+        for script in STAGED_SCRIPTS:
+            assert os.path.isfile(os.path.join(staging_dir, script)), script
+
+    @pytest.mark.parametrize("script", sorted(EXECUTABLE))
+    def test_the_executable_bit_survives(self, localizer_class, tmp_path, script):
+        staging_dir = self._staging_dir(localizer_class, tmp_path)
+        assert os.stat(os.path.join(staging_dir, script)).st_mode & stat.S_IXUSR
+
+    def test_contents_are_the_installed_scripts(self, localizer_class, tmp_path):
+        staging_dir = self._staging_dir(localizer_class, tmp_path)
+        for script in STAGED_SCRIPTS:
+            with open(os.path.join(staging_dir, script), "rb") as staged, \
+                 open(AbstractLocalizer.staged_script_source(script), "rb") as source:
+                assert staged.read() == source.read(), script
 
 
 class TestEmittedCommandsAreRunAsBash:

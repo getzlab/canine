@@ -9,7 +9,7 @@ import shutil
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
-from .base import AbstractLocalizer, PathType, Localization, BASH
+from .base import AbstractLocalizer, PathType, Localization, STAGED_SCRIPTS, BASH
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project, check_call
