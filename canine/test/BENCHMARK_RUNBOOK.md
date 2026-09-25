@@ -1878,7 +1878,7 @@ pdl sweep --url "$GDC_URL" --size $GDC_SIZE --md5 "$GDC_MD5" \
 
 > The GDC numbers elsewhere in this runbook (13.85× at 16 connections) are the GDC *S3*
 > endpoint through presigned URLs. The GDC API itself differs in two ways, measured in
-> update_localization.md §13.72. It answers HEAD with 400, and its 206s carry
+> PARALLEL_LOCALIZATION.md §13.72. It answers HEAD with 400, and its 206s carry
 > `Content-Range: 0-0/N` with no `bytes ` unit. Before that section's fix, the second one
 > sent every GDC-API download down the single stream. **Measured since** (§13.73, 12 GiB
 > prefix to tmpfs): 16.0 MiB/s single-stream, 145 MiB/s at 16 connections (9.24×), held back
@@ -3120,7 +3120,7 @@ constraint does not apply to `scratch_disk_type`, which is per-node and never sh
 if scratch ever lands on the critical path that lever is still open.)
 
 **That leaves size as the only in-family lever, and it does not pay for itself.**
-`update_localization.md` §13.15/§13.16 recommended oversizing to ~742 GB; §13.46
+`PARALLEL_LOCALIZATION.md` §13.15/§13.16 recommended oversizing to ~742 GB; §13.46
 re-derived that case with the measured constant and, decisively, with the fact that **the
 localization VM is preemptible**. §13.15 priced saved time at the on-demand $0.38/h. A
 preemptible VM-hour is the cheapest hour in the system and a retained persistent disk-hour
@@ -3232,7 +3232,7 @@ experiment that needed it.
 >
 > That gate has never run against real infrastructure. **Verify it before measuring
 > anything**, and note it needs no large transfer — a small input exercises the whole
-> interaction. The full order is in `update_localization.md` §13.48; the short version:
+> interaction. The full order is in `PARALLEL_LOCALIZATION.md` §13.48; the short version:
 >
 > 1. route correctness on a real RW gcsfuse mount (does it reach `bucket-compose`, or drop
 >    to `stage-publish` and stage onto the same boot disk it was avoiding?)
@@ -3820,7 +3820,7 @@ lose track of, and this is the only thing that finds the ones from earlier attem
 ### 6.6b `--gunzip` on the bucket route — the only part with no real-GCS coverage
 
 Everything in this route has now run against real GCS except the decompress pass
-(`update_localization.md` §13.56). That pass is verified against the **fake** service only,
+(`PARALLEL_LOCALIZATION.md` §13.56). That pass is verified against the **fake** service only,
 and it is the one place where the fake could be wrong in a way that matters, because it
 uses a request shape nothing else in canine sends: a resumable PUT with
 `Content-Range: bytes X-Y/*`.
@@ -4279,7 +4279,7 @@ rm -f /tmp/gz-src.tsv /tmp/gz-src.tsv.gz /tmp/keep-check.gz
 
 ### 6.7 Size `bucket_upload_wait_tries` — should the timeout go back to 1 hour?
 
-The default was raised 60 → 180 (1 h → 3 h) in `update_localization.md` §13.49, on risk
+The default was raised 60 → 180 (1 h → 3 h) in `PARALLEL_LOCALIZATION.md` §13.49, on risk
 asymmetry rather than a measurement, because the relay's throughput was unknown. It is a
 placeholder and lowering it again with data is the good outcome — characterization runs on
 the bucket path report noticeably better speeds than the disk path, which is exactly the
@@ -4479,7 +4479,7 @@ per 300 disks). It is still worth shipping; it is just not where most of the mon
 so paying for gigabytes across the whole lifetime to save time in a small fraction of it
 never recovers: +$1.12/disk of storage against $0.10/disk of preemptible VM time. Earlier
 revisions of this document recommended 742 GB; that used on-demand pricing and a single-disk
-view, and is withdrawn. The reasoning is preserved in `update_localization.md` §13.16 and
+view, and is withdrawn. The reasoning is preserved in `PARALLEL_LOCALIZATION.md` §13.16 and
 §13.18.
 
 **3. The machine type is worth questioning, but localization is not as CPU-free as I
@@ -4517,7 +4517,7 @@ unlimited fan-out is what the rodisk exists for. Do not change the type.
 
 ## What to write down
 
-Record these in `update_localization.md` §13 whatever the outcome — a negative result here
+Record these in `PARALLEL_LOCALIZATION.md` §13 whatever the outcome — a negative result here
 is as useful as a positive one, and more useful than an unmeasured assumption:
 
 | Question | Where it comes from | Answer |
@@ -4556,7 +4556,7 @@ is as useful as a positive one, and more useful than an unmeasured assumption:
 
 **The bucket path (#20). Record results here, not in `LOCALIZATION.md`** — that file is
 `fuse-localize`'s design reference and editing it from this side only creates merge
-friction. This table is the single place measurements land; `update_localization.md` §13
+friction. This table is the single place measurements land; `PARALLEL_LOCALIZATION.md` §13
 carries the narrative once a row is filled in.
 
 | Question | Where it comes from | Answer |

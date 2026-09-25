@@ -2373,7 +2373,7 @@ class TestSizingTheUploadWaitCeiling:
     `pdl claim` answers one question: is 60 enough, or is 180 needed?
 
     It exists rather than reusing `routeb`'s single timing because of
-    update_localization.md §13.49 -- the constant was previously sized from a
+    PARALLEL_LOCALIZATION.md §13.49 -- the constant was previously sized from a
     pd-standard *download* figure, which is a different path entirely. The shape of the
     measurement matters more here than its precision: the timeout gates the whole
     claim, has to clear the SLOWEST legitimate upload rather than the typical one, and

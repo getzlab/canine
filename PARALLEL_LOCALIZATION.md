@@ -187,7 +187,7 @@ Algorithm:
    object via a resumable upload session and `compose` them server-side — no local staging and
    no concatenation transfer. Any other non-POSIX destination ⇒ **the stage-publish route**,
    stage-then-publish via a block-device work directory.
-3. **Create the working file sparse** (Routes A/C only) with `ftruncate` to the final size —
+3. **Create the working file sparse** (the in-place and stage-publish routes only) with `ftruncate` to the final size —
    deliberately **not** `posix_fallocate`, so that written and unwritten regions stay
    distinguishable (§4.1). Probe `SEEK_HOLE` support on that filesystem. The bucket-compose route has no local
    file: its durable frontier comes from the resumable upload sessions instead (§4.7).
@@ -200,7 +200,7 @@ Algorithm:
 5. **Download** with a `ThreadPoolExecutor(connections)`; each worker issues
    `Range: bytes=start-end`, verifies the response is `206` and that
    `Content-Range`/`Content-Length` match the request exactly, and streams 8 MiB buffers
-   **strictly sequentially within its chunk** — via `os.pwrite(fd, buf, offset)` on Routes A/C,
+   **strictly sequentially within its chunk** — via `os.pwrite(fd, buf, offset)` on the in-place and stage-publish routes,
    so the chunk's durable frontier is recoverable via `SEEK_HOLE` (§4.1), or into the chunk's
    resumable upload session on the bucket-compose route, whose durable frontier is queryable from GCS. No
    periodic fsync.
@@ -555,7 +555,7 @@ already-verified file without re-downloading anything. This route is strictly wo
 (a full sequential publish, and up to a whole file of staged work at risk), which is why the bucket-compose route
 is preferred whenever the destination is a resolvable bucket.
 
-*Sidecars under Routes B/C.* Under the bucket-compose route the manifest is written as an object next to `dest`
+*Sidecars under the bucket-compose and stage-publish routes.* Under the bucket-compose route the manifest is written as an object next to `dest`
 (object writes are atomic, so no dependence on rename semantics) and the parts live under a
 dotted `.k9pdl.parts/` prefix that is deleted by the compose itself. Under the stage-publish route the manifest
 follows the **working** file into the staging directory rather than onto the mount. In both
@@ -934,7 +934,7 @@ automatically the way `.py` modules are).
        `/proc/mounts`: `fuse.gcsfuse` with a resolvable bucket ⇒ the bucket-compose route; `fuse.gcsfuse` with
        an ambiguous/unresolvable mount ⇒ the stage-publish route; an unrecognised fstype ⇒ the safe route
        (allowlist, not denylist); a filesystem passing the fstype check but failing the
-       random-write or `SEEK_HOLE` probe ⇒ still off the in-place route. Assert that on Routes B/C the
+       random-write or `SEEK_HOLE` probe ⇒ still off the in-place route. Assert that on the bucket-compose and stage-publish routes the
        downloader never issues an out-of-order `pwrite` or a full-size `ftruncate` against the
        mount, and that `flock` raising `ENOTSUP` is tolerated rather than fatal;
    (o) **the bucket-compose route resumability**: `SIGKILL` mid-upload ⇒ assert the re-run queries each session
@@ -1672,7 +1672,7 @@ read resume state means starting fresh, which is wasteful and safe.
 
 ### 13.11 A unit test was reaching real GCS with real credentials
 
-The Route-B-writes-nothing-in-place test forced the route with no fake behind it and
+The test that the bucket-compose route writes nothing in place forced the route with no fake behind it and
 asserted the run failed without writing locally. Once the manifest moved into the bucket,
 that test began issuing live requests to `storage.googleapis.com` — `GcsClient.token`
 falls back to `gcloud auth print-access-token`, which succeeds on any developer machine.

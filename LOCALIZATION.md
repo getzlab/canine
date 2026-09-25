@@ -212,7 +212,7 @@ This replaced an earlier runtime branch here: `describe`, then
 - It fell through to the plain copy, reproducing the bug, whenever `describe` failed.
 - It relied on `gcloud storage cat` never transcoding.
 
-See `update_localization.md` §13.71.
+See `PARALLEL_LOCALIZATION.md` §13.71.
 
 **Directory sources** get the same treatment one object at a time. The Funcotator data sources
 directory has 35 of its 46 objects gzip-encoded, among them a GATK `.dict`.

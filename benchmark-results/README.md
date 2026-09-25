@@ -1,7 +1,7 @@
 # §6.6 raw results — bucket-compose localization
 
 The `--json` output behind every figure in `canine/test/BENCHMARK_RUNBOOK.md` §6.6 and
-`update_localization.md` §13.50–§13.53. Kept because most of those conclusions rest on
+`PARALLEL_LOCALIZATION.md` §13.50–§13.53. Kept because most of those conclusions rest on
 comparing two runs, and a comparison is only checkable if both sides survive.
 
 All from one `pdl-bench` (`n1-standard-8`, `us-east1-c`), source

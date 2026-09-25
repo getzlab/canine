@@ -2409,7 +2409,7 @@ def command_claim(args):
 
     Three things this deliberately does differently from `routeb`, each because getting
     it wrong is how the constant was mis-sized in the first place (see
-    update_localization.md 13.49, where a pd-standard DOWNLOAD figure was used to size a
+    PARALLEL_LOCALIZATION.md 13.49, where a pd-standard DOWNLOAD figure was used to size a
     relay):
 
       * **Repeats.** A ceiling is a question about the tail. One run is a point, and the

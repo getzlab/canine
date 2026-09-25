@@ -5,7 +5,7 @@ They are now N simultaneous ranged GETs of even-sized chunks, reassembled byte-i
 and **resumable across VM preemption** (`parallel_download.py`).
 
 This is the operational surface: how to turn it off, how to tune it, and how to tell what
-it did. For the design and its rationale see `update_localization.md`; for measuring it,
+it did. For the design and its rationale see `PARALLEL_LOCALIZATION.md`; for measuring it,
 `test/BENCHMARK_RUNBOOK.md`.
 
 ---

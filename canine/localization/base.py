@@ -172,7 +172,7 @@ class AbstractLocalizer(abc.ABC):
           The value has to sit above the first and as close to it as that allows.
 
           It was 60, then briefly 180. 180 was a placeholder chosen on risk asymmetry
-          when this route's throughput was unknown (update_localization.md §13.49), and
+          when this route's throughput was unknown (PARALLEL_LOCALIZATION.md §13.49), and
           against the pd-standard's 1.62 h it was defensible. The bucket route measured
           at **0.57 h** for the largest real input (BENCHMARK_RUNBOOK.md §6.6, two runs
           agreeing to 0.7%), so: 0.57 h + the 60 s bucket-create ceiling, doubled for
