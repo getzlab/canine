@@ -3691,3 +3691,94 @@ class TestTheReadBackUsesLargeBlocks:
         import inspect
         signature = inspect.signature(pdl.decompress_object)
         assert signature.parameters["block"].default == pdl.READ_BUFFER == 8 * MIB
+
+
+class TestTheReadBackKeepsConnectionsAlive:
+    """
+    urllib sends `Connection: close`, so every ranged read paid a new TLS handshake and a
+    TCP ramp-up (~0.15 s, §13.78). download_range now keeps one connection open per
+    reader thread.
+    """
+
+    def _object(self, gcs, size=40 * MIB, name="ka.bin"):
+        data = os.urandom(size)
+        gcs.state.objects[name] = data
+        gcs.state.created[name] = time.time()
+        return name, data
+
+    def _read_all(self, client, name, data, block=MIB):
+        out = b"".join(client.download_range(BUCKET, name, s, min(s + block, len(data)))
+                       for s in range(0, len(data), block))
+        assert out == data
+
+    def test_one_thread_reuses_one_connection(self, gcs):
+        name, data = self._object(gcs)
+        self._read_all(pdl.GcsClient(), name, data)
+        assert len(gcs.state.media_ports) == 40
+        assert len(set(gcs.state.media_ports)) == 1, "a new connection per request"
+
+    def test_the_opt_out_opens_one_per_request(self, gcs, monkeypatch):
+        """The control: proves the fake can tell the two apart."""
+        monkeypatch.setattr(pdl.GcsClient, "reuse_connections", False)
+        name, data = self._object(gcs)
+        self._read_all(pdl.GcsClient(), name, data)
+        assert len(set(gcs.state.media_ports)) == 40
+
+    def test_each_reader_thread_has_its_own_connection(self, gcs):
+        name, data = self._object(gcs, 64 * MIB)
+        options = options_for("/tmp/unused", "http://x/y", len(data),
+                              check_md5=hashlib.md5(data).hexdigest())
+        pdl.verify_bucket_object(pdl.GcsClient(), BUCKET, name, len(data), options,
+                                 block=MIB)
+        ports = gcs.state.media_ports
+        assert len(ports) == 64
+        assert 1 < len(set(ports)) <= pdl.DEFAULT_DECODE_READAHEAD
+
+    def test_a_connection_the_server_closed_is_retried_fresh(self, gcs):
+        """An idle keep-alive connection the server dropped must not fail the read."""
+        name, data = self._object(gcs)
+        gcs.state.close_after_response = True
+        self._read_all(pdl.GcsClient(), name, data)
+        assert len(set(gcs.state.media_ports)) == 40
+
+    def test_an_expired_token_is_refreshed_on_a_kept_connection(self, gcs, monkeypatch):
+        issued = []
+
+        def fetch(self):
+            issued.append("t{}".format(len(issued) + 1))
+            return issued[-1], 3600
+
+        monkeypatch.setattr(pdl.GcsClient, "token", _REAL_TOKEN)
+        monkeypatch.setattr(pdl.GcsClient, "_fetch_token", fetch)
+        name, data = self._object(gcs, 4 * MIB)
+        gcs.state.rejected_tokens = {"t1"}
+        self._read_all(pdl.GcsClient(), name, data)
+        assert issued == ["t1", "t2"]
+
+    def test_a_missing_object_is_permanent(self, gcs):
+        with pytest.raises(pdl.PermanentError):
+            pdl.GcsClient().download_range(BUCKET, "does-not-exist", 0, 10)
+
+    def test_a_401_that_survives_a_refresh_is_permanent(self, gcs):
+        """The stubbed token is the one rejected, so the refresh cannot help."""
+        name, _ = self._object(gcs, MIB)
+        gcs.state.rejected_tokens = {"fake-token"}
+        with pytest.raises(pdl.PermanentError):
+            pdl.GcsClient().download_range(BUCKET, name, 0, 10)
+        assert gcs.state.rejections["fake-token"] == 2, "exactly one retry"
+
+    def test_a_dead_server_is_transient(self, gcs, monkeypatch):
+        client = pdl.GcsClient()
+        monkeypatch.setattr(pdl, "GCS_API_ROOT", "http://127.0.0.1:9/storage/v1")
+        with pytest.raises(pdl.TransientError):
+            client.download_range(BUCKET, "x", 0, 10)
+
+    def test_a_proxy_falls_back_to_urllib(self, gcs, monkeypatch):
+        """http.client ignores proxy settings; urllib honors them."""
+        monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+        monkeypatch.setattr(pdl.GcsClient, "_get_kept_alive",
+                            lambda *a, **k: pytest.fail("bypassed the proxy"))
+        name, data = self._object(gcs, 2 * MIB)
+        monkeypatch.delenv("HTTPS_PROXY")               # let urllib reach the fake directly
+        monkeypatch.setattr(pdl, "_proxy_configured", lambda: True)
+        self._read_all(pdl.GcsClient(), name, data)

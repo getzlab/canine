@@ -89,6 +89,12 @@ class FakeGcs:
         # as an expired access token does (measured, §13.77). Counted per token.
         self.rejected_tokens = set()
         self.rejections = {}
+        # The client port of every media GET, one per TCP connection, so a test can tell a
+        # kept-alive connection from a new one per request.
+        self.media_ports = []
+        # Close the connection after every response, as a server does to an idle
+        # keep-alive connection: the client's next request on it fails.
+        self.close_after_response = False
 
     def new_session(self, name, custom_time=None):
         with self.lock:
@@ -129,6 +135,9 @@ def make_handler(state):
             self.end_headers()
             if body:
                 self.wfile.write(body)
+            if state.close_after_response:
+                # no Connection: close header -- the client only finds out on reuse
+                self.close_connection = True
 
         def _rejected(self):
             """401 for a token the state marks expired; True if the request was answered."""
@@ -373,6 +382,9 @@ def make_handler(state):
                        if committed else {})
 
         def do_GET(self):
+            if "alt=media" in self.path:
+                with state.lock:
+                    state.media_ports.append(self.client_address[1])
             if self._rejected():
                 return
             parsed = urllib.parse.urlsplit(self.path)
