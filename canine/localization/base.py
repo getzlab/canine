@@ -2144,7 +2144,6 @@ class AbstractLocalizer(abc.ABC):
         exports += ["export CANINE_N_BUCKETMOUNTS={}".format(len(canine_bucketmounts))]
         if len(canine_bucketmounts):
             localization_tasks += [
-              "[ -f .bucketmount_lock_pids ] && rm .bucketmount_lock_pids || :",
               "for i in `seq ${CANINE_N_BUCKETMOUNTS}`; do",
               "CANINE_BUCKETMOUNT=CANINE_BUCKETMOUNT_${i}",
               "CANINE_BUCKETMOUNT=${!CANINE_BUCKETMOUNT}",
@@ -2153,34 +2152,21 @@ class AbstractLocalizer(abc.ABC):
 
               'echo "INFO: Mounting bucket ${CANINE_BUCKETMOUNT} ..." >&2',
 
-              # The busy-lock lives OUTSIDE the mount, as a plain file beside it.
-              # Locking the mountpoint directory itself (as this used to) puts the
-              # lock inside the very thing it protects: once any job unmounts,
-              # the fd is invalid and flock cannot even open the path, so the
-              # teardown guard silently stops guarding.
+              # Bucket mounts are node-lifetime: once mounted, a bucket stays
+              # mounted until the VM is deleted and no job ever unmounts it. Any
+              # unmount in teardown races the other shards sharing the mount on
+              # this node, and no lock closes that race cheaply.
               #
-              # Created (as root, since the parent dir may still be root-owned
-              # from a prior bucket's first mkdir) and handed to the invoking
-              # user here, before any locking, since these two lines are
-              # themselves safe under unsynchronized concurrent execution:
-              # `mkdir -p`/repeated `touch`/`chown`-to-the-same-owner are all
-              # idempotent no-ops when raced by multiple shards on the same
-              # node, so nothing below needs a lock held for them.
-              #
-              # CANINE_BUCKETMOUNT_MOUNTLOCK is a SEPARATE file from
-              # CANINE_BUCKETMOUNT_LOCK (below), not just a differently-named
-              # handle on the same one: CANINE_BUCKETMOUNT_LOCK is held
-              # shared, for a whole job's lifetime, by every shard already
-              # using this mount (`flock -os ... sleep infinity &`, further
-              # down) -- an exclusive lock on that same file would block a
-              # newly-starting shard behind every already-running shard on
-              # this node for as long as THEIR jobs take, not just the brief
-              # mount-setup race this is actually meant to serialize.
+              # The lock file lives beside the mountpoint, not inside it, so it
+              # stays openable whatever state the mount is in. mkdir -p/touch/
+              # chown are idempotent under concurrent shards, so no lock needed.
               "sudo mkdir -p $(dirname ${CANINE_BUCKETMOUNT_DIR})",
-              "CANINE_BUCKETMOUNT_LOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).lock",
-              "sudo touch ${CANINE_BUCKETMOUNT_LOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_LOCK}",
               "CANINE_BUCKETMOUNT_MOUNTLOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).mountlock",
               "sudo touch ${CANINE_BUCKETMOUNT_MOUNTLOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_MOUNTLOCK}",
+
+              # Fast path: already mounted and live on this node, so skip the
+              # lock entirely. timeout guards stat against a hung FUSE daemon.
+              "if ! { mountpoint -q ${CANINE_BUCKETMOUNT_DIR} && timeout 10 stat ${CANINE_BUCKETMOUNT_DIR} > /dev/null 2>&1; }; then",
 
               # Multiple shards of the same scatter job routinely start on the
               # same node in the same instant, and each independently checks
@@ -2271,22 +2257,31 @@ class AbstractLocalizer(abc.ABC):
               # backends/dockerTransient.py. Scoped to this subshell only --
               # nothing else in this script reads GOOGLE_APPLICATION_CREDENTIALS.
               'if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${CLOUDSDK_CONFIG}/application_default_credentials.json" ]; then export GOOGLE_APPLICATION_CREDENTIALS=${CLOUDSDK_CONFIG}/application_default_credentials.json; fi',
-              "timeout -k 60 60 gcsfuse -o ro --implicit-dirs ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
+              # 200>&-: the gcsfuse daemon must not inherit the mountlock fd. It
+              # lives for the node's lifetime, so an inherited fd would hold the
+              # lock forever and every other shard waiting here would time out.
+              "timeout -k 60 60 gcsfuse -o ro --implicit-dirs ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} 200>&- || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
+
+              # Slurm (proctrack/cgroup) kills every process in a job's cgroup
+              # when the job ends, including this gcsfuse daemon -- which would
+              # leave every other shard on the node reading a dead mount
+              # ("Transport endpoint is not connected"). Move the daemon to the
+              # root cgroup of each controller Slurm tracks so it outlives the
+              # job that started it. Confirmed live: without this the mount dies
+              # with its first job; with it, a later job still reads it.
+              'for CANINE_GCSFUSE_PID in $(pgrep -f -- "gcsfuse.* ${CANINE_BUCKETMOUNT_DIR}$"); do',
+              '  for CANINE_CG in freezer cpuset memory devices; do',
+              '    [ -f /sys/fs/cgroup/${CANINE_CG}/cgroup.procs ] && echo ${CANINE_GCSFUSE_PID} | sudo tee /sys/fs/cgroup/${CANINE_CG}/cgroup.procs > /dev/null || :',
+              '  done',
+              '  [ -f /sys/fs/cgroup/cgroup.controllers ] && echo ${CANINE_GCSFUSE_PID} | sudo tee /sys/fs/cgroup/cgroup.procs > /dev/null || :',
+              'done',
               "fi",
 
               'mountpoint -q ${CANINE_BUCKETMOUNT_DIR} || { echo "ERROR: Bucket mount did not appear!" >&2; exit 1; }',
               ") 200>${CANINE_BUCKETMOUNT_MOUNTLOCK} || exit 1",
+              "fi",
 
-            ] + self.bucketmount_reachability_check() + [
-
-              # hold the busy-lock; released during teardown (or if the script
-              # crashes). unlike RODISK, this isn't to coordinate a cross-node
-              # attach race -- it's so a concurrent job sharing this same
-              # node/mountpoint doesn't get it unmounted out from under it by
-              # another job's teardown
-              "flock -os ${CANINE_BUCKETMOUNT_LOCK} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids",
-
-            ] + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + [
+            ] + self.bucketmount_reachability_check() + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + [
 
               'echo "INFO: Successfully mounted bucket ${CANINE_BUCKETMOUNT}." >&2',
 
@@ -2389,34 +2384,10 @@ class AbstractLocalizer(abc.ABC):
                 '  fi',
                 'done)',
 
-                # unmount all bucket mounts, if they're not in use
-                # first, stop refreshing customTime -- we are done holding this
-                # content, so it should resume ageing normally
-            ] + self.bucketmount_heartbeat_stop() + [
-                # then release all locks obtained by this job
-                'if [ -f ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids ]; then',
-                '  while read -r pid; do',
-                '    kill $pid',
-                '  done < ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids',
-                '  rm -f ${CANINE_JOB_INPUTS}/.bucketmount_lock_pids',
-                'fi',
-                '(cd /',
-                'for i in $(seq ${CANINE_N_BUCKETMOUNTS}); do',
-                '  CANINE_BUCKETMOUNT=CANINE_BUCKETMOUNT_${i}',
-                '  CANINE_BUCKETMOUNT=${!CANINE_BUCKETMOUNT}',
-                '  CANINE_BUCKETMOUNT_DIR=CANINE_BUCKETMOUNT_DIR_${i}',
-                '  CANINE_BUCKETMOUNT_DIR=${!CANINE_BUCKETMOUNT_DIR}',
-                '  echo "Unmounting bucket ${CANINE_BUCKETMOUNT}" >&2',
-                # lock file lives beside the mountpoint, not inside it, so this
-                # stays openable no matter what state the mount is in
-                "  CANINE_BUCKETMOUNT_LOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).lock",
-                '  if flock -n ${CANINE_BUCKETMOUNT_LOCK} true && mountpoint -q ${CANINE_BUCKETMOUNT_DIR}; then',
-                '    fusermount -u ${CANINE_BUCKETMOUNT_DIR} && echo "Unmounted ${CANINE_BUCKETMOUNT}" >&2 || echo "Error unmounting ${CANINE_BUCKETMOUNT}" >&2',
-                '  else',
-                '    echo "Bucket mount ${CANINE_BUCKETMOUNT} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
-                '  fi',
-                'done)',
-            ] + self.bucketmount_lease_release() + [
+                # Bucket mounts are node-lifetime and are never unmounted here
+                # (see the mount loop). Only this job's own bookkeeping is undone:
+                # stop refreshing customTime, then drop its mount leases.
+            ] + self.bucketmount_heartbeat_stop() + self.bucketmount_lease_release() + [
             ] + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
         return setup_script, localization_script, teardown_script, array_exports
