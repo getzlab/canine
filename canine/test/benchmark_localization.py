@@ -1035,6 +1035,18 @@ def _drain_stderr(stream, sink, echo_every=HEARTBEAT_INTERVAL, out=None,
         pass
 
 
+# The downloader's transfer phase ending: `download` on the POSIX routes, `relay` on the
+# bucket route. Whatever the process moves after it -- the bucket route's md5 read-back
+# from GCS, its --gunzip decode -- is not source traffic.
+TRANSFER_PHASE = re.compile(rb"k9pdl-phase (download|relay) ")
+
+
+def wire_nic_bytes(outcome):
+    """NIC bytes that count against the source: up to the transfer's end when known."""
+    transfer = outcome.get("nic_transfer_bytes")
+    return transfer if transfer is not None else outcome.get("nic_bytes")
+
+
 def run_download(source, dest, size, connections, min_chunk, extra=(), verification=None,
                  kill_after_bytes=None, max_chunk=None):
     """
@@ -1079,6 +1091,25 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
         killed = False
         killed_at = None
         rss = 0
+        # NIC bytes when the transfer phase ended. The wire ratio is "did every SOURCE byte
+        # cross once", and on the bucket route a verified run also reads the whole object
+        # back from GCS, so the process total came out ~2x and was flagged DUPLICATE
+        # FETCHING on every verified run (§13.77). Snapshotted when the phase line
+        # arrives: at most one 0.25 s poll late, which is noise against GiB payloads.
+        transfer_nic = None
+        scanned = 0
+
+        def note_transfer_end():
+            nonlocal transfer_nic, scanned
+            if transfer_nic is not None:
+                return
+            upto = len(captured)
+            if any(TRANSFER_PHASE.search(raw) for raw in captured[scanned:upto]):
+                now = nic_bytes()
+                if None not in (now, sampler.nic0):
+                    transfer_nic = now - sampler.nic0
+            scanned = upto
+
         while True:
             # RSS is read before poll(), so the last sample is taken while the process is
             # still alive; /proc/<pid> is gone by the time poll() reports an exit.
@@ -1088,6 +1119,7 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
             if process.poll() is not None:
                 break
             sampler.tick()
+            note_transfer_end()
             if kill_after_bytes is not None and not killed:
                 try:
                     # ALLOCATED blocks, not apparent size. The downloader creates the
@@ -1211,6 +1243,9 @@ def run_download(source, dest, size, connections, min_chunk, extra=(), verificat
         "killed_at_bytes": killed_at,
         "peak_rss": rss or None,
         "nic_bytes": sampler.nic_total,
+        # NIC bytes up to the end of the transfer phase; None if the phase line never
+        # arrived while the process ran (then nothing came after it, and nic_bytes is it)
+        "nic_transfer_bytes": transfer_nic,
         "disk_bytes": sampler.disk_total,
         "peak_nic_bytes_per_s": sampler.peak("nic_bytes_per_s"),
         "peak_disk_bytes_per_s": sampler.peak("disk_bytes_per_s"),
@@ -1812,11 +1847,15 @@ def command_sweep(args):
         # connection count. probe_range is supposed to stop that before any parallel work
         # starts, but the ratio is the observable, and a cost alarm besides: GCS bills
         # for the whole object per request.
-        if outcome.get("nic_bytes") and args.size:
-            ratio = outcome["nic_bytes"] / float(args.size)
+        wire_bytes = wire_nic_bytes(outcome)
+        if wire_bytes and args.size:
+            ratio = wire_bytes / float(args.size)
             note = "" if ratio < 1.5 else "   <-- DUPLICATE FETCHING"
-            say("        wire   : {:.2f}x payload ({} on the NIC){}".format(
-                ratio, human(outcome["nic_bytes"]), note))
+            after = (outcome.get("nic_bytes") or 0) - wire_bytes
+            extra = ("; {} more after it, e.g. the md5 read-back".format(human(after))
+                     if after > 0.05 * args.size else "")
+            say("        wire   : {:.2f}x payload ({} on the NIC during the transfer{}){}".format(
+                ratio, human(wire_bytes), extra, note))
         if not args.keep:
             # The sidecars go with it. Unlinking only the payload leaves
             # `.bench.N.bin.k9pdl.done` behind, and a completion marker with no file is
@@ -2046,8 +2085,8 @@ def command_sweep(args):
         say("the `downloader:` md5 in the header against your working copy.")
         say()
 
-    wire = [r["nic_bytes"] / float(args.size) for r in usable
-            if r.get("nic_bytes") and args.size]
+    wire = [wire_nic_bytes(r) / float(args.size) for r in usable
+            if wire_nic_bytes(r) and args.size]
     if wire and max(wire) >= 1.5:
         heading("DUPLICATE FETCHING")
         say("At least one setting put {:.2f}x the payload on the NIC. Every byte should".

@@ -1008,6 +1008,44 @@ class TestDuplicateFetchingIsVisible:
                 "--connections"] + [str(c) for c in sorted(ratios)]
         bench.command_sweep(bench.build_parser().parse_args(argv))
 
+    def sweep_split(self, tmp_path, monkeypatch, total, transfer):
+        """A row whose NIC total and transfer-phase figure differ, as a verified bucket run's do."""
+        payload = b"z" * 8192
+        digest = hashlib.md5(payload).hexdigest()
+
+        def fake_run_download(source, dest, size, connections, min_chunk, **kw):
+            with open(dest, "wb") as fh:
+                fh.write(payload)
+            return {"connections": connections, "returncode": 0, "seconds": 10.0,
+                    "killed": False, "peak_rss": 1 << 20,
+                    "phases": {"relay": 5.0, "compose": 1.0, "verify": 4.0},
+                    "nic_bytes": int(total * len(payload)),
+                    "nic_transfer_bytes": int(transfer * len(payload)),
+                    "disk_bytes": 0,
+                    "peak_nic_bytes_per_s": 1e8, "peak_disk_bytes_per_s": None,
+                    "mean_streams": None, "workers": None, "stderr_tail": []}
+
+        monkeypatch.setattr(bench, "run_download", fake_run_download)
+        monkeypatch.setattr(bench, "resolve_source",
+                            lambda a: (len(payload), bench.Verification("md5", digest)))
+        argv = ["sweep", "--url", "https://h/o", "--size", str(len(payload)),
+                "--dest-dir", str(tmp_path), "--connections", "16"]
+        bench.command_sweep(bench.build_parser().parse_args(argv))
+
+    def test_the_bucket_routes_md5_read_back_is_not_duplicate_fetching(
+            self, tmp_path, monkeypatch, capsys):
+        """§13.77: 2.02x on the NIC, of which 1.0x was the read-back from GCS."""
+        self.sweep_split(tmp_path, monkeypatch, total=2.02, transfer=1.01)
+        out = capsys.readouterr().out
+        assert "DUPLICATE FETCHING" not in out
+        assert "1.01x payload" in out
+        assert "more after it" in out, "the read-back traffic must still be visible"
+
+    def test_duplicate_fetching_during_the_transfer_is_still_flagged(
+            self, tmp_path, monkeypatch, capsys):
+        self.sweep_split(tmp_path, monkeypatch, total=17.0, transfer=16.0)
+        assert "DUPLICATE FETCHING" in capsys.readouterr().out
+
     def test_a_one_to_one_ratio_is_not_flagged(self, tmp_path, monkeypatch, capsys):
         self.sweep(tmp_path, monkeypatch, {1: 1.02, 16: 1.03})
         assert "DUPLICATE FETCHING" not in capsys.readouterr().out
@@ -2504,3 +2542,43 @@ class TestTheBenchmarkMirrorsTheDownloadersConstants:
         assert literals == [], (
             "hardcoded --connections defaults: {} -- use DEFAULT_CONNECTIONS_HINT so "
             "they follow the downloader".format(literals))
+
+
+
+class TestTheTransferPhaseIsSnapshotted:
+    """
+    run_download records NIC bytes when the downloader's transfer phase ends, so traffic
+    after it (the bucket route's md5 read-back) does not count against the source.
+    """
+
+    def test_the_snapshot_is_taken_at_the_phase_line(self, tmp_path, monkeypatch):
+        """
+        Every bound is load-safe: a sleep can only run long, so each is a floor, and the
+        3 s after the phase line leaves room for up to 1.5 s of polling lag -- the snapshot
+        can be late, never early, and only lateness shrinks the gap.
+        """
+        script = tmp_path / "fake_downloader.py"
+        script.write_text(
+            "import sys, time\n"
+            "time.sleep(0.6)\n"
+            "sys.stderr.write('[k9pdl] k9pdl-phase relay 0.6s, 1.0 MB/s\\n'); sys.stderr.flush()\n"
+            "time.sleep(3.0)\n"                    # the 'read-back', after the transfer
+            "sys.stderr.write('[k9pdl] k9pdl-phase verify 3.0s\\n'); sys.stderr.flush()\n")
+        t0 = time.monotonic()
+        # a NIC counter that climbs at 1 byte per microsecond, whatever reads it
+        monkeypatch.setattr(bench, "nic_bytes", lambda: int((time.monotonic() - t0) * 1e6))
+        monkeypatch.setattr(bench, "DOWNLOADER", str(script))
+        outcome = bench.run_download([], str(tmp_path / "d.bin"), 1, 1, 1)
+        transfer, total = outcome["nic_transfer_bytes"], outcome["nic_bytes"]
+        assert transfer is not None, "the phase line was never noticed"
+        assert transfer >= 0.6e6, "snapshotted before the phase line: {}".format(transfer)
+        assert total - transfer >= 1.5e6, (
+            "the traffic after the transfer was counted against it: {} of {}".format(
+                transfer, total))
+
+    def test_no_phase_line_means_no_transfer_figure(self, tmp_path, monkeypatch):
+        script = tmp_path / "quiet.py"
+        script.write_text("import time; time.sleep(0.3)\n")
+        monkeypatch.setattr(bench, "DOWNLOADER", str(script))
+        outcome = bench.run_download([], str(tmp_path / "d.bin"), 1, 1, 1)
+        assert outcome["nic_transfer_bytes"] is None
