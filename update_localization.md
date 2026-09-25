@@ -5918,3 +5918,93 @@ disks, which is what the comparison needs.
 
 The BAM prefix existed only on the two disks. The run script's exit trap wiped both and
 shredded the GDC token, and the node and disks were then deleted.
+
+### 13.81 The decode's upload slices: grown to 256 MiB, starting from the compressed size
+
+§13.68 found the bucket route's `--gunzip` decode upload-bound: its slices uploaded at ~104
+MB/s in situ, against inflation's 183 MB/s. The obvious "bigger blocks" lever, the decode's
+read-back block, is the wrong stage. At a VCF ratio the read is ~552 MB of a 9.1 GB decode,
+a few seconds of ~98. The write is the stage that matters, and it goes out as
+DECODE_SLICE_BYTES (32 MiB) slices. Each slice is its own resumable session, a POST to start
+it and one PUT of the whole slice, four at a time.
+
+**Method.** n1-standard-8 in us-east1-b, private bucket, the worker image, `routeb --gunzip`
+at readahead 4 and width 4, as in §13.67. The fixture was regenerated from that section's
+recipe and came out byte-identical in size (552331810 → 9110203400, 16.49:1). The slice size
+was varied through a wrapper downloader that overrides the uploader's default. Setting the
+module constant would have changed nothing, since the default is bound at class definition.
+The size in force was confirmed from the in-flight slice objects (exactly 134217728 bytes in
+a 128 MiB run). Each size ran twice, in rotated order. Peak RSS comes from the benchmark's
+own sampler.
+
+| slice | decode, every run | mean | whole run | peak RSS |
+|---|---|---|---|---|
+| **32 MiB (was)** | 90.3, 88.9 | 89.6 s | 99.7 s | 0.71-0.73 GB |
+| 64 MiB | 75.9, 75.8 | 75.9 s | 85.5 s | 0.83-0.84 GB |
+| 128 MiB | 70.2, 69.7 | 70.0 s | 79.5 s | 0.99-1.03 GB |
+| **256 MiB** | 66.8, 65.1, 66.0, 68.3 | **66.6 s** | 75.5 s | 1.32-1.56 GB |
+| 512 MiB | 64.8, 66.6 | 65.7 s | 75.6 s | 2.45-2.49 GB |
+| 1 GiB | 67.0, 65.3 | 66.2 s | 76.2 s | 3.72 GB |
+
+Every run decoded to exactly 9110203400 bytes, and a kept 256 MiB output's CRC32C
+(`TXmp3w==`) matched the fixture decoded locally.
+
+**1.35× on the decode, flat from 256 MiB.** Beyond 256 the runs fall within ±2 s of each
+other while memory climbs ~1 GB per doubling. So 256 MiB is the cap, and the remaining ~64 s
+is the inflater and the upload rate, not slice overhead.
+
+**The memory ceiling is the localize job's SLURM request, not the node.** wolF's
+`LocalizeToDisk` asks for 28200M (`nodetypes.json`'s n1-standard-8) with `--exclusive`, and
+the job's cgroup is charged for the downloader, gcsfuse and dirty page cache. Exceeding it is
+an OOM kill. 1.3-1.6 GB is ~6% of it.
+
+#### Grown, not fixed (`9da3287`)
+
+A large fixed slice starves a small output of upload parallelism. So slices start at 32 MiB
+and double after each round of `width`, to DECODE_SLICE_MAX_BYTES = 256 MiB. That needs no
+estimate of the decoded size, which is unknown until the end. The sequence depends only on the
+slice count, so two writers decoding the same object cut identical slices under identical
+names, which abandon() relies on.
+
+| | decode | CRC32C |
+|---|---|---|
+| 9.1 GB output, growth | 66.2, 66.1 s | `TXmp3w==`, identical |
+| 9.1 GB output, fixed 256 MiB | 64.6, 66.4 s | |
+| ~200 MB output, fixed 32 MiB | 2.4, 2.5 s | |
+| ~200 MB output, **growth** | **2.6, 2.6 s** (5 slices) | `0XlC9Q==`, identical |
+| ~200 MB output, fixed 256 MiB | 3.0, 3.2 s (1 session) | |
+
+Growth matches fixed 256 MiB on the large output and fixed 32 MiB on the small one, where a
+fixed 256 MiB is 25% slower.
+
+#### Starting from the compressed size (`80decb8`)
+
+The compressed size is known before the decode starts and bounds the output from below: gzip
+grows incompressible data by only a few bytes per 64 KiB. So `decode_start_slice` starts at
+the largest size in the doubling sequence with `width × size ≤ compressed size` (a 1% margin),
+never below 32 MiB or above the cap. That guarantees `width` full slices at the starting size
+whatever the ratio. It is still a function of the object alone, so the layout stays
+deterministic. The VCF fixture now starts at 128 MiB (36 slices rather than 43), and
+anything just over 1 GiB compressed starts at the cap.
+
+At a VCF ratio this rarely matters: any input big enough to skip rounds decodes to many GiB,
+where growth already cost ~1 s. It pays at low ratios, where a large input decodes to a
+modest output. On a 1.74:1 fixture (1.32 GB → 2.30 GB), with the forced start confirmed from
+the in-flight slices (exactly 33554432 bytes; the new rule's were 268435456):
+
+| | decode | whole run |
+|---|---|---|
+| forced start at 32 MiB | 27.1, 27.7 s | 50.1, 52.6 s |
+| **starts at 256 MiB** | **24.6, 24.8 s** | **47.1, 47.8 s** |
+
+**1.11× on the decode.** The VCF fixture under the new rule decoded in 66.7 s, CRC32C
+`TXmp3w==`, identical.
+
+#### Two harness mistakes, caught before they cost a result
+
+* Setting the module constant would have left every run at 32 MiB; overriding the default,
+  and confirming from the objects, avoided that.
+* `export K9_START_MIB` on the host never reached the downloader, because `docker exec`
+  inherits no host environment. The "baseline" runs would have measured the new rule against
+  itself. It was caught before the first run, and fixed with an explicit `-e` that was
+  checked inside the container.
