@@ -5838,3 +5838,45 @@ keystream, so nothing was read back beforehand. The runs were ordered new, old, 
 
 **1.93×**, with the two new runs 4% apart on either side of the control. For the 324.75 GiB
 BAM that is ~23 minutes of read-back instead of 47.
+
+### 13.79 Keep-alive for the read-back: no measurable gain at 64 MiB
+
+§13.78 blamed a fixed ~0.15 s per ranged GET, from a fit to three depth-4 points, on the new
+TLS connection each request opens, and named persistent connections as the next lever. They
+were built (`98f12c2`): one `http.client` connection per reader thread for `download_range`,
+with request()'s error classes, the single 401 refresh, one retry for a kept-alive
+connection the server has closed, and a urllib fallback when a proxy is configured.
+
+**Measured on fresh composites, same night and node (n1-standard-8, Intel Haswell,
+us-east1-b), every window cold:**
+
+| 4 × 64 MiB | keep-alive off | keep-alive on |
+|---|---|---|
+| harness windows | 125.3, 134.0, 142.5, 139.1 | 135.8, 131.4, 131.6, 136.3 |
+| real `verify_bucket_object`, 32 GiB | 138.7 (md5 ok) | 139.3 (md5 ok) |
+
+Also: 4 × 16 MiB with keep-alive read 122.6 and 129.3, and 8 × 64 MiB with keep-alive read
+164.0 and 166.7. **Keep-alive made no measurable difference at the 64 MiB block.** Either
+the 0.15 s is not connection setup, or at 64 MiB it is lost in the variance.
+
+**The whole night ran at about half of §13.78's rates, and the code was ruled out.** §13.78's
+4 × 64 MiB read 234-276 in the harness and 240-250 in the real verify. Here, yesterday's exact
+module (`76451ea`, the one that measured 245) was run in rotation with today's, on fresh
+windows: **128.3 and 125.9 MiB/s**, the slowest of the three variants. Also checked on this
+node:
+
+* Raw `curl`, 4 parallel × 1 GiB cold: **409.5 MiB/s**, so the network was not capped.
+* One stream on warm data: Python `download_range` read 161-179 MiB/s and a streamed urllib
+  read 293, against 131-204 for `curl`. Python has no per-stream deficit.
+* md5 alone: 490 MiB/s, against 511 on §13.78's node, so the CPU does not explain it either.
+
+What varied is the rate of **several cold ranged reads at once from one Python process**:
+about 130 MiB/s tonight, 240-276 on §13.78's node. That makes the environment (host,
+bucket, time) a factor of ~2 in this measurement. One consequence: §13.78's 1.93× for 64 MiB
+blocks holds, because it compared blocks within one run, but its absolute times do not
+transfer between nodes. Another: the depth result flipped. Here 8 × 64 beat 4 × 64 by 23%,
+where §13.78 had 8 × 32 losing to 4 × 32. The depth optimum is environment-dependent, and
+DEFAULT_DECODE_READAHEAD is left at 4.
+
+**Decision pending:** keep-alive is neutral at 64 MiB and adds code, a failure mode (stale
+connections) and a proxy caveat. Keep it or revert it.
