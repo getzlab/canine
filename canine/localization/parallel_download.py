@@ -310,9 +310,11 @@ PROGRESS_INTERVAL = 5
 # there. So bash is named explicitly rather than inherited.
 SHELL = "/bin/bash"
 
-# Exit codes are interpreted by canine's entrypoint: 5 means requeue-and-resume, 15
-# means skip the job, and ANY other nonzero value is treated as do-not-retry. So a
-# transient failure must never escape as an arbitrary nonzero code.
+# Exit codes are interpreted by canine's entrypoint: 5 means requeue-and-resume (uncapped,
+# so only after forward progress), 15 means skip the job, and ANY other nonzero value
+# fails the shard without a requeue. Under wolF that failure is retried a bounded number
+# of times and resumes (see fetch_or_exit). So a child's exit code is normalized before
+# it is passed on: curl itself returns 5 and 15.
 EXIT_OK = 0
 EXIT_FAIL = 1
 EXIT_REQUEUE = 5
@@ -1136,7 +1138,7 @@ class GcsManifest(Manifest):
             # correctness -- the same rule flush() follows for failing to write it. The
             # asymmetry matters because this call happens before the downloader's own
             # error handling, so raising here would escape as an "unexpected failure" and
-            # exit do-not-retry, turning a GCS blip into a permanently failed job. If the
+            # exit 1, turning a GCS blip into a failed shard with no requeue. If the
             # service is genuinely unreachable the first upload fails a moment later, with
             # progress correctly accounted for.
             log("could not read the manifest ({}); starting fresh".format(e))
@@ -1324,7 +1326,7 @@ class IntegrityError(PermanentError):
     this attempt created means another writer cleaned it up, which is the signature of
     losing a race: the right answer is to check whether that writer's object landed. The
     verify and decode handlers used to catch bare PermanentError and treat a 404 on a
-    vanished sidecar as corruption -- failing, do-not-retry, a job whose output another
+    vanished sidecar as corruption -- failing, with no requeue, a job whose output another
     writer had just produced.
     """
 
@@ -4061,7 +4063,7 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     # it expected vanish. Every such site funnels through here rather than deciding for
     # itself, because all of them used to decide wrong: a vanished part, sidecar or
     # part-under-re-read surfaced as PermanentError, and `main` turns that into
-    # EXIT_FAIL -- do not retry -- on a job whose output another writer had just
+    # EXIT_FAIL, a failure with no requeue, on a job whose output another writer had just
     # produced. Two workers on one object is designed for (LOCALIZATION.md §3), and a
     # node dying mid-upload produces the same overlap with no timeout involved.
     def lost_race(what, manifest_is_stale, after_own_compose=False, orphans=()):
@@ -5175,7 +5177,7 @@ def main(argv=None):
     except Exception:
         # Nothing may escape as a bare traceback: canine's entrypoint reads the exit
         # code, and an unhandled exception exiting 1 is indistinguishable from a
-        # deliberate do-not-retry. Log the traceback for diagnosis and return 1
+        # deliberate failure. Log the traceback for diagnosis and return 1
         # explicitly -- a code defect should surface loudly rather than requeue forever.
         import traceback
         log("unexpected failure:\n" + traceback.format_exc())

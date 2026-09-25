@@ -6076,3 +6076,29 @@ encoded objects as well.
 * Each scatter shard still gets its own bucket and its own full copy of the directory,
   because the bucket name hashes every input of the job. This is the per-shard FIXME in
   `job_setup_teardown`, and it predates this change.
+
+### 13.83 Exit 1 is not "do not retry"
+
+Sections 1 through 13.69 call exit 1 (any nonzero other than 5 or 15) "do-not-retry". That
+is only true of canine itself, and the rest of this log should be read with the correction:
+
+* **canine** does not requeue a localization failure. The entrypoint (`orchestrator.py`)
+  requeues exit 5 at once and skips on exit 15. For anything else it records the failure
+  and fails the shard. Its own `CANINE_RETRY_LIMIT` loop covers failures of the task's
+  script, not of localization.
+* **wolF** then retries the failed task: `retry`, 3 by default, `retry_delay` a minute
+  apart (`wolf/task.py`). Job avoidance reruns only the failed shards, and localization
+  resumes from what is on disk. Only standalone canine, without wolF, stops at the
+  failure.
+* The `DNR` that §1 glosses as "do-not-retry" is written to `.job_exit_code` whenever the
+  job script never ran: a localization failure, or a skip (exit 15). Nothing reads it as a
+  retry instruction.
+
+So the cost of exiting 1 where 5 was right is a failed shard that waits for wolF's retry
+and spends one of a few, not a permanently failed job. Standalone canine does pay the full
+cost. The decisions recorded here still stand. Exit 5 is uncapped, so it still needs a
+forward-progress gate, and transient drops with no progress still exit 1 (`fetch_or_exit`)
+to take the bounded retry. Only the description of exit 1's consequence was overstated.
+The code comments, test docstrings, `PARALLEL_DOWNLOAD.md` and canine's `CLAUDE.md` now
+say "fails the shard without a requeue" instead. Two tests were renamed to match:
+`test_it_does_not_fail_the_shard` and `test_permanent_http_error_exits_one`.

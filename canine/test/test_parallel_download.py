@@ -629,7 +629,7 @@ class TestEndToEnd:
     def test_hash_mismatch_deletes_dest_and_exits_one(self, tmp_path, payload):
         """
         Exit 1 rather than 5: a corrupt object is a real error, and canine's entrypoint
-        treats anything other than 5/15 as do-not-retry.
+        fails anything other than 5/15 without a requeue.
         """
         dest = str(tmp_path / "obj.bin")
         with Server(payload) as server:

@@ -49,8 +49,15 @@ individually and composed server-side, never written through the mount), and
 `stage-publish` (the fallback). Progress is recovered from file extents via
 `SEEK_HOLE`, with an 8 MiB checkpoint fallback where that is unsupported.
 
-Exit codes are load-bearing for SLURM: **5** = requeue and resume, **15** = skip this job,
-any other nonzero = do not retry. A network error must never escape as a generic nonzero.
+Exit codes are read by canine's job entrypoint (`orchestrator.py`). **5** = requeue on
+SLURM at once and resume. It is uncapped and not counted against `CANINE_PREEMPT_LIMIT`,
+so it is only returned after forward progress. **15** = skip the job; it is marked done
+without running. **Any other nonzero** = canine does not requeue, and the shard fails.
+Under wolF that is a bounded retry, not the end: the failed task is retried (`retry`, 3 by
+default, a minute apart), job avoidance reruns only the failed shards, and localization
+resumes from what is on disk. Standalone canine has no such retry. So a transient failure
+with no forward progress exits 1. A child process's exit code must be normalized before it
+is passed on, because curl itself returns 5 and 15.
 
 Tests: `test_parallel_download.py`, `test_parallel_download_bucket.py` (against a fake GCS
 in `pdl_gcs.py`), `test_parallel_download_resume.py` (SIGKILL), `test_pdl_command.py`

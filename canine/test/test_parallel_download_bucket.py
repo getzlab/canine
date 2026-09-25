@@ -1008,7 +1008,8 @@ class TestAnUnreadableManifestIsNotFatal:
 
     This asymmetry was a real bug: load() happens before the downloader's own error
     handling, so a raised TransientError escaped to main()'s catch-all and exited
-    do-not-retry, turning a transient GCS blip into a permanently failed job.
+    1, turning a transient GCS blip into a failed shard: no requeue, and one of
+    wolF's few task retries spent.
     """
 
     def test_a_transient_read_failure_starts_fresh_and_succeeds(
@@ -1027,10 +1028,10 @@ class TestAnUnreadableManifestIsNotFatal:
         assert rc == pdl.EXIT_OK, "an unreadable manifest should not fail the transfer"
         assert gcs.state.objects.get(OBJECT) == payload
 
-    def test_it_does_not_exit_do_not_retry(self, tmp_path, monkeypatch, gcs, payload):
+    def test_it_does_not_fail_the_shard(self, tmp_path, monkeypatch, gcs, payload):
         """
-        The specific regression: exit 1 is canine's do-not-retry, so this must never be
-        the way a manifest read failure surfaces.
+        The specific regression: exit 1 fails the shard without a requeue, so this must
+        never be the way a manifest read failure surfaces.
         """
         force_bucket_route(monkeypatch)
         dest = str(tmp_path / "sample.bam")
@@ -1212,17 +1213,17 @@ class TestTwoWritersOnOneObject:
         object verified in every case.
 
         What must NOT vary is the *kind* of failure. canine reads these codes: 5 means
-        requeue this shard, 15 means skip it, and **anything else nonzero is
-        do-not-retry**. A loser is not a broken job -- it lost a race to a sibling that
+        requeue this shard, 15 means skip it, and **anything else nonzero fails
+        it without a requeue**. A loser is not a broken job -- it lost a race to a sibling that
         succeeded, which is the most retryable situation there is. If this ever returns
-        EXIT_FAIL, a workflow dies where it should have requeued, and the trigger is a
+        EXIT_FAIL, a shard fails where it should have requeued, and the trigger is a
         timing window nobody will reproduce on demand.
         """
         results, _ = self._race(tmp_path, monkeypatch, gcs, payload, payload_md5)
 
         allowed = {pdl.EXIT_OK, pdl.EXIT_REQUEUE}
         assert set(results) <= allowed, (
-            "a writer returned a do-not-retry code: {} (allowed {})".format(
+            "a writer failed its shard: {} (allowed {})".format(
                 results, sorted(allowed)))
         assert pdl.EXIT_OK in results, "nobody completed the object"
 
@@ -1241,8 +1242,8 @@ class TestTwoWritersOnOneObject:
         This is what a take-over worker finds when it arrives after the winner has
         already composed and swept the parts: every upload succeeded, and then the
         parts are gone. canine reads the exit code -- 5 requeue, 15 skip, **anything
-        else nonzero do-not-retry** -- and losing a race to a sibling that succeeded is
-        the most retryable situation there is. EXIT_FAIL here kills a workflow that
+        else nonzero a failure with no requeue** -- and losing a race to a sibling that succeeded is
+        the most retryable situation there is. EXIT_FAIL here fails a shard that
         should simply have run again, on a timing window nobody can reproduce on demand.
         """
         force_bucket_route(monkeypatch)
@@ -2315,7 +2316,7 @@ class TestTheBucketRouteDecompresses:
                 tmp_path, source.url(), body)) == pdl.EXIT_FAIL
 
         assert gcs.state.object_names() == [], (
-            "a do-not-retry failure left objects behind: {}".format(
+            "a failed run left objects behind: {}".format(
                 gcs.state.object_names()))
 
     def test_the_unknown_total_path_is_actually_taken(self, tmp_path, monkeypatch, gcs,
@@ -2663,9 +2664,9 @@ class TestLosingTheComposeRace:
     and removed its sources.
 
     That raised `PermanentError` out of `run_bucket_route`, which `main` turns into
-    **EXIT_FAIL -- do not retry**. The loser therefore killed the job while the object
-    it wanted sat complete and correct in the bucket, and a retry would have returned
-    EXIT_OK in milliseconds off the marker check.
+    **EXIT_FAIL**, a failure canine does not requeue. The loser therefore failed its
+    shard while the object it wanted sat complete and correct in the bucket, and a retry
+    would have returned EXIT_OK in milliseconds off the marker check.
 
     Found as a 1-in-4 intermittent failure of TestTwoWritersOnOneObject and initially
     written off as test noise. It is not: two workers on one object is designed for
@@ -2694,8 +2695,8 @@ class TestLosingTheComposeRace:
                                      len(payload), check_md5=payload_md5,
                                      upload_block=pdl.GCS_UPLOAD_GRANULARITY))
         assert rc == pdl.EXIT_OK, (
-            "the loser of a compose race returned {}; EXIT_FAIL here is do-not-retry "
-            "on a job whose object already exists".format(rc))
+            "the loser of a compose race returned {}; EXIT_FAIL here fails a shard "
+            "whose object already exists".format(rc))
         assert "completed by another writer" in capsys.readouterr().err
         assert gcs.state.objects[OBJECT] == payload, "the loser damaged the winner's object"
 
@@ -2735,7 +2736,7 @@ class TestLosingTheComposeRace:
                                                   payload, payload_md5):
         """
         TransientError is not caught by `main` either -- it falls to the generic
-        handler, which logs a traceback and returns 1. Same do-not-retry outcome, from
+        handler, which logs a traceback and returns 1. Same failed shard, from
         a GCS hiccup.
         """
         force_bucket_route(monkeypatch)
@@ -2755,7 +2756,7 @@ class TestRaceAndCleanupExitCodes:
     """
     The audit that followed the compose race. `GcsClient.request` does not retry, and
     `main` catches PermanentError but not TransientError, so any error escaping
-    `run_bucket_route` exits 1 -- do not retry. canine requeues exit 5 with no cap, so the
+    `run_bucket_route` exits 1, a failure canine does not requeue. canine requeues exit 5 with no cap, so the
     inverse mistake is just as bad: a requeue that sees the same state every time loops
     forever. Each test here pins one site to the only correct answer.
     """
@@ -3468,7 +3469,7 @@ class TestTheSlicedDecodeUpload:
 
     def test_a_failed_slice_does_not_leave_the_others_behind(self, gcs):
         """
-        A do-not-retry failure must not strand slices: they are under a dotted prefix
+        A failed run must not strand slices: they are under a dotted prefix
         nothing else sweeps, and together they are a whole extra copy of the object.
         """
         client = pdl.GcsClient(timeout=30)

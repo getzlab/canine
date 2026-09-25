@@ -394,7 +394,7 @@ class TestTheStrideIsVerifiedNotAssumed:
 
     Getting it wrong is not a benign miss: verify() raises PermanentError on an ETag
     mismatch and discards the file, so a byte-perfect 279 GB download would be deleted
-    and the job marked do-not-retry.
+    and the shard failed rather than requeued, to be downloaded again in full on retry.
     """
 
     def fake_aws(self, tmp_path, monkeypatch, size, count, lengths):

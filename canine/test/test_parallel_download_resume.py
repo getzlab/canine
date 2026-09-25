@@ -792,8 +792,8 @@ class TestExitCodeContract:
                 + proc.stderr
             )
 
-    def test_permanent_http_error_is_do_not_retry(self, tmp_path):
-        """404 is a real error; anything other than 5/15 marks the job do-not-retry."""
+    def test_permanent_http_error_exits_one(self, tmp_path):
+        """404 is a real error: exit 1, which canine fails without a requeue."""
         dest = str(tmp_path / "obj.bin")
 
         class NotFound(Server):

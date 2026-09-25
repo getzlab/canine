@@ -1503,7 +1503,7 @@ class HandleAWSURL(FileType):
             # for do not finish in one hour. A 279 GiB BAM at the ~60 MB/s measured
             # against the GDC endpoint takes about 80 minutes, so the signature expires
             # mid-transfer; `open_range` then gets a 403, which is a PermanentError, so
-            # the download fails do-not-retry with most of the object already on disk.
+            # the shard fails with most of the object already on disk.
             # The exact case this work exists to fix.
             #
             # The cost of a longer window is a longer-lived credential in the emitted

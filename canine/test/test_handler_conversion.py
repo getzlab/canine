@@ -312,8 +312,8 @@ class TestEmittedCommandActuallyDownloads:
 
     def test_corrupt_download_is_rejected_with_exit_one(self, tmp_path):
         """
-        A wrong checksum must delete the file and fail. Exit 1 is do-not-retry as far as
-        canine's entrypoint is concerned, which is right for a corrupt object.
+        A wrong checksum must delete the file and fail. Exit 1 fails the shard without a
+        requeue, which is right for a corrupt object.
         """
         payload = os.urandom(2 * MIB)
         with Server(payload) as server:
@@ -1481,7 +1481,7 @@ class TestTheSignedUrlOutlivesTheTransfer:
     re-minted. A 279 GiB object at the ~60 MB/s measured against the GDC endpoint takes
     about 80 minutes, so the signature expired mid-transfer; HttpSource.open_range got a
     403, HttpSource.refresh_url returned False for want of a --url-refresh-cmd, and the
-    403 became a PermanentError -- exit 1, do-not-retry, with most of the object already
+    403 became a PermanentError -- exit 1, a failed shard, with most of the object already
     written. The exact workload this work exists to speed up was the one guaranteed to
     hit it.
     """

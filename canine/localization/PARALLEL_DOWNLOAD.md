@@ -207,9 +207,11 @@ The contract canine's entrypoint reads. Unchanged from the rest of canine:
 |---|---|
 | `0` | complete, and verified if a hash was available |
 | `5` | requeue and resume — a transient failure *after* bytes moved. Excluded from `CANINE_PREEMPT_LIMIT` |
-| `1` | do not retry: a hash mismatch, a permanent HTTP error, or no forward progress at all |
+| `1` | failed: a hash mismatch, a permanent HTTP error, or no forward progress at all. canine does not requeue it; under wolF the task is retried (`retry`, 3 by default) and resumes from what is on disk |
 
-The distinction between 5 and 1 is deliberate. Exit 5 is for "this will work if tried
+The distinction between 5 and 1 is deliberate. Exit 1 is not "never retried": canine
+leaves the shard failed, but wolF retries the task a bounded number of times, rerunning
+only the failed shards. Standalone canine does not retry at all. Exit 5 is for "this will work if tried
 again", and because those requeues do not count against the preemption limit, it must not
 be returned when nothing was accomplished — a server that will never answer would
 otherwise loop forever. No forward progress therefore exits 1.
