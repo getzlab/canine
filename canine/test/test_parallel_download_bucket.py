@@ -3363,8 +3363,10 @@ class TestTheSlicedDecodeUpload:
                     live["now"] -= 1
                 return {"name": session}, total
 
+        # fixed-size slices (no growth), so 20 of them are cut and the slots must bind
         uploader = pdl.DecodeSliceUploader(SlowClient(), "b", "p", width,
-                                           slice_bytes=slice_bytes)
+                                           slice_bytes=slice_bytes,
+                                           max_slice_bytes=slice_bytes)
         feeder = threading.Thread(
             target=lambda: uploader.feed(b"x" * (slice_bytes * 20)), daemon=True)
         feeder.start()
@@ -3719,3 +3721,69 @@ class TestTheReadBackUsesLargeBlocks:
         import inspect
         signature = inspect.signature(pdl.decompress_object)
         assert signature.parameters["block"].default == pdl.READ_BUFFER == 8 * MIB
+
+
+
+class TestDecodeSlicesGrow:
+    """
+    Slices start at DECODE_SLICE_BYTES and double after each round of `width`, up to
+    DECODE_SLICE_MAX_BYTES (§13.81): 32 -> 256 MiB took the VCF decode 89.6 -> 66.6 s,
+    and beyond 256 it was flat while memory climbed.
+    """
+
+    class Recorder:
+        def __init__(self):
+            self.bodies = {}
+            self.lock = threading.Lock()
+
+        def start_resumable_upload(self, bucket, name):
+            return name
+
+        def upload_range(self, session, body, offset, total):
+            with self.lock:
+                self.bodies[session] = bytes(body)
+            return {"name": session}, total
+
+    def _decode(self, total, width=4, start=1024, cap=8192, chunk=700):
+        client = self.Recorder()
+        up = pdl.DecodeSliceUploader(client, "b", "p", width, slice_bytes=start,
+                                     max_slice_bytes=cap)
+        data = os.urandom(total)
+        for i in range(0, total, chunk):            # uneven feeds, as the inflater gives
+            up.feed(data[i:i + chunk])
+        names, written = up.finish()
+        return data, names, [len(client.bodies[n]) for n in names], client
+
+    def test_sizes_double_per_round_of_width_up_to_the_cap(self):
+        _, _, sizes, _ = self._decode(100 * 1024)
+        assert sizes[:12] == [1024] * 4 + [2048] * 4 + [4096] * 4
+        assert set(sizes[12:-1]) == {8192}, "the cap did not hold"
+        assert sizes[-1] <= 8192
+
+    def test_a_cap_that_is_not_a_doubling_still_holds(self):
+        """1024 -> 2048 -> 4096 -> 5000, never 8192."""
+        _, _, sizes, _ = self._decode(100 * 1024, cap=5000)
+        assert max(sizes) == 5000
+        assert sizes[12:14] == [5000, 5000]
+
+    def test_the_slices_reassemble_to_the_input_in_order(self):
+        data, names, _, client = self._decode(100 * 1024 + 37)
+        assert b"".join(client.bodies[n] for n in names) == data
+        assert names == sorted(names), "names must sort in slice order for compose"
+
+    def test_the_layout_is_deterministic(self):
+        """Two writers decoding the same object share slice names (see abandon)."""
+        a = self._decode(50 * 1024 + 5)
+        b = self._decode(50 * 1024 + 5)
+        assert (a[1], a[2]) == (b[1], b[2])
+
+    def test_a_small_output_keeps_its_parallelism(self):
+        """Under one round of the starting size, every slice is the starting size."""
+        _, _, sizes, _ = self._decode(3 * 1024 + 100)
+        assert sizes == [1024, 1024, 1024, 100]
+
+    def test_the_defaults_are_the_measured_ones(self):
+        assert pdl.DECODE_SLICE_BYTES == 32 * MIB
+        assert pdl.DECODE_SLICE_MAX_BYTES == 256 * MIB
+        signature = inspect.signature(pdl.DecodeSliceUploader.__init__)
+        assert signature.parameters["max_slice_bytes"].default == pdl.DECODE_SLICE_MAX_BYTES

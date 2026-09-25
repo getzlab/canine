@@ -142,6 +142,24 @@ DEFAULT_DECODE_UPLOAD_WIDTH = 4
 # honest if a slice ever has to be sent in pieces.
 DECODE_SLICE_BYTES = 32 * 1024 * 1024
 
+# Slices GROW from DECODE_SLICE_BYTES to this: the size doubles after each round of `width`
+# slices (32, 64, 128 MiB, then 256 from ~896 MiB of output on). Each slice is its own
+# resumable session, so a bigger slice amortizes the session start and the request round
+# trip; measured on a 16.49:1 VCF fixture (§13.81), the decode ran 89.6 s at 32 MiB, 75.9 at
+# 64, 70.0 at 128 and 66.6 at 256 -- then flat: 65.7 at 512 and 66.2 at 1 GiB, while peak
+# RSS kept climbing (1.3-1.6 GB at 256, 2.5 at 512, 3.7 at 1 GiB).
+#
+# Grown rather than fixed, because a large fixed slice starves a small output of upload
+# parallelism: a 100 MiB output would be one session. Growing needs no estimate of the
+# decoded size, which is unknown until the end. The sequence depends only on the slice
+# count, so it is deterministic: two writers decoding the same object cut identical slices
+# under identical names (see abandon()).
+#
+# Memory is bounded by the cap, not the object: (width + queue_slices + 1) slices at most.
+# The ceiling that matters is the localize job's SLURM request (28200M on n1-standard-8,
+# wolF's LocalizeToDisk), not the node -- exceeding it is an OOM kill.
+DECODE_SLICE_MAX_BYTES = 256 * 1024 * 1024
+
 # Assembled slices allowed to wait in the upload pool's queue beyond the `width` that
 # are actively uploading. This is what decouples the inflater from the uploader: with
 # none, it blocks on every slice past the first `width` and the decode measures as
@@ -3392,11 +3410,16 @@ class DecodeSliceUploader:
     """
 
     def __init__(self, client, bucket, prefix, width, slice_bytes=DECODE_SLICE_BYTES,
-                 queue_slices=DEFAULT_DECODE_QUEUE_SLICES):
+                 queue_slices=DEFAULT_DECODE_QUEUE_SLICES,
+                 max_slice_bytes=DECODE_SLICE_MAX_BYTES):
         self.client = client
         self.bucket = bucket
         self.prefix = prefix
+        # The current slice size; grows to max_slice_bytes (see DECODE_SLICE_MAX_BYTES).
         self.slice_bytes = slice_bytes
+        self.max_slice_bytes = max(slice_bytes, max_slice_bytes)
+        self._width = width
+        self._at_this_size = 0
         self.total = 0
         # A list of decoded chunks, joined exactly once per slice. The first version
         # accumulated into a bytearray and then re-materialised the slice out of it,
@@ -3466,6 +3489,14 @@ class DecodeSliceUploader:
         self._pending += len(data)
         while self._pending >= self.slice_bytes:
             self._emit(self.slice_bytes)
+            self._grow()
+
+    def _grow(self):
+        """Double the slice size after each round of `width` slices, up to the cap."""
+        self._at_this_size += 1
+        if self._at_this_size >= self._width and self.slice_bytes < self.max_slice_bytes:
+            self.slice_bytes = min(self.slice_bytes * 2, self.max_slice_bytes)
+            self._at_this_size = 0
 
     def finish(self):
         """Flush the tail, wait for every slice, and return their names in order."""
