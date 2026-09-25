@@ -13,7 +13,7 @@ object-level read access works fine. get_requester_pays() must fall back to
 not just when its error text happens to contain "404".
 """
 import io
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -95,3 +95,37 @@ class TestDownloadGate:
         loc.backend.invoke = MagicMock(return_value=_invoke_result(0))
         loc.gs_copy("gs://bucket/file.txt", "/local/dest", "remote")
         loc.backend.invoke.assert_called_once()
+
+
+class TestDownloadGateLocalContext:
+    """
+    The same gate on gs_dircp's local-context path, which copies via
+    subprocess.check_call rather than backend.invoke. Moved from
+    test_localizer_batched.py, whose Docker module setup kept it from running.
+    """
+
+    def test_denied_by_default_raises_before_any_command(self, tmp_path):
+        loc = make_localizer()
+        loc.get_requester_pays = MagicMock(return_value=True)
+        with patch("canine.localization.base.subprocess.check_call") as check_call:
+            with pytest.raises(ValueError, match="disabled"):
+                loc.gs_dircp("gs://bucket/dir", str(tmp_path / "dest"), "local")
+        check_call.assert_not_called()
+
+    def test_allowed_adds_billing_project(self, tmp_path):
+        loc = make_localizer(allow_requester_pays=True, project="my-project")
+        loc.get_requester_pays = MagicMock(return_value=True)
+        with patch("canine.localization.base.subprocess.check_call") as check_call:
+            loc.gs_dircp("gs://bucket/dir", str(tmp_path / "dest"), "local")
+        check_call.assert_called_once()
+        assert "--billing-project" in check_call.call_args[0][0]
+
+    def test_upload_direction_not_gated(self, tmp_path):
+        """The flag only guards downloads; an upload to a requester-pays bucket proceeds."""
+        loc = make_localizer()
+        loc.get_requester_pays = MagicMock(return_value=True)
+        with patch("canine.localization.base.subprocess.check_call") as check_call, \
+             patch("canine.localization.base.subprocess.run"):
+            loc.gs_dircp(str(tmp_path), "gs://bucket/dir", "local")
+        check_call.assert_called_once()
+        assert "--billing-project" in check_call.call_args[0][0]
