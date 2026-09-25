@@ -5883,3 +5883,41 @@ own (stale connections) and a proxy caveat. `download_range` is back to urllib, 
 connection per request, and `parallel_download.py` is byte-identical to `76451ea`. If a later
 change needs small blocks again, where per-request cost weighs more, this is the section to
 revisit.
+
+### 13.80 Size-scaled chunks on the pd-standard disk: no regression
+
+§13.76-§13.78 validated the size-scaled chunks on local SSD and the bucket route. This checks
+`LocalizeToDisk`, the path most production jobs take, where the disk is expected to be the
+limit whichever rule is in use.
+
+**Method.** n1-standard-8 in us-east1-b, the worker image, commit `a7740c0`. Two fresh 368 GB
+pd-standard disks, sized as `create_persistent_disk` would size them for the 348.7 GB BAM,
+with production's `mkfs` flags and mount inside the container. **One disk per rule**, so each
+started with the same credit rather than one inheriting the other's burst. Both were
+formatted simultaneously. The source was a 128 GiB prefix of the BAM from the GDC API (above
+the disk's rate), at 16 connections. Each disk's rate before and after 96 GiB of data comes
+from `/proc/diskstats`, sampled every 30 s, with ~6.8 GiB of formatting writes subtracted.
+
+| | fixed 64 MiB | size-scaled (1 GiB) |
+|---|---|---|
+| download | 1,324.7 s, **98.80 MiB/s** | 1,327.7 s, **98.56 MiB/s** |
+| 0 → 96 GiB / 96 GiB → end | 99.5 / 96.7 MiB/s | 98.5 / 98.0 MiB/s |
+| peak disk write | 100.50 MiB/s | 100.52 MiB/s |
+| streams | 13.01 of 16 | 15.19 of 16 |
+| io | 37% read / 63% write | 21% read / 79% write |
+| wire | 1.01× | 1.01× |
+
+**0.2% apart: no regression, and as expected no gain.** Both are disk-bound at ~100 MiB/s.
+The new layout shows only in the split: more streams active, with more of their time spent
+in writes, which is what a no-longer-binding source looks like.
+
+**The disk did not slow down after 96 GiB, which contradicts §6.5i.** There, a 316 GB
+pd-standard fell from ~92 to ~46 MB/s at around 56 GiB, and PARALLEL_DOWNLOAD.md tells
+operators the disk sustains 43.9 MiB/s. These 368 GB disks held 97-98 MiB/s for all 128 GiB.
+Either pd-standard behaves differently now, or its burst outlasts 128 GiB at this size.
+**Open:** a full-size run on a fresh disk would settle it, and the guide's 43.9 MiB/s figure
+should not be relied on until one does. The conclusion above does not depend on it: both
+rules ran on identical fresh disks.
+
+The BAM prefix existed only on the two disks. The run script's exit trap wiped both and
+shredded the GDC token, and the node and disks were then deleted.
