@@ -138,8 +138,17 @@ of any bucket nobody touched for a day. Checking the label alone would mount an 
 So the check is label **and** `gcloud storage ls` of the expected objects (`base.py:1297`).
 
 `stale` needs its own branch rather than falling into the wait: nobody else is going to finish
-that upload, so waiting would deadlock until the timeout. `-n` on the copies keeps a double
-take-over harmless.
+that upload, so waiting would deadlock until the timeout.
+
+Only bucket creation is a mutex. Two jobs can take over the same `stale` or expired bucket at
+once, and in production two jobs with the same inputs did both repopulate one expired bucket.
+`-n` alone does not make that harmless: it checks for the destination before copying, so a
+sibling that writes the object in between makes the second copy fail with HTTP 412
+(`GcsPreconditionFailedError`). Each server-side and shared-mount copy is therefore rerun up
+to three times, ten seconds apart. The rerun sees the object and skips it with exit 0
+(`Skipping existing destination item (no-clobber)`). The `gcloud_exp_backoff` alias does not
+cover this, because it only retries on "Quota exceeded". Downloads onto the read-write mount
+need no retry here, since the parallel downloader handles two writers on one object itself.
 
 ### Waiting, and giving up
 
@@ -275,6 +284,10 @@ Four things worth knowing:
   content is actually there" rather than "the writes were issued".
 - **gcsfuse cannot set customTime on write.** Hence the explicit `objects update` — without it
   these objects would be invisible to the lifecycle rule and the bucket would grow forever.
+  Objects the parallel downloader composes already carry one: it stamps its own at compose
+  time, which is later than `$CANINE_BUCKET_CT`, and GCS refuses to move a customTime earlier
+  ("Custom time cannot be decreased", HTTP 400). So when the update fails, the script checks
+  each object with `objects describe` and fails only if one has no customTime at all.
 
 Inputs with `localization_mode == "stream"`, `StringLiteral`, and already-localized
 `bucketmount://`/`rodisk://` URLs are excluded from the plan entirely (`base.py:1065`).

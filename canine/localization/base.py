@@ -1444,6 +1444,27 @@ class AbstractLocalizer(abc.ABC):
 
         mount_dir = "/mnt/localize/{}".format(bucket)
 
+        def retried(copy):
+            """
+            `copy`, rerun up to three times.
+
+            Two jobs can populate one bucket at once: both find an expired or stale
+            bucket and take it over, since only creation is a mutex. `-n` then does
+            not make the second copy a no-op. It checks for the destination before
+            copying, and a sibling that writes the object in between makes it fail
+            with a 412, which failed localization in production. A rerun sees the
+            object and skips it with exit 0, so retrying settles the race. The
+            gcloud_exp_backoff alias only retries on "Quota exceeded", so it does not.
+            """
+            return [
+              '    for CANINE_COPY_TRY in 1 2 3; do',
+              '      {} && break'.format(copy.strip()),
+              '      if [ $CANINE_COPY_TRY -eq 3 ]; then echo "ERROR: copy failed 3 times" >&2; exit 1; fi',
+              '      echo "WARNING: copy failed (attempt $CANINE_COPY_TRY of 3); another job may be populating this bucket. Retrying; -n skips what is already there" >&2',
+              '      sleep 10',
+              '    done',
+            ]
+
         uploads = []
         for item in upload_plan:
             if item.kind == "server_side":
@@ -1474,14 +1495,14 @@ class AbstractLocalizer(abc.ABC):
                 # instead leave encoded objects readable until the decode lands.
                 if item.exclude:
                     pattern = "^(?:{})$".format("|".join(re.escape(n) for n in item.exclude))
-                    uploads.append(
+                    uploads += retried(
                       '    gcloud storage rsync -r -n{rp} --custom-time="$CANINE_BUCKET_CT" --exclude={pat} {src} {dst}'.format(
                         rp = item.fh.rp_string, pat = shlex.quote(pattern),
                         src = shlex.quote(item.fh.path), dst = shlex.quote(item.dest),
                       )
                     )
                     continue
-                uploads.append(plain_cp)
+                uploads += retried(plain_cp)
             elif item.kind == "copy":
                 # Already a file on the shared mount -- typically an upstream
                 # task's output. The worker uploads it from where it already
@@ -1501,7 +1522,7 @@ class AbstractLocalizer(abc.ABC):
                 # server-side rewrite of an existing GCS object, so there's no
                 # pre-existing object metadata for `cp` to inherit.
                 dest = os.path.dirname(item.dest) + "/" if os.path.isdir(item.fh.path) else item.dest
-                uploads.append(
+                uploads += retried(
                   '    gcloud storage cp -r -n --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
                     src = shlex.quote(item.fh.path),
                     dst = shlex.quote(dest),
@@ -1551,9 +1572,21 @@ class AbstractLocalizer(abc.ABC):
             # invisible to the daysSinceCustomTime lifecycle rule -- it would
             # never expire and the bucket would grow forever. The gs:// path gets
             # this from `cp --custom-time`; this path has to set it afterwards.
+            #
+            # What matters is that every object HAS a customTime, not that it is
+            # $CANINE_BUCKET_CT. The parallel downloader stamps its own, at compose
+            # time, which is later than $CANINE_BUCKET_CT, and GCS refuses to move a
+            # customTime earlier ("Custom time cannot be decreased", HTTP 400). So a
+            # failed update is only an error for an object left with no customTime at
+            # all. gcloud still updates the other objects in the batch when one fails.
+            objs = " ".join(shlex.quote(x.dest) for x in indirect)
             uploads += [
-              '    gcloud storage objects update {objs} --custom-time="$CANINE_BUCKET_CT" > /dev/null'.format(
-                objs = " ".join(shlex.quote(x.dest) for x in indirect)),
+              '    if ! gcloud storage objects update {objs} --custom-time="$CANINE_BUCKET_CT" > /dev/null 2>&1; then'.format(objs = objs),
+              '      echo "INFO: not every object took customTime $CANINE_BUCKET_CT; the downloader stamps a later one of its own. Checking that each has one" >&2',
+              '      for CANINE_OBJ in {objs}; do'.format(objs = objs),
+              '        [ -n "$(gcloud storage objects describe "$CANINE_OBJ" --format="value(custom_time)" 2>/dev/null)" ] || { echo "ERROR: $CANINE_OBJ has no customTime, so the lifecycle rule would never expire it" >&2; exit 1; }',
+              '      done',
+              '    fi',
             ]
 
         all_objects = " ".join(shlex.quote(x.dest) for x in upload_plan)
@@ -1600,8 +1633,10 @@ class AbstractLocalizer(abc.ABC):
           '      fi',
           '    elif [ "$CANINE_BUCKET_STATE" == "stale" ]; then',
           # a previous uploader timed out or died and released its claim. Take
-          # over rather than waiting: nobody else is going to finish this, and
-          # -n on the copies keeps a double take-over harmless.
+          # over rather than waiting: nobody else is going to finish this. A double
+          # take-over, here or on an expired bucket above, is harmless because the
+          # copies are -n and rerun when a sibling wins a race (see retried()), and
+          # the downloader handles two writers on one object.
           '      echo "INFO: taking over stale localization bucket {b}" >&2'.format(b = bucket),
           '      CANINE_BUCKET_UPLOAD=1',
           '    else',

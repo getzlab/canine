@@ -38,6 +38,12 @@ def gs_item(path="gs://src-bucket/reads.bam", dest="gs://wolf-1-us-central1-abc/
     return UploadItem(fh=fh, dest=dest, kind="server_side")
 
 
+def copy_command(line):
+    """A copy line without the `&& break` of the retry loop it sits in."""
+    line = line.strip()
+    return line[:-len("&& break")].rstrip() if line.endswith("&& break") else line
+
+
 def script_for(items, wait_tries=60, region="us-central1"):
     loc = make_localizer(bucket_upload_wait_tries=wait_tries)
     return "\n".join(loc.bucket_upload_script(items, "gs://wolf-1-us-central1-abc", region))
@@ -102,11 +108,11 @@ class TestCopyFlags:
         cp = [l for l in script_for([
             gs_item(path="gs://src/dir", dest="gs://b/inp/dir", is_dir=True)
         ]).splitlines() if "storage cp" in l][0]
-        assert cp.rstrip().endswith("gs://b/inp/")
+        assert copy_command(cp).endswith("gs://b/inp/")
 
     def test_file_source_targets_the_object_itself(self):
         cp = [l for l in script_for([gs_item()]).splitlines() if "storage cp" in l][0]
-        assert cp.rstrip().endswith("gs://wolf-1-us-central1-abc/inp/reads.bam")
+        assert copy_command(cp).endswith("gs://wolf-1-us-central1-abc/inp/reads.bam")
 
 class TestContentEncoding:
     """
@@ -268,7 +274,7 @@ class TestAGzipEncodedObjectInADirectory:
 
     def _rsync(self):
         [line] = [l for l in self._script().split("\n") if "gcloud storage rsync" in l]
-        return shlex.split(line)
+        return shlex.split(copy_command(line))
 
     def test_the_copy_is_an_rsync_into_the_directory_itself(self):
         """rsync copies a directory's contents, so the destination is the directory."""
@@ -761,3 +767,131 @@ class TestTheUploadWaitCeiling:
         """The constant is only worth pinning if it reaches the generated script."""
         assert "-ge 90" in script_for([gs_item()], wait_tries=90)
         assert "-ge 7" in script_for([gs_item()], wait_tries=7)
+
+
+def emitted_block(script, first, last):
+    """The lines of `script` from the first containing `first` to the next containing `last`."""
+    lines = script.split("\n")
+    start = next(i for i, l in enumerate(lines) if first in l)
+    end = next(i for i in range(start, len(lines)) if last in lines[i])
+    return "\n".join(lines[start:end + 1])
+
+
+def run_with_fake_gcloud(block, tmp_path, gcloud_body):
+    """
+    Run `block` under `set -e`, as localization.sh runs it, with `gcloud` and `sleep`
+    replaced by stubs on PATH. The fake gcloud logs each call to calls.log.
+    """
+    import os
+    import subprocess
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gcloud").write_text("#!/bin/bash\necho \"$*\" >> {}\n{}\n".format(
+        tmp_path / "calls.log", gcloud_body))
+    (bin_dir / "sleep").write_text("#!/bin/bash\n:\n")
+    for stub in ("gcloud", "sleep"):
+        os.chmod(str(bin_dir / stub), 0o755)
+    env = dict(os.environ, PATH="{}:{}".format(bin_dir, os.environ["PATH"]),
+               CANINE_BUCKET_CT="2026-09-25T22:00:00Z")
+    proc = subprocess.run(["bash", "-c", "set -e\n" + block + "\necho CANINE_BLOCK_DONE"],
+                          capture_output=True, text=True, env=env, timeout=60)
+    log = tmp_path / "calls.log"
+    calls = log.read_text().splitlines() if log.exists() else []
+    return proc, calls
+
+
+class TestTwoJobsPopulatingOneBucket:
+    """
+    Production, 2026-09-25: two jobs with the same inputs found their shared bucket
+    expired and both repopulated it. The second `cp -n` of dbsnp_138.hg19.vcf.gz failed
+    with GcsPreconditionFailedError, because its sibling wrote the object between the
+    no-clobber check and the copy, and localization failed. Reproduced against real GCS:
+    the losing copy exits 1 with HTTP 412, and a rerun skips the object with exit 0.
+    """
+
+    FIRST_COPY_LOSES = (
+        'if [ "$1 $2" = "storage cp" ] || [ "$1 $2" = "storage rsync" ]; then\n'
+        '  n=$(grep -c "^storage " {log} || true)\n'
+        '  if [ "$n" -le 1 ]; then echo "ERROR: HTTPError 412: At least one of the '
+        'pre-conditions you specified did not hold." >&2; exit 1; fi\n'
+        'fi\nexit 0')
+
+    def _copy_block(self, item):
+        return emitted_block(script_for([item]), "for CANINE_COPY_TRY", "done")
+
+    @pytest.mark.parametrize("item", [
+        gs_item(),
+        gs_item(path="gs://src/dir", dest="gs://b/inp/dir", is_dir=True),
+        UploadItem(fh=MagicMock(path="/mnt/nfs/out/ref.fa", localization_mode="local"),
+                   dest="gs://b/reference/ref.fa", kind="copy"),
+    ], ids=["object", "directory", "shared-mount copy"])
+    def test_a_lost_race_is_retried_and_succeeds(self, tmp_path, item):
+        body = self.FIRST_COPY_LOSES.replace("{log}", str(tmp_path / "calls.log"))
+        proc, calls = run_with_fake_gcloud(self._copy_block(item), tmp_path, body)
+        assert "CANINE_BLOCK_DONE" in proc.stdout, proc.stderr
+        assert len(calls) == 2, calls
+        assert "another job may be populating this bucket" in proc.stderr
+
+    def test_the_directory_rsync_is_retried_too(self, tmp_path):
+        item = UploadItem(fh=TestAGzipEncodedObjectInADirectory()._dir_fh(), dest=DIR_DEST,
+                          kind="server_side", exclude=ENCODED)
+        body = self.FIRST_COPY_LOSES.replace("{log}", str(tmp_path / "calls.log"))
+        proc, calls = run_with_fake_gcloud(self._copy_block(item), tmp_path, body)
+        assert "CANINE_BLOCK_DONE" in proc.stdout, proc.stderr
+        assert [c.split()[1] for c in calls] == ["rsync", "rsync"]
+
+    def test_a_copy_that_keeps_failing_fails_after_three_tries(self, tmp_path):
+        proc, calls = run_with_fake_gcloud(self._copy_block(gs_item()), tmp_path, "exit 1")
+        assert proc.returncode == 1
+        assert "CANINE_BLOCK_DONE" not in proc.stdout
+        assert len(calls) == 3
+        assert "copy failed 3 times" in proc.stderr
+
+    def test_a_copy_that_succeeds_runs_once(self, tmp_path):
+        proc, calls = run_with_fake_gcloud(self._copy_block(gs_item()), tmp_path, "exit 0")
+        assert "CANINE_BLOCK_DONE" in proc.stdout, proc.stderr
+        assert len(calls) == 1
+        assert "WARNING" not in proc.stderr
+
+
+class TestTheDownloadersOwnCustomTimeIsAccepted:
+    """
+    Production, 2026-09-25: every object the parallel downloader composed onto the rw
+    mount failed the post-unmount customTime patch with GcsApiError(''). The downloader
+    stamps customTime at compose time (f09504a), later than $CANINE_BUCKET_CT, and GCS
+    refuses to decrease one: "HTTPError 400: Custom time cannot be decreased", confirmed
+    against real GCS. The patch only has to ensure each object HAS a customTime.
+    """
+
+    def _block(self):
+        return emitted_block(script_for([s3_item(), s3_item(dest="gs://wolf-1-us-central1-abc/inp/b.bam")]),
+                             "if ! gcloud storage objects update", "    fi")
+
+    @staticmethod
+    def _gcloud(update_rc, described):
+        return ('if [ "$1 $2 $3" = "storage objects update" ]; then\n'
+                '  [ {rc} -eq 0 ] || echo "ERROR: HTTPError 400: Custom time cannot be decreased." >&2\n'
+                '  exit {rc}\nfi\n'
+                'if [ "$1 $2 $3" = "storage objects describe" ]; then\n'
+                '  case "$4" in {cases} esac\nfi\nexit 0').format(
+                    rc=update_rc,
+                    cases="".join('*{}) echo "{}";; '.format(k, v) for k, v in described.items()))
+
+    def test_a_later_customtime_from_the_downloader_is_accepted(self, tmp_path):
+        body = self._gcloud(1, {"reads.bam": "2026-09-25T22:17:20+0000",
+                                "b.bam": "2026-09-25T22:17:21+0000"})
+        proc, calls = run_with_fake_gcloud(self._block(), tmp_path, body)
+        assert "CANINE_BLOCK_DONE" in proc.stdout, proc.stderr
+        assert sum("objects describe" in c for c in calls) == 2
+
+    def test_an_object_with_no_customtime_still_fails(self, tmp_path):
+        """The invariant the patch exists for: nothing may be left that never expires."""
+        body = self._gcloud(1, {"reads.bam": "2026-09-25T22:17:20+0000", "b.bam": ""})
+        proc, _ = run_with_fake_gcloud(self._block(), tmp_path, body)
+        assert proc.returncode == 1
+        assert "b.bam has no customTime" in proc.stderr
+
+    def test_a_successful_update_checks_nothing(self, tmp_path):
+        proc, calls = run_with_fake_gcloud(self._block(), tmp_path, self._gcloud(0, {}))
+        assert "CANINE_BLOCK_DONE" in proc.stdout, proc.stderr
+        assert not any("objects describe" in c for c in calls)
