@@ -3787,3 +3787,69 @@ class TestDecodeSlicesGrow:
         assert pdl.DECODE_SLICE_MAX_BYTES == 256 * MIB
         signature = inspect.signature(pdl.DecodeSliceUploader.__init__)
         assert signature.parameters["max_slice_bytes"].default == pdl.DECODE_SLICE_MAX_BYTES
+
+
+
+class TestDecodeSlicesStartFromTheCompressedSize:
+    """
+    The compressed size is known before the decode starts and bounds the output from
+    below, so a decode can start at the largest slice that `width` of it already cover,
+    skipping growth rounds it cannot need.
+    """
+
+    @pytest.mark.parametrize("compressed, start_mib", [
+        (12086399, 32),              # the 200 MB small fixture: full growth
+        (128 * MIB, 32),
+        (300 * MIB, 64),
+        (552331810, 128),            # the VCF fixture
+        (1024 * MIB, 128),           # exactly width * cap is inside the 1% margin
+        (1040 * MIB, 256),
+        (50 * 1024 * MIB, 256),      # never above the cap
+    ])
+    def test_the_starting_size(self, compressed, start_mib):
+        assert pdl.decode_start_slice(compressed, 4) == start_mib * MIB
+
+    @pytest.mark.parametrize("width", [2, 4, 8])
+    def test_width_full_slices_always_fit_the_lower_bound(self, width):
+        """The guarantee that makes skipping safe: `width` slices of output exist."""
+        import random
+        rng = random.Random(5)
+        for _ in range(500):
+            compressed = rng.randrange(1, 64 * 1024 * MIB)
+            start = pdl.decode_start_slice(compressed, width)
+            assert start == pdl.DECODE_SLICE_BYTES or width * start <= compressed * 0.99
+            assert pdl.DECODE_SLICE_BYTES <= start <= pdl.DECODE_SLICE_MAX_BYTES
+
+    def test_incompressible_output_still_covers_the_bound(self):
+        """gzip grows random data only slightly, so decoded >= 0.99 * compressed holds."""
+        import gzip as gziplib
+        data = os.urandom(4 * MIB)
+        compressed = len(gziplib.compress(data, 6))
+        assert len(data) >= compressed * 0.99
+
+    def test_decompress_object_starts_from_the_compressed_size(self, gcs, monkeypatch):
+        import gzip as gziplib
+        plain = os.urandom(MIB).hex().encode() * 3            # ~6 MiB, compressible
+        body = gziplib.compress(plain, 6)
+        gcs.state.objects["c.gz"] = body
+        gcs.state.created["c.gz"] = time.time()
+        seen = []
+        real = pdl.decode_start_slice
+
+        def recording(compressed_size, width, **kwargs):
+            seen.append((compressed_size, width))
+            return 1 * MIB                                     # small, so slices are visible
+
+        monkeypatch.setattr(pdl, "decode_start_slice", recording)
+        built = []
+        real_init = pdl.DecodeSliceUploader.__init__
+
+        def init(self, *args, **kwargs):
+            real_init(self, *args, **kwargs)
+            built.append(self.slice_bytes)
+
+        monkeypatch.setattr(pdl.DecodeSliceUploader, "__init__", init)
+        pdl.decompress_object(pdl.GcsClient(), BUCKET, "c.gz", "c.txt", upload_width=4)
+        assert seen == [(len(body), 4)], "not given the compressed size"
+        assert built == [1 * MIB], "the uploader did not start at the size it was given"
+        assert gcs.state.objects["c.txt"] == plain

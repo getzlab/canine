@@ -160,6 +160,32 @@ DECODE_SLICE_BYTES = 32 * 1024 * 1024
 # wolF's LocalizeToDisk), not the node -- exceeding it is an OOM kill.
 DECODE_SLICE_MAX_BYTES = 256 * 1024 * 1024
 
+
+def decode_start_slice(compressed_size, width, start=DECODE_SLICE_BYTES,
+                       cap=DECODE_SLICE_MAX_BYTES):
+    """
+    The slice size a decode can START at, skipping growth rounds it cannot need.
+
+    The decoded size is unknown until the end, but the COMPRESSED size is known before it
+    starts and bounds it from below: gzip grows incompressible data by only a few bytes per
+    64 KiB block, so the output is never meaningfully smaller than the input. Growth exists
+    so a small output keeps `width` uploads busy; any size that `width` full slices of the
+    input already cover is safe to start at. So: the largest size in the doubling sequence
+    with width * size <= compressed_size, never below `start` or above `cap`. A compressed
+    input just over width * cap (1 GiB at the defaults, plus the margin below) starts at
+    the cap outright.
+
+    Depends only on the object's compressed size, so two writers decoding the same object
+    still cut identical slices.
+    """
+    # 1% margin on the lower bound: stored-block overhead is well under 0.01%, and a
+    # multi-member file adds only a header per member.
+    bound = int(compressed_size * 0.99)
+    size = start
+    while size * 2 <= cap and width * size * 2 <= bound:
+        size *= 2
+    return size
+
 # Assembled slices allowed to wait in the upload pool's queue beyond the `width` that
 # are actively uploading. This is what decouples the inflater from the uploader: with
 # none, it blocks on every slice past the first `width` and the decode measures as
@@ -3609,6 +3635,7 @@ def decompress_object(client, bucket, source, dest, block=READ_BUFFER,
 
     session = None
     uploader = (DecodeSliceUploader(client, bucket, dest + ".k9pdl.slice", upload_width,
+                                    slice_bytes=decode_start_slice(size, upload_width),
                                     queue_slices=queue_slices)
                 if upload_width > 1 else None)
     pending = bytearray()
