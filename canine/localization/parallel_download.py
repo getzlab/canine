@@ -2863,8 +2863,11 @@ class Downloader:
             commit = self._commit_seconds
             batches = self._commit_batches
             committed = self._commit_chunks
+        # Seconds to 3 decimals, as k9pdl-io prints read and write: its read + write is a
+        # decomposition of this streaming time, and comparing values rounded to different
+        # precisions made that check fail whenever streaming came in under 0.05 s.
         log("k9pdl-streams mean {:.2f} of {} workers "
-            "({} chunks, {:.1f}s wall, {:.1f}s streaming)".format(
+            "({} chunks, {:.3f}s wall, {:.3f}s streaming)".format(
                 streaming / wall, workers, chunks, wall, streaming))
         # Worker-seconds, not wall: with `workers` threads the available budget is
         # workers*wall, so this says what share of the pool was doing bookkeeping rather

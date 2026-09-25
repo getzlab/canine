@@ -147,7 +147,7 @@ resuming: 47/71 chunks already complete
 Concurrency and bookkeeping, at the end of the download phase:
 
 ```
-k9pdl-streams mean 14.82 of 16 workers (3283 chunks, 5748.2s wall, 85189.4s streaming)
+k9pdl-streams mean 14.82 of 16 workers (3283 chunks, 5748.214s wall, 85189.412s streaming)
 k9pdl-bookkeeping 2.1s over 3283 calls (mean 0.001s, 0.0% of 91971.2 worker-seconds)
 k9pdl-commit 94.7s over 212 batches (3283 chunks, mean batch 15.5, 1.6% of 5748.2s wall)
 ```

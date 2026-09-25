@@ -2360,6 +2360,29 @@ class TestTheBucketRouteDecompresses:
         body = gziplib.compress(plain_text)
         force_bucket_route(monkeypatch,
                            gs_url="gs://{}/{}".format(BUCKET, PLAIN_OBJECT))
+
+        # A known minimum cost inside each timed region. Against the fake the real work
+        # takes well under a millisecond, so a timer printed to 3 decimals read 0.000 on
+        # a fast run and `> 0` failed at random. With a floor injected where the timers
+        # sit, the check is deterministic, and it is stronger: it proves the timer wraps
+        # the work, since time spent outside the timer could not raise the figure.
+        cost = 0.003
+        calls = {"feed": 0, "upload": 0}
+        real_feed = pdl.GzipStreamDecoder.feed
+        real_upload = pdl.GcsClient.upload_range
+
+        def slow_feed(self, payload):
+            calls["feed"] += 1
+            time.sleep(cost)
+            return real_feed(self, payload)
+
+        def slow_upload(self, *args, **kwargs):
+            calls["upload"] += 1
+            time.sleep(cost)
+            return real_upload(self, *args, **kwargs)
+
+        monkeypatch.setattr(pdl.GzipStreamDecoder, "feed", slow_feed)
+        monkeypatch.setattr(pdl.GcsClient, "upload_range", slow_upload)
         with Server(body) as source:
             assert pdl.run(gunzip_options(tmp_path, source.url(), body)) == pdl.EXIT_OK
 
@@ -2374,8 +2397,13 @@ class TestTheBucketRouteDecompresses:
         assert int(line.group(4)) >= 1
         assert int(line.group(5)) == len(body)
         assert int(line.group(6)) == len(plain_text)
-        assert inflate > 0, "inflate cannot be free; the timer is not around the work"
-        assert write > 0, "write cannot be free; the timer is not around the work"
+        # The injected floor, less half a unit of the printed precision. If the timer
+        # did not wrap the work, the injected sleep could not appear in the figure.
+        assert calls["feed"] >= 1 and calls["upload"] >= 1
+        assert inflate >= calls["feed"] * cost - 0.0005, \
+            "inflate below its injected floor; the timer is not around the work"
+        assert write >= calls["upload"] * cost - 0.0005, \
+            "write below its injected floor; the timer is not around the work"
 
         # The ceiling is total/max, so it is bounded by the stage count and is 1.0 when
         # one stage is everything. A formula of 1/(1-share) would report infinity here
