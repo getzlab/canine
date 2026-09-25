@@ -5878,5 +5878,8 @@ transfer between nodes. Another: the depth result flipped. Here 8 × 64 beat 4 �
 where §13.78 had 8 × 32 losing to 4 × 32. The depth optimum is environment-dependent, and
 DEFAULT_DECODE_READAHEAD is left at 4.
 
-**Decision pending:** keep-alive is neutral at 64 MiB and adds code, a failure mode (stale
-connections) and a proxy caveat. Keep it or revert it.
+**Reverted.** Keep-alive was neutral at 64 MiB, and it added ~90 lines, a failure mode of its
+own (stale connections) and a proxy caveat. `download_range` is back to urllib, one
+connection per request, and `parallel_download.py` is byte-identical to `76451ea`. If a later
+change needs small blocks again, where per-request cost weighs more, this is the section to
+revisit.

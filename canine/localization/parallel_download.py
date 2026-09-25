@@ -66,7 +66,6 @@ import collections
 import binascii
 import errno
 import hashlib
-import http.client
 import json
 import os
 import random
@@ -1732,16 +1731,11 @@ class GcsClient:
     cache and non-atomic rename in one move.
     """
 
-    # Ranged reads (download_range) keep one HTTP/1.1 connection open per thread; see
-    # _get_kept_alive. False restores a new connection per request.
-    reuse_connections = True
-
     def __init__(self, timeout=DEFAULT_TIMEOUT):
         self.timeout = timeout
         self._token = None
         self._token_expiry = 0.0
         self._lock = threading.Lock()
-        self._local = threading.local()
 
     # -- auth ---------------------------------------------------------------
 
@@ -2107,85 +2101,12 @@ class GcsClient:
             GCS_API_ROOT, urllib.parse.quote(bucket, safe=""),
             urllib.parse.quote(name, safe=""),
         )
-        headers = {"Range": "bytes={}-{}".format(start, end - 1)}
-        if self.reuse_connections and not _proxy_configured():
-            _, _, body = self._get_kept_alive(url, headers, expect=(200, 206))
-        else:
-            _, _, body = self.request("GET", url, headers=headers, expect=(200, 206))
+        _, _, body = self.request(
+            "GET", url,
+            headers={"Range": "bytes={}-{}".format(start, end - 1)},
+            expect=(200, 206),
+        )
         return body
-
-    def _get_kept_alive(self, url, headers, expect):
-        """
-        GET over a connection this thread keeps open, returning (status, headers, body).
-
-        urllib sends `Connection: close`, so every ranged read paid a TLS handshake and a
-        TCP ramp-up from zero -- ~0.15 s whatever it carried (§13.78). The md5 read-back and
-        the decode's read-ahead are a few threads each issuing thousands of GETs to one
-        host, which is the case keep-alive exists for. One connection per thread, because
-        an http.client connection carries one request at a time.
-
-        Behaves as request() does -- the same errors, the same single 401 refresh -- plus
-        one case it does not have: a kept-alive connection the server has since closed
-        fails on reuse, and is retried once on a fresh connection. A failure on a fresh
-        connection is a real one, and is transient as before.
-        """
-        split = urllib.parse.urlsplit(url)
-        path = split.path + ("?" + split.query if split.query else "")
-        refreshed = retried_stale = False
-        while True:
-            token = self.token()
-            conn = self._kept_connection(split.scheme, split.netloc)
-            reused = conn.sock is not None
-            all_headers = {"Authorization": "Bearer " + token}
-            all_headers.update(headers)
-            try:
-                conn.request("GET", path, headers=all_headers)
-                response = conn.getresponse()
-                body = response.read()
-            except (http.client.HTTPException, OSError) as e:
-                self._drop_connection(split.scheme, split.netloc)
-                if reused and not retried_stale:
-                    retried_stale = True
-                    continue
-                raise TransientError("GET {} -> {}".format(_strip_query(url), e))
-            # A response that closes (Connection: close) needs nothing here: http.client
-            # closes the socket itself, and the next request reconnects.
-            status = response.status
-            if status in expect:
-                return status, dict(response.getheaders()), body
-            if status == 401 and not refreshed:
-                refreshed = True
-                self.invalidate_token(token)
-                continue
-            if status in (401, 403, 404, 410):
-                raise PermanentError("GET {} -> HTTP {}: {}".format(
-                    _strip_query(url), status, body[:200].decode("utf-8", "replace")))
-            raise TransientError("GET {} -> HTTP {}".format(_strip_query(url), status))
-
-    def _kept_connection(self, scheme, netloc):
-        pool = getattr(self._local, "connections", None)
-        if pool is None:
-            pool = self._local.connections = {}
-        conn = pool.get((scheme, netloc))
-        if conn is None:
-            cls = http.client.HTTPSConnection if scheme == "https" else http.client.HTTPConnection
-            conn = pool[(scheme, netloc)] = cls(netloc, timeout=self.timeout)
-        return conn
-
-    def _drop_connection(self, scheme, netloc):
-        pool = getattr(self._local, "connections", None) or {}
-        conn = pool.pop((scheme, netloc), None)
-        if conn is not None:
-            conn.close()
-
-
-def _proxy_configured():
-    """
-    Whether requests must go through a proxy. urllib honors these variables and
-    http.client does not, so a kept-alive connection would bypass a required proxy.
-    """
-    return any(os.environ.get(name) for name in
-               ("HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"))
 
 
 def _strip_query(url):
