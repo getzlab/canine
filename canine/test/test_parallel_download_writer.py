@@ -614,3 +614,40 @@ class TestResumeWithMissingDoneMarkers:
             # legitimately costs a re-download. Asserted rather than skipped so the
             # fallback's behaviour is pinned down too.
             assert progress.transferred == len(payload)
+
+
+class TestDurationsSurviveAClockStep:
+    """
+    Every duration the downloader logs is measured on time.monotonic(). They were on
+    time.time(), which NTP can step: a step back mid-transfer made every interval spanning
+    it about -3600 s, and the logged concurrency, io split and commit share meaningless.
+    """
+
+    def test_a_wall_clock_step_back_does_not_corrupt_the_accounting(self, tmp_path, monkeypatch):
+        real = pdl.time.time
+        calls = [0]
+
+        def stepped():
+            calls[0] += 1
+            return real() - (3600 if calls[0] > 3 else 0)   # steps back an hour, early on
+
+        monkeypatch.setattr(pdl.time, "time", stepped)
+        payload = os.urandom(8 * MIB)
+        downloader, sink, manifest, fd, dest, chunks = build(tmp_path, payload, MIB,
+                                                             connections=4)
+        try:
+            downloader.run()
+        finally:
+            os.close(fd)
+        for name in ("_stream_seconds", "_read_seconds", "_write_seconds",
+                     "_commit_seconds", "_bookkeeping_seconds"):
+            value = getattr(downloader, name)
+            assert 0 <= value < 600, "{} = {} after a clock step".format(name, value)
+
+    def test_the_only_wall_clock_read_is_the_attempt_timestamp(self):
+        """landed_during() compares against GCS's timeCreated, so that one must stay."""
+        import inspect
+        source = inspect.getsource(pdl)
+        uses = [l.strip() for l in source.splitlines() if "time.time()" in l
+                and not l.strip().startswith("#")]
+        assert uses == ["attempt_started = time.time()"], uses

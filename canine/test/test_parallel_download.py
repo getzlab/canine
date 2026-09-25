@@ -2106,7 +2106,7 @@ class TestConcurrencyIsReported:
         the source rather than trusting it.
         """
         source = inspect.getsource(pdl.Downloader.download_chunk)
-        body = source.split("stream_started = time.time()", 1)[1]
+        body = source.split("stream_started = time.monotonic()", 1)[1]
         # Exactly this indent: handlers of the read loop itself. A deeper `except`
         # belongs to the nested stream.close() in the `finally`, which is not an exit
         # path from the loop and must not be counted as one.

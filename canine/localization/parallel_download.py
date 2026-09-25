@@ -2673,7 +2673,7 @@ class Downloader:
                         self._writer_cv.wait(remaining)
                 batch = self._writer_queue
                 self._writer_queue = []
-            started = time.time()
+            started = time.monotonic()
             try:
                 self.sink.commit(batch)
             except BaseException as e:
@@ -2686,7 +2686,7 @@ class Downloader:
                     self._writer_cv.notify_all()
                 return
             finally:
-                elapsed = time.time() - started
+                elapsed = time.monotonic() - started
                 with self._writer_cv:
                     self._commit_seconds += elapsed
                     self._commit_batches += 1
@@ -2757,7 +2757,7 @@ class Downloader:
             # were really running" means. Backoff sleeps and the open itself are excluded
             # deliberately -- counting them would inflate the concurrency figure with
             # time nothing was being transferred.
-            stream_started = time.time()
+            stream_started = time.monotonic()
             # Accumulated locally and folded in once per attempt. READ_BLOCK is 1 MiB,
             # so a 279 GiB object is ~285k iterations; taking the shared lock per block
             # would put 285k acquisitions through 16 threads to measure something the
@@ -2766,16 +2766,16 @@ class Downloader:
             try:
                 while offset < end:
                     want = min(self.sink.read_block, end - offset)
-                    mark = time.time()
+                    mark = time.monotonic()
                     buf = stream.read(want)
-                    after_read = time.time()
+                    after_read = time.monotonic()
                     io[0] += after_read - mark
                     if not buf:
                         raise TransientError(
                             "short read at {} ({} bytes short)".format(offset, end - offset)
                         )
                     durable = self.sink.write(index, offset, buf)
-                    io[1] += time.time() - after_read
+                    io[1] += time.monotonic() - after_read
                     io[2] += 1
                     sent_to = offset + len(buf)
                     self.progress.add(len(buf))
@@ -2823,12 +2823,12 @@ class Downloader:
         Worker-thread completion. Validates on this thread (so a failure still reaches the
         retry loop) and hands the durable part off to the writer.
         """
-        started = time.time()
+        started = time.monotonic()
         try:
             state = self.sink.chunk_ready(index)
         finally:
             with self._stream_lock:
-                self._bookkeeping_seconds += time.time() - started
+                self._bookkeeping_seconds += time.monotonic() - started
                 self._bookkeeping_calls += 1
         if state is CHUNK_ALREADY_DONE:
             return
@@ -2920,7 +2920,7 @@ class Downloader:
         figure downward -- and a low figure is read as "the requests were not concurrent".
         """
         with self._stream_lock:
-            self._stream_seconds += time.time() - started
+            self._stream_seconds += time.monotonic() - started
             if io is not None:
                 self._read_seconds += io[0]
                 self._write_seconds += io[1]
@@ -2958,7 +2958,7 @@ class Downloader:
         if not pending:
             return
         workers = max(1, min(self.options.connections, len(pending), MAX_CONNECTIONS))
-        wall_started = time.time()
+        wall_started = time.monotonic()
         errors = []
         self._start_writer()
         try:
@@ -2977,7 +2977,7 @@ class Downloader:
             writer_error = self._stop_writer()
         if writer_error is not None:
             errors.append(writer_error)
-        self._log_concurrency(workers, len(pending), time.time() - wall_started)
+        self._log_concurrency(workers, len(pending), time.monotonic() - wall_started)
         if errors:
             for error in errors:
                 if isinstance(error, PermanentError):
@@ -3948,6 +3948,9 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     client = GcsClient(timeout=options.timeout)
     parts_prefix = "{}.k9pdl.parts".format(object_name)
     # Anchors "did another writer finish during this attempt?" -- see landed_during().
+    # Wall clock, deliberately -- the one place here that is a timestamp, not a duration:
+    # landed_during() compares it against GCS's timeCreated. Every duration uses
+    # time.monotonic(), which a clock step (NTP) cannot make negative or inflate.
     attempt_started = time.time()
 
     # With --gunzip the parts compose into a compressed sidecar, not into the destination:
