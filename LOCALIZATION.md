@@ -365,13 +365,21 @@ The mount block runs per bucket (`base.py:1885`), driven by these exports:
 
 Order matters, and each step exists because of a specific failure:
 
-1. **Create both lock files, beside the mountpoint, before any locking.** `CANINE_BUCKETMOUNT_LOCK`
-   (the long-lived busy-lock, step 6 below) and `CANINE_BUCKETMOUNT_MOUNTLOCK` (the short-lived
-   setup-race lock, step 2) are two *separate* files, each created as root (the parent dir may
-   still be root-owned from a prior bucket's first `mkdir`) and immediately `chown`'d to the
-   invoking user, so later plain (non-`sudo`) opens can succeed. Both `mkdir -p` and repeated
-   `touch`/`chown`-to-the-same-owner are safe under unsynchronized concurrent execution, so this
-   step itself needs no lock (`base.py:1919-1923`).
+Bucket mounts live for the **node's lifetime**: once a bucket is mounted on a node it stays
+mounted until the VM is deleted, and no job ever unmounts it. An unmount in one job's teardown
+raced every other shard still reading the same mount on that node, and no lock closed that race
+cheaply.
+
+1. **Create the mount-setup lock file, beside the mountpoint.** `CANINE_BUCKETMOUNT_MOUNTLOCK`,
+   created as root (the parent dir may still be root-owned from a prior bucket's first `mkdir`)
+   and immediately `chown`'d to the invoking user, so later plain (non-`sudo`) opens succeed. It
+   lives beside the mountpoint, not inside it, so it stays openable whatever state the mount is
+   in. `mkdir -p` and repeated `touch`/`chown`-to-the-same-owner are safe under unsynchronized
+   concurrent execution, so this step needs no lock.
+
+   **Fast path:** if the bucket is already mounted and live -- `mountpoint -q` passes and `stat`
+   answers within 10 s, the `timeout` guarding against a hung FUSE daemon -- steps 2-5 are skipped
+   entirely, lock included. That is now the common case for every shard after a node's first.
 
 2. **Acquire the mount-setup lock** (`flock -x -w 300 200 ... ) 200>$CANINE_BUCKETMOUNT_MOUNTLOCK`,
    wrapping steps 3-5 below). Shards of the same scatter job routinely start on the same node in
@@ -379,12 +387,8 @@ Order matters, and each step exists because of a specific failure:
    to run `gcsfuse` on the identical path concurrently. Confirmed live: every racing shard failed,
    with `fusermount3` reporting *"the user doesn't have write-access on the mount point: read-only
    file system"* — a symptom of the race, not of the mountpoint's real permissions or a stale
-   mount. This must be a **separate** file from `CANINE_BUCKETMOUNT_LOCK`: that one is held shared
-   for a whole job's lifetime by every shard already using the mount (step 7), so an exclusive lock
-   on it would block a newly-arriving shard behind every already-running shard on the node for as
-   long as *their* jobs take, not just this brief setup race. No shard holds
-   `CANINE_BUCKETMOUNT_MOUNTLOCK` past this subshell, so contention is only ever with other shards
-   currently in this same race (`base.py:1949-1950,2006`).
+   mount. No shard holds the lock past this subshell, so contention is only ever with other shards
+   currently in this same race.
 
    `-w` is a defensive bound against a holder that's genuinely hung, not a way to cap normal
    contention — the lock is scoped to the holder's own subshell fd, so it's released automatically
@@ -395,10 +399,10 @@ Order matters, and each step exists because of a specific failure:
    under a second moments earlier. `flock` gives no fairness guarantee among waiters, so real wait
    times under ordinary contention can run well past what any single mount's own duration suggests.
 
-3. **Clear a stale FUSE endpoint.** A job that finished on this node moments ago may have
-   unmounted this same path. Every subsequent operation on it — `stat`, `mkdir`, even `flock` —
-   then fails with `ENOTCONN`/`EACCES` rather than `ENOENT`, so it has to be cleared before the
-   path is touched at all (`base.py:1974`).
+3. **Clear a stale FUSE endpoint.** A mount whose gcsfuse daemon has died -- no longer another
+   job's unmount, since none happens, but a crashed daemon still leaves one -- makes every
+   subsequent operation on the path (`stat`, `mkdir`, even `flock`) fail with `ENOTCONN`/`EACCES`
+   rather than `ENOENT`, so it has to be cleared before the path is touched at all.
 
 4. **`mkdir` + `chown` to the invoking user.** The mountpoint must be writable by whoever runs
    gcsfuse; `fusermount3` refuses otherwise. Deliberately *not* fixed with `sudo gcsfuse`:
@@ -411,6 +415,18 @@ Order matters, and each step exists because of a specific failure:
    ```bash
    timeout -k 60 60 gcsfuse -o ro --implicit-dirs <bucket> /mnt/bucketmounts/<bucket>
    ```
+
+   Two things keep that mount alive past the job that made it:
+
+   - **`200>&-`**: gcsfuse must not inherit the mount-setup lock's fd. The daemon lives for the
+     node's lifetime, so an inherited fd would hold the lock forever and every later shard
+     would time out in step 2.
+   - **The daemon is moved out of the job's cgroup**, into the root cgroup of each controller
+     Slurm tracks (`freezer`, `cpuset`, `memory`, `devices`, and the v2 root). Slurm's
+     `proctrack/cgroup` kills every process in a job's cgroup when the job ends. Left there, the
+     daemon died with its first job and every other shard on the node was left reading a dead
+     mount ("Transport endpoint is not connected"). Confirmed live both ways. A side effect:
+     gcsfuse's memory is no longer charged against the job's `--mem` request.
 
    The **whole bucket** is mounted; each input's object path lives in its symlink, so one gcsfuse
    process serves every input from that bucket. Unlike a RODISK there's no cross-node attach race
@@ -428,18 +444,12 @@ Order matters, and each step exists because of a specific failure:
    this node already had the bucket mounted from *before* they were and its metadata cache is
    stale.
 
-7. **Take the busy-lock.** `flock -os <lock> sleep infinity &`, pid recorded. This is not a
-   cross-node attach race — it stops a concurrent job on the *same node* from having the mount
-   pulled out from under it by another job's teardown. The lock file lives **beside** the
-   mountpoint, not inside it: locking the mountpoint directory itself (as this once did) puts the
-   lock inside the thing it protects, so after any unmount `flock` cannot even open the path and
-   the teardown guard silently stops guarding (`base.py:2015`).
+7. **Register the mount lease** (§7).
 
-8. **Register the mount lease** (§7).
+8. **Start the heartbeat** (§7).
 
-9. **Start the heartbeat** (§7).
-
-Steps 6–9 sit **outside** the "mount if not already mounted" conditional. A job landing on a node
+Steps 6–8 sit **outside** the "mount if not already mounted" conditional, and outside the
+fast path. A job landing on a node
 where the bucket is already mounted does no mounting itself, but is every bit as much a consumer.
 
 ---
@@ -531,13 +541,14 @@ reclamation forever.
 
 ## 8. Teardown and deletion
 
-Teardown order (`base.py:2073`–`2097`), and it is an order, not a list:
+Teardown undoes only this job's own bookkeeping, in order:
 
 1. `bucketmount_heartbeat_stop()` — stop refreshing customTime first.
-2. Kill the busy-lock pids.
-3. Per bucket: if `flock -n` succeeds (nobody else on this node holds it) **and** it is still a
-   mountpoint, `fusermount -u`. Otherwise log "busy, likely in use by another job" and leave it.
-4. `bucketmount_lease_release()` — drop this job's `_MOUNTS/` objects.
+2. `bucketmount_lease_release()` — drop this job's `_MOUNTS/` objects.
+
+**No consumer bucket mount is unmounted.** They are node-lifetime (§6) and go away with the VM.
+(The read-write *upload* mount is a different thing: the upload script unmounts it before the
+task runs, because the unmount is what finalizes its objects, §4.)
 
 **Nothing deletes the bucket.** Objects age out under the lifecycle rule; the empty bucket
 survives. That is the intended steady state — the next task needing that content finds
@@ -567,11 +578,10 @@ Normally you don't need this task at all.
 
 | Path | What |
 |---|---|
-| `/mnt/bucketmounts/<bucket>` | consumer mount, read-only |
-| `/mnt/bucketmounts/.<bucket>.lock` | busy-lock, deliberately outside the mount |
+| `/mnt/bucketmounts/<bucket>` | consumer mount, read-only, lives for the node's lifetime |
+| `/mnt/bucketmounts/.<bucket>.mountlock` | mount-setup lock, deliberately outside the mount |
 | `/mnt/localize/<bucket>` | read-write upload mount, unmounted before the task runs |
 | `${CANINE_JOB_INPUTS}/.bucketmount_leases` | lease URLs this job took |
-| `${CANINE_JOB_INPUTS}/.bucketmount_lock_pids` | busy-lock pids |
 | `${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids` | heartbeat pids |
 
 **In the bucket**
