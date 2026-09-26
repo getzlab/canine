@@ -1,0 +1,50 @@
+{
+  "routeb": {
+    "token_source": "metadata server",
+    "outcome": {
+      "phases": {
+        "download": 8.4
+      },
+      "decompressed_from": null,
+      "decompressed_to": null,
+      "fell_back": "server returned HTTP 200 to a ranged request",
+      "bookkeeping_seconds": null,
+      "bookkeeping_calls": null,
+      "bookkeeping_mean": null,
+      "bookkeeping_pct_workers": null,
+      "read_seconds": null,
+      "write_seconds": null,
+      "loop_other_seconds": null,
+      "io_blocks": null,
+      "read_pct_of_loop": null,
+      "overlap_ceiling": null,
+      "commit_seconds": null,
+      "commit_batches": null,
+      "commit_chunks": null,
+      "commit_mean_batch": null,
+      "commit_pct_wall": null,
+      "mean_streams": null,
+      "workers": null,
+      "connections": 16,
+      "returncode": 0,
+      "seconds": 8.76,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 33124352,
+      "nic_bytes": 331722661,
+      "disk_bytes": 1224704,
+      "peak_nic_bytes_per_s": 44197219.54865285,
+      "peak_disk_bytes_per_s": 594642.8132184194,
+      "stderr_tail": [
+        "[k9pdl] falling back to a single stream: server returned HTTP 200 to a ranged request",
+        "[k9pdl] k9pdl-phase download 8.4s, 20.3 MB/s"
+      ]
+    },
+    "gunzip": {
+      "ran": false,
+      "compressed_bytes": null,
+      "decompressed_bytes": null,
+      "seconds": null
+    }
+  }
+}

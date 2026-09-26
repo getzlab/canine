@@ -1,0 +1,48 @@
+{
+  "sweep": [
+    {
+      "phases": {
+        "relay": 671.3,
+        "compose": 16.1
+      },
+      "fell_back": null,
+      "bookkeeping_seconds": 38.4,
+      "bookkeeping_calls": 1536,
+      "bookkeeping_mean": 0.025,
+      "bookkeeping_pct_workers": 0.4,
+      "read_seconds": 7767.856,
+      "write_seconds": 2505.829,
+      "loop_other_seconds": 0.203,
+      "io_blocks": 12288,
+      "read_pct_of_loop": 76,
+      "overlap_ceiling": 1.32,
+      "commit_seconds": 106.5,
+      "commit_batches": 1505,
+      "commit_chunks": 1536,
+      "commit_mean_batch": 1.0,
+      "commit_pct_wall": 15.9,
+      "mean_streams": 15.3,
+      "workers": 16,
+      "connections": 16,
+      "returncode": 0,
+      "seconds": 783.8,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 416555008,
+      "nic_bytes": 104328708266,
+      "disk_bytes": 1003520,
+      "peak_nic_bytes_per_s": 227420308.0140963,
+      "peak_disk_bytes_per_s": 245390.47850527475,
+      "stderr_tail": [
+        "[k9pdl] k9pdl-phase relay 671.3s, 153.5 MB/s",
+        "[k9pdl] k9pdl-phase compose 16.1s",
+        "[k9pdl] complete: 103079215104 bytes composed from 1536 parts"
+      ],
+      "verified": null,
+      "reread_seconds": 0.0,
+      "ok": true,
+      "throughput_bytes_per_s": 131512139.70910947,
+      "speedup_vs_single_stream": null
+    }
+  ]
+}
