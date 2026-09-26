@@ -6151,3 +6151,214 @@ part before composing. A second check of the same leg would add nothing.
 For non-gs:// sources (http, S3, GDC, DRS) nothing changes. They publish an md5 or an ETag,
 not a crc32c, and an md5 cannot be combined from out-of-order chunks. So their bucket-route
 verification is still the read-back.
+
+### 13.85 §13.84 on a node: the worker image, and the production object
+
+Run 2026-09-25, 20:39–20:46 EDT, on canine `b300fde`. The questions were whether the worker
+image's `python3` can import `google_crc32c`, since the downloader now fails at import
+without it, and whether the production object from §13.84 now verifies.
+
+**Setup.**
+
+* An n1-standard-8 in us-central1-a, from the `slurm-gcp-docker-v3` image family with a
+  pd-standard boot disk. It was not preemptible.
+* The container was `gcr.io/broad-getzlab-workflows/slurm_gcp_docker:v0.18.3`, the tag
+  canine's `fuse-localize` pin builds. It was started by hand, with the runbook's
+  `docker run` flags minus the credential mounts.
+* Your credentials were not copied to the node. The two production objects were copied
+  server-side into a private scratch bucket (public access prevention, uniform access), and
+  the node's service account got `storage.objectAdmin` on that bucket only. The downloader
+  authenticated through the node's own identity (`k9pdl-auth using gcloud account`). What
+  was tested does not depend on which identity reads the object.
+* The copies kept their shape:
+  * `ucsc.hg19.fasta`: 921645029 bytes, crc32c `G6w3Qw==`, gzip-encoded, no md5. The source
+    has 19 components and the copy 1, but both are composite.
+  * `ucsc.hg19.dict`: 2966 bytes, crc32c `LhEETA==`, md5 present, gzip-encoded.
+* The commands were the ones canine emits: `HandleGSURL.downloader_command` at `b300fde`,
+  wrapped in `set -e` as `localization.sh` is. They ran in the container with
+  `CANINE_ROOT=/tmp/pdl` holding the downloader, onto a read-write gcsfuse mount at
+  `/mnt/localize/<bucket>`. There was no SLURM controller.
+
+**Results.**
+
+| Check | Result |
+|---|---|
+| Image interpreter | `/usr/bin/python3` 3.14.6 imports `google_crc32c` from `/usr/local/lib/python3.14/dist-packages`, `implementation: c`. The known answer (`123456789` → `4waSgw==`) is correct. gcsfuse is 3.11.2 |
+| Emitted flags | the fasta gets `--check-crc32c G6w3Qw==` and no `--check-md5`; the dict gets both |
+| Downloader used | both runs logged `route bucket-compose`, so neither was the `gcloud storage cp` fallback |
+| `ucsc.hg19.fasta` | rc 0 in 39 s: relay 8.6 s at 106.9 MB/s, compose 0.2 s, `crc32c G6w3Qw== verified from the composed object's metadata`, gunzip 26.3 s, 921645029 → 3199905909 bytes, `complete: ... (verified)` |
+| `ucsc.hg19.dict` | rc 0 in 4 s: `crc32c LhEETA== verified from the composed object's metadata`, with no `k9pdl-phase verify` line |
+| Output content | md5 of each decoded object equals that of `gcloud storage cp` decoding the same source: fasta `a244d8a32473650b25c6e8e1654387d6`, dict `32caae303b1799ffe4794b12a29be71b`. Neither output carries a `Content-Encoding` |
+| Wrong crc32c | the dict's command with `AAAAAA==`: rc 1, `crc32c mismatch after compose: expected AAAAAA==, got LhEETA==`, and no output object or part left |
+
+Against production, 2026-09-25 (the second log in §13.86):
+
+* **The fasta** timed the same: relay 8.6 s, gunzip 27.6 s there against 26.3 s here. It
+  finished `complete: 921645029 bytes composed from 14 parts` with no `(verified)`. It is now
+  verified, at no measurable cost.
+* **The dict** ran a `k9pdl-phase verify` read-back in production. Here it has none.
+
+**Not covered.** No SLURM job ran, and the node authenticated as its own service account
+rather than with production's copied user credentials. Everything was torn down at 20:46
+EDT: the VM, its disk, and the scratch bucket together with its IAM binding.
+
+
+### 13.86 The production logs, 2026-09-25
+
+Two localization jobs failed on 2026-09-25, reported with the logs below, reproduced
+verbatim. Both jobs had the same inputs, so they shared one localization bucket
+(`wolf-406002258908-us-central1-e2fa74eed4ff5cf905754`). Both found it expired and
+repopulated it at the same time (`LOCALIZATION.md`, "Only bucket creation is a mutex").
+
+**The first log.** The second `gcloud storage cp -n` of `dbsnp_138.hg19.vcf.gz` failed with
+`GcsPreconditionFailedError`. Its sibling (the second log) wrote the object between the
+no-clobber check and the copy, so the precondition returned HTTP 412, and localization
+failed. Fixed in canine `8de7076`: every server-side and shared-mount copy is rerun up to
+three times, and a rerun skips the existing object with exit 0. The same race was reproduced
+against real GCS before the fix and resolved after it.
+
+```
+---- STARTING JOB SETUP ... COMPLETE ----
+~~~~ STARTING JOB LOCALIZATION ~~~~
+INFO: localization bucket wolf-406002258908-us-central1-e2fa74eed4ff5cf905754 expired; repopulating
+  
+Updating gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/...
+
+Copying gs://getzlab-workflows-reference_files-oa/hg19/UCSC/dbsnp_138.hg19.vcf.gz to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/DB_SNP_VCF/dbsnp_138.hg19.vcf.gz
+  
+ERROR: Task 'gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/DB_SNP_VCF/dbsnp_138.hg19.vcf.gz' failed: GcsPreconditionFailedError('')
+...........................................................................................................................................
+
+Average throughput: 56.5MiB/s
+!~~~ LOCALIZATION FAILURE! JOB CANNOT RUN! ~~~!
+++++ STARTING JOB DELOCALIZATION ++++
+INFO: matched output name "stdout" (pattern "/mnt/nfs/wolf-test-slw/HG002_HG003Run01/Localize_ref_files_char__2026-09-17--22-50-33_mg4xwxy_tbhx1ki_lrnqk1qo4quv0/jobs/0/stdout")
+INFO: matched output name "stderr" (pattern "/mnt/nfs/wolf-test-slw/HG002_HG003Run01/Localize_ref_files_char__2026-09-17--22-50-33_mg4xwxy_tbhx1ki_lrnqk1qo4quv0/jobs/0/stderr")
+++++ DELOCALIZATION COMPLETE ++++
+```
+
+**The second log.** The copies succeeded, and the downloader decoded the four gzip-encoded
+references onto the read-write mount. It then failed on the post-unmount customTime update,
+with `GcsApiError('')` for each of the four objects. Since f09504a the downloader stamps its
+own customTime at compose time, later than `$CANINE_BUCKET_CT`, and GCS refuses to decrease
+one ("Custom time cannot be decreased", HTTP 400). Also fixed in `8de7076`: a failed update
+checks each object and fails only if one has no customTime at all.
+
+The same log shows the two things §13.84 and §13.85 then addressed. `ucsc.hg19.fasta`
+finished `complete: 921645029 bytes composed from 14 parts` with no `(verified)`, because it
+is a composite with no md5. The small references (`ucsc.hg19.dict`, `.fai`, the masked
+intervals) each ran a `k9pdl-phase verify` read-back. With the two `could not update the
+manifest ... HTTP 429` lines, GCS limited writes to the manifest object; each costs at most
+some re-uploaded parts, and nothing was changed for it. The warning §13.84 starts from came
+from the first job (`HG002_HG003Run01`), outside either log, and applies to both:
+
+```
+2026-09-25 22:17:20 | WARNING | [HG002_HG003Run01:Localize_ref_files_char] - check_hash was requested for gs://getzlab-workflows-reference_files-oa/hg19/UCSC/ucsc.hg19.fasta, but it is a composite object with no md5, so the decode cannot be verified
+```
+
+```
+---- STARTING JOB SETUP ... COMPLETE ----
+~~~~ STARTING JOB LOCALIZATION ~~~~
+INFO: localization bucket wolf-406002258908-us-central1-e2fa74eed4ff5cf905754 expired; repopulating
+  
+Updating gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/...
+
+Copying gs://getzlab-workflows-reference_files-oa/hg19/UCSC/dbsnp_138.hg19.vcf.gz to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/DB_SNP_VCF/dbsnp_138.hg19.vcf.gz
+  
+...............................................................................................................................
+
+Average throughput: 59.7MiB/s
+Copying gs://getzlab-workflows-reference_files-oa/hg19/UCSC/dbsnp_138.hg19.vcf.gz.tbi to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/DB_SNP_VCF_IDX/dbsnp_138.hg19.vcf.gz.tbi
+  
+..
+Copying gs://getzlab-workflows-reference_files-oa/hg19/UCSC/hg19_cosmic_v54_120711.vcf.gz to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/cosmicVCF/hg19_cosmic_v54_120711.vcf.gz
+  
+.
+Copying gs://getzlab-workflows-reference_files-oa/hg19/UCSC/hg19_cosmic_v54_120711.vcf.gz.tbi to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/cosmicVCF_IDX/hg19_cosmic_v54_120711.vcf.gz.tbi
+  
+.
+Copying gs://getzlab-workflows-reference_files-oa/hg38/twist/broad_custom_exome_v1.Homo_sapiens_assembly38.targets.interval_list to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/targetIntervals/broad_custom_exome_v1.Homo_sapiens_assembly38.targets.interval_list
+  
+...
+{"timestamp":{"seconds":1790373392,"nanos":396216282},"severity":"INFO","message":"Start gcsfuse/3.11.2 (Go version go1.26.5) for app \"\" using mount point: /mnt/localize/wolf-406002258908-us-central1-e2fa74eed4ff5cf905754\n","mount-id":"wolf-406002258908-us-central1-e2fa74eed4ff5cf905754-1b82c1b2"}
+{"timestamp":{"seconds":1790373392,"nanos":396264457},"severity":"INFO","message":"GCSFuse Config","mount-id":"wolf-406002258908-us-central1-e2fa74eed4ff5cf905754-1b82c1b2","CLI Flags":{"implicit-dirs":"true"}}
+{"timestamp":{"seconds":1790373392,"nanos":396289010},"severity":"INFO","message":"GCSFuse Config","mount-id":"wolf-406002258908-us-central1-e2fa74eed4ff5cf905754-1b82c1b2","Full Config":{"AppName":"","CacheDir":"","CloudProfiler":{"AllocatedHeap":true,"Cpu":true,"Enabled":false,"Goroutines":false,"Heap":true,"Label":"gcsfuse-0.0.0","Mutex":false,"ServiceName":"gcsfuse"},"Debug":{"ExitOnInvariantViolation":false,"Fuse":false,"Gcs":false,"LogMutex":false},"DisableAutoconfig":false,"DummyIo":{"Enable":false,"PerMbLatency":0,"ReaderLatency":0},"EnableAtomicRenameObject":true,"EnableGoogleLibAuth":true,"EnableHns":true,"EnableNewReader":true,"EnableStandardSymlinks":true,"EnableTypeCacheDeprecation":true,"EnableUnsupportedPathSupport":true,"FileCache":{"CacheFileForRangeRead":false,"DownloadChunkSizeMb":200,"EnableCrc":false,"EnableExperimentalSharedChunkCache":false,"EnableODirect":false,"EnableParallelDownloads":false,"ExcludeRegex":"","ExperimentalDisableSizeCalculationFix":false,"ExperimentalEnableChunkCache":false,"ExperimentalParallelDownloadsDefaultOn":true,"IncludeRegex":"","MaxParallelDownloads":16,"MaxSizeMb":-1,"ParallelDownloadsPerFile":16,"SharedCacheChunkSizeMb":8,"WriteBufferSize":4194304},"FileSystem":{"CongestionThreshold":0,"DirMode":"755","DisableParallelDirops":false,"EnableKernelReader":false,"ExperimentalEnableDentryCache":false,"ExperimentalEnablePirlo":false,"ExperimentalEnableReaddirplus":false,"ExperimentalODirect":false,"FileMode":"644","FuseMaxRequestSizeKb":1024,"FuseOptions":[],"Gid":-1,"IgnoreInterrupts":true,"InactiveMrdCacheSize":1000,"KernelListCacheTtlSecs":0,"KernelParamsFile":"","MaxBackground":0,"MaxReadAheadKb":0,"RenameDirLimit":0,"TempDir":"","Uid":-1},"Foreground":false,"GcsAuth":{"AnonymousAccess":false,"KeyFile":"","ReuseTokenFromUrl":true,"TokenUrl":""},"GcsConnection":{"BillingProject":"","ClientProtocol":"http1","CustomEndpoint":"","EnableHttpDnsCache":true,"ExperimentalEnableJsonRead":false,"ExperimentalLocalSocketAddress":"","GrpcConnPoolSize":1,"GrpcPathStrategy":"direct-path-with-fallback","HttpClientTimeout":0,"LimitBytesPerSec":-1,"LimitOpsPerSec":-1,"MaxConnsPerHost":0,"MaxIdleConnsPerHost":100,"SequentialReadSizeMb":200},"GcsRetries":{"ChunkRetryDeadlineSecs":120,"ChunkTransferTimeoutSecs":10,"EnableMountRetries":false,"ExperimentalNonrapidFolderApiStallRetry":false,"MaxRetryAttempts":9223372036854775807,"MaxRetrySleep":30000000000,"Multiplier":2,"ReadStall":{"Enable":true,"InitialReqTimeout":20000000000,"MaxReqTimeout":1200000000000,"MinReqTimeout":1500000000,"ReqIncreaseRate":15,"ReqTargetPercentile":0.99}},"ImplicitDirs":true,"List":{"EnableEmptyManagedFolders":false},"Logging":{"FilePath":"","Format":"json","LogRotate":{"BackupFileCount":10,"Compress":true,"MaxFileSizeMb":512},"Severity":"INFO","WireLog":""},"MachineType":"n1-standard-8","MetadataCache":{"DeprecatedStatCacheCapacity":20460,"DeprecatedStatCacheTtl":60000000000,"DeprecatedTypeCacheTtl":60000000000,"EnableMetadataPrefetch":true,"EnableNonexistentTypeCache":false,"ExperimentalEnableOptimizedMetadataCache":false,"ExperimentalMetadataPrefetchOnMount":"disabled","MetadataPrefetchEntriesLimit":5000,"MetadataPrefetchMaxWorkers":10,"NegativeTtlSecs":5,"StatCacheMaxSizeMb":34,"TtlSecs":60,"TypeCacheMaxSizeMb":4},"Metrics":{"BufferSize":256,"CloudMetricsExportIntervalSecs":0,"ExperimentalEnableGrpcMetrics":true,"PrometheusPort":0,"StackdriverExportInterval":0,"UseNewNames":false,"Workers":3},"Mrd":{"PoolSize":4},"OnlyDir":"","Profile":"","Read":{"BlockSizeMb":16,"EnableBufferedRead":false,"GlobalMaxBlocks":40,"InactiveStreamTimeout":10000000000,"MaxBlocksPerHandle":20,"MinBlocksPerHandle":4,"RandomSeekThreshold":3,"StartBlocksPerHandle":1},"Trace":{"Exporters":["gcpexporter"],"ProjectId":"","SamplingRatio":0},"WorkloadInsight":{"ForwardMergeThresholdMb":0,"OutputFile":"","Visualize":false},"Write":{"BlockSizeMb":32,"CreateEmptyFile":false,"EnableRapidAppends":true,"EnableRapidWrites":false,"EnableStreamingWrites":true,"FinalizeFileForRapid":false,"GlobalMaxBlocks":4,"MaxBlocksPerFile":1}}}
+{"timestamp":{"seconds":1790373392,"nanos":899982829},"severity":"INFO","message":"File system has been successfully mounted.","mount-id":"wolf-406002258908-us-central1-e2fa74eed4ff5cf905754-1b82c1b2"}
+[k9pdl] k9pdl-auth using ADC (/user_gcloud_config/application_default_credentials.json)
+[k9pdl] route bucket-compose: fuse.gcsfuse on /mnt/localize/wolf-406002258908-us-central1-e2fa74eed4ff5cf905754 resolves to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/mutectMaskedIntervals/ucsc_hg19_wgs_masked_intervals.bed
+[k9pdl] k9pdl-auth using ADC (/user_gcloud_config/application_default_credentials.json)
+[k9pdl] 100.0% (4584/4584 bytes, 4584 transferred)
+[k9pdl] k9pdl-streams mean 0.23 of 1 workers (1 chunks, 0.436s wall, 0.102s streaming)
+[k9pdl] k9pdl-bookkeeping 0.0s over 1 calls (mean 0.000s, 0.0% of 0.4361358310000014 worker-seconds)
+[k9pdl] k9pdl-io read 0.000s write 0.101s other 0.000s over 1 blocks (read 0% of loop, overlap ceiling 1.00x)
+[k9pdl] k9pdl-commit 0.1s over 1 batches (1 chunks, mean batch 1.0, 23.3% of 0.4s wall)
+[k9pdl] k9pdl-phase relay 0.4s, 0.0 MB/s
+[k9pdl] k9pdl-phase compose 0.1s
+[k9pdl] k9pdl-phase verify 0.1s, 0.1 MB/s
+[k9pdl] k9pdl-gunzip read 0.048s inflate 0.000s write 0.358s over 1 blocks (readahead 4, width 4, slices 1, 4584 -> 12554 bytes, ceiling 1.14x, pipe2 1.14x)
+[k9pdl] k9pdl-phase gunzip 0.4s, 0.0 MB/s
+[k9pdl] decompressed 4584 bytes into 12554 bytes
+[k9pdl] complete: 4584 bytes composed from 1 parts (verified)
+[k9pdl] k9pdl-auth using ADC (/user_gcloud_config/application_default_credentials.json)
+[k9pdl] route bucket-compose: fuse.gcsfuse on /mnt/localize/wolf-406002258908-us-central1-e2fa74eed4ff5cf905754 resolves to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/refFasta/ucsc.hg19.fasta
+[k9pdl] k9pdl-auth using ADC (/user_gcloud_config/application_default_credentials.json)
+[k9pdl] could not update the manifest (POST https://storage.googleapis.com/upload/storage/v1/b/wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/o -> HTTP 429); parts may be re-uploaded
+[k9pdl] could not update the manifest (POST https://storage.googleapis.com/upload/storage/v1/b/wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/o -> HTTP 429); parts may be re-uploaded
+[k9pdl] 0.9% (8388608/921645029 bytes, 8388608 transferred)
+[k9pdl] 77.4% (713031680/921645029 bytes, 713031680 transferred)
+[k9pdl] k9pdl-streams mean 11.33 of 14 workers (14 chunks, 8.616s wall, 97.630s streaming)
+[k9pdl] k9pdl-bookkeeping 0.1s over 14 calls (mean 0.004s, 0.0% of 120.61980664999996 worker-seconds)
+[k9pdl] k9pdl-io read 69.388s write 28.241s other 0.001s over 110 blocks (read 71% of loop, overlap ceiling 1.41x)
+[k9pdl] k9pdl-commit 0.1s over 1 batches (14 chunks, mean batch 14.0, 1.0% of 8.6s wall)
+[k9pdl] k9pdl-phase relay 8.6s, 107.0 MB/s
+[k9pdl] k9pdl-phase compose 0.3s
+[k9pdl] k9pdl-gunzip read 0.247s inflate 18.750s write 8.376s over 110 blocks (readahead 4, width 4, slices 14, 921645029 -> 3199905909 bytes, ceiling 1.46x, pipe2 1.44x)
+[k9pdl] k9pdl-phase gunzip 27.6s, 33.4 MB/s
+[k9pdl] decompressed 921645029 bytes into 3199905909 bytes
+[k9pdl] complete: 921645029 bytes composed from 14 parts
+[k9pdl] k9pdl-auth using ADC (/user_gcloud_config/application_default_credentials.json)
+[k9pdl] route bucket-compose: fuse.gcsfuse on /mnt/localize/wolf-406002258908-us-central1-e2fa74eed4ff5cf905754 resolves to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/refFastaDict/ucsc.hg19.dict
+[k9pdl] k9pdl-auth using ADC (/user_gcloud_config/application_default_credentials.json)
+[k9pdl] 100.0% (2966/2966 bytes, 2966 transferred)
+[k9pdl] k9pdl-streams mean 0.20 of 1 workers (1 chunks, 0.565s wall, 0.114s streaming)
+[k9pdl] k9pdl-bookkeeping 0.0s over 1 calls (mean 0.000s, 0.0% of 0.5654639539999948 worker-seconds)
+[k9pdl] k9pdl-io read 0.000s write 0.114s other 0.000s over 1 blocks (read 0% of loop, overlap ceiling 1.00x)
+[k9pdl] k9pdl-commit 0.1s over 1 batches (1 chunks, mean batch 1.0, 20.6% of 0.6s wall)
+[k9pdl] k9pdl-phase relay 0.6s, 0.0 MB/s
+[k9pdl] k9pdl-phase compose 0.1s
+[k9pdl] k9pdl-phase verify 0.0s, 0.1 MB/s
+[k9pdl] k9pdl-gunzip read 0.045s inflate 0.000s write 0.299s over 1 blocks (readahead 4, width 4, slices 1, 2966 -> 12689 bytes, ceiling 1.15x, pipe2 1.15x)
+[k9pdl] k9pdl-phase gunzip 0.4s, 0.0 MB/s
+[k9pdl] decompressed 2966 bytes into 12689 bytes
+[k9pdl] complete: 2966 bytes composed from 1 parts (verified)
+[k9pdl] k9pdl-auth using ADC (/user_gcloud_config/application_default_credentials.json)
+[k9pdl] route bucket-compose: fuse.gcsfuse on /mnt/localize/wolf-406002258908-us-central1-e2fa74eed4ff5cf905754 resolves to gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/refFastaIdx/ucsc.hg19.fasta.fai
+[k9pdl] k9pdl-auth using ADC (/user_gcloud_config/application_default_credentials.json)
+[k9pdl] 100.0% (1269/1269 bytes, 1269 transferred)
+[k9pdl] k9pdl-streams mean 0.23 of 1 workers (1 chunks, 0.460s wall, 0.104s streaming)
+[k9pdl] k9pdl-bookkeeping 0.0s over 1 calls (mean 0.000s, 0.0% of 0.4595567969999763 worker-seconds)
+[k9pdl] k9pdl-io read 0.000s write 0.104s other 0.000s over 1 blocks (read 0% of loop, overlap ceiling 1.00x)
+[k9pdl] k9pdl-commit 0.1s over 1 batches (1 chunks, mean batch 1.0, 23.6% of 0.5s wall)
+[k9pdl] k9pdl-phase relay 0.5s, 0.0 MB/s
+[k9pdl] k9pdl-phase compose 0.1s
+[k9pdl] k9pdl-phase verify 0.1s, 0.0 MB/s
+[k9pdl] k9pdl-gunzip read 0.047s inflate 0.000s write 0.293s over 1 blocks (readahead 4, width 4, slices 1, 1269 -> 3534 bytes, ceiling 1.16x, pipe2 1.16x)
+[k9pdl] k9pdl-phase gunzip 0.4s, 0.0 MB/s
+[k9pdl] decompressed 1269 bytes into 3534 bytes
+[k9pdl] complete: 1269 bytes composed from 1 parts (verified)
+  
+Patching gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/mutectMaskedIntervals/ucsc_hg19_wgs_masked_intervals.bed...
+Patching gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/refFasta/ucsc.hg19.fasta...
+Patching gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/refFastaDict/ucsc.hg19.dict...
+ERROR: Task 140339509330672 failed: GcsApiError('')
+Patching gs://wolf-406002258908-us-central1-e2fa74eed4ff5cf905754/refFastaIdx/ucsc.hg19.fasta.fai...
+ERROR: Task 140339509360144 failed: GcsApiError('')
+ERROR: Task 140339509361424 failed: GcsApiError('')
+ERROR: Task 140339510198352 failed: GcsApiError('')
+
+!~~~ LOCALIZATION FAILURE! JOB CANNOT RUN! ~~~!
+++++ STARTING JOB DELOCALIZATION ++++
+INFO: matched output name "stdout" (pattern "/mnt/nfs/wolf-test-slw/HG003_HG002-Run2/Localize_ref_files_char__2026-09-17--22-50-32_mg4xwxy_tbhx1ki_lrnqk1qo4quv0/jobs/0/stdout")
+INFO: matched output name "stderr" (pattern "/mnt/nfs/wolf-test-slw/HG003_HG002-Run2/Localize_ref_files_char__2026-09-17--22-50-32_mg4xwxy_tbhx1ki_lrnqk1qo4quv0/jobs/0/stderr")
+++++ DELOCALIZATION COMPLETE ++++
+```
