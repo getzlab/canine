@@ -1332,10 +1332,34 @@ class TestAGzipEncodedGsObject:
         _, script = self._command()
         assert "--check-md5 " + GZ_MD5.hex() in script
 
-    def test_a_composite_object_is_decoded_unverified(self):
-        _, script = self._command(_Blob(777, "gzip", md5_hash=None))
+    def test_a_composite_object_is_verified_by_its_crc32c(self):
+        """
+        A composite has no md5, but GCS stores a crc32c for every object. Production:
+        ucsc.hg19.fasta is composite, and its decode ran unverified, with a warning.
+        """
+        _, script = self._command(_Blob(777, "gzip", md5_hash=None, crc32c="4waSgw=="))
         assert "--gs-source" in script
         assert "--check-md5" not in script
+        assert "--check-crc32c 4waSgw==" in script
+
+    def test_an_object_with_an_md5_passes_its_crc32c_too(self):
+        _, script = self._command(_Blob(777, "gzip", base64.b64encode(GZ_MD5).decode(),
+                                        crc32c="4waSgw=="))
+        assert "--check-md5 " + GZ_MD5.hex() in script
+        assert "--check-crc32c 4waSgw==" in script
+
+    def test_a_composite_no_longer_warns(self, caplog):
+        import logging
+        with caplog.at_level(logging.WARNING):
+            self._command(_Blob(777, "gzip", md5_hash=None, crc32c="4waSgw=="),
+                          check_hash=True)
+        assert "cannot be verified" not in caplog.text
+
+    def test_an_object_with_neither_digest_still_warns(self):
+        warned = []
+        with patch.object(fh.canine_logging, "warning", side_effect=warned.append):
+            self._command(_Blob(777, "gzip", md5_hash=None, crc32c=None), check_hash=True)
+        assert any("neither an md5 nor a crc32c" in w for w in warned), warned
 
     @pytest.mark.parametrize("check_hash", [True, False])
     def test_verifies_whatever_check_hash_says(self, check_hash):
@@ -1432,6 +1456,13 @@ class TestAGzipEncodedObjectInADirectory:
         assert "--gs-source gs://bkt/funcotator/MANIFEST.txt" in script
         assert "--size 201 " in script
         assert "--check-md5 " + GZ_MD5.hex() in script
+
+    def test_a_member_is_verified_by_its_own_crc32c(self):
+        blobs = [_named("funcotator/MANIFEST.txt", 201, "gzip", crc32c="4waSgw=="),
+                 _named("funcotator/other.txt", 90, "gzip", crc32c="AAAAAA==")]
+        members = encoded_gs_directory(blobs).gzip_members
+        assert "--check-crc32c 4waSgw==" in members[0].downloader_command("/m/MANIFEST.txt")
+        assert "--check-crc32c AAAAAA==" in members[1].downloader_command("/m/other.txt")
 
     def test_a_member_is_sized_decoded(self):
         """The directory's disk estimate already counted it that way; so does the member."""

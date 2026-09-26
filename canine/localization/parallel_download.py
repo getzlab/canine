@@ -56,8 +56,8 @@ Runnable standalone for debugging:
 and as a module:
     python3 -m canine.localization.parallel_download [...]
 
-Stdlib only, so it works inside the worker image with no added dependencies. It must
-not import canine.
+The standard library plus one package, google_crc32c, which canine depends on and the
+worker image installs. It must not import canine.
 """
 
 import argparse
@@ -81,6 +81,8 @@ import urllib.parse
 import urllib.request
 import zlib
 from concurrent.futures import ThreadPoolExecutor
+
+import google_crc32c
 
 SCHEMA_VERSION = 1
 
@@ -3043,6 +3045,20 @@ def file_md5(path, block=READ_BUFFER):
     return digest.hexdigest()
 
 
+def file_crc32c(path, block=READ_BUFFER):
+    """
+    The file's crc32c, base64 over the big-endian value as GCS reports `crc32c`.
+
+    The standard library has no crc32c (zlib.crc32 is the IEEE polynomial, not
+    Castagnoli), hence google_crc32c.
+    """
+    checksum = google_crc32c.Checksum()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(block), b""):
+            checksum.update(chunk)
+    return base64.b64encode(checksum.digest()).decode()
+
+
 def multipart_etag(path, part_length, block=READ_BUFFER, workers=None):
     """
     S3's multipart ETag is md5-of-md5s with a "-N" part-count suffix.
@@ -3206,6 +3222,27 @@ def _hash_parts_into(path, part_length, size, indices, digests, block, workers):
         raise errors[0]
 
 
+def normalize_expected_crc32c(value):
+    """
+    Accept 8 hex digits or the base64 form GCS reports, and return the base64 form, so a
+    bucket-route check is a comparison with the composed object's metadata.
+
+    The two forms cannot be confused: a 4-byte value in base64 is always 8 characters
+    ending in "==", and hex has no "=".
+    """
+    value = value.strip().strip('"')
+    if re.fullmatch(r"[0-9a-fA-F]{8}", value):
+        return base64.b64encode(binascii.unhexlify(value)).decode()
+    try:
+        raw = base64.b64decode(value, validate=True)
+    except (binascii.Error, ValueError):
+        raw = b""
+    if len(raw) != 4:
+        raise ValueError("not a crc32c (8 hex digits or 4 bytes of base64): {!r}"
+                         .format(value))
+    return base64.b64encode(raw).decode()
+
+
 def normalize_expected_md5(value):
     """Accept either hex or the base64 form servers put in Content-MD5."""
     value = value.strip().strip('"')
@@ -3296,6 +3333,17 @@ def verify(path, options, manifest=None):
                 "md5 mismatch: expected {}, got {}".format(expected, actual)
             )
         return actual
+
+    # Only when there is no md5. On a local route either check is a full read, so the
+    # stronger one is used; a crc32c alone is what a composite gs:// object carries.
+    if getattr(options, "check_crc32c", None):
+        actual = file_crc32c(path)
+        expected = normalize_expected_crc32c(options.check_crc32c)
+        if actual != expected:
+            raise PermanentError(
+                "crc32c mismatch: expected {}, got {}".format(expected, actual)
+            )
+        return "crc32c:" + actual
 
     return None
 
@@ -4149,7 +4197,23 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
         return EXIT_FAIL
 
     digest = None
-    if options.check_md5:
+    if getattr(options, "check_crc32c", None):
+        # GCS computes a crc32c for every object, a composite included (derived from its
+        # parts' crc32cs), and returns it from compose. So against a source that
+        # publishes one, which every gs:// object does, verification is a comparison
+        # with metadata already in hand: no read-back. It takes the place of the md5
+        # read-back when both are given. That trades a 128-bit check for a 32-bit one,
+        # the same trade gcloud makes for its own downloads, and the read-back was the
+        # largest single cost of a verified run on this route. With --gunzip this checks
+        # the stored bytes, before anything is decoded.
+        expected = normalize_expected_crc32c(options.check_crc32c)
+        actual = composed.get("crc32c")
+        if actual != expected:
+            return integrity_failure("crc32c mismatch after compose: expected {}, got {}"
+                                     .format(expected, actual))
+        log("crc32c {} verified from the composed object's metadata".format(actual))
+        digest = "crc32c:" + actual
+    elif options.check_md5:
         try:
             with phase("verify", size):
                 digest = verify_bucket_object(
@@ -4414,8 +4478,8 @@ def run_staged_route(options, decision, source, size, chunks, chunk_size, plan_i
 
         # Verify BEFORE publishing, so a corrupt download never costs an upload.
         try:
-            with phase("verify",
-                       size if (options.check_md5 or options.check_etag) else None):
+            with phase("verify", size if (options.check_md5 or options.check_etag
+                                          or getattr(options, "check_crc32c", None)) else None):
                 digest = verify(staged, options, manifest)
         except PermanentError as e:
             log("verification failed on the staged copy: {}".format(e))
@@ -4743,6 +4807,15 @@ def run(options):
     dest = options.dest
     manifest_path, marker_path = sidecar_paths(dest)
 
+    # Checked before anything moves, so a malformed value costs nothing rather than a
+    # whole transfer that then cannot be verified.
+    if getattr(options, "check_crc32c", None):
+        try:
+            options.check_crc32c = normalize_expected_crc32c(options.check_crc32c)
+        except ValueError as e:
+            log("{}".format(e))
+            return EXIT_FAIL
+
     if not options.no_resume:
         marker = read_done_marker(marker_path)
         if marker and marker.get("size") == options.size:
@@ -4912,7 +4985,8 @@ def run(options):
     try:
         # On this route verification is a full re-read of the object, so its share of the
         # wall clock is worth knowing on its own.
-        with phase("verify", size if (options.check_md5 or options.check_etag) else None):
+        with phase("verify", size if (options.check_md5 or options.check_etag
+                                      or getattr(options, "check_crc32c", None)) else None):
             digest = verify(target, options, manifest)
     except PermanentError as e:
         log("verification failed: {}".format(e))
@@ -5119,6 +5193,11 @@ def build_parser():
                         help="expected whole-file md5 (hex or base64)")
     parser.add_argument("--check-etag", dest="check_etag",
                         help="expected S3 multipart ETag")
+    parser.add_argument("--check-crc32c", dest="check_crc32c",
+                        help="expected crc32c (8 hex digits or GCS's base64), as a gs:// "
+                             "object carries even when it is composite. On the "
+                             "bucket-compose route it is checked against the composed "
+                             "object's metadata and replaces the --check-md5 read-back")
     parser.add_argument("--part-length", dest="part_length", type=int,
                         help="S3 multipart part length, for ETag verification")
     # Only a benchmark passes this. A prefix run asks for `--size` bytes of an object

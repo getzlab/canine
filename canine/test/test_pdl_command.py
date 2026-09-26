@@ -289,6 +289,17 @@ class TestArguments:
                              part_length=MIB, md5="0" * 32)
         assert "--check-etag" in script and "--check-md5" not in script
 
+    def test_a_crc32c_is_passed_alongside_the_md5(self):
+        """Which check runs is the downloader's decision, per route, so both go."""
+        script = command_for("/tmp/o", "https://h/o", MIB, md5="0" * 32,
+                             crc32c="4waSgw==")
+        assert "--check-md5 " + "0" * 32 in script
+        assert "--check-crc32c 4waSgw==" in script
+
+    def test_no_crc32c_flag_without_one(self):
+        assert "--check-crc32c" not in command_for("/tmp/o", "https://h/o", MIB,
+                                                   md5="0" * 32)
+
     def test_s3_source_needs_no_url(self):
         script = command_for("/tmp/o", None, MIB,
                              s3={"bucket": "b", "key": "k"})

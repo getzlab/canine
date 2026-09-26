@@ -40,8 +40,11 @@ and `PARALLEL_LOCALIZATION.md` (repo root) for the design rationale and the meas
 **One hard constraint: `parallel_download.py` must not import `canine`.** It is staged
 onto nodes and run by hand as a standalone script, where canine is not installed, and the
 import would also be circular — `file_handlers.py` imports *from it*, not the reverse.
-`TestTheModuleContracts` in `canine/test/test_parallel_download.py` enforces this by AST
-walk, along with the constants the two modules must share.
+Besides the standard library it may import only `google_crc32c`, which the worker image
+installs and canine depends on. It runs under the job's own `python3`, not canine's
+interpreter. `TestScriptConventions` and `TestTheModuleContracts` in
+`canine/test/test_parallel_download.py` enforce this by AST walk, along with the constants
+the two modules must share.
 
 Three write routes, chosen by `select_route` from the destination's filesystem:
 `in-place` (POSIX), `bucket-compose` (a gcsfuse-mounted bucket — parts uploaded

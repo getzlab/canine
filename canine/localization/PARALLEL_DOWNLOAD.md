@@ -197,6 +197,22 @@ complete: 3060000000 bytes (verified)
 `(verified)` means a hash was supplied and matched. Its absence means no hash was
 available — not that verification failed, which is always a hard error.
 
+Which hash, by route:
+
+* **bucket-compose, with `--check-crc32c`:** the source's crc32c is compared with the one
+  GCS returns for the composed object, a composite included. That is a metadata comparison
+  with no read-back, and it replaces the `--check-md5` read-back when both are given. The
+  log says `crc32c ... verified from the composed object's metadata`, and there is no
+  `k9pdl-phase verify` line. canine passes a crc32c for every gs:// source, since GCS
+  stores one for every object; a composite gs:// object has no md5 at all.
+* **bucket-compose, md5 or ETag only:** the composed object is read back and hashed.
+* **in-place and stage-publish:** the file is re-read and hashed. md5 is preferred; a
+  crc32c is used only when there is no md5, and it is computed locally with
+  `google_crc32c`.
+
+With `--gunzip` any of these checks the stored, compressed bytes, before decoding. The
+decoded bytes are covered separately, by each gzip member's own CRC-32.
+
 ---
 
 ## Exit codes

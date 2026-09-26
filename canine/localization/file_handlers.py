@@ -261,6 +261,7 @@ def _pdl_command(
     gunzip=False,
     gs_source=None,
     user_project=None,
+    crc32c=None,
 ):
     """
     Emit the lines that download one object with the parallel downloader, falling back
@@ -329,6 +330,11 @@ def _pdl_command(
         arguments += ["--part-length", str(int(part_length))]
     elif md5:
         arguments += ["--check-md5", shlex.quote(str(md5))]
+    # Alongside the md5, not instead of it: which check runs is the downloader's decision.
+    # On the bucket-compose route the crc32c is a metadata comparison that replaces the
+    # md5 read-back; on a local route, where either is a full read, md5 is preferred.
+    if crc32c:
+        arguments += ["--check-crc32c", shlex.quote(str(crc32c))]
 
     if url_refresh_cmd:
         arguments += ["--url-refresh-cmd", shlex.quote(str(url_refresh_cmd))]
@@ -1054,6 +1060,9 @@ class HandleGSURL(FileType):
             meta = {
                 "encoding": (getattr(blob, "content_encoding", None) or "").strip().lower(),
                 "md5_b64": getattr(blob, "md5_hash", None),
+                # Every object has one, a composite included, which is what makes a
+                # composite verifiable at all.
+                "crc32c_b64": getattr(blob, "crc32c", None),
                 "size": blob.size,
             }
             if not self.is_dir:
@@ -1133,9 +1142,8 @@ class HandleGSURL(FileType):
         Localize a transport_gzip object through the parallel downloader's decode.
 
         The stored bytes are read over the JSON API (`--gs-source`, refreshing token,
-        `userProject` for requester-pays), verified against the object's stored md5 (always,
-        as `gcloud storage cp` does; a composite object has none), and
-        decoded on the way into `dest` -- which in the bucket planner is a path on the
+        `userProject` for requester-pays), verified against the object's stored crc32c and
+        md5 (always, as `gcloud storage cp` does), and decoded on the way into `dest` -- which in the bucket planner is a path on the
         read-write gcsfuse mount, so nothing is staged on local disk. A name promising
         gzip (.vcf.gz, .bam, ...) whose decoded bytes are not gzip keeps its stored bytes:
         the encoding was set by mistake on a singly compressed file.
@@ -1151,21 +1159,27 @@ class HandleGSURL(FileType):
             raise ValueError("{} is not gzip-encoded; it has no decode to route "
                              "through".format(self.path))
         meta = self._stored_meta
-        # Verified whenever the object has an md5, regardless of check_hash: the digest
-        # came with metadata already fetched, and `gcloud storage cp` -- the copy this
-        # replaces -- always validates. Opting out here would be a silent regression.
+        # Verified whenever the object has a digest, regardless of check_hash: the
+        # digests came with metadata already fetched, and `gcloud storage cp` -- the copy
+        # this replaces -- always validates. Opting out here would be a silent regression.
+        # Every object has a crc32c, a composite included; only a non-composite one also
+        # has an md5. The decoded bytes are checked separately, by each gzip member's own
+        # CRC-32.
         md5 = None
         if meta.get("md5_b64"):
             md5 = binascii.hexlify(base64.b64decode(meta["md5_b64"])).decode()
-        elif self.check_hash:
+        crc32c = meta.get("crc32c_b64")
+        if not md5 and not crc32c and self.check_hash:
             canine_logging.warning(
-              "check_hash was requested for {}, but it is a composite object with no "
-              "md5, so the decode cannot be verified".format(self.path))
+              "check_hash was requested for {}, but GCS reported neither an md5 nor a "
+              "crc32c for it, so its stored bytes cannot be verified; the decode is still "
+              "checked by gzip's own CRC-32".format(self.path))
         dest_dir = os.path.dirname(self.localized_path)
         lines = ["[ ! -d {d} ] && mkdir -p {d} || :".format(d = dest_dir)]
         lines += _pdl_command(
             None, self.localized_path, meta["size"],
             md5 = md5,
+            crc32c = crc32c,
             gs_source = self.path,
             user_project = self.extra_args.get("project") if self.rp_string else None,
             legacy_cmd = legacy,

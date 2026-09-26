@@ -85,7 +85,9 @@ class TestScriptConventions:
                 imported.add(node.module.split(".")[0])
 
         assert "canine" not in imported
-        non_stdlib = imported - set(sys.stdlib_module_names)
+        # google_crc32c is the one exception: canine depends on it and the worker image
+        # installs it (slurm_gcp_docker/Dockerfile), so it is present wherever this runs.
+        non_stdlib = imported - set(sys.stdlib_module_names) - {"google_crc32c"}
         assert not non_stdlib, "non-stdlib imports would need the worker image rebuilt: {}".format(
             sorted(non_stdlib))
 
@@ -479,6 +481,7 @@ class _Options:
     def __init__(self, **kwargs):
         self.check_md5 = None
         self.check_etag = None
+        self.check_crc32c = None
         self.part_length = None
         for k, v in kwargs.items():
             setattr(self, k, v)
@@ -553,6 +556,83 @@ class TestNormalizeExpectedMd5:
     def test_quotes_stripped(self):
         assert pdl.normalize_expected_md5('"d41d8cd98f00b204e9800998ecf8427e"') == \
             "d41d8cd98f00b204e9800998ecf8427e"
+
+
+# The standard CRC-32C check value: crc32c(b"123456789") == 0xE3069283. A known answer
+# from outside google_crc32c, so these tests do not only agree with the library.
+CHECK_INPUT = b"123456789"
+CHECK_HEX = "e3069283"
+CHECK_B64 = "4waSgw=="
+
+
+class TestCrc32c:
+
+    def test_the_known_answer(self, tmp_path):
+        f = tmp_path / "f"
+        f.write_bytes(CHECK_INPUT)
+        assert pdl.file_crc32c(str(f)) == CHECK_B64
+
+    def test_hex_and_base64_normalize_to_what_gcs_reports(self):
+        assert pdl.normalize_expected_crc32c(CHECK_HEX) == CHECK_B64
+        assert pdl.normalize_expected_crc32c(CHECK_HEX.upper()) == CHECK_B64
+        assert pdl.normalize_expected_crc32c(CHECK_B64) == CHECK_B64
+        assert pdl.normalize_expected_crc32c('"{}"'.format(CHECK_B64)) == CHECK_B64
+
+    @pytest.mark.parametrize("bad", ["", "e30692", "e3069283ff", "not-a-crc!",
+                                     "1B2M2Y8AsgTpgAmY7PhCfg=="])
+    def test_anything_else_is_refused(self, bad):
+        """An md5 in base64 included: a crc32c is 4 bytes, and a wrong length is a bug."""
+        with pytest.raises(ValueError):
+            pdl.normalize_expected_crc32c(bad)
+
+    def test_verify_uses_it_when_there_is_no_md5(self, tmp_path):
+        f = tmp_path / "f"
+        f.write_bytes(CHECK_INPUT)
+        assert pdl.verify(str(f), _Options(check_crc32c=CHECK_HEX)) == "crc32c:" + CHECK_B64
+
+    def test_verify_rejects_a_wrong_crc32c(self, tmp_path):
+        f = tmp_path / "f"
+        f.write_bytes(CHECK_INPUT + b"!")
+        with pytest.raises(pdl.PermanentError, match="crc32c mismatch"):
+            pdl.verify(str(f), _Options(check_crc32c=CHECK_HEX))
+
+    def test_verify_prefers_the_md5_on_a_local_route(self, tmp_path):
+        """Either is a full read here, so the stronger one is used."""
+        f = tmp_path / "f"
+        f.write_bytes(CHECK_INPUT)
+        digest = hashlib.md5(CHECK_INPUT).hexdigest()
+        assert pdl.verify(str(f), _Options(check_md5=digest, check_crc32c="00000000")) \
+            == digest
+
+    def test_the_in_place_route_verifies_a_crc32c(self, tmp_path, payload):
+        import base64
+        import google_crc32c
+        dest = str(tmp_path / "obj.bin")
+        expected = base64.b64encode(google_crc32c.Checksum(payload).digest()).decode()
+        with Server(payload) as server:
+            proc = run_downloader(server.url(), dest, len(payload), "--min-chunk", MIB,
+                                  "--check-crc32c", expected)
+        assert proc.returncode == 0, proc.stderr
+        assert "(verified)" in proc.stderr
+
+    def test_the_in_place_route_rejects_a_wrong_crc32c(self, tmp_path, payload):
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            proc = run_downloader(server.url(), dest, len(payload), "--min-chunk", MIB,
+                                  "--check-crc32c", "00000000")
+        assert proc.returncode == 1
+        assert not os.path.exists(dest)
+
+    def test_a_malformed_value_fails_before_anything_moves(self, tmp_path, payload):
+        dest = str(tmp_path / "obj.bin")
+        with Server(payload) as server:
+            proc = run_downloader(server.url(), dest, len(payload), "--min-chunk", MIB,
+                                  "--check-crc32c", "zz")
+            requests = server.state.requests
+        assert requests == 0, "the source was contacted before the value was checked"
+        assert proc.returncode == 1
+        assert "not a crc32c" in proc.stderr
+        assert not os.path.exists(dest)
 
 
 # ---------------------------------------------------------------------------

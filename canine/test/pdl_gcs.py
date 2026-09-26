@@ -162,12 +162,15 @@ def make_handler(state):
             import base64
             import datetime
             import hashlib
+            import google_crc32c
             created = datetime.datetime.fromtimestamp(
                 state.created.get(name, 0), tz=datetime.timezone.utc)
             payload = {
                 "name": name,
                 "size": str(len(data)),
-                "crc32c": "AAAAAA==",
+                # The real value, as GCS reports it for every object, composites
+                # included: base64 of the big-endian crc32c of the object's bytes.
+                "crc32c": base64.b64encode(google_crc32c.Checksum(data).digest()).decode(),
                 "timeCreated": created.strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             }
             if name in state.custom_time:

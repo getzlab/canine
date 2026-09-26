@@ -693,6 +693,113 @@ class TestBucketVerification:
         assert not os.path.exists(marker_path)
 
 
+TSV_OBJECT = "inputs/variants.tsv"
+
+
+def crc32c_b64(data):
+    """What GCS reports as an object's crc32c: base64 of the big-endian value."""
+    import base64
+    import google_crc32c
+    return base64.b64encode(google_crc32c.Checksum(data).digest()).decode()
+
+
+class TestBucketRouteVerifiesACrc32c:
+    """
+    A gs:// source always carries a crc32c, a composite included, and GCS computes one for
+    the composed object too. So on this route a crc32c check is a comparison with the
+    metadata compose already returned, and it replaces the md5 read-back, which was the
+    largest single cost of a verified run.
+    """
+
+    def _run(self, tmp_path, monkeypatch, body, **checks):
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(body) as source:
+            return pdl.run(options_for(dest, source.url(), len(body), **checks)), dest
+
+    @staticmethod
+    def _forbid_read_back(monkeypatch):
+        def read_back(*args, **kwargs):
+            raise AssertionError("the composed object was read back")
+        monkeypatch.setattr(pdl, "verify_bucket_object", read_back)
+
+    def test_a_matching_crc32c_verifies_without_reading_back(
+        self, tmp_path, monkeypatch, gcs, payload, payload_md5, capsys
+    ):
+        self._forbid_read_back(monkeypatch)
+        rc, _ = self._run(tmp_path, monkeypatch, payload,
+                          check_crc32c=crc32c_b64(payload), check_md5=payload_md5)
+        assert rc == pdl.EXIT_OK
+        assert gcs.state.objects[OBJECT] == payload
+        err = capsys.readouterr().err
+        assert "verified from the composed object's metadata" in err
+        assert "(verified)" in err
+
+    def test_the_marker_records_the_crc32c(self, tmp_path, monkeypatch, gcs, payload):
+        rc, dest = self._run(tmp_path, monkeypatch, payload,
+                             check_crc32c=crc32c_b64(payload))
+        assert rc == pdl.EXIT_OK
+        _, marker_path = pdl.sidecar_paths(dest)
+        assert pdl.read_done_marker(marker_path)["hash"] == \
+            "crc32c:" + crc32c_b64(payload)
+
+    def test_a_wrong_crc32c_fails_and_leaves_nothing_behind(
+        self, tmp_path, monkeypatch, gcs, payload
+    ):
+        """A destination that failed verification must not be left for a consumer."""
+        rc, dest = self._run(tmp_path, monkeypatch, payload, check_crc32c="00000000")
+        assert rc == pdl.EXIT_FAIL
+        assert OBJECT not in gcs.state.objects
+        assert [n for n in gcs.state.object_names() if ".k9pdl.parts/" in n] == []
+        _, marker_path = pdl.sidecar_paths(dest)
+        assert not os.path.exists(marker_path)
+
+    def test_the_md5_alone_still_reads_back(self, tmp_path, monkeypatch, gcs, payload,
+                                            payload_md5):
+        """Only a crc32c can skip the read-back; an md5 source keeps it."""
+        calls = []
+        real = pdl.verify_bucket_object
+        monkeypatch.setattr(pdl, "verify_bucket_object",
+                            lambda *a, **kw: calls.append(1) or real(*a, **kw))
+        rc, _ = self._run(tmp_path, monkeypatch, payload, check_md5=payload_md5)
+        assert rc == pdl.EXIT_OK
+        assert calls == [1]
+
+    def test_with_gunzip_it_checks_the_stored_bytes(self, tmp_path, monkeypatch, gcs,
+                                                   plain_text, capsys):
+        """The source's crc32c covers what is stored, which is the compressed stream."""
+        self._forbid_read_back(monkeypatch)
+        body = zlib.compress(plain_text, 6, 31)            # gzip framing
+        # A .tsv, so the decode runs: a name that promises gzip content, like the
+        # default sample.bam, keeps its stored bytes.
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, TSV_OBJECT))
+        with Server(body) as source:
+            options = options_for(str(tmp_path / "variants.tsv"), source.url(), len(body),
+                                  check_crc32c=crc32c_b64(body))
+            options.gunzip = True
+            rc = pdl.run(options)
+        assert rc == pdl.EXIT_OK
+        assert gcs.state.objects[TSV_OBJECT] == plain_text
+        assert "crc32c {} verified".format(crc32c_b64(body)) in capsys.readouterr().err
+
+    def test_with_gunzip_a_wrong_crc32c_is_caught_before_decoding(
+        self, tmp_path, monkeypatch, gcs, plain_text
+    ):
+        body = zlib.compress(plain_text, 6, 31)
+        force_bucket_route(monkeypatch, gs_url="gs://{}/{}".format(BUCKET, TSV_OBJECT))
+        decoded = []
+        monkeypatch.setattr(pdl, "decompress_object",
+                            lambda *a, **kw: decoded.append(1) or (0, False))
+        with Server(body) as source:
+            options = options_for(str(tmp_path / "variants.tsv"), source.url(), len(body),
+                                  check_crc32c=crc32c_b64(body + b"x"))
+            options.gunzip = True
+            rc = pdl.run(options)
+        assert rc == pdl.EXIT_FAIL
+        assert decoded == []
+        assert TSV_OBJECT not in gcs.state.objects
+
+
 class TestGcsObjectMd5:
 
     def test_converts_base64_to_hex(self):

@@ -159,7 +159,8 @@ correctness in that case regardless.
 A **stdlib-only** (`urllib`, `os`, `threading`, `hashlib`, `subprocess`) Python 3 script,
 runnable both as `python3 <path>/parallel_download.py` and `python3 -m
 canine.localization.parallel_download`. Stdlib-only so it works inside the slurm_gcp_docker
-worker image without adding dependencies.
+worker image without adding dependencies. *(Since §13.84 it also imports google_crc32c,
+which that image already installs and canine depends on.)*
 
 CLI:
 ```
@@ -6102,3 +6103,51 @@ to take the bounded retry. Only the description of exit 1's consequence was over
 The code comments, test docstrings, `PARALLEL_DOWNLOAD.md` and canine's `CLAUDE.md` now
 say "fails the shard without a requeue" instead. Two tests were renamed to match:
 `test_it_does_not_fail_the_shard` and `test_permanent_http_error_exits_one`.
+
+### 13.84 crc32c verification, and the first package besides the standard library
+
+Production, 2026-09-25, logged `check_hash was requested for
+gs://getzlab-workflows-reference_files-oa/hg19/UCSC/ucsc.hg19.fasta, but it is a composite
+object with no md5, so the decode cannot be verified`. The object is gzip-encoded and has 19
+components. GCS stores no md5 for a composite, so the downloader had nothing to check the
+stored bytes against. It does store a crc32c for every object, a composite included
+(`G6w3Qw==` here). The downloader could not use it only because the standard library has no
+crc32c: `zlib.crc32` is the IEEE polynomial, not Castagnoli.
+
+The standard-library-only rule (§3) was there to avoid rebuilding the worker image. The image
+already installs `google-crc32c` (`slurm_gcp_docker/Dockerfile`), and canine depends on it.
+So the downloader now imports it at the top, and `TestScriptConventions` allows exactly that
+one package besides the standard library. The emitted command runs the downloader under the
+job's own `python3`, which on a worker is the image's. The root `conftest.py` now puts the
+test interpreter first on `PATH`, so that the commands tests execute get a `python3` with
+canine's packages, as a worker does.
+
+#### What `--check-crc32c` does
+
+* **The bucket-compose route computes nothing.** Compose returns the composed object's
+  metadata, and GCS includes its crc32c, derived from the parts' crc32cs. Checked against
+  real GCS: a two-part compose returned `crc32c` and no `md5Hash`, and the value equalled the
+  crc32c of the concatenated bytes. So the check is a comparison with metadata already in
+  hand. By decision, it replaces the md5 read-back when both are given. That trades a 128-bit
+  check for a 32-bit one, the same trade gcloud makes for its own downloads, and the read-back
+  was the largest single cost of a verified run on this route. With `--gunzip` it checks the
+  stored bytes before decoding; the decoded bytes are covered by each gzip member's CRC-32.
+  A mismatch is cleaned up like an md5 mismatch.
+* **The in-place and stage-publish routes** re-read the file either way, so md5 is preferred
+  there. A crc32c is computed locally with `google_crc32c` only when there is no md5.
+* A malformed value fails before anything is transferred. It is kept out of `plan_id`, so
+  a manifest written before this change still resumes.
+* canine passes the crc32c of every gs:// source it hands the downloader, next to the md5
+  when there is one. That covers gzip-encoded single objects and the encoded members of a
+  directory (§13.82). The warning now fires only for an object that has neither.
+
+#### Considered and not built
+
+A crc32c on each part upload, so that GCS would reject a part corrupted between node and
+bucket. That check already exists in another form. `BucketChunkSink` keeps a running md5 of
+each part as it streams, and `run_bucket_route` compares it with the md5 GCS stored for that
+part before composing. A second check of the same leg would add nothing.
+
+For non-gs:// sources (http, S3, GDC, DRS) nothing changes. They publish an md5 or an ETag,
+not a crc32c, and an md5 cannot be combined from out-of-order chunks. So their bucket-route
+verification is still the read-back.
