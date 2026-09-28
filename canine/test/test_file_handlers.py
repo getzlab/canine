@@ -404,7 +404,7 @@ class TestDRSResolution:
                 }
 
         class FakeSession:
-            def post(self, url, headers=None, json=None):
+            def post(self, url, headers=None, json=None, timeout=None):
                 calls.append(json["fields"])
                 return FakeResponse()
 

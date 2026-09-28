@@ -406,12 +406,17 @@ def drs_handler(access_url="https://storage.googleapis.com/b/o?sig=x", **kwargs)
                     "accessUrl": {"url": access_url}}
 
     class FakeSession:
-        def post(self, url, headers=None, json=None):
+        def post(self, url, headers=None, json=None, timeout=None):
+            DRS_POST_TIMEOUTS.append(timeout)
             return FakeResponse()
 
     with patch("canine.localization.file_handlers.gcp_auth_session",
                return_value=FakeSession()):
         return fh.HandleDRSURI(DRS_URI, **kwargs)
+
+
+# The timeout each fake DRShub resolve was given, in order.
+DRS_POST_TIMEOUTS = []
 
 
 def gdc_handler(**kwargs):
@@ -511,12 +516,13 @@ class TestDRSConversion:
     def test_resolver_snippet_is_unchanged(self):
         """
         The resolution step is reused verbatim; only its surroundings changed. Pinning the
-        exact string keeps a future edit from quietly altering a known-good command.
+        exact string keeps a future edit from quietly altering a known-good command. The
+        one deliberate change is --max-time (see TestAnUnresponsiveDRShubCannotHangTheJob).
         """
         import json as _json
         data_str = _json.dumps({"url": DRS_URI, "fields": ["accessUrl"]})
         expected = (
-            'curl -S -X POST --url "{}" '
+            'curl -S -X POST --max-time 30 --url "{}" '
             '-H "authorization: Bearer $(gcloud auth print-access-token)" '
             "-H \"content-type: application/json\" --data '{}' | "
             "python3 -c 'import json,sys; print(json.load(sys.stdin)[\"accessUrl\"][\"url\"])'"
@@ -589,6 +595,76 @@ class TestDRSConversion:
 
     def test_no_heredoc(self):
         assert "<<" not in drs_handler(check_md5=True).localization_command(DEST)
+
+
+class TestAnUnresponsiveDRShubCannotHangTheJob:
+    """
+    Found in integration testing (canine e7df17f, fuse-localize): DRShub accepted the
+    connection and never answered, and localization hung with no output.
+
+    Measured against a local server that does exactly that, before the fix, on this
+    branch: the emitted resolve was still hanging when killed at 180 s, since curl has no
+    default overall timeout. The requests call in __init__ raised ReadTimeout at 121 s,
+    because AuthorizedSession already defaults to 120 s. Every resolve is now bounded by
+    drs_resolve_timeout.
+    """
+
+    def test_the_init_resolve_is_bounded(self):
+        del DRS_POST_TIMEOUTS[:]
+        drs_handler()
+        assert DRS_POST_TIMEOUTS == [fh.HandleDRSURI.drs_resolve_timeout]
+
+    def test_the_emitted_resolve_is_bounded(self):
+        """It is also the downloader's --url-refresh-cmd, so both carry the limit."""
+        script = drs_handler().localization_command(DEST)
+        expected = "--max-time {}".format(fh.HandleDRSURI.drs_resolve_timeout)
+        mint = script.split("\n")[0]
+        assert mint.startswith("export signed_url=$(curl") and expected in mint
+        refresh = shlex.split(script[script.index("--url-refresh-cmd"):])[1]
+        assert expected in refresh
+
+    def test_the_stream_resolve_is_bounded(self):
+        h = drs_handler()
+        h.__class__ = fh.HandleDRSURIStream
+        assert "--max-time {}".format(fh.HandleDRSURI.drs_resolve_timeout) in \
+            h.localization_command(DEST)
+
+    def test_the_download_itself_is_not(self):
+        """A large object may legitimately take hours."""
+        script = drs_handler().localization_command(DEST)
+        assert script.count("--max-time") == 2      # the mint, and the refresh command
+
+    @pytest.fixture
+    def silent_drshub(self):
+        """Accepts connections and never answers."""
+        import socket
+        import threading
+        server = socket.socket()
+        server.bind(("127.0.0.1", 0))
+        server.listen(8)
+        held = []
+
+        def accept():
+            while True:
+                try:
+                    held.append(server.accept()[0])
+                except OSError:
+                    return
+        threading.Thread(target=accept, daemon=True).start()
+        yield "http://127.0.0.1:{}/api/v4/drs/resolve".format(server.getsockname()[1])
+        server.close()
+
+    def test_the_emitted_resolve_gives_up_on_a_silent_drshub(self, silent_drshub):
+        import time
+        with patch.object(fh.HandleDRSURI, "drs_resolve_timeout", 2):
+            script = drs_handler().localization_command(DEST)
+        mint = script.split("\n")[0].replace(fh.HandleDRSURI.drs_resolver, silent_drshub)
+        started = time.monotonic()
+        # gcloud stubbed out: only the resolve's own behavior is under test
+        proc = subprocess.run(["bash", "-c", "gcloud() { echo token; }; " + mint],
+                              capture_output=True, text=True, timeout=60)
+        assert time.monotonic() - started < 30
+        assert "timed out" in proc.stderr.lower(), proc.stderr
 
 
 class TestDRSEndToEnd:

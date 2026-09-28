@@ -1732,6 +1732,11 @@ class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
 class HandleDRSURI(FileType):
     localization_mode = "url"
     drs_resolver = "https://drshub.dsde-prod.broadinstitute.org/api/v4/drs/resolve"
+    # Bounds every DRShub resolve. The emitted curl needs it most: curl has no default
+    # overall timeout, so an unresponsive DRShub hung the job with no output. The
+    # requests calls in __init__ go through AuthorizedSession, which already defaults to
+    # 120 s, so there it only makes a stalled DRShub fail sooner.
+    drs_resolve_timeout = 30
 
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
@@ -1754,7 +1759,8 @@ class HandleDRSURI(FileType):
 
         drshub_session = gcp_auth_session()
         resp = drshub_session.post(type(self).drs_resolver,
-                                   headers={"Content-type": "application/json"}, json=data)
+                                   headers={"Content-type": "application/json"}, json=data,
+                                   timeout=type(self).drs_resolve_timeout)
 
         try:
             metadata = resp.json()
@@ -1833,14 +1839,19 @@ class HandleDRSURI(FileType):
         # assignment, because it serves twice: once to mint the URL up front, and again as
         # --url-refresh-cmd so the downloader can re-mint it on a 403 and resume in place.
         # A signed URL can expire mid-transfer, and re-minting beats starting over.
-        resolver = f'curl -S -X POST --url "{type(self).drs_resolver}" ' + \
+        #
+        # --max-time on the resolve only: curl has no default overall timeout, so an
+        # unresponsive DRShub would hang the job with no output. Not applied to the
+        # download itself, which may legitimately run long.
+        resolver = f'curl -S -X POST --max-time {type(self).drs_resolve_timeout} --url "{type(self).drs_resolver}" ' + \
                    '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
                    f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
                    'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\''
         # Exported, not just assigned: the fallback command passed via --legacy-cmd
         # references "$signed_url", and the downloader runs it in its own subshell.
         # A plain shell variable would not be inherited there, so the fallback would
-        # curl an empty URL. The resolver snippet itself is unchanged.
+        # curl an empty URL. The resolver snippet itself is the original one plus
+        # --max-time.
         cmd = [f'export signed_url=$({resolver})']
 
         def legacy(target):
@@ -1877,7 +1888,7 @@ class HandleDRSURIStream(HandleDRSURI):
 
         # get signed URL
         data_str = json.dumps({"url": self.uri, "fields": ["accessUrl"]})
-        signed_url = f'$(curl -S -X POST --url "{type(self).drs_resolver}" ' + \
+        signed_url = f'$(curl -S -X POST --max-time {type(self).drs_resolve_timeout} --url "{type(self).drs_resolver}" ' + \
                      '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
                      f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
                      'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
