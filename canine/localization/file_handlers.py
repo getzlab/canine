@@ -573,6 +573,9 @@ class HandleGDCHTTPURLStream(HandleGDCHTTPURL):
 class HandleDRSURI(FileType):
     localization_mode = "url"
     drs_resolver = "https://drshub.dsde-prod.broadinstitute.org/api/v4/drs/resolve"
+    # requests has no default timeout -- an unresponsive DRShub would otherwise
+    # hang __init__ forever with no exception and nothing in the logs to show why.
+    drs_resolve_timeout = 30
 
     def __init__(self, path, **kwargs):
         super().__init__(path, **kwargs)
@@ -593,7 +596,8 @@ class HandleDRSURI(FileType):
 
         drshub_session = gcp_auth_session()
         resp = drshub_session.post(type(self).drs_resolver,
-                                   headers={"Content-type": "application/json"}, json=data)
+                                   headers={"Content-type": "application/json"}, json=data,
+                                   timeout=type(self).drs_resolve_timeout)
 
         try:
             metadata = resp.json()
@@ -614,7 +618,8 @@ class HandleDRSURI(FileType):
                     # Make another call to get the accessUrl
                     access_data = {"url": self.uri, "fields": ["accessUrl"]}
                     access_resp = drshub_session.post(type(self).drs_resolver,
-                                                    headers={"Content-type": "application/json"}, json=access_data)
+                                                    headers={"Content-type": "application/json"}, json=access_data,
+                                                    timeout=type(self).drs_resolve_timeout)
                     
                     try:
                         access_metadata = access_resp.json()
@@ -674,7 +679,11 @@ class HandleDRSURI(FileType):
         dest_file = shlex.quote(os.path.basename(dest))
         self.localized_path = os.path.join(dest_dir, dest_file)
         data_str = json.dumps({"url": self.uri, "fields": ["accessUrl"]})
-        signed_url = f'$(curl -S -X POST --url "{type(self).drs_resolver}" ' + \
+        # --max-time on the resolve call only -- curl has no default timeout either,
+        # so an unresponsive DRShub would otherwise hang the job with no output, same
+        # failure mode as the unbounded requests.post() calls in __init__ above. Not
+        # applied to the actual download below, which may legitimately run long.
+        signed_url = f'$(curl -S -X POST --max-time {type(self).drs_resolve_timeout} --url "{type(self).drs_resolver}" ' + \
                      '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
                      f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
                      'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
@@ -708,7 +717,7 @@ class HandleDRSURIStream(HandleDRSURI):
 
         # get signed URL
         data_str = json.dumps({"url": self.uri, "fields": ["accessUrl"]})
-        signed_url = f'$(curl -S -X POST --url "{type(self).drs_resolver}" ' + \
+        signed_url = f'$(curl -S -X POST --max-time {type(self).drs_resolve_timeout} --url "{type(self).drs_resolver}" ' + \
                      '-H "authorization: Bearer $(gcloud auth print-access-token)" ' + \
                      f'-H "content-type: application/json" --data \'{data_str}\' | ' + \
                      'python3 -c \'import json,sys; print(json.load(sys.stdin)["accessUrl"]["url"])\')'
