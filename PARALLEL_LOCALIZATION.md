@@ -6476,6 +6476,13 @@ no bytes through the node at all. canine's `TODO.md` listed that second case, an
   submitted. It counts as avoided, which is how wolF already supplies placeholder accounting,
   and its stdout and stderr are written where `delocalization.py` would put them.
 * **Anything that fails on the controller falls back** to a node job.
+* **The log says what a settled job did.** Most transfer nothing, so a line claiming the job
+  "localized on the controller" would be wrong for them. There are three outcomes:
+  * found complete, filled by an earlier or concurrent workflow's job;
+  * complete after waiting on another job's live claim;
+  * transferred on the controller by this job.
+
+  None returns before the bucket is labelled `success` with every object present.
 * **It is on by default**, and turned off by `resolve_on_controller = False` or by
   `CANINE_DISABLE_CONTROLLER_LOCALIZATION` set on the controller.
 

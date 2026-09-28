@@ -63,6 +63,10 @@ BASH = "/bin/bash"
 # shorter than waiting out bucket_upload_wait_tries. Dotted, like the downloader's
 # sidecars, so nothing mistakes it for content.
 BUCKET_CLAIM_OBJECT = ".wolf_claim"
+# Phrases the emitted bucket scripts print, and resolve_on_controller reads back to say
+# what a localization job settled on the controller actually did.
+BUCKET_ALREADY_POPULATED = "already populated"
+BUCKET_WAITING = "another job is uploading into"
 BUCKET_HEARTBEAT_INTERVAL = 60
 BUCKET_HEARTBEAT_STALE = 600
 # types: stream, download, ro_disk, None
@@ -1692,7 +1696,7 @@ class AbstractLocalizer(abc.ABC):
           # upload. The content may have aged out under the lifecycle rule, so the
           # label alone is not enough.
           '  if [ "$CANINE_BUCKET_STATE" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(objs = all_objects),
-          '    echo "INFO: localization bucket {b} already populated" >&2'.format(b = bucket),
+          '    echo "INFO: localization bucket {b} {populated}" >&2'.format(b = bucket, populated = BUCKET_ALREADY_POPULATED),
           '  elif canine_bucket_claim; then',
           # Look again now that the claim is ours. The label was read before the
           # claim, and an uploader finishing in between sets "success" and then
@@ -1700,7 +1704,8 @@ class AbstractLocalizer(abc.ABC):
           # "success" here. Without this, that late job uploaded a second time.
           '    if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(
             burl = burl, objs = all_objects),
-          '      echo "INFO: localization bucket {b} was populated while claiming it" >&2'.format(b = bucket),
+          '      echo "INFO: localization bucket {b} {populated}, by another job, while claiming it" >&2'.format(
+            b = bucket, populated = BUCKET_ALREADY_POPULATED),
           '      gcloud storage rm --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || :',
           '    else',
           '      case "$CANINE_BUCKET_STATE" in',
@@ -1719,7 +1724,7 @@ class AbstractLocalizer(abc.ABC):
           '      echo "WARNING: timed out waiting for {b}; retrying elsewhere" >&2'.format(b = bucket),
           '      exit 5',
           '    fi',
-          '    [ $CANINE_BUCKET_WAITS -gt 0 ] || echo "INFO: another job is uploading into {b}; waiting" >&2'.format(b = bucket),
+          '    [ $CANINE_BUCKET_WAITS -gt 0 ] || echo "INFO: {waiting} {b}; waiting" >&2'.format(waiting = BUCKET_WAITING, b = bucket),
           '    sleep 60; CANINE_BUCKET_WAITS=$((CANINE_BUCKET_WAITS+1))',
           '    continue',
           '  fi',
@@ -1784,7 +1789,7 @@ class AbstractLocalizer(abc.ABC):
         return [
           'if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(
             burl = burl, objs = all_objects),
-          '  echo "INFO: localization bucket {b} already populated" >&2'.format(b = bucket),
+          '  echo "INFO: localization bucket {b} {populated}" >&2'.format(b = bucket, populated = BUCKET_ALREADY_POPULATED),
           # refresh the expiry clock, as the node job this replaces would have
           '  gcloud storage objects update {objs} --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :'.format(objs = all_objects),
           '  exit 0',
@@ -1870,7 +1875,17 @@ class AbstractLocalizer(abc.ABC):
             link = os.path.join(out_root, name)
             if not os.path.lexists(link):
                 os.symlink(os.path.relpath(path, out_root), link)
-        canine_logging.info1("localization job {}: localized on the controller; no node needed".format(jobId))
+        # Say what happened, not just that no node was needed: most jobs settled here
+        # transfer nothing -- another workflow's job, earlier or concurrent, already
+        # filled the shared bucket -- and "localized on the controller" would claim a
+        # transfer that never happened.
+        if BUCKET_ALREADY_POPULATED not in proc.stderr:
+            what = "transferred on the controller into {} (server-side copies)".format(bucket_prefix)
+        elif BUCKET_WAITING in proc.stderr:
+            what = "localized in {} by another job, waited for its upload".format(bucket_prefix)
+        else:
+            what = "already localized in {}, found complete".format(bucket_prefix)
+        canine_logging.info1("localization job {}: {}; no node needed".format(jobId, what))
         return True
 
     def bucketmount_lease_register(self):

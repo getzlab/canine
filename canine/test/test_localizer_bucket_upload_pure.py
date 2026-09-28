@@ -1393,3 +1393,58 @@ class TestTheOrchestratorDropsSettledJobs:
         assert orch.job_spec == {"0": None, "1": {"a": 2}, "2": None}
         # an already-avoided job is not asked
         assert [c.args[0] for c in loc.resolve_on_controller.call_args_list] == ["0", "1"]
+
+
+class TestTheLogSaysWhatASettledJobDid:
+    '''
+    Most localization jobs settled on the controller transfer nothing: another
+    workflow's job, earlier or concurrent, already filled the shared bucket. The log
+    must not call that "localized on the controller".
+    '''
+
+    def _settle(self, monkeypatch, tmp_path, items, setup=None, **fake):
+        logged = []
+        monkeypatch.setattr("canine.localization.base.canine_logging.info1", logged.append)
+        loc, state = TestSettlingALocalizationOnTheController()._localizer(
+            monkeypatch, tmp_path, items, **fake)
+        if setup:
+            setup(state)
+        assert loc.resolve_on_controller("0") is True
+        return [m for m in logged if m.startswith("localization job 0:")][-1]
+
+    def test_a_bucket_found_complete(self, monkeypatch, tmp_path):
+        msg = self._settle(monkeypatch, tmp_path, [gs_item()], exists=True, populated=True,
+                           labels={"wolf": "success"})
+        assert "already localized in gs://wolf-1-us-central1-abc, found complete" in msg
+        assert "transferred" not in msg
+
+    def test_a_download_bucket_found_complete(self, monkeypatch, tmp_path):
+        msg = self._settle(monkeypatch, tmp_path, [s3_item()], exists=True, populated=True,
+                           labels={"wolf": "success"})
+        assert "found complete" in msg
+
+    def test_a_bucket_completed_by_another_job_while_waiting(self, monkeypatch, tmp_path):
+        import json
+        import threading
+        import time
+
+        def owner_finishes(state):
+            def finish():
+                time.sleep(0.5)
+                (state / "populated").write_text("")
+                (state / "labels.json").write_text(json.dumps({"wolf": "success"}))
+                (state / "claim.json").unlink()
+            threading.Thread(target=finish).start()
+        msg = self._settle(monkeypatch, tmp_path, [gs_item()], setup=owner_finishes, exists=True,
+                           labels={"wolf": "working"}, claim={"gen": 7, "updated": aged(5)})
+        assert "localized in gs://wolf-1-us-central1-abc by another job, waited for its upload" in msg
+
+    def test_a_transfer_this_job_made(self, monkeypatch, tmp_path):
+        msg = self._settle(monkeypatch, tmp_path, [gs_item()], exists=True,
+                           labels={"wolf": "success"})              # expired
+        assert "transferred on the controller into gs://wolf-1-us-central1-abc" in msg
+        assert "already localized" not in msg
+
+    def test_a_bucket_this_job_created_and_filled(self, monkeypatch, tmp_path):
+        msg = self._settle(monkeypatch, tmp_path, [gs_item()])
+        assert "transferred on the controller" in msg

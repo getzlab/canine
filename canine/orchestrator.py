@@ -856,8 +856,8 @@ class Orchestrator(object):
                 self.job_spec[jobId] = None
                 settled += 1
         if settled:
-            canine_logging.info1("{} of {} localization job(s) settled on the controller; "
-                                 "no node needed".format(settled, len(self.job_spec)))
+            canine_logging.info1("{} of {} localization job(s) needed no worker node".format(
+                                 settled, len(self.job_spec)))
         return settled
 
     def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)

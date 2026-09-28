@@ -224,8 +224,18 @@ canine to settle each job on the controller (`Orchestrator.resolve_localizations
 A job settled this way is dropped from the batch, the way job avoidance drops one, and is never
 submitted. Its `stdout` and `stderr` are the controller-side output, written where
 `delocalization.py` would put them. Anything that doesn't settle is submitted to a node exactly
-as before: a failed controller run falls back to a node job. The logs say which happened, for
-example `localization job 0: localized on the controller; no node needed`.
+as before: a failed controller run falls back to a node job. The log says which of these
+happened, so it never claims a transfer that did not occur:
+
+| log line (`localization job <id>: ...; no node needed`) | meaning |
+|---|---|
+| `already localized in gs://<bucket>, found complete` | an earlier or concurrent workflow's job had filled the bucket; nothing transferred |
+| `localized in gs://<bucket> by another job, waited for its upload` | another job held a live claim; this one waited on the controller until the bucket was complete |
+| `transferred on the controller into gs://<bucket> (server-side copies)` | this job won the claim and made the copies itself |
+
+A job whose bucket is not yet complete never returns early. It waits on the other job's live
+claim, on the controller or on its node, until the bucket is labelled `success` with every
+object present, so a downstream task never mounts a partial localization.
 
 **Only `LocalizeToBucket` does this.** An ordinary task that localizes its inputs to a bucket
 still needs its node for its own script, so the hook (`Task.after_localize`) does nothing
