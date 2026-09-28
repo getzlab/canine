@@ -125,6 +125,7 @@ class AbstractLocalizer(abc.ABC):
         bucket_upload_wait_tries: int = 90,
         localization_expiry_days: int = 1,
         bucketmount_heartbeat_seconds: int = 3600,
+        resolve_on_controller: bool = True,
         **kwargs
     ):
         """
@@ -205,6 +206,14 @@ class AbstractLocalizer(abc.ABC):
           idle storage rather than the lifetime of a running workflow. Raise it if
           you re-run the same inputs over several days and would rather pay for
           storage than re-transfer.
+
+        resolve_on_controller: let a caller whose job would only localize (wolF's
+          LocalizeToBucket) settle a localization job on the controller instead of submitting
+          it to a worker node, when no node is needed: the bucket is already
+          populated, or every input is a server-side gs:// copy or a file on the
+          shared mount. See resolve_on_controller(). Default True. The environment
+          variable CANINE_DISABLE_CONTROLLER_LOCALIZATION, set on the controller,
+          turns it off without a code change.
         """
         self.file_handler_defaults = self.build_file_handler_defaults(
             parallel_download, download_connections, download_min_chunk, check_hash,
@@ -272,10 +281,16 @@ class AbstractLocalizer(abc.ABC):
             )
         self.bucketmount_heartbeat_seconds = bucketmount_heartbeat_seconds
 
+        self.controller_resolution = resolve_on_controller
+
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
         # jobId : { input : [RODISK URLs] }
         self.rodisk_paths = {}
+
+        # jobId : (bucket_prefix, region, upload plan), kept from job_setup_teardown so
+        # a job can be settled on the controller without re-planning it
+        self.bucket_plans = {}
 
         # will be removed
         self.disk_key = os.urandom(4).hex()
@@ -1755,6 +1770,109 @@ class AbstractLocalizer(abc.ABC):
           'rm -f "$CANINE_BUCKET_LC" "$CANINE_BUCKET_CLAIM_BODY"',
         ]
 
+    def bucket_populated_script(self, upload_plan, bucket_prefix):
+        """
+        Commands that exit 0 only if the localization bucket is already populated,
+        refreshing its objects' customTime as a node job finding it populated would.
+
+        Read-only apart from that refresh, so it is safe to run for a job with inputs
+        to download: they need a node only when the bucket still has to be filled.
+        """
+        bucket = bucket_prefix[len("gs://"):] if bucket_prefix.startswith("gs://") else bucket_prefix
+        burl = shlex.quote("gs://" + bucket)
+        all_objects = " ".join(shlex.quote(x.dest) for x in upload_plan)
+        return [
+          'if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(
+            burl = burl, objs = all_objects),
+          '  echo "INFO: localization bucket {b} already populated" >&2'.format(b = bucket),
+          # refresh the expiry clock, as the node job this replaces would have
+          '  gcloud storage objects update {objs} --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :'.format(objs = all_objects),
+          '  exit 0',
+          'fi',
+          'exit 1',
+        ]
+
+    def resolve_on_controller(self, jobId) -> bool:
+        """
+        Settle job `jobId`'s bucket localization here on the controller, and say
+        whether it worked. A job settled here needs no worker node at all.
+
+        **Only for a job that does nothing but localize** -- wolF's LocalizeToBucket.
+        The caller drops a settled job from the batch, so for any other task this
+        would skip the task's own script.
+
+        Every LocalizeToBucket used to take an exclusive n1-standard-8, even to find
+        the bucket already populated, or to copy gs:// objects server-side with no
+        bytes through the node. With 50-100 workflows sharing reference files, 99
+        nodes booted to do nothing. A node is needed only to download onto the
+        read-write mount, so:
+
+          * every input is a server-side copy or a file on the shared mount (which the
+            controller serves): run the job's whole emitted claim-and-upload block
+            here. The claim, heartbeat, release trap and retries all apply unchanged,
+            so this competes fairly with uploaders on nodes. It waits on another job's
+            live claim here too, holding a thread rather than a node.
+          * some inputs must be downloaded: settle only if the bucket is already
+            populated (bucket_populated_script); otherwise a node is needed.
+
+        Any failure returns False and the job goes to a node as before, which runs
+        the same protocol with the node path's requeue behavior. Turned off by
+        resolve_on_controller=False, or by CANINE_DISABLE_CONTROLLER_LOCALIZATION set
+        on the controller.
+
+        A settled job's stdout and stderr are the script's output, written where
+        delocalization.py would put them, so delocalize() and callers building
+        results from it see an ordinary finished job.
+        """
+        if os.environ.get("CANINE_DISABLE_CONTROLLER_LOCALIZATION"):
+            reason = "CANINE_DISABLE_CONTROLLER_LOCALIZATION is set"
+        elif not self.controller_resolution:
+            reason = "resolve_on_controller is off"
+        elif jobId not in self.bucket_plans:
+            reason = "it has no bucket upload"
+        else:
+            reason = None
+        if reason:
+            canine_logging.info1("localization job {}: submitting it to a node: {}".format(jobId, reason))
+            return False
+
+        bucket_prefix, region, upload_plan = self.bucket_plans[jobId]
+        downloads = [item for item in upload_plan if item.kind == "mount"]
+        if downloads:
+            lines = self.bucket_populated_script(upload_plan, bucket_prefix)
+        else:
+            lines = self.bucket_upload_script(upload_plan, bucket_prefix, region)
+        proc = subprocess.run([BASH, "-c", "set -e\n" + "\n".join(lines) + "\n"],
+                              capture_output = True, text = True)
+
+        env = self.environment("local")
+        job_root = os.path.join(env["CANINE_JOBS"], jobId)
+        os.makedirs(job_root, exist_ok = True)
+        if proc.returncode != 0:
+            with open(os.path.join(job_root, "controller_localization.log"), "w") as log:
+                log.write(proc.stdout + proc.stderr)
+            if downloads:
+                canine_logging.info1("localization job {}: bucket not yet populated, and {} input(s) must be "
+                                     "downloaded; submitting it to a node".format(jobId, len(downloads)))
+            else:
+                canine_logging.warning("localization job {}: localizing on the controller exited {}; "
+                                       "submitting it to a node instead (see {})".format(
+                                         jobId, proc.returncode,
+                                         os.path.join(job_root, "controller_localization.log")))
+            return False
+
+        out_root = os.path.join(env["CANINE_OUTPUT"], jobId)
+        os.makedirs(out_root, exist_ok = True)
+        for name, text in (("stdout", proc.stdout), ("stderr", proc.stderr)):
+            path = os.path.join(job_root, name)
+            with open(path, "w") as f:
+                f.write(text)
+            link = os.path.join(out_root, name)
+            if not os.path.lexists(link):
+                os.symlink(os.path.relpath(path, out_root), link)
+        canine_logging.info1("localization job {}: localized on the controller; no node needed".format(jobId))
+        return True
+
     def bucketmount_lease_register(self):
         """
         Commands registering this job as a live consumer of the bucket it just
@@ -1925,6 +2043,7 @@ class AbstractLocalizer(abc.ABC):
             # concurrent sibling wait instead of re-uploading the same content.
             if not self.persistent_disk_dry_run and len(upload_plan):
                 zone = self.backend_zone()
+                self.bucket_plans[jobId] = (bucket_prefix, _zone_to_region(zone), upload_plan)
                 localization_tasks += self.bucket_upload_script(
                   upload_plan, bucket_prefix, _zone_to_region(zone)
                 )

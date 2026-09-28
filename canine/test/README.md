@@ -33,7 +33,7 @@ uv pip install --python .venv-test/bin/python -r canine/test/requirements.txt
   --ignore=canine/test/test_localizer_remote.py
 ```
 
-Expected: **1668 passed, 1 skipped** (Python 3.14, pandas 3.0).
+Expected: **1682 passed, 1 skipped** (Python 3.14, pandas 3.0).
 
 ## Tests that need the Docker SLURM cluster
 

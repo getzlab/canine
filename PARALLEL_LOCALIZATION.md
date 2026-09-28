@@ -6449,7 +6449,87 @@ Their claim logic is the same code, and the downloader already handles two write
 object. Waiters on `success` still each refresh every object's customTime, which is
 best-effort (`|| :`) and was not a source of failures.
 
-### 13.88 Summary: speedups versus the original localization
+### 13.88 No worker node for a localization that needs none
+
+**The problem.** Every `LocalizeToBucket` job asked SLURM for an exclusive n1-standard-8, and
+only a download onto the read-write mount needs one. When 50–100 concurrent workflows share
+reference files, their localization jobs all resolve to the same bucket (§13.87). One uploads;
+before this change, the other 99 each booted a node only to find the bucket populated, or to
+wait on the claim. The same held when every input was a server-side gs:// copy, which moves
+no bytes through the node at all. canine's `TODO.md` listed that second case, and wolF's
+`LocalizeToBucket` carried the first as a TODO: "skip submitting the job altogether".
+
+**The change.**
+
+* **The hook.** wolF's `Task._run` calls `after_localize()` between
+  `localize_inputs_and_script` and `submit_batch_job`. It returns 0 by default. The plans it
+  needs exist only after localize, which is why `prolog()` could not do this: `prolog()` runs
+  before canine has built the file handlers or named the bucket.
+* **`LocalizeToBucket.after_localize()`** calls canine's
+  `Orchestrator.resolve_localizations_on_controller`, which asks
+  `AbstractLocalizer.resolve_on_controller` about each job:
+  * **every input `server_side` or `copy`:** run the job's emitted claim-and-upload block on
+    the controller, unchanged from what a node runs;
+  * **some input `mount`:** settle only if the bucket is already populated, using the
+    read-only `bucket_populated_script`, which also refreshes customTime.
+* **A settled job** is set to `None` in `job_spec`, as job avoidance does, so it is never
+  submitted. It counts as avoided, which is how wolF already supplies placeholder accounting,
+  and its stdout and stderr are written where `delocalization.py` would put them.
+* **Anything that fails on the controller falls back** to a node job.
+* **It is on by default**, and turned off by `resolve_on_controller = False` or by
+  `CANINE_DISABLE_CONTROLLER_LOCALIZATION` set on the controller.
+
+**Measured.** 100 concurrent copies of what `resolve_on_controller` runs, against one real
+bucket. They used the same five reference files as §13.87 (1.48 GB of dbSNP plus four small
+files), on an **n2-standard-8** controller, the size used for large cohorts. As on a
+controller, `gcloud` was not aliased to `gcloud_exp_backoff`. 2026-09-28, 16:13–16:31 EDT.
+
+| scenario | node jobs | exit 0 | copies of dbSNP | wall | peak memory | peak 1-min load | OOM kills |
+|---|---|---|---|---|---|---|---|
+| server-side inputs, new bucket | **0** | 100 | 1 | 213 s | 7.3 GB | 48.7 | 0 |
+| server-side inputs, expired bucket | **0** | 100 | 1 | 267 s | 7.4 GB | 59.0 | 0 |
+| inputs to download, populated bucket | **0** | 100 | 0 | 66 s | 9.1 GB | 71.4 | 0 |
+| inputs to download, unpopulated bucket | 100 | 0 | 0 | 41 s | 7.4 GB | 75.6 | 0 |
+
+There were no 429s in any run, and no claim was left behind.
+
+* **The first three** would each have been 100 node jobs: one uploader and 99 that booted to
+  find the bucket populated or to wait on the claim.
+* **The last is correct as it stands.** Downloads need a node, the check is read-only, and the
+  node jobs then run the claim protocol from §13.87 as before.
+
+**Controller load.** 100 concurrent `gcloud` processes drive an 8-vCPU controller to a
+1-minute load of 49–76, with up to 9.1 GB resident. That is heavy, but within 31 GB, and every
+run finished correctly. No limit was added, by decision (measure first). A smaller controller,
+such as the n2-standard-2 default, was not measured and would be tighter; if a cohort that size
+is run on one, a limit on concurrent controller-side localizations would be the next step.
+
+**Tests.**
+
+* canine (`test_localizer_bucket_upload_pure.py`, 14 tests):
+  * settling a populated bucket, an expired or new server-side bucket, or a shared-mount file;
+  * waiting on another job's live claim, then settling;
+  * inputs to download, which settle only when the bucket is populated, and do so read-only;
+  * a failed controller run falling back to a node;
+  * both off switches;
+  * the plan recorded by `job_setup_teardown`, which fails without the recording line;
+  * the orchestrator dropping only settled jobs.
+* wolF (`test_localize_on_controller.py`, 8 tests) drive the real `Task._run` against a mocked
+  orchestrator:
+  * the call order is job_avoid, localize, resolve, submit;
+  * an ordinary task and a dry run settle nothing;
+  * settled jobs count as avoided;
+  * the `LocalizeToDisk` alias works too;
+  * with an older canine that lacks the method, the job is submitted to a node as before,
+    with a warning, rather than failing.
+  * Removing the hook from `_run` fails 5 of the 7 hook tests.
+
+**Not covered.** No full wolF workflow on a cluster was run: the scale test exercised canine's
+controller-side scripts, and the wiring was tested with mocks. Phase 3 is not built. That is a
+job with inputs to download, waiting on another job's live claim from the controller rather
+than on a node.
+
+### 13.89 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by
@@ -6496,6 +6576,7 @@ single stream is the slowest of any source.
 | gzip decode: upload slices grown to 256 MiB | 89.6 → 66.6 s decode | **1.35×** (§13.81) |
 | gzip decode: slices start from the compressed size | 27.1–27.7 → 24.6–24.8 s decode | **1.11×** (§13.81) |
 | gs:// sources verified by crc32c from compose metadata | a full read-back → none | read-back removed (§13.84, §13.85) |
+| a `LocalizeToBucket` job that needs no node is settled on the controller | an exclusive n1-standard-8 per job → none | 0 of 100 concurrent jobs needed a node for server-side inputs or a populated bucket (§13.88) |
 
 §13.77's 324.75 GiB relay ran at 393–409 MiB/s, against DRS's single-stream 67.70 MiB/s from
 §13.73. The two were measured separately, so that ratio of 5.8–6.0× is indicative rather than

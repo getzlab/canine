@@ -194,6 +194,57 @@ downloader handles two writers on one object itself.
 than a workflow failure. Every give-up path here uses it, because every cause is transient or
 node-local.
 
+### When no node is needed: settling on the controller
+
+A `LocalizeToBucket` job does nothing but localize, and every one used to take an exclusive
+n1-standard-8. That included jobs whose bucket was already populated, and jobs whose inputs
+were all server-side copies moving no bytes through the node. When 50–100 concurrent workflows
+share reference files, their localization jobs all resolve to the same bucket, so 99 nodes
+booted to do nothing. Only one kind of input needs a node:
+
+| upload kind | needs a node? |
+|---|---|
+| `server_side` (gs://, not gzip-encoded) | no: a GCS rewrite |
+| `copy` (a file on the shared mount) | no: the controller serves the NFS share |
+| `mount` (http, S3, GDC, DRS, gzip-encoded gs://) | **yes**: a download onto the read-write mount |
+
+So after localizing and before submitting, wolF's `LocalizeToBucket.after_localize()` asks
+canine to settle each job on the controller (`Orchestrator.resolve_localizations_on_controller`
+→ `AbstractLocalizer.resolve_on_controller`):
+
+* **Every input is `server_side` or `copy`:** the controller runs the job's emitted
+  claim-and-upload block itself, the same `bucket_upload_script` output a node runs. The
+  claim, heartbeat, release trap and retries all apply, so it competes fairly with node-side
+  uploaders. Waiting on another job's live claim holds a controller thread, not a node.
+* **Some input is `mount`:** the controller checks only whether the bucket is already
+  populated (`bucket_populated_script`: `success` plus every object present), refreshing
+  customTime if so. That check is read-only, so the node job still does any claiming and
+  downloading.
+
+A job settled this way is dropped from the batch, the way job avoidance drops one, and is never
+submitted. Its `stdout` and `stderr` are the controller-side output, written where
+`delocalization.py` would put them. Anything that doesn't settle is submitted to a node exactly
+as before: a failed controller run falls back to a node job. The logs say which happened, for
+example `localization job 0: localized on the controller; no node needed`.
+
+**Only `LocalizeToBucket` does this.** An ordinary task that localizes its inputs to a bucket
+still needs its node for its own script, so the hook (`Task.after_localize`) does nothing
+by default.
+
+**Turning it off**, on by default:
+
+* **On the controller, at runtime:** `export CANINE_DISABLE_CONTROLLER_LOCALIZATION=1` before
+  running wolF. It must be set where wolF runs, not on the nodes, since the controller makes
+  the decision.
+* **Per localization:** `wolf.LocalizeToBucket(files = {...}, resolve_on_controller = False)`.
+
+Measured at 100 concurrent workflows on an n2-standard-8 controller
+(`PARALLEL_LOCALIZATION.md` §13.88):
+
+* **Server-side inputs,** on a new or an expired bucket: 0 node jobs.
+* **Inputs to download, on a populated bucket:** 0 node jobs.
+* **Inputs to download, on an unpopulated bucket:** 100 node jobs. They still need nodes.
+
 ---
 
 ## 4. The three upload paths
@@ -335,7 +386,8 @@ Pass from wolF via `LocalizeToBucket(files=..., <kwarg>=...)`, or workflow-wide 
 | `localize_to_persistent_disk` | `False` | Master switch for this whole path. `LocalizeToBucket` sets it `True`. Also forces `common = False` (`base.py:158`). |
 | `localization_expiry_days` | `1` | `daysSinceCustomTime` in the lifecycle rule. Bounds *idle* storage, not the life of a running workflow — live content has its clock refreshed on every localization and by the heartbeat. Raise it if you re-run the same inputs over several days and would rather pay for storage than re-transfer. |
 | `bucketmount_heartbeat_seconds` | `3600` | How often a held mount re-stamps customTime (§7). Must be `< localization_expiry_days * 86400 / 4`, else `ValueError` at construction (`base.py:181`) — for the default 1-day expiry, anything `< 21600`. |
-| `bucket_upload_wait_tries` | `90` | 60-second polls a worker waits for a sibling's upload before declaring the claim stale and requeueing (`exit 5`) — a ~1.5 hour ceiling. **Derived, not guessed**: the bucket route measures 0.57 h for the largest real input, so 0.57 h + the 60 s create ceiling, doubled, is 71 polls. Bounded on both sides — below it healthy uploads are taken over mid-flight, above it every preemption stalls siblings for the full window. Scale by **bytes** if your largest set relays more (`pdl claim --localization-bytes`); a BAM plus indices is ~1.0x, two BAMs is 2.0x, and `gs://` inputs do not count. `canine/test/BENCHMARK_RUNBOOK.md` §6.6/§6.7. |
+| `bucket_upload_wait_tries` | `90` | 60-second polls a job waits on another job's live claim before requeueing (`exit 5`) — a ~1.5 hour ceiling. **Derived, not guessed**: the bucket route measures 0.57 h for the largest real input, so 0.57 h + the 60 s create ceiling, doubled, is 71 polls. It must exceed the longest upload, or waiters requeue on healthy ones. A dead uploader no longer costs this window: its claim's heartbeat goes stale after 10 minutes and one waiter takes over (§3). Scale by **bytes** if your largest set relays more (`pdl claim --localization-bytes`); a BAM plus indices is ~1.0x, two BAMs is 2.0x, and `gs://` inputs do not count. `canine/test/BENCHMARK_RUNBOOK.md` §6.6/§6.7. |
+| `resolve_on_controller` | `True` | Let `LocalizeToBucket` settle a job on the controller when no node is needed (§3, "When no node is needed"). `CANINE_DISABLE_CONTROLLER_LOCALIZATION`, set on the controller, turns it off at runtime. |
 | `allow_requester_pays` | `False` | If `False`, reading from a requester-pays source raises instead of silently billing `project`. |
 | `persistent_disk_dry_run` | `False` | Return the `bucketmount://` URLs that *would* be produced without creating or uploading anything. |
 
@@ -395,7 +447,7 @@ instance per zone per bucket, and a worker in another zone of the same region ge
 
 | Class | Purpose |
 |---|---|
-| `LocalizeToBucket(files={...}, **kwargs)` | Produce a localization. `kwargs` pass straight through as `extra_localization_args`. `job_avoid=False`, script is a no-op. |
+| `LocalizeToBucket(files={...}, **kwargs)` | Produce a localization. `kwargs` pass straight through as `extra_localization_args`. `job_avoid=False`, script is a no-op, and a job needing no node is settled on the controller instead of submitted (§3). |
 | `DeleteLocalizedFiles(disk=<bucketmount:// URL>)` | Evict one input key's objects early (§8). |
 | `DeleteDisk` | **Deprecated** alias for the above; emits a `DeprecationWarning` (`:135`). |
 | `LocalizeToDisk` | **Deprecated** alias for `LocalizeToBucket`; warns on every use. |

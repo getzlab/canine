@@ -1024,16 +1024,14 @@ sys.exit(0)                                           # the inputs' objects upda
 '''
 
 
-def run_claim_script(tmp_path, items=None, labels=None, exists=False, populated=False,
-                     claim=None, wait_tries=60, background=False, jobs=1, **env):
+def install_fake_gcs(tmp_path, labels=None, exists=False, populated=False, claim=None):
     '''
-    Run the whole emitted bucket script, `jobs` copies at once, under `set -e`, against
-    FAKE_GCS_GCLOUD. `sleep` is shortened, not removed, so the heartbeat really runs;
-    gcsfuse and fusermount are no-ops.
+    Put FAKE_GCS_GCLOUD first on a PATH, with its bucket in the given state. `sleep` is
+    shortened, not removed, so a heartbeat really runs; gcsfuse and fusermount are
+    no-ops. Returns (the PATH to use, the state directory).
     '''
     import json
     import os
-    import subprocess
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     (bin_dir / "gcloud").write_text(FAKE_GCS_GCLOUD)
@@ -1057,9 +1055,21 @@ def run_claim_script(tmp_path, items=None, labels=None, exists=False, populated=
         (state / "labels.json").write_text(json.dumps(labels))
     if claim:
         (state / "claim.json").write_text(json.dumps(claim))
+    return "{}:{}".format(bin_dir, os.environ["PATH"]), state
+
+
+def run_claim_script(tmp_path, items=None, labels=None, exists=False, populated=False,
+                     claim=None, wait_tries=60, background=False, jobs=1, **env):
+    '''
+    Run the whole emitted bucket script, `jobs` copies at once, under `set -e`, against
+    FAKE_GCS_GCLOUD.
+    '''
+    import os
+    import subprocess
+    path, state = install_fake_gcs(tmp_path, labels=labels, exists=exists,
+                                   populated=populated, claim=claim)
     script = script_for(items or [gs_item()], wait_tries=wait_tries)
-    environ = dict(os.environ, PATH="{}:{}".format(bin_dir, os.environ["PATH"]),
-                   FAKE_STATE=str(state), **env)
+    environ = dict(os.environ, PATH=path, FAKE_STATE=str(state), **env)
     argv = ["bash", "-c", "set -e\n" + script + "\necho CANINE_SCRIPT_DONE"]
     if background:
         return subprocess.Popen(argv, env=environ, stdout=subprocess.PIPE,
@@ -1228,3 +1238,158 @@ class TestTheClaimMakesTakeoverExclusive:
                                        claim={"gen": 7, "updated": aged(5)})
         assert proc.returncode == 5
         assert input_copy_calls(state) == []
+
+
+class TestSettlingALocalizationOnTheController:
+    '''
+    Every LocalizeToBucket used to take an exclusive n1-standard-8, even to find its
+    bucket already populated or to copy gs:// objects server-side. With 50-100
+    workflows sharing reference files, 99 nodes booted to do nothing.
+    resolve_on_controller settles a job on the controller when no node is needed,
+    running the same claim-and-upload a node would.
+    '''
+
+    PREFIX = "gs://wolf-1-us-central1-abc"
+
+    def _localizer(self, monkeypatch, tmp_path, items, localizer_kwargs=None, **fake):
+        path, state = install_fake_gcs(tmp_path, **fake)
+        monkeypatch.setenv("PATH", path)
+        monkeypatch.setenv("FAKE_STATE", str(state))
+        monkeypatch.delenv("CANINE_DISABLE_CONTROLLER_LOCALIZATION", raising=False)
+        loc = make_localizer(**(localizer_kwargs or {}))
+        loc.bucket_plans["0"] = (self.PREFIX, "us-central1", items)
+        return loc, state
+
+    @staticmethod
+    def _delocalized(loc):
+        import os
+        out = os.path.join(loc.environment("local")["CANINE_OUTPUT"], "0")
+        return {name: os.path.isfile(os.path.join(out, name)) for name in ("stdout", "stderr")}
+
+    def test_a_populated_bucket_is_settled_without_copying(self, monkeypatch, tmp_path):
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()], exists=True,
+                                     populated=True, labels={"wolf": "success"})
+        assert loc.resolve_on_controller("0") is True
+        assert input_copy_calls(state) == []
+        assert self._delocalized(loc) == {"stdout": True, "stderr": True}
+
+    def test_its_expiry_clock_is_refreshed(self, monkeypatch, tmp_path):
+        '''The node job this replaces renewed customTime; without it, content in use ages out.'''
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()], exists=True,
+                                     populated=True, labels={"wolf": "success"})
+        loc.resolve_on_controller("0")
+        assert any(c.startswith("storage objects update") and "--custom-time" in c
+                   and ".wolf_claim" not in c for c in fake_calls(state))
+
+    def test_a_server_side_only_bucket_is_claimed_and_copied_here(self, monkeypatch, tmp_path):
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()], exists=True,
+                                     labels={"wolf": "success"})           # expired
+        assert loc.resolve_on_controller("0") is True
+        assert len(input_copy_calls(state)) == 1
+        assert fake_labels(state) == {"wolf": "success"}
+        assert fake_claim(state) is None
+        assert self._delocalized(loc) == {"stdout": True, "stderr": True}
+
+    def test_a_new_bucket_is_created_and_filled_here(self, monkeypatch, tmp_path):
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()])
+        assert loc.resolve_on_controller("0") is True
+        assert any(c.startswith("storage buckets create") for c in fake_calls(state))
+        assert len(input_copy_calls(state)) == 1
+
+    def test_a_shared_mount_file_is_uploaded_here(self, monkeypatch, tmp_path):
+        '''The controller serves the NFS share, so it has an upstream output locally.'''
+        fh = MagicMock(path="/mnt/nfs/workspace/ref.fa", localization_mode="local")
+        item = UploadItem(fh=fh, dest=self.PREFIX + "/reference/ref.fa", kind="copy")
+        loc, state = self._localizer(monkeypatch, tmp_path, [item])
+        assert loc.resolve_on_controller("0") is True
+        assert len(input_copy_calls(state)) == 1
+
+    def test_another_jobs_live_claim_is_waited_on_here(self, monkeypatch, tmp_path):
+        '''Waiting holds a controller thread instead of an exclusive node.'''
+        import json
+        import threading
+        import time
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()], exists=True,
+                                     labels={"wolf": "working"},
+                                     claim={"gen": 7, "updated": aged(5)})
+
+        def owner_finishes():
+            time.sleep(0.5)
+            (state / "populated").write_text("")
+            (state / "labels.json").write_text(json.dumps({"wolf": "success"}))
+            (state / "claim.json").unlink()
+        threading.Thread(target=owner_finishes).start()
+        assert loc.resolve_on_controller("0") is True
+        assert input_copy_calls(state) == []
+
+    def test_download_inputs_are_settled_only_if_already_populated(self, monkeypatch, tmp_path):
+        loc, state = self._localizer(monkeypatch, tmp_path, [s3_item(), gs_item()],
+                                     exists=True, populated=True, labels={"wolf": "success"})
+        assert loc.resolve_on_controller("0") is True
+
+    def test_download_inputs_on_an_unpopulated_bucket_go_to_a_node(self, monkeypatch, tmp_path):
+        '''Read-only: the node job does the claiming.'''
+        loc, state = self._localizer(monkeypatch, tmp_path, [s3_item()], exists=True,
+                                     labels={"wolf": "success"})           # expired
+        assert loc.resolve_on_controller("0") is False
+        assert not any(".wolf_claim" in c for c in fake_calls(state))
+        assert input_copy_calls(state) == []
+        assert self._delocalized(loc) == {"stdout": False, "stderr": False}
+
+    def test_a_failed_controller_run_goes_to_a_node(self, monkeypatch, tmp_path):
+        import os
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()])
+        monkeypatch.setenv("FAKE_CP", "fail")
+        assert loc.resolve_on_controller("0") is False
+        log = os.path.join(loc.environment("local")["CANINE_JOBS"], "0", "controller_localization.log")
+        assert "copy failed 3 times" in open(log).read()
+        assert self._delocalized(loc) == {"stdout": False, "stderr": False}
+        assert fake_claim(state) is None                   # the trap released it
+
+    def test_the_environment_variable_turns_it_off(self, monkeypatch, tmp_path):
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()], exists=True,
+                                     populated=True, labels={"wolf": "success"})
+        monkeypatch.setenv("CANINE_DISABLE_CONTROLLER_LOCALIZATION", "1")
+        assert loc.resolve_on_controller("0") is False
+        assert fake_calls(state) == []
+
+    def test_the_option_turns_it_off(self, monkeypatch, tmp_path):
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()], exists=True,
+                                     populated=True, labels={"wolf": "success"},
+                                     localizer_kwargs={"resolve_on_controller": False})
+        assert loc.resolve_on_controller("0") is False
+        assert fake_calls(state) == []
+
+    def test_a_job_with_no_bucket_upload_goes_to_a_node(self, monkeypatch, tmp_path):
+        loc, state = self._localizer(monkeypatch, tmp_path, [gs_item()])
+        assert loc.resolve_on_controller("1") is False
+
+    def test_job_setup_teardown_keeps_the_plan(self):
+        '''resolve_on_controller settles from what localization already planned.'''
+        loc = make_localizer(localize_to_persistent_disk=True)
+        loc.inputs = {"0": {}}
+        loc.clean_on_exit = False
+        item = gs_item()
+        with patch.object(loc, "create_bucket_mount",
+                          return_value=(self.PREFIX, False, {"inp": ["bucketmount://x"]}, [item])), \
+             patch.object(loc, "backend_zone", return_value="us-central1-c"):
+            try:
+                loc.job_setup_teardown("0", {"stdout": "../stdout", "stderr": "../stderr"},
+                                       MagicMock())
+            except Exception:
+                pass                                      # only the bucket branch matters here
+        assert loc.bucket_plans.get("0") == (self.PREFIX, "us-central1", [item])
+
+
+class TestTheOrchestratorDropsSettledJobs:
+
+    def test_settled_jobs_are_dropped_like_avoided_ones(self):
+        import types
+        from canine.orchestrator import Orchestrator
+        orch = types.SimpleNamespace(job_spec={"0": {"a": 1}, "1": {"a": 2}, "2": None})
+        loc = MagicMock()
+        loc.resolve_on_controller.side_effect = lambda job: job == "0"
+        assert Orchestrator.resolve_localizations_on_controller(orch, loc) == 1
+        assert orch.job_spec == {"0": None, "1": {"a": 2}, "2": None}
+        # an already-avoided job is not asked
+        assert [c.args[0] for c in loc.resolve_on_controller.call_args_list] == ["0", "1"]

@@ -840,6 +840,26 @@ class Orchestrator(object):
 
         return batch_id
 
+    def resolve_localizations_on_controller(self, localizer: AbstractLocalizer) -> int:
+        """
+        Drop from the batch every job whose bucket localization the localizer could
+        settle on the controller (AbstractLocalizer.resolve_on_controller), marking it
+        None the way job avoidance does, so it is never submitted. Returns how many.
+
+        Call after localize_inputs_and_script, and only for a task whose job does
+        nothing but localize (wolF's LocalizeToBucket): a dropped job's script never
+        runs.
+        """
+        settled = 0
+        for jobId, spec in self.job_spec.items():
+            if spec is not None and localizer.resolve_on_controller(jobId):
+                self.job_spec[jobId] = None
+                settled += 1
+        if settled:
+            canine_logging.info1("{} of {} localization job(s) settled on the controller; "
+                                 "no node needed".format(settled, len(self.job_spec)))
+        return settled
+
     def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)
         """
         Detects jobs which have previously been run in this staging directory.
