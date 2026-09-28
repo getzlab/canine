@@ -6362,3 +6362,89 @@ INFO: matched output name "stdout" (pattern "/mnt/nfs/wolf-test-slw/HG003_HG002-
 INFO: matched output name "stderr" (pattern "/mnt/nfs/wolf-test-slw/HG003_HG002-Run2/Localize_ref_files_char__2026-09-17--22-50-32_mg4xwxy_tbhx1ki_lrnqk1qo4quv0/jobs/0/stderr")
 ++++ DELOCALIZATION COMPLETE ++++
 ```
+
+### 13.87 One bucket, 100 jobs: the upload claim at scale
+
+Two production problems (`TODO.md`). First, a cancelled workflow left its bucket labelled
+`wolf=working`, and the restarted one waited up to `bucket_upload_wait_tries` (90 minutes)
+before taking over. Second, it is common for 50–100 workflows to share reference files, and
+every one of them then shares one localization bucket, whichever workflow it belongs to.
+
+**The test.** 100 copies of canine's emitted claim-and-upload script ran at once against one
+real bucket (private, in `getzlab-wolf-develop`). Each was wrapped as `localization.sh` wraps
+it: `set -e`, and `gcloud` aliased to the production `gcloud_exp_backoff`. The inputs were five
+real reference files that production copies server-side: 1.48 GB of dbSNP plus four small
+files. The jobs ran on one n1-standard-8 with a user's ADC, so it is GCS's per-bucket contention
+that was measured, not the node's. Each scenario used a fresh bucket name, never the
+production name for these inputs, and everything was deleted afterwards. 2026-09-28,
+13:19–15:08 EDT.
+
+**Before: a SIGTERM trap and a label heartbeat on the old state machine.** Only bucket
+creation was a mutex. Every other decision was made per job from the labels.
+
+| scenario | jobs that uploaded | own dbSNP copy | failed | why |
+|---|---|---|---|---|
+| cold start | 1 | 1 | 0 | — |
+| expired (the code before this work) | 49 | 39 | **14** | HTTP 429 on the `wolf=success` update |
+| dead heartbeat | 42 | 39 | 4 | 3 × 429, 1 × 503 |
+| cancel, 99 waiting | 47 | 33 | 4 | 429 |
+
+Every job that saw an expired, stale or dead bucket took it over at the same moment. Here that
+cost about 39 redundant server-side copies. For inputs downloaded onto the mount it would mean
+up to about 40 nodes each downloading the same object, and an object can be a 300 GB BAM.
+GCS allows about one metadata update per second per bucket. `buckets update` was not retried
+on its 429, because `gcloud_exp_backoff` only retries "Quota exceeded". So a job whose content
+was complete failed on the label, and its trap marked the bucket stale again.
+
+**The fix (canine `base.py`, `bucket_upload_script`).**
+
+* **The claim object.** `gs://<bucket>/.wolf_claim` decides who uploads. Taking an upload
+  over means writing it with `--if-generation-match=<generation just read>`, 0 if absent.
+  That is a compare-and-swap, so exactly one racer wins; against real GCS a second
+  conditional create returned 412.
+* **The heartbeat.** It is the claim's server-side update time. The owner refreshes it every
+  60 s with `objects update --if-generation-match=<its generation>`, so it can never keep
+  someone else's claim alive. A claim more than 600 s old is dead.
+* **The labels** (`working`, `success`, `stale`) are still written, for older canine
+  versions, but no longer decide anything. Their writes are retried with jitter, up to 8
+  times, on a 429.
+* **The EXIT trap**, reached on SIGTERM too, releases the claim (conditional delete) and
+  marks the bucket stale. The exit code is kept, so 5 still means requeue.
+* **On success**, `wolf=success` is written and only then is the claim released. A job that
+  wins a claim re-reads the label before uploading. Otherwise a job that read `working`
+  just before an owner finished, and found no claim just after, uploaded a second time; the
+  20-job unit test caught this.
+* **A waiter that times out** exits 5 but no longer marks the bucket stale, because the
+  claim it waited on was live.
+
+**After.**
+
+| scenario | jobs that uploaded | failed | 429s | notes |
+|---|---|---|---|---|
+| cold start | 1 | 0 | 0 | 99 waited on the creator's claim |
+| expired | **1** | **0** | 0 | 99 waited |
+| cancel (SIGTERM) | **1** | **0** | 0 | the cancelled job released its claim; one waiter took over |
+| killed (SIGKILL, no trap) | **1** | **0** | 0 | 99 waited until the dead claim was 600 s old; one took over |
+
+The killed job is the case no trap can cover: preemption, a deleted node, or a torn-down
+cluster. That run took 850 s, most of it the deliberate 600 s staleness wait. The old
+protocol waited out the full 90 minutes, or stampeded. In every run the final contents were
+the five objects at their source sizes, labelled `wolf=success`, with no claim left.
+
+**Unit tests** (`test_localizer_bucket_upload_pure.py`). A stateful fake `gcloud` models the
+claim like GCS: generation, compare-and-swap, conditional heartbeat and delete, and update
+time. Every call holds a file lock, so concurrent jobs race.
+
+* 20 racing jobs produce exactly one uploader when the bucket is expired, stale, has a dead
+  claim, or is unclaimed.
+* A live claim is waited on even when the label says stale.
+* A failed upload, an upload that exits 5, and a SIGTERM each release the claim and keep
+  their exit code.
+* The heartbeat refreshes the claim, and none outlives the upload.
+* With the compare-and-swap made unconditional, 6 of the 8 exclusivity tests fail. With the
+  trap removed, 3 of the release tests fail.
+
+**Not covered.** Mount-kind inputs (downloads onto the rw mount) were not in the 100-job runs.
+Their claim logic is the same code, and the downloader already handles two writers on one
+object. Waiters on `success` still each refresh every object's customTime, which is
+best-effort (`|| :`) and was not a source of failures.

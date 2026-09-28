@@ -54,6 +54,17 @@ STAGED_SCRIPTS = ("delocalization.py", "debug.sh", "parallel_download.py")
 # substitution -- that shell=True's default /bin/sh rejects outright. On the controller
 # image /bin/sh is dash, so anything running an emitted command must name bash explicitly.
 BASH = "/bin/bash"
+
+# The object in a localization bucket whose owner is uploading into it (see
+# bucket_upload_script). Its generation is the compare-and-swap token for taking an upload
+# over, and its server-side update time is the owner's heartbeat: refreshed every
+# BUCKET_HEARTBEAT_INTERVAL seconds, and considered dead once BUCKET_HEARTBEAT_STALE seconds
+# old -- long enough that a few failed refreshes cannot look like a dead owner, far
+# shorter than waiting out bucket_upload_wait_tries. Dotted, like the downloader's
+# sidecars, so nothing mistakes it for content.
+BUCKET_CLAIM_OBJECT = ".wolf_claim"
+BUCKET_HEARTBEAT_INTERVAL = 60
+BUCKET_HEARTBEAT_STALE = 600
 # types: stream, download, ro_disk, None
 # indicates what kind of action needs to be taken during job startup
 
@@ -1601,14 +1612,54 @@ class AbstractLocalizer(abc.ABC):
             days = int(self.localization_expiry_days)),
           'CANINE_LIFECYCLE_EOF',
           'CANINE_BUCKET_WAITS=0',
+          'CANINE_BUCKET_CLAIM={claim}'.format(claim = shlex.quote("gs://{}/{}".format(bucket, BUCKET_CLAIM_OBJECT))),
+          'CANINE_BUCKET_CLAIM_BODY=$(mktemp)',
+          # Label writes are rate-limited per bucket (about one a second), and at
+          # 50-100 jobs sharing a bucket they returned HTTP 429 -- which
+          # gcloud_exp_backoff does not retry, since it looks only for "Quota
+          # exceeded". So they are retried here, with jitter.
+          'canine_bucket_label() {',
+          '  local try',
+          '  for try in 1 2 3 4 5 6 7 8; do',
+          '    gcloud storage buckets update {burl} "$@" > /dev/null 2>&1 && return 0'.format(burl = burl),
+          '    sleep $(( RANDOM % 5 + try ))',
+          '  done',
+          '  echo "WARNING: could not update the labels of {b}: $*" >&2'.format(b = bucket),
+          '  return 1',
+          '}',
+          # Take the upload over, exclusively. Only bucket creation used to be a
+          # mutex, so an expired or stale bucket was taken over by every job that
+          # saw it at once: at 100 jobs, 40-50 uploaded the same inputs and a
+          # tenth failed on label rate limits. The claim object is a
+          # compare-and-swap instead: its write is conditional on the generation
+          # just read (0 if absent), so exactly one racer wins. A claim is held
+          # while its server-side update time is under BUCKET_HEARTBEAT_STALE
+          # old; the owner refreshes it every BUCKET_HEARTBEAT_INTERVAL. A failed
+          # describe reads as "absent", which is safe: the conditional write then
+          # fails against the object that is there.
+          'canine_bucket_claim() {',
+          '  local gen updated',
+          '  read -r gen updated < <(gcloud storage objects describe "$CANINE_BUCKET_CLAIM" --format="value(generation,update_time.date(%s))" 2> /dev/null || :)',
+          '  updated=${updated%%.*}',
+          '  case "$gen" in ""|*[!0-9]*) gen=0;; esac',
+          '  case "$updated" in ""|*[!0-9]*) updated=0;; esac',
+          '  if [ "$gen" != "0" ] && [ $(( $(date +%s) - updated )) -le {stale} ]; then return 1; fi'.format(stale = BUCKET_HEARTBEAT_STALE),
+          '  echo "$(hostname) ${SLURM_JOB_ID:-$$}.${SLURM_ARRAY_TASK_ID:-0} $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CANINE_BUCKET_CLAIM_BODY"',
+          '  gcloud storage cp --if-generation-match=$gen --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CANINE_BUCKET_CLAIM_BODY" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || return 1',
+          '  CANINE_BUCKET_CLAIM_GEN=$(gcloud storage objects describe "$CANINE_BUCKET_CLAIM" --format="value(generation)" 2> /dev/null)',
+          '}',
           'while :; do',
+          '  CANINE_BUCKET_UPLOAD=0',
           # --soft-delete-duration=0 disables GCS soft delete, which new buckets
           # otherwise get at 7 days. Without it every expired or deleted object
           # is retained and *billed* for a further week, so a 1-day expiry on a
           # multi-TB localization would still be paying for 7 days of soft-deleted
           # copies. This is a cache; there is nothing here worth undeleting.
           '  if gcloud storage buckets create {burl} --location={region} --soft-delete-duration=0 --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1; then'.format(burl = burl, region = shlex.quote(region)),
-          '    CANINE_BUCKET_UPLOAD=1',
+          # Creating the bucket makes this job the natural uploader, but it still
+          # takes the claim like anyone else: a waiter that finds a new, unlabelled
+          # bucket with no claim may otherwise take it first.
+          '    CANINE_BUCKET_STATE=created',
           '  else',
           # Two different 409s land here, and under real contention the transient
           # one dominates: "A conflicting operation is currently in progress ...
@@ -1621,48 +1672,87 @@ class AbstractLocalizer(abc.ABC):
           '      sleep 2; CANINE_BUCKET_TRIES=$((CANINE_BUCKET_TRIES+1))',
           '    done',
           '    CANINE_BUCKET_STATE=$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)'.format(burl = burl),
-          '    if [ "$CANINE_BUCKET_STATE" == "success" ]; then',
-          # content is supposed to be here -- but it may have aged out under the
-          # lifecycle rule, in which case we take the bucket over and re-upload
-          '      if gcloud storage ls {objs} > /dev/null 2>&1; then'.format(objs = all_objects),
-          '        echo "INFO: localization bucket {b} already populated" >&2'.format(b = bucket),
-          '        CANINE_BUCKET_UPLOAD=0',
-          '      else',
-          '        echo "INFO: localization bucket {b} expired; repopulating" >&2'.format(b = bucket),
-          '        CANINE_BUCKET_UPLOAD=1',
-          '      fi',
-          '    elif [ "$CANINE_BUCKET_STATE" == "stale" ]; then',
-          # a previous uploader timed out or died and released its claim. Take
-          # over rather than waiting: nobody else is going to finish this. A double
-          # take-over, here or on an expired bucket above, is harmless because the
-          # copies are -n and rerun when a sibling wins a race (see retried()), and
-          # the downloader handles two writers on one object.
-          '      echo "INFO: taking over stale localization bucket {b}" >&2'.format(b = bucket),
-          '      CANINE_BUCKET_UPLOAD=1',
+          '  fi',
+          # "success" with the content present is the only state that needs no
+          # upload. The content may have aged out under the lifecycle rule, so the
+          # label alone is not enough.
+          '  if [ "$CANINE_BUCKET_STATE" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(objs = all_objects),
+          '    echo "INFO: localization bucket {b} already populated" >&2'.format(b = bucket),
+          '  elif canine_bucket_claim; then',
+          # Look again now that the claim is ours. The label was read before the
+          # claim, and an uploader finishing in between sets "success" and then
+          # releases its claim -- so a claim won after that release always sees
+          # "success" here. Without this, that late job uploaded a second time.
+          '    if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(
+            burl = burl, objs = all_objects),
+          '      echo "INFO: localization bucket {b} was populated while claiming it" >&2'.format(b = bucket),
+          '      gcloud storage rm --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || :',
           '    else',
-          # "working", or absent because the owner created the bucket but has not
-          # labelled it yet (buckets create cannot set labels) -- either way,
-          # somebody else is uploading, so wait rather than duplicating the work
-          '      if [ $CANINE_BUCKET_WAITS -ge {tries} ]; then'.format(tries = self.bucket_upload_wait_tries),
-          '        echo "WARNING: timed out waiting for {b}; releasing claim and retrying elsewhere" >&2'.format(b = bucket),
-          '        gcloud storage buckets update {burl} --update-labels=wolf=stale > /dev/null 2>&1 || :'.format(burl = burl),
-          '        exit 5',
-          '      fi',
-          '      sleep 60; CANINE_BUCKET_WAITS=$((CANINE_BUCKET_WAITS+1))',
-          '      continue',
+          '      case "$CANINE_BUCKET_STATE" in',
+          '        created) ;;',
+          '        success) echo "INFO: localization bucket {b} expired; repopulating" >&2 ;;'.format(b = bucket),
+          '        stale) echo "INFO: taking over stale localization bucket {b}" >&2 ;;'.format(b = bucket),
+          '        *) echo "INFO: the upload into {b} has no live claim; taking it over" >&2 ;;'.format(b = bucket),
+          '      esac',
+          '      CANINE_BUCKET_UPLOAD=1',
           '    fi',
+          '  else',
+          # Another job holds a live claim, so wait for it. Timing out requeues
+          # this job, but no longer marks the bucket stale: a live claim is a live
+          # uploader, and taking it over would only duplicate the work.
+          '    if [ $CANINE_BUCKET_WAITS -ge {tries} ]; then'.format(tries = self.bucket_upload_wait_tries),
+          '      echo "WARNING: timed out waiting for {b}; retrying elsewhere" >&2'.format(b = bucket),
+          '      exit 5',
+          '    fi',
+          '    [ $CANINE_BUCKET_WAITS -gt 0 ] || echo "INFO: another job is uploading into {b}; waiting" >&2'.format(b = bucket),
+          '    sleep 60; CANINE_BUCKET_WAITS=$((CANINE_BUCKET_WAITS+1))',
+          '    continue',
           '  fi',
           '  if [ "$CANINE_BUCKET_UPLOAD" == "1" ]; then',
-          '    gcloud storage buckets update {burl} --update-labels=wolf=working > /dev/null'.format(burl = burl),
+          # Informational now, for older canine versions still reading labels:
+          # the claim decides who uploads.
+          '    canine_bucket_label --update-labels=wolf=working || :',
+          # The heartbeat. It refreshes the claim's update time, conditional on
+          # this job's generation, so it can never keep someone else's claim alive.
+          '    ( while sleep {interval}; do gcloud storage objects update "$CANINE_BUCKET_CLAIM" --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :; done ) &'.format(
+            interval = BUCKET_HEARTBEAT_INTERVAL),
+          '    CANINE_BUCKET_HB_PID=$!',
+          # A failed or cancelled upload used to leave the bucket "working", so the
+          # next job waited out the whole limit before taking over -- seen in
+          # production when a workflow was cancelled and restarted. scancel sends
+          # SIGTERM with KillWait (300 s) before SIGKILL, so the trap has time to
+          # run. Releasing the claim lets exactly one waiter take over at once. It
+          # does not change the exit code: the requeue-vs-fail meaning of 5 and 1
+          # survives.
+          '    canine_bucket_release() {',
+          '      kill $CANINE_BUCKET_HB_PID 2> /dev/null || :',
+          '      if [ "${CANINE_BUCKET_DONE:-0}" != "1" ]; then',
+          '        echo "WARNING: the upload into {b} did not finish; releasing it so the next job takes over at once" >&2'.format(b = bucket),
+          '        canine_bucket_label --update-labels=wolf=stale || :',
+          '        gcloud storage rm --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || :',
+          '      fi',
+          '    }',
+          '    trap canine_bucket_release EXIT',
+          # So that a signal ends the script through the EXIT trap, with the
+          # conventional 128+N code.
+          '    trap "exit 143" TERM',
+          '    trap "exit 130" INT',
         ] + uploads + [
-          '    gcloud storage buckets update {burl} --update-labels=wolf=success > /dev/null'.format(burl = burl),
+          '    kill $CANINE_BUCKET_HB_PID 2> /dev/null || :',
+          '    wait $CANINE_BUCKET_HB_PID 2> /dev/null || :',
+          '    canine_bucket_label --update-labels=wolf=success',
+          '    CANINE_BUCKET_DONE=1',
+          '    trap - EXIT TERM INT',
+          # Only after "success": released first, a waiter could find no claim and
+          # the bucket still "working", and upload it again.
+          '    gcloud storage rm --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || :',
           '  else',
           # refresh the expiry clock so content still in use is not reclaimed
           '    gcloud storage objects update {objs} --custom-time="$CANINE_BUCKET_CT" > /dev/null 2>&1 || :'.format(objs = all_objects),
           '  fi',
           '  break',
           'done',
-          'rm -f "$CANINE_BUCKET_LC"',
+          'rm -f "$CANINE_BUCKET_LC" "$CANINE_BUCKET_CLAIM_BODY"',
         ]
 
     def bucketmount_lease_register(self):

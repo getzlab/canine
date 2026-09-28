@@ -38,6 +38,18 @@ def gs_item(path="gs://src-bucket/reads.bam", dest="gs://wolf-1-us-central1-abc/
     return UploadItem(fh=fh, dest=dest, kind="server_side")
 
 
+def input_copies(script):
+    """The lines that copy inputs, not the claim write (see bucket_upload_script)."""
+    return [l for l in script.splitlines()
+            if "storage cp" in l and "CANINE_BUCKET_CLAIM" not in l]
+
+
+def describes_a_source(script):
+    """Whether any line describes an object other than the bucket's own claim."""
+    return any("objects describe" in l and "CANINE_BUCKET_CLAIM" not in l
+               for l in script.splitlines())
+
+
 def copy_command(line):
     """A copy line without the `&& break` of the retry loop it sits in."""
     line = line.strip()
@@ -85,14 +97,14 @@ class TestNoNFSInvolvement:
 class TestCopyFlags:
 
     def test_no_clobber_so_a_requeued_shard_does_not_recopy(self):
-        assert "-n" in [l for l in script_for([gs_item()]).splitlines() if "storage cp" in l][0]
+        assert "-n" in input_copies(script_for([gs_item()]))[0]
 
     def test_custom_time_set_on_upload(self):
         """
         Without --custom-time the daysSinceCustomTime lifecycle rule can never
         match the object, so nothing ever expires and the bucket grows forever.
         """
-        cp = [l for l in script_for([gs_item()]).splitlines() if "storage cp" in l][0]
+        cp = input_copies(script_for([gs_item()]))[0]
         assert "--custom-time=" in cp
 
     def test_requester_pays_source_carries_billing_project(self):
@@ -105,13 +117,13 @@ class TestCopyFlags:
 
     def test_directory_source_targets_parent(self):
         """`cp -r gs://a/d gs://B/k/d` would otherwise yield gs://B/k/d/d/..."""
-        cp = [l for l in script_for([
+        cp = input_copies(script_for([
             gs_item(path="gs://src/dir", dest="gs://b/inp/dir", is_dir=True)
-        ]).splitlines() if "storage cp" in l][0]
+        ]))[0]
         assert copy_command(cp).endswith("gs://b/inp/")
 
     def test_file_source_targets_the_object_itself(self):
-        cp = [l for l in script_for([gs_item()]).splitlines() if "storage cp" in l][0]
+        cp = input_copies(script_for([gs_item()]))[0]
         assert copy_command(cp).endswith("gs://wolf-1-us-central1-abc/inp/reads.bam")
 
 class TestContentEncoding:
@@ -134,9 +146,10 @@ class TestContentEncoding:
 
     def test_the_server_side_branch_is_a_plain_copy(self):
         script = script_for([gs_item()])
-        for absent in ("objects describe", "gunzip", "storage cat", "CANINE_DECOMP_TMP"):
+        assert not describes_a_source(script)
+        for absent in ("gunzip", "storage cat", "CANINE_DECOMP_TMP"):
             assert absent not in script, absent
-        cp = [l for l in script.splitlines() if "storage cp" in l]
+        cp = input_copies(script)
         assert len(cp) == 1
         assert "gs://src-bucket/reads.bam" in cp[0] and "-r -n" in cp[0]
 
@@ -146,7 +159,7 @@ class TestContentEncoding:
         inspecting every object under the prefix.
         """
         script = script_for([gs_item(path="gs://src/dir", dest="gs://b/inp/dir", is_dir=True)])
-        assert "objects describe" not in script
+        assert not describes_a_source(script)
         assert "gunzip" not in script
 
     def test_local_copy_has_no_content_encoding_handling(self):
@@ -160,7 +173,7 @@ class TestContentEncoding:
         fh.localization_mode = "local"
         item = UploadItem(fh=fh, dest="gs://b/reference/ref.fa", kind="copy")
         script = "\n".join(make_localizer().bucket_upload_script([item], "gs://b", "us-central1"))
-        assert "objects describe" not in script
+        assert not describes_a_source(script)
         assert "gunzip" not in script
 
     @staticmethod
@@ -366,7 +379,8 @@ class TestStateMachine:
 
     def test_upload_happens_between_the_two_labels(self):
         script = script_for([gs_item()])
-        assert script.index("wolf=working") < script.index("storage cp") < script.index("wolf=success")
+        copy = input_copies(script)[0]
+        assert script.index("wolf=working") < script.index(copy) < script.index("wolf=success")
 
     def test_waits_for_bucket_to_resolve_before_reading_label(self):
         """
@@ -401,16 +415,20 @@ class TestStateMachine:
 
     def test_stale_claim_is_taken_over_not_waited_on(self):
         """
-        Regression: the timeout path marks the bucket "stale" and exits 5. If the
-        job that retries elsewhere treated "stale" like "working" it would wait
-        again -- nobody would ever finish the upload, and the shard would just
-        ping-pong between nodes until its retry budget ran out.
+        Regression: a job treating "stale" like "working" would wait again, nobody
+        would ever finish the upload, and the shard would ping-pong between nodes
+        until its retry budget ran out. A stale bucket has no live claim, so the
+        claim is taken; TestTheClaimMakesTakeoverExclusive runs it.
         """
         script = script_for([gs_item()])
-        assert '"$CANINE_BUCKET_STATE" == "stale"' in script
-        stale_branch = script.index('== "stale"')
-        wait_branch = script.index("CANINE_BUCKET_WAITS=$((")
-        assert stale_branch < wait_branch, "stale must be handled before the wait branch"
+        assert 'stale) echo "INFO: taking over stale localization bucket' in script
+
+    def test_a_timed_out_waiter_does_not_mark_a_live_upload_stale(self):
+        """It waited on a live claim, so its uploader is alive: exit 5, nothing more."""
+        script = script_for([gs_item()])
+        timeout = script[script.index("timed out waiting"):]
+        timeout = timeout[:timeout.index("exit 5")]
+        assert "wolf=stale" not in timeout
 
     def test_wait_tries_is_configurable(self):
         assert "-ge 7 " in script_for([gs_item()], wait_tries=7)
@@ -545,7 +563,7 @@ class TestCreateBucketMountLayouts:
         loc.staging_dir = "/mnt/nfs/workspace"
         item = UploadItem(fh=self._local_fh(), dest="gs://b/reference/ref.fa", kind="copy")
         script = "\n".join(loc.bucket_upload_script([item], "gs://b", "us-central1"))
-        cp = [l for l in script.splitlines() if "storage cp" in l]
+        cp = input_copies(script)
         assert len(cp) == 1
         assert "/mnt/nfs/workspace/ref.fa" in cp[0]
         assert "gs://b/reference/ref.fa" in cp[0]
@@ -895,3 +913,318 @@ class TestTheDownloadersOwnCustomTimeIsAccepted:
         proc, calls = run_with_fake_gcloud(self._block(), tmp_path, self._gcloud(0, {}))
         assert "CANINE_BLOCK_DONE" in proc.stdout, proc.stderr
         assert not any("objects describe" in c for c in calls)
+
+
+FAKE_GCS_GCLOUD = r'''#!/usr/bin/env python3
+# A stand-in gcloud that keeps one bucket's existence, labels and claim object in files,
+# enough to run the whole emitted claim-and-upload script. Every call holds a file lock,
+# so concurrent jobs race the way they do against GCS, and the claim's compare-and-swap
+# is atomic. FAKE_CP selects how input copies behave: "ok", "fail", or "hang".
+# FAKE_SUCCESS_RC makes every wolf=success label update fail.
+import fcntl, json, os, sys, time
+state = os.environ["FAKE_STATE"]
+args = sys.argv[1:]
+lock = open(os.path.join(state, "lock"), "a")
+
+def path(name):
+    return os.path.join(state, name)
+
+def labels():
+    try:
+        return json.load(open(path("labels.json")))
+    except (OSError, ValueError):
+        return {}
+
+def claim():
+    try:
+        return json.load(open(path("claim.json")))
+    except (OSError, ValueError):
+        return None
+
+def write(name, value):
+    with open(path(name) + ".tmp", "w") as f:
+        json.dump(value, f)
+    os.replace(path(name) + ".tmp", path(name))
+
+def flag(name):
+    for a in args:
+        if a.startswith(name + "="):
+            return a.split("=", 1)[1]
+
+def is_claim(url):
+    return url.endswith("/.wolf_claim")
+
+with open(path("calls.log"), "a") as log:
+    log.write(" ".join(args) + "\n")
+
+if args[:2] in (["storage", "cp"], ["storage", "rsync"]) and not is_claim(args[-1]):
+    mode = os.environ.get("FAKE_CP", "ok")            # outside the lock: copies run long
+    if mode == "hang":
+        time.sleep(float(os.environ.get("FAKE_CP_SECONDS", "60")))
+    if mode == "fail":
+        sys.exit(1)
+    open(path("populated"), "w").close()
+    sys.exit(0)
+
+fcntl.flock(lock, fcntl.LOCK_EX)
+if args[:3] == ["storage", "buckets", "create"]:
+    if os.path.exists(path("exists")):
+        sys.exit(1)                                   # 409: someone else created it
+    open(path("exists"), "w").close()
+    sys.exit(0)
+if args[:3] == ["storage", "buckets", "describe"]:
+    if not os.path.exists(path("exists")):
+        sys.exit(1)
+    for a in args:
+        if a.startswith("--format=value(labels."):
+            print(labels().get(a[len("--format=value(labels."):-1], ""))
+    sys.exit(0)
+if args[:3] == ["storage", "buckets", "update"]:
+    d = labels()
+    for a in args:
+        if a.startswith("--update-labels="):
+            pairs = dict(p.split("=", 1) for p in a[len("--update-labels="):].split(","))
+            if pairs.get("wolf") == "success" and os.environ.get("FAKE_SUCCESS_RC"):
+                sys.exit(int(os.environ["FAKE_SUCCESS_RC"]))
+            d.update(pairs)
+    write("labels.json", d)
+    sys.exit(0)
+if args[:3] == ["storage", "objects", "describe"] and is_claim(args[3]):
+    c = claim()
+    if c is None:
+        sys.exit(1)                                   # 404
+    fmt = flag("--format")
+    print("{}\t{}.0".format(c["gen"], c["updated"]) if "update_time" in fmt else c["gen"])
+    sys.exit(0)
+if args[:2] == ["storage", "cp"]:                     # the claim write: compare-and-swap
+    c = claim()
+    if int(flag("--if-generation-match")) != (c["gen"] if c else 0):
+        print("ERROR: HTTPError 412: At least one of the pre-conditions you specified did not hold.",
+              file=sys.stderr)
+        sys.exit(1)
+    write("claim.json", {"gen": time.time_ns(), "updated": int(time.time()),
+                         "body": open(args[-2]).read()})
+    sys.exit(0)
+if args[:3] == ["storage", "objects", "update"] and is_claim(args[3]):
+    c = claim()                                       # the heartbeat
+    if c is None or int(flag("--if-generation-match")) != c["gen"]:
+        sys.exit(1)
+    c["updated"] = int(time.time())
+    write("claim.json", c)
+    sys.exit(0)
+if args[:2] == ["storage", "rm"] and is_claim(args[-1]):
+    c = claim()                                       # the release
+    if c is None or int(flag("--if-generation-match")) != c["gen"]:
+        sys.exit(1)
+    os.remove(path("claim.json"))
+    sys.exit(0)
+if args[:2] == ["storage", "ls"]:
+    sys.exit(0 if os.path.exists(path("populated")) else 1)
+sys.exit(0)                                           # the inputs' objects update
+'''
+
+
+def run_claim_script(tmp_path, items=None, labels=None, exists=False, populated=False,
+                     claim=None, wait_tries=60, background=False, jobs=1, **env):
+    '''
+    Run the whole emitted bucket script, `jobs` copies at once, under `set -e`, against
+    FAKE_GCS_GCLOUD. `sleep` is shortened, not removed, so the heartbeat really runs;
+    gcsfuse and fusermount are no-ops.
+    '''
+    import json
+    import os
+    import subprocess
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    (bin_dir / "gcloud").write_text(FAKE_GCS_GCLOUD)
+    (bin_dir / "sleep").write_text("#!/bin/bash\n/bin/sleep 0.05\n")
+    for noop in ("gcsfuse", "fusermount"):
+        (bin_dir / noop).write_text("#!/bin/bash\nexit 0\n")
+    # The mount setup is `sudo mkdir -p /mnt/localize/...`, which cannot run here.
+    (bin_dir / "sudo").write_text("#!/bin/bash\nexit 0\n")
+    # `timeout -k 60 60 gcsfuse ...`; macOS has no GNU timeout.
+    (bin_dir / "timeout").write_text(
+        '#!/bin/bash\nwhile [ "${1#-}" != "$1" ] || [ -z "${1//[0-9]/}" ]; do shift; done\nexec "$@"\n')
+    for stub in ("gcloud", "sleep", "gcsfuse", "fusermount", "sudo", "timeout"):
+        os.chmod(str(bin_dir / stub), 0o755)
+    state = tmp_path / "state"
+    state.mkdir()
+    if exists:
+        (state / "exists").write_text("")
+    if populated:
+        (state / "populated").write_text("")
+    if labels:
+        (state / "labels.json").write_text(json.dumps(labels))
+    if claim:
+        (state / "claim.json").write_text(json.dumps(claim))
+    script = script_for(items or [gs_item()], wait_tries=wait_tries)
+    environ = dict(os.environ, PATH="{}:{}".format(bin_dir, os.environ["PATH"]),
+                   FAKE_STATE=str(state), **env)
+    argv = ["bash", "-c", "set -e\n" + script + "\necho CANINE_SCRIPT_DONE"]
+    if background:
+        return subprocess.Popen(argv, env=environ, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True, start_new_session=True), state
+    if jobs > 1:
+        procs = [subprocess.Popen(argv, env=environ, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) for _ in range(jobs)]
+        return [(p.wait(timeout=300), p.stdout.read(), p.stderr.read()) for p in procs], state
+    return subprocess.run(argv, env=environ, capture_output=True, text=True, timeout=120), state
+
+
+def fake_labels(state):
+    import json
+    try:
+        return json.loads((state / "labels.json").read_text())
+    except OSError:
+        return {}
+
+
+def fake_claim(state):
+    import json
+    try:
+        return json.loads((state / "claim.json").read_text())
+    except OSError:
+        return None
+
+
+def fake_calls(state):
+    path = state / "calls.log"
+    return path.read_text().splitlines() if path.exists() else []
+
+
+def input_copy_calls(state):
+    return [c for c in fake_calls(state)
+            if c.startswith(("storage cp", "storage rsync")) and ".wolf_claim" not in c]
+
+
+def aged(seconds):
+    import time
+    return int(time.time()) - seconds
+
+
+class TestAnUnfinishedUploadReleasesItsClaim:
+    '''
+    Production, 2026-09: a workflow was cancelled and restarted, and the new job waited up
+    to bucket_upload_wait_tries minutes (90 by default) on a bucket its cancelled
+    predecessor had left labelled wolf=working. An upload that does not finish now
+    releases its claim and marks the bucket stale on the way out, so the next job takes
+    over at once.
+    '''
+
+    def test_a_failed_upload_releases_the_claim(self, tmp_path):
+        proc, state = run_claim_script(tmp_path, FAKE_CP="fail")
+        assert proc.returncode == 1, proc.stderr
+        assert fake_labels(state).get("wolf") == "stale"
+        assert fake_claim(state) is None
+        assert "releasing it so the next job takes over at once" in proc.stderr
+
+    def test_the_exit_code_is_kept(self, tmp_path):
+        '''canine reads 5 as requeue and 1 as a failure; the trap must not rewrite it.'''
+        proc, state = run_claim_script(tmp_path, items=[s3_item(command="exit 5")])
+        assert proc.returncode == 5, proc.stderr
+        assert fake_labels(state).get("wolf") == "stale"
+        assert fake_claim(state) is None
+
+    def test_a_cancelled_upload_releases_the_claim(self, tmp_path):
+        '''scancel sends SIGTERM to every process in the job, and waits before SIGKILL.'''
+        import os
+        import signal
+        import time
+        proc, state = run_claim_script(tmp_path, background=True, FAKE_CP="hang")
+        deadline = time.monotonic() + 30
+        while not input_copy_calls(state):
+            assert time.monotonic() < deadline, "the copy never started"
+            time.sleep(0.05)
+        os.killpg(proc.pid, signal.SIGTERM)
+        _, err = proc.communicate(timeout=30)
+        assert proc.returncode == 143, err
+        assert fake_labels(state).get("wolf") == "stale"
+        assert fake_claim(state) is None
+
+    def test_a_finished_upload_is_success_and_releases_the_claim(self, tmp_path):
+        proc, state = run_claim_script(tmp_path)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert fake_labels(state) == {"wolf": "success"}
+        assert fake_claim(state) is None
+        assert "releasing it" not in proc.stderr
+
+    def test_a_rate_limited_success_label_is_retried(self, tmp_path):
+        '''At 100 jobs this update returned HTTP 429 and failed a tenth of them.'''
+        proc, state = run_claim_script(tmp_path, FAKE_SUCCESS_RC="1")
+        attempts = [c for c in fake_calls(state) if "--update-labels=wolf=success" in c]
+        assert len(attempts) == 8
+        assert proc.returncode == 1          # still fails if the limit never lifts
+
+    def test_no_heartbeat_outlives_the_upload(self, tmp_path):
+        import time
+        proc, state = run_claim_script(tmp_path)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        settled = len(fake_calls(state))
+        time.sleep(0.5)                              # ten shortened heartbeat intervals
+        assert len(fake_calls(state)) == settled
+
+    def test_the_heartbeat_refreshes_the_claim_while_uploading(self, tmp_path):
+        proc, state = run_claim_script(tmp_path, FAKE_CP="hang", FAKE_CP_SECONDS="1")
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        beats = [c for c in fake_calls(state)
+                 if c.startswith("storage objects update") and ".wolf_claim" in c]
+        assert len(beats) >= 3, fake_calls(state)
+        assert all("--if-generation-match=" in b for b in beats)
+
+
+class TestTheClaimMakesTakeoverExclusive:
+    '''
+    Only bucket creation used to be a mutex. At 100 jobs sharing a bucket, an expired,
+    stale or dead-heartbeat bucket was taken over by 40-50 of them at once, 33-39 made
+    their own copy of a 1.48 GB input, and up to 14 failed on label rate limits. Taking
+    an upload over now means winning a compare-and-swap on the claim object.
+    '''
+
+    def test_a_new_bucket_is_claimed_by_its_creator(self, tmp_path):
+        proc, state = run_claim_script(tmp_path)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert any(c.startswith("storage cp --if-generation-match=0") and ".wolf_claim" in c
+                   for c in fake_calls(state))
+
+    def test_a_populated_bucket_needs_no_claim(self, tmp_path):
+        proc, state = run_claim_script(tmp_path, exists=True, populated=True,
+                                       labels={"wolf": "success"})
+        assert "already populated" in proc.stderr
+        assert not any(".wolf_claim" in c for c in fake_calls(state))
+        assert input_copy_calls(state) == []
+
+    @pytest.mark.parametrize("scenario", ["expired", "stale", "dead", "unclaimed"])
+    def test_one_of_twenty_racing_jobs_takes_it_over(self, tmp_path, scenario):
+        from canine.localization.base import BUCKET_HEARTBEAT_STALE
+        setup = {
+            "expired": dict(labels={"wolf": "success"}),
+            "stale": dict(labels={"wolf": "stale"}),
+            "dead": dict(labels={"wolf": "working"},
+                         claim={"gen": 7, "updated": aged(BUCKET_HEARTBEAT_STALE + 60)}),
+            "unclaimed": dict(labels={"wolf": "working"}),
+        }[scenario]
+        results, state = run_claim_script(tmp_path, exists=True, jobs=20,
+                                          FAKE_CP="hang", FAKE_CP_SECONDS="0.5", **setup)
+        assert [rc for rc, _, _ in results] == [0] * 20, [e for rc, _, e in results if rc]
+        uploaders = [e for _, _, e in results
+                     if "repopulating" in e or "taking over stale" in e or "taking it over" in e]
+        assert len(uploaders) == 1, uploaders
+        assert len(input_copy_calls(state)) == 1
+        assert fake_labels(state) == {"wolf": "success"}
+
+    def test_a_live_claim_is_waited_on(self, tmp_path):
+        proc, state = run_claim_script(tmp_path, exists=True, wait_tries=0,
+                                       labels={"wolf": "working"},
+                                       claim={"gen": 7, "updated": aged(5)})
+        assert proc.returncode == 5                   # the existing wait-then-requeue
+        assert input_copy_calls(state) == []
+        assert fake_claim(state)["gen"] == 7           # untouched
+        assert fake_labels(state).get("wolf") == "working"
+
+    def test_a_live_claim_is_waited_on_even_when_the_label_says_stale(self, tmp_path):
+        '''The claim decides who uploads; the labels are informational.'''
+        proc, state = run_claim_script(tmp_path, exists=True, wait_tries=0,
+                                       labels={"wolf": "stale"},
+                                       claim={"gen": 7, "updated": aged(5)})
+        assert proc.returncode == 5
+        assert input_copy_calls(state) == []

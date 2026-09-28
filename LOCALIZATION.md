@@ -121,34 +121,60 @@ customTime is what gets refreshed to keep live content alive. An object with no 
 The rule carries **no prefix filter**, so it applies to `_MOUNTS/` leases exactly as it applies
 to data objects. That is deliberate (§7).
 
-### The label state machine
+### Who uploads: the claim object
 
-The `wolf` bucket label carries the state. A worker that loses the create race reads it:
+Only bucket creation is a mutex, and after it every decision used to be made per job from
+the `wolf` label. With 50–100 workflows sharing reference files, and so sharing one bucket,
+an expired, stale or abandoned bucket was taken over by every job that saw it at once. At
+100 jobs, 40–50 uploaded the same inputs, and up to 14 failed on bucket-label rate limits
+(`PARALLEL_LOCALIZATION.md` §13.87).
+
+So **the claim object `gs://<bucket>/.wolf_claim` decides who uploads**:
+
+* **Taking an upload means winning a compare-and-swap.** A job reads the claim's generation
+  (0 if absent) and writes the claim with `--if-generation-match=<that generation>`; exactly
+  one racer succeeds. The bucket's creator takes the claim the same way.
+* **A claim is live while its server-side update time is under 600 s old**
+  (`BUCKET_HEARTBEAT_STALE`). The owner refreshes it every 60 s
+  (`BUCKET_HEARTBEAT_INTERVAL`), conditional on its own generation, so it can never keep
+  someone else's claim alive. A live claim is waited on, whatever the label says.
+* **A dead or absent claim is taken**, by exactly one job, whether the label says
+  `working`, `stale`, or nothing. This covers an owner that vanished without running its
+  trap: preemption, a deleted node, or a torn-down cluster. It is taken 10 minutes after
+  the last heartbeat, instead of after `bucket_upload_wait_tries`.
+* **An upload that does not finish releases its claim.** On a failure, or scancel's SIGTERM
+  (`KillWait` gives it 300 s), an EXIT trap deletes the claim (conditional on its generation)
+  and labels the bucket `stale`, so one waiter takes over at its next poll. The exit code is
+  kept.
+* **On success**, the owner labels the bucket `wolf=success`, then releases the claim. A job
+  that wins a claim re-reads the label before uploading, because an owner may have finished
+  between that job's two reads.
+
+The label still carries the state, for readers and for older canine versions, but only
+`success` changes what a job does:
 
 | Label | Meaning | Worker does |
 |---|---|---|
-| *(absent)* | Owner created the bucket but has not labelled it yet — `buckets create` cannot set labels | Wait |
-| `working` | Someone is uploading | Wait |
 | `success` + objects present | Content is there | Skip upload, refresh customTime |
-| `success` + objects **absent** | Content aged out under the lifecycle rule | Re-upload |
-| `stale` | A previous uploader timed out or died and released its claim | Take over and upload |
+| `success` + objects **absent** | Content aged out under the lifecycle rule | Take the claim and re-upload |
+| `working`, `stale`, or absent | An upload is in progress, was abandoned, or has not started | Take the claim if it is dead or absent, else wait |
 
 The `success`-but-empty case is not hypothetical: with a 1-day expiry it is the normal end state
 of any bucket nobody touched for a day. Checking the label alone would mount an empty bucket.
-So the check is label **and** `gcloud storage ls` of the expected objects (`base.py:1297`).
+So the check is label **and** `gcloud storage ls` of the expected objects.
 
-`stale` needs its own branch rather than falling into the wait: nobody else is going to finish
-that upload, so waiting would deadlock until the timeout.
+**Label writes are retried** with jitter, up to 8 times: GCS allows about one bucket-metadata
+update per second, and `gcloud_exp_backoff` does not retry that 429, because it retries only
+"Quota exceeded".
 
-Only bucket creation is a mutex. Two jobs can take over the same `stale` or expired bucket at
-once, and in production two jobs with the same inputs did both repopulate one expired bucket.
-`-n` alone does not make that harmless: it checks for the destination before copying, so a
-sibling that writes the object in between makes the second copy fail with HTTP 412
-(`GcsPreconditionFailedError`). Each server-side and shared-mount copy is therefore rerun up
-to three times, ten seconds apart. The rerun sees the object and skips it with exit 0
-(`Skipping existing destination item (no-clobber)`). The `gcloud_exp_backoff` alias does not
-cover this, because it only retries on "Quota exceeded". Downloads onto the read-write mount
-need no retry here, since the parallel downloader handles two writers on one object itself.
+**Copies are still made safe against a race.** Two jobs can still both copy an object, since
+the pre-claim protocol exists in older canine versions still running. `-n` alone does not
+make that harmless: it checks for the destination before copying, so a sibling that writes
+the object in between makes the second copy fail with HTTP 412 (`GcsPreconditionFailedError`).
+Each server-side and shared-mount copy is therefore rerun up to three times, ten seconds
+apart. The rerun sees the object and skips it with exit 0 (`Skipping existing destination item
+(no-clobber)`). Downloads onto the read-write mount need no retry here, since the parallel
+downloader handles two writers on one object itself.
 
 ### Waiting, and giving up
 
@@ -157,10 +183,11 @@ need no retry here, since the parallel downloader handles two writers on one obj
   flight — not that the bucket is readable. So the worker polls `buckets describe` up to 30
   times at 2s before reading the label; failing that, `exit 5` (`base.py:1289`).
 - **Someone else is uploading.** `sleep 60`, up to `bucket_upload_wait_tries` times (default 90,
-  so a ~1.5 hour ceiling). On timeout the worker sets `wolf=stale`, releases the claim, and
-  `exit 5` (`base.py:1314`). **This ceiling has to exceed the longest localization you expect**,
-  or it fires on healthy uploads and every large input gets taken over mid-flight — while also
-  being the recovery time when an uploader genuinely dies. Sized in
+  so a ~1.5 hour ceiling), while another job holds a live claim. On timeout the worker
+  `exit 5`s, but no longer marks the bucket stale: the claim it waited on was live, so its
+  uploader is alive. **This ceiling has to exceed the longest localization you expect**, or
+  waiters requeue on healthy uploads. It is no longer the recovery time when an uploader
+  dies; the claim's heartbeat is (10 minutes). Sized in
   `canine/test/BENCHMARK_RUNBOOK.md` §6.7.
 
 **`exit 5` means "requeue this shard on another node"** — canine treats it as retryable rather
@@ -617,13 +644,15 @@ Normally you don't need this task at all.
 |---|---|
 | `<input_name>/<basename>` | a localized input |
 | `_MOUNTS/<host>-<job>-<shard>` | a live consumer's lease |
+| `.wolf_claim` | the uploader's claim; its generation is the takeover token, its update time the heartbeat |
 
-**Labels:** `wolf=working` · `wolf=success` · `wolf=stale`
+**Labels:** `wolf=working` · `wolf=success` · `wolf=stale` (only `success` changes what a job does)
 
 **`exit 5`** anywhere in this path means *requeue this shard on another node* — used for every
 give-up, because every cause here is transient or node-local.
 
-**Tests:** `canine/test/test_localizer_bucket_upload_pure.py` (bucket naming, layout, state
-machine, upload plan, and `TestContentEncoding` for routing gzip-encoded objects to the mount),
+**Tests:** `canine/test/test_localizer_bucket_upload_pure.py` (bucket naming, layout, the
+claim protocol with a stateful fake gcloud and a 20-job race, upload plan, and
+`TestContentEncoding` for routing gzip-encoded objects to the mount),
 `canine/test/test_localizer_reachability_pure.py` (reachability, leases, heartbeat),
 `canine/test/test_rapid_cache_pure.py`. All pure — no cluster, no GCP credentials.
