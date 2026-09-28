@@ -6448,3 +6448,57 @@ time. Every call holds a file lock, so concurrent jobs race.
 Their claim logic is the same code, and the downloader already handles two writers on one
 object. Waiters on `success` still each refresh every object's customTime, which is
 best-effort (`|| :`) and was not a source of failures.
+
+### 13.88 Summary: speedups versus the original localization
+
+"Original" means canine before this work. Each object was fetched by a single stream
+(`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by
+a sequential md5 read-back. Every figure below was measured on an n1-standard-8, the
+production worker type. Each row cites the section with the method and raw numbers.
+
+#### End to end: the 278.91 GiB TCGA BAM (GDC S3, 16 connections)
+
+| | wall clock | vs original |
+|---|---|---|
+| original: single stream to pd-standard | 4.97 h | 1.00× |
+| parallel, in place on pd-standard | 1.62 h | **3.07×** (§13.51, measured in §6.3) |
+| parallel, bucket-compose route, verified | 0.57 h | **8.7×** (§13.51; 8.8× on the first run) |
+
+The in-place route is capped by the disk. The pd-standard sustains about 46 MB/s at 316 GB,
+bursting to 2× for the first 56 GiB, and the downloader runs within 1% of `dd` on it
+(§13.46). The bucket route is not disk-bound, which is why it reaches 8.7×. The same table
+in §13.51 gives consumer reads through gcsfuse of 109 MiB/s against 43.9 MiB/s from the
+pd-standard, and 24–48 h of storage at $0.20–$0.39 against $0.42–$0.83.
+
+#### Per source: 16 connections against a single stream
+
+| source | single stream | 16 connections | speedup |
+|---|---|---|---|
+| GDC S3, 4 GiB slice, not disk-bound | 16.62 MiB/s | 230.11 MiB/s | **13.85×** (§13.42) |
+| GDC API | 16.01 MiB/s | 145.04 MiB/s | **9.24×**, no knee (§13.73) |
+| DRS → AWS S3, presigned | 67.70 MiB/s | 490.73 MiB/s | **7.43×**, knee at 12 (§13.73) |
+| GDC S3 to pd-standard, 4 GiB | 15.96 MiB/s | 72.06 MiB/s | **4.52×**; the disk-bound floor is 5.49× (§13.43) |
+
+Throughput is linear in connections until something else binds. The GDC API's per-request
+time to first byte is 1.1–1.7 s, against 0.27–0.38 s for presigned S3 (§13.73), so its
+single stream is the slowest of any source.
+
+#### Refinements after the headline, each against the version before it
+
+| change | before → after | gain |
+|---|---|---|
+| size-scaled chunks (size/32, 64 MiB–1 GiB), GDC API at full size | 173.6 → 240.5 MiB/s | **+38.5%** (§13.76) |
+| size-scaled chunks, bucket-route relay at full size (324.75 GiB, DRS) | 246.5 → 393.3–409.0 MiB/s; compose 55.6 → 16.2 s | **+60–66%**; compose 3.4× (§13.77) |
+| size-scaled chunks, pd-standard | 98.80 → 98.56 MiB/s | none: disk-bound, as predicted (§13.80) |
+| bucket-route md5 read-back in 64 MiB blocks, not 8 MiB | measured on the node | **1.93×** (§13.78) |
+| gzip decode: read-ahead, sliced upload, read-ahead on the verify read-back | 102.9 → 36.1 s | **2.85×** (§13.61–§13.63) |
+| gzip decode: zero-copy (VCF-like fixture, 16.5:1) | 126.0 → ~98 s | **1.28×** (§13.68) |
+| gzip decode: upload slices grown to 256 MiB | 89.6 → 66.6 s decode | **1.35×** (§13.81) |
+| gzip decode: slices start from the compressed size | 27.1–27.7 → 24.6–24.8 s decode | **1.11×** (§13.81) |
+| gs:// sources verified by crc32c from compose metadata | a full read-back → none | read-back removed (§13.84, §13.85) |
+
+§13.77's 324.75 GiB relay ran at 393–409 MiB/s, against DRS's single-stream 67.70 MiB/s from
+§13.73. The two were measured separately, so that ratio of 5.8–6.0× is indicative rather than
+a like-for-like run. The later refinements have not been combined into a single new
+end-to-end run of the §13.51 object. So 8.7× remains the measured headline, and the
+bucket-route gains above (+60–66% on the relay, 1.93× on the read-back) come on top of it.
