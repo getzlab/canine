@@ -6616,7 +6616,35 @@ The full pure suite is 1711 passed, 1 skipped.
 keeps its staging directory in a host temp directory, not `/mnt/nfs`, so its local files are now
 copied rather than symlinked. That's correct, but slower.
 
-### 13.90 Summary: speedups versus the original localization
+### 13.90 Localization buckets are private
+
+**The problem.** Localization buckets were created with no public access prevention (`inherited`)
+and fine-grained ACLs. None had a public grant, but nothing refused one, and localized inputs
+include protected data such as BAMs.
+
+**New buckets** are created with `--public-access-prevention --uniform-bucket-level-access`, on
+the node and on the controller alike (`BUCKET_CREATE_FLAGS`). Tested on a scratch bucket in
+`getzlab-wolf-develop`:
+
+* access is unchanged: the new bucket's IAM policy gives project owners and editors
+  `legacyObjectOwner` and viewers `legacyObjectReader`, alongside the bucket roles;
+* the creator read its object back;
+* an `allUsers` grant was refused with HTTP 412.
+
+Admins keep access through basic project roles and inherited storage roles. There are no
+per-object ACLs any more, so sharing with someone outside those roles is a bucket IAM grant.
+
+**Existing buckets**, which are never deleted, get public access prevention the next time a job
+uploads into them. It is added to the `wolf=working` label update, so costs no extra call. They
+do not get uniform access. A second scratch-bucket test turned it on for a bucket created the old
+way, and the policy was left with only `legacyBucketOwner` and `legacyBucketReader`: reading the
+bucket's own object returned 403. The object ACLs that project teams had read through were gone,
+and nothing replaced them.
+
+**Tests:** 4 new (`TestLocalizationBucketsArePrivate`). The full pure suite is 1715 passed,
+1 skipped.
+
+### 13.91 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

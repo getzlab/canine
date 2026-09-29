@@ -122,6 +122,16 @@ def retried_copy(copy):
       '    done',
     ]
 
+# Flags every localization bucket is created with, on a node or on the controller.
+# --soft-delete-duration=0 disables GCS soft delete, which new buckets otherwise get at 7
+# days: every expired or deleted object would be retained and *billed* for a further week,
+# for a cache with nothing worth undeleting. --public-access-prevention and
+# --uniform-bucket-level-access keep the bucket private, since localized inputs include
+# protected data such as BAMs. Created that way, the project's owners and editors can still
+# write its objects and its viewers read them (legacyObjectOwner and legacyObjectReader),
+# and project-level storage roles still apply, so nodes and users see no difference.
+BUCKET_CREATE_FLAGS = "--soft-delete-duration=0 --public-access-prevention --uniform-bucket-level-access"
+
 # types: stream, download, ro_disk, None
 # indicates what kind of action needs to be taken during job startup
 PathType = namedtuple(
@@ -1726,12 +1736,9 @@ class AbstractLocalizer(abc.ABC):
           '}',
           'while :; do',
           '  CANINE_BUCKET_UPLOAD=0',
-          # --soft-delete-duration=0 disables GCS soft delete, which new buckets
-          # otherwise get at 7 days. Without it every expired or deleted object
-          # is retained and *billed* for a further week, so a 1-day expiry on a
-          # multi-TB localization would still be paying for 7 days of soft-deleted
-          # copies. This is a cache; there is nothing here worth undeleting.
-          '  if gcloud storage buckets create {burl} --location={region} --soft-delete-duration=0 --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1; then'.format(burl = burl, region = shlex.quote(region)),
+          # BUCKET_CREATE_FLAGS: no soft delete, and private
+          '  if gcloud storage buckets create {burl} --location={region} {flags} --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1; then'.format(
+            burl = burl, region = shlex.quote(region), flags = BUCKET_CREATE_FLAGS),
           # Creating the bucket makes this job the natural uploader, but it still
           # takes the claim like anyone else: a waiter that finds a new, unlabelled
           # bucket with no claim may otherwise take it first.
@@ -1788,7 +1795,14 @@ class AbstractLocalizer(abc.ABC):
           '  if [ "$CANINE_BUCKET_UPLOAD" == "1" ]; then',
           # Informational now, for older canine versions still reading labels:
           # the claim decides who uploads.
-          '    canine_bucket_label --update-labels=wolf=working || :',
+          #
+          # The same call enforces public access prevention, so a bucket created
+          # before BUCKET_CREATE_FLAGS made buckets private becomes so the next
+          # time it is populated. Buckets are never deleted, only their objects.
+          # Not uniform access: turned on for an existing bucket, it drops the
+          # object ACLs that project editors and viewers read through, and adds no
+          # IAM role in their place (tested: a 403 reading the bucket's own object).
+          '    canine_bucket_label --update-labels=wolf=working --public-access-prevention || :',
           # The heartbeat. It refreshes the claim's update time, conditional on
           # this job's generation, so it can never keep someone else's claim alive.
           '    ( while sleep {interval}; do gcloud storage objects update "$CANINE_BUCKET_CLAIM" --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :; done ) &'.format(
@@ -1871,8 +1885,8 @@ class AbstractLocalizer(abc.ABC):
           'if ! gcloud storage buckets describe {burl} > /dev/null 2>&1; then'.format(burl = burl),
           # A 409 here is another job creating it at the same moment, so wait for
           # the bucket to become readable rather than failing.
-          '  gcloud storage buckets create {burl} --location={region} --soft-delete-duration=0 --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1 || :'.format(
-            burl = burl, region = shlex.quote(region)),
+          '  gcloud storage buckets create {burl} --location={region} {flags} --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1 || :'.format(
+            burl = burl, region = shlex.quote(region), flags = BUCKET_CREATE_FLAGS),
           '  CANINE_BUCKET_TRIES=0',
           '  until gcloud storage buckets describe {burl} > /dev/null 2>&1; do'.format(burl = burl),
           '    if [ $CANINE_BUCKET_TRIES -gt 30 ]; then echo "ERROR: localization bucket {b} never became readable" >&2; exit 1; fi'.format(b = bucket),

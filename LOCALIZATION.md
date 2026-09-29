@@ -95,14 +95,18 @@ because that is the only state every worker VM can see.
 gcloud storage buckets create gs://<bucket> \
   --location=<region> \
   --soft-delete-duration=0 \
+  --public-access-prevention \
+  --uniform-bucket-level-access \
   --lifecycle-file="$CANINE_BUCKET_LC"
 ```
+
+(`BUCKET_CREATE_FLAGS` in `base.py`, shared by the node and the controller.)
 
 Bucket names are globally unique, so of N racing workers exactly one succeeds and the rest get
 HTTP 409. No compare-and-swap on a sentinel object is needed — and `gcloud storage buckets
 update` has no `--if-metageneration-match` to build one with anyway.
 
-Two flags matter:
+Three things matter:
 
 - **`--soft-delete-duration=0`** disables GCS soft delete, which new buckets otherwise get at 7
   days. Without it, every expired object is retained *and billed* for a further week — a 1-day
@@ -110,6 +114,20 @@ Two flags matter:
   cache; nothing here is worth undeleting.
 - **`--lifecycle-file`** applies the expiry rule *at creation*. A second call to set it might
   never happen if the job dies in between.
+- **The bucket is private.** Localized inputs include protected data such as BAMs.
+  `--public-access-prevention` refuses any `allUsers` or `allAuthenticatedUsers` grant (HTTP 412).
+  `--uniform-bucket-level-access` puts access entirely in IAM. Created this way, a bucket gives
+  the project's owners and editors read/write and its viewers read (`legacyObjectOwner`,
+  `legacyObjectReader`), and project-, folder- and org-level storage roles still apply. So nodes,
+  users and admins troubleshooting see no difference. There are no per-object ACLs: to let
+  someone outside those roles read a bucket, grant it on the bucket,
+  `gcloud storage buckets add-iam-policy-binding gs://<bucket> --member=user:<email> --role=roles/storage.objectViewer`.
+
+  Buckets created before this (never deleted, only emptied) get public access prevention the
+  next time a job uploads into them: it rides on the `wolf=working` label update, so costs no
+  extra call. They do not get uniform access. Turned on for an existing bucket, it drops the
+  object ACLs that project editors and viewers read through and adds no IAM role in their place:
+  tested, reading the bucket's own object then returned 403.
 
 The rule (`base.py:1270`):
 
@@ -370,7 +388,7 @@ a disk of the controller that workers can't see. That includes a link on the sha
 off it. So the controller uploads it, in `job_setup_teardown`, when the job is localized and
 before anything is submitted (`upload_local_paths` running `local_upload_script`):
 
-* It creates the bucket if it's absent, with the node's lifecycle and soft-delete settings.
+* It creates the bucket if it's absent, with the node's lifecycle, soft-delete and privacy settings.
 * It runs `gcloud storage cp -r -n --custom-time`, rerun on a lost race.
 * It takes no claim and sets no label. The object is content-addressed, so every job uploading it
   uploads the same bytes, and `-n` skips what is already there.

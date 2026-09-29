@@ -1733,3 +1733,34 @@ class TestNFSLocalizerAndTheShare:
         monkeypatch.setattr("canine.localization.base.SHARED_MOUNT", str((tmp_path / "nfs").resolve()))
         dest = self._localize(tmp_path / "home" / "ref.fa")
         assert not dest.is_symlink() and dest.read_text() == ">chr1\n"
+
+
+class TestLocalizationBucketsArePrivate:
+    '''Localized inputs include protected data such as BAMs.'''
+    PRIVATE = ("--public-access-prevention", "--uniform-bucket-level-access")
+
+    def test_a_node_creates_a_private_bucket(self):
+        create = [l for l in script_for([gs_item()]).splitlines() if "buckets create" in l]
+        assert len(create) == 1
+        assert all(flag in create[0].split() for flag in self.PRIVATE)
+
+    def test_the_controller_creates_a_private_bucket(self):
+        fh = MagicMock(path="/home/user/ref.fa", localization_mode="local")
+        item = UploadItem(fh=fh, dest="gs://wolf-1-us-central1-abc/ref/ref.fa", kind="local")
+        lines = make_localizer().local_upload_script([item], "gs://wolf-1-us-central1-abc", "us-central1")
+        create = [l for l in lines if "buckets create" in l]
+        assert len(create) == 1
+        assert all(flag in create[0].split() for flag in self.PRIVATE)
+
+    def test_an_existing_bucket_gets_public_access_prevention_when_uploaded_into(self, tmp_path):
+        proc, state = run_claim_script(tmp_path, exists=True)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        updates = [c for c in fake_calls(state) if "wolf=working" in c]
+        assert len(updates) == 1 and "--public-access-prevention" in updates[0].split()
+
+    def test_but_not_uniform_access_which_would_drop_its_acls(self):
+        '''Enabling it on an existing bucket cut project editors off from its objects.'''
+        script = script_for([gs_item()])
+        assert not any("buckets update" in l and "uniform-bucket-level-access" in l
+                       for l in script.splitlines())
+        assert "canine_bucket_label --update-labels=wolf=working --public-access-prevention" in script
