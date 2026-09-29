@@ -142,6 +142,12 @@ So **the claim object `gs://<bucket>/.wolf_claim` decides who uploads**:
   `working`, `stale`, or nothing. This covers an owner that vanished without running its
   trap: preemption, a deleted node, or a torn-down cluster. It is taken 10 minutes after
   the last heartbeat, instead of after `bucket_upload_wait_tries`.
+* **A requeued job takes back its own claim at once.** The claim records its owner as
+  custom metadata (`canine_owner` = the submitting controller's host and `SLURM_JOB_ID`, both
+  kept across a SLURM requeue). A job that finds a live-looking claim with its own owner knows
+  the holder is its previous attempt, since SLURM runs one attempt at a time. It takes the
+  claim back with the same compare-and-swap, instead of waiting out the 10 minutes. A
+  controller-side run is never requeued and gets an owner no job matches.
 * **An upload that does not finish releases its claim.** On a failure, or scancel's SIGTERM
   (`KillWait` gives it 300 s), an EXIT trap deletes the claim (conditional on its generation)
   and labels the bucket `stale`, so one waiter takes over at its next poll. The exit code is
@@ -200,26 +206,29 @@ A `LocalizeToBucket` job does nothing but localize, and every one used to take a
 n1-standard-8. That included jobs whose bucket was already populated, and jobs whose inputs
 were all server-side copies moving no bytes through the node. When 50–100 concurrent workflows
 share reference files, their localization jobs all resolve to the same bucket, so 99 nodes
-booted to do nothing. Only one kind of input needs a node:
+booted to do nothing.
+
+**The controller moves no data.** It is shared by every workflow in a large run, so only
+metadata and GCS server-side copies happen there. Any input that moves bytes needs a node:
 
 | upload kind | needs a node? |
 |---|---|
-| `server_side` (gs://, not gzip-encoded) | no: a GCS rewrite |
-| `copy` (a file on the shared mount) | no: the controller serves the NFS share |
+| `server_side` (gs://, not gzip-encoded) | no: a GCS rewrite, with no bytes through anything |
+| `copy` (a file on the shared mount) | **yes**: uploaded by a node, as always |
 | `mount` (http, S3, GDC, DRS, gzip-encoded gs://) | **yes**: a download onto the read-write mount |
 
 So after localizing and before submitting, wolF's `LocalizeToBucket.after_localize()` asks
 canine to settle each job on the controller (`Orchestrator.resolve_localizations_on_controller`
 → `AbstractLocalizer.resolve_on_controller`):
 
-* **Every input is `server_side` or `copy`:** the controller runs the job's emitted
+* **Every input is `server_side`:** the controller runs the job's emitted
   claim-and-upload block itself, the same `bucket_upload_script` output a node runs. The
   claim, heartbeat, release trap and retries all apply, so it competes fairly with node-side
   uploaders. Waiting on another job's live claim holds a controller thread, not a node.
-* **Some input is `mount`:** the controller checks only whether the bucket is already
-  populated (`bucket_populated_script`: `success` plus every object present), refreshing
-  customTime if so. That check is read-only, so the node job still does any claiming and
-  downloading.
+* **Some input is `copy` or `mount`:** the controller checks only whether the bucket is
+  already populated (`bucket_populated_script`: `success` plus every object present),
+  refreshing customTime if so. That check is read-only, so the node job still does any
+  claiming, uploading and downloading.
 
 A job settled this way is dropped from the batch, the way job avoidance drops one, and is never
 submitted. Its `stdout` and `stderr` are the controller-side output, written where

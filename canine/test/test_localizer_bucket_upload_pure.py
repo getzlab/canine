@@ -994,7 +994,12 @@ if args[:3] == ["storage", "objects", "describe"] and is_claim(args[3]):
     if c is None:
         sys.exit(1)                                   # 404
     fmt = flag("--format")
-    print("{}\t{}.0".format(c["gen"], c["updated"]) if "update_time" in fmt else c["gen"])
+    if "custom_fields.canine_owner" in fmt:
+        print("{}\t{}.0\t{}".format(c["gen"], c["updated"], c.get("owner", "")))
+    elif "update_time" in fmt:
+        print("{}\t{}.0".format(c["gen"], c["updated"]))
+    else:
+        print(c["gen"])
     sys.exit(0)
 if args[:2] == ["storage", "cp"]:                     # the claim write: compare-and-swap
     c = claim()
@@ -1002,8 +1007,10 @@ if args[:2] == ["storage", "cp"]:                     # the claim write: compare
         print("ERROR: HTTPError 412: At least one of the pre-conditions you specified did not hold.",
               file=sys.stderr)
         sys.exit(1)
+    meta = flag("--custom-metadata") or ""
+    owner = meta.split("=", 1)[1] if meta.startswith("canine_owner=") else ""
     write("claim.json", {"gen": time.time_ns(), "updated": int(time.time()),
-                         "body": open(args[-2]).read()})
+                         "body": open(args[-2]).read(), "owner": owner})
     sys.exit(0)
 if args[:3] == ["storage", "objects", "update"] and is_claim(args[3]):
     c = claim()                                       # the heartbeat
@@ -1296,13 +1303,26 @@ class TestSettlingALocalizationOnTheController:
         assert any(c.startswith("storage buckets create") for c in fake_calls(state))
         assert len(input_copy_calls(state)) == 1
 
-    def test_a_shared_mount_file_is_uploaded_here(self, monkeypatch, tmp_path):
-        '''The controller serves the NFS share, so it has an upstream output locally.'''
+    def _shared_mount_item(self):
         fh = MagicMock(path="/mnt/nfs/workspace/ref.fa", localization_mode="local")
-        item = UploadItem(fh=fh, dest=self.PREFIX + "/reference/ref.fa", kind="copy")
-        loc, state = self._localizer(monkeypatch, tmp_path, [item])
+        return UploadItem(fh=fh, dest=self.PREFIX + "/reference/ref.fa", kind="copy")
+
+    def test_a_shared_mount_file_is_not_uploaded_from_the_controller(self, monkeypatch, tmp_path):
+        '''
+        The controller moves no data: it is shared by every workflow in a large run. So
+        an upstream output on the NFS share is uploaded by a node, as it always was.
+        '''
+        loc, state = self._localizer(monkeypatch, tmp_path, [self._shared_mount_item()])
+        assert loc.resolve_on_controller("0") is False
+        assert input_copy_calls(state) == []
+        assert not any(".wolf_claim" in c for c in fake_calls(state))
+
+    def test_a_shared_mount_file_in_a_populated_bucket_settles(self, monkeypatch, tmp_path):
+        '''Metadata only: nothing moves.'''
+        loc, state = self._localizer(monkeypatch, tmp_path, [self._shared_mount_item()],
+                                     exists=True, populated=True, labels={"wolf": "success"})
         assert loc.resolve_on_controller("0") is True
-        assert len(input_copy_calls(state)) == 1
+        assert input_copy_calls(state) == []
 
     def test_another_jobs_live_claim_is_waited_on_here(self, monkeypatch, tmp_path):
         '''Waiting holds a controller thread instead of an exclusive node.'''
@@ -1448,3 +1468,51 @@ class TestTheLogSaysWhatASettledJobDid:
     def test_a_bucket_this_job_created_and_filled(self, monkeypatch, tmp_path):
         msg = self._settle(monkeypatch, tmp_path, [gs_item()])
         assert "transferred on the controller" in msg
+
+
+
+class TestARequeuedJobTakesBackItsOwnClaim:
+    '''
+    An uploader whose node was preempted before its trap could run leaves a claim whose
+    heartbeat looks live for up to BUCKET_HEARTBEAT_STALE. SLURM requeues the job with
+    the same SLURM_JOB_ID, and used to wait out that time on its own dead predecessor.
+    The claim now records its owner (the submitting controller's host and the job ID),
+    and a requeued attempt that finds its own claim takes it back at once.
+    '''
+
+    JOB = {"SLURM_JOB_ID": "4242", "SLURM_SUBMIT_HOST": "wolf-ctl"}
+
+    def test_its_own_live_claim_is_taken_back_at_once(self, tmp_path):
+        proc, state = run_claim_script(tmp_path, exists=True, wait_tries=0,
+                                       labels={"wolf": "working"},
+                                       claim={"gen": 7, "updated": aged(5), "owner": "wolf-ctl:4242"},
+                                       **self.JOB)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert "is this job's own" in proc.stderr
+        assert len(input_copy_calls(state)) == 1
+        assert fake_labels(state) == {"wolf": "success"}
+
+    @pytest.mark.parametrize("owner", ["wolf-ctl:9999", "other-ctl:4242", ""])
+    def test_anyone_elses_live_claim_is_waited_on(self, tmp_path, owner):
+        '''Another job, the same job ID on another cluster, or an owner not recorded.'''
+        proc, state = run_claim_script(tmp_path, exists=True, wait_tries=0,
+                                       labels={"wolf": "working"},
+                                       claim={"gen": 7, "updated": aged(5), "owner": owner},
+                                       **self.JOB)
+        assert proc.returncode == 5
+        assert input_copy_calls(state) == []
+
+    def test_the_claim_records_its_owner(self, tmp_path):
+        proc, state = run_claim_script(tmp_path, **self.JOB)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert any(".wolf_claim" in c and "--custom-metadata=canine_owner=wolf-ctl:4242" in c
+                   for c in fake_calls(state))
+
+    def test_a_controller_side_owner_never_matches_a_job(self, tmp_path):
+        '''A controller run is never requeued, so it must never take back a live claim.'''
+        proc, state = run_claim_script(tmp_path, exists=True, wait_tries=0,
+                                       labels={"wolf": "working"},
+                                       claim={"gen": 7, "updated": aged(5), "owner": ""})
+        assert proc.returncode == 5
+        claims = [c for c in fake_calls(state) if c.startswith("storage cp") and ".wolf_claim" in c]
+        assert claims == []

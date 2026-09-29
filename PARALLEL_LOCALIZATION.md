@@ -6449,6 +6449,20 @@ Their claim logic is the same code, and the downloader already handles two write
 object. Waiters on `success` still each refresh every object's customTime, which is
 best-effort (`|| :`) and was not a source of failures.
 
+**Follow-up: a requeued uploader and its own claim.** A localization job cannot run out of
+preemptions while uploading. canine's entrypoint only exits 123 when the previous attempt got
+past localization, and every attempt deletes its exit-code files when it starts. So a
+preempted uploader is simply requeued, again. If its trap did not run, the requeued attempt
+found its predecessor's claim looking live, and waited up to `BUCKET_HEARTBEAT_STALE` (10
+minutes) on its own dead attempt. The claim now records its owner as custom metadata:
+`canine_owner`, the submitting controller's host plus `SLURM_JOB_ID`, both of which a requeue
+keeps. It is read in the same `objects describe` as the generation and update time. A job
+that finds its own live claim takes it back at once, by the same compare-and-swap. Checked
+against real GCS: the owner survives the heartbeat's metadata update, which advances the
+update time and leaves the generation alone. Tests cover taking it back, waiting on another
+owner (another job, the same job ID on another controller, or an unrecorded owner), and a
+controller-side run never matching one.
+
 ### 13.88 No worker node for a localization that needs none
 
 **The problem.** Every `LocalizeToBucket` job asked SLURM for an exclusive n1-standard-8, and
@@ -6468,10 +6482,15 @@ no bytes through the node at all. canine's `TODO.md` listed that second case, an
 * **`LocalizeToBucket.after_localize()`** calls canine's
   `Orchestrator.resolve_localizations_on_controller`, which asks
   `AbstractLocalizer.resolve_on_controller` about each job:
-  * **every input `server_side` or `copy`:** run the job's emitted claim-and-upload block on
-    the controller, unchanged from what a node runs;
-  * **some input `mount`:** settle only if the bucket is already populated, using the
-    read-only `bucket_populated_script`, which also refreshes customTime.
+  * **every input `server_side`:** run the job's emitted claim-and-upload block on the
+    controller, unchanged from what a node runs;
+  * **some input `copy` or `mount`:** settle only if the bucket is already populated, using
+    the read-only `bucket_populated_script`, which also refreshes customTime.
+* **The controller moves no data.** It is shared by every workflow in a large run. The first
+  version also uploaded `copy` inputs from it: upstream outputs on the NFS share, which the
+  controller serves. The bytes were the same as a node reading them over NFS, but the upload's
+  CPU and hashing moved onto the controller, so that was reverted. Those inputs go to a node,
+  as before, unless the bucket is already populated.
 * **A settled job** is set to `None` in `job_spec`, as job avoidance does, so it is never
   submitted. It counts as avoided, which is how wolF already supplies placeholder accounting,
   and its stdout and stderr are written where `delocalization.py` would put them.

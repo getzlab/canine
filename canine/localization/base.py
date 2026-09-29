@@ -214,8 +214,8 @@ class AbstractLocalizer(abc.ABC):
         resolve_on_controller: let a caller whose job would only localize (wolF's
           LocalizeToBucket) settle a localization job on the controller instead of submitting
           it to a worker node, when no node is needed: the bucket is already
-          populated, or every input is a server-side gs:// copy or a file on the
-          shared mount. See resolve_on_controller(). Default True. The environment
+          populated, or every input is a server-side gs:// copy. See
+          resolve_on_controller(). Default True. The environment
           variable CANINE_DISABLE_CONTROLLER_LOCALIZATION, set on the controller,
           turns it off without a code change.
         """
@@ -1633,6 +1633,12 @@ class AbstractLocalizer(abc.ABC):
           'CANINE_BUCKET_WAITS=0',
           'CANINE_BUCKET_CLAIM={claim}'.format(claim = shlex.quote("gs://{}/{}".format(bucket, BUCKET_CLAIM_OBJECT))),
           'CANINE_BUCKET_CLAIM_BODY=$(mktemp)',
+          # Who holds the claim. A SLURM requeue keeps SLURM_JOB_ID, so a requeued
+          # attempt can recognize the claim its dead predecessor left. Job IDs
+          # restart on every cluster, hence the submitting controller's host too. A
+          # controller-side run is never requeued, and gets an owner no job matches.
+          'CANINE_BUCKET_OWNER=${SLURM_JOB_ID:+${SLURM_SUBMIT_HOST:-}:${SLURM_JOB_ID}}',
+          'CANINE_BUCKET_OWNER=${CANINE_BUCKET_OWNER:-controller-$(hostname)-$$}',
           # Label writes are rate-limited per bucket (about one a second), and at
           # 50-100 jobs sharing a bucket they returned HTTP 429 -- which
           # gcloud_exp_backoff does not retry, since it looks only for "Quota
@@ -1657,14 +1663,21 @@ class AbstractLocalizer(abc.ABC):
           # describe reads as "absent", which is safe: the conditional write then
           # fails against the object that is there.
           'canine_bucket_claim() {',
-          '  local gen updated',
-          '  read -r gen updated < <(gcloud storage objects describe "$CANINE_BUCKET_CLAIM" --format="value(generation,update_time.date(%s))" 2> /dev/null || :)',
+          '  local gen updated owner',
+          '  read -r gen updated owner < <(gcloud storage objects describe "$CANINE_BUCKET_CLAIM" --format="value(generation,update_time.date(%s),custom_fields.canine_owner)" 2> /dev/null || :)',
           '  updated=${updated%%.*}',
           '  case "$gen" in ""|*[!0-9]*) gen=0;; esac',
           '  case "$updated" in ""|*[!0-9]*) updated=0;; esac',
-          '  if [ "$gen" != "0" ] && [ $(( $(date +%s) - updated )) -le {stale} ]; then return 1; fi'.format(stale = BUCKET_HEARTBEAT_STALE),
+          '  if [ "$gen" != "0" ] && [ $(( $(date +%s) - updated )) -le {stale} ]; then'.format(stale = BUCKET_HEARTBEAT_STALE),
+          # A live-looking claim that is this job's own was left by an attempt a
+          # requeue replaced -- SLURM runs one attempt at a time -- and its heartbeat
+          # has only not aged out yet. Waiting for that cost up to
+          # BUCKET_HEARTBEAT_STALE per preemption whenever the trap did not run.
+          '    [ "$owner" == "$CANINE_BUCKET_OWNER" ] || return 1',
+          '    echo "INFO: the claim on {b} is this job\'s own, left by an attempt before a requeue; taking it back" >&2'.format(b = bucket),
+          '  fi',
           '  echo "$(hostname) ${SLURM_JOB_ID:-$$}.${SLURM_ARRAY_TASK_ID:-0} $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CANINE_BUCKET_CLAIM_BODY"',
-          '  gcloud storage cp --if-generation-match=$gen --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$CANINE_BUCKET_CLAIM_BODY" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || return 1',
+          '  gcloud storage cp --if-generation-match=$gen --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --custom-metadata=canine_owner="$CANINE_BUCKET_OWNER" "$CANINE_BUCKET_CLAIM_BODY" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || return 1',
           '  CANINE_BUCKET_CLAIM_GEN=$(gcloud storage objects describe "$CANINE_BUCKET_CLAIM" --format="value(generation)" 2> /dev/null)',
           '}',
           'while :; do',
@@ -1781,7 +1794,7 @@ class AbstractLocalizer(abc.ABC):
         refreshing its objects' customTime as a node job finding it populated would.
 
         Read-only apart from that refresh, so it is safe to run for a job with inputs
-        to download: they need a node only when the bucket still has to be filled.
+        a node must move: they need one only when the bucket still has to be filled.
         """
         bucket = bucket_prefix[len("gs://"):] if bucket_prefix.startswith("gs://") else bucket_prefix
         burl = shlex.quote("gs://" + bucket)
@@ -1809,16 +1822,20 @@ class AbstractLocalizer(abc.ABC):
         Every LocalizeToBucket used to take an exclusive n1-standard-8, even to find
         the bucket already populated, or to copy gs:// objects server-side with no
         bytes through the node. With 50-100 workflows sharing reference files, 99
-        nodes booted to do nothing. A node is needed only to download onto the
-        read-write mount, so:
+        nodes booted to do nothing.
 
-          * every input is a server-side copy or a file on the shared mount (which the
-            controller serves): run the job's whole emitted claim-and-upload block
-            here. The claim, heartbeat, release trap and retries all apply unchanged,
-            so this competes fairly with uploaders on nodes. It waits on another job's
-            live claim here too, holding a thread rather than a node.
-          * some inputs must be downloaded: settle only if the bucket is already
-            populated (bucket_populated_script); otherwise a node is needed.
+        **The controller moves no data.** It is shared by every workflow in a large
+        run, so only work that is metadata or a GCS server-side copy happens here:
+
+          * every input is a server-side gs:// copy: run the job's whole emitted
+            claim-and-upload block here. The claim, heartbeat, release trap and
+            retries all apply unchanged, so this competes fairly with uploaders on
+            nodes. It waits on another job's live claim here too, holding a thread
+            rather than a node.
+          * some input moves bytes -- a download onto the mount, or a file on the
+            shared mount uploaded from where it lives: settle only if the bucket is
+            already populated (bucket_populated_script); otherwise the job goes to a
+            node, which moves the bytes.
 
         Any failure returns False and the job goes to a node as before, which runs
         the same protocol with the node path's requeue behavior. Turned off by
@@ -1842,8 +1859,9 @@ class AbstractLocalizer(abc.ABC):
             return False
 
         bucket_prefix, region, upload_plan = self.bucket_plans[jobId]
-        downloads = [item for item in upload_plan if item.kind == "mount"]
-        if downloads:
+        # Anything that moves bytes goes to a node: see the docstring.
+        needs_node = [item for item in upload_plan if item.kind in ("mount", "copy")]
+        if needs_node:
             lines = self.bucket_populated_script(upload_plan, bucket_prefix)
         else:
             lines = self.bucket_upload_script(upload_plan, bucket_prefix, region)
@@ -1856,9 +1874,9 @@ class AbstractLocalizer(abc.ABC):
         if proc.returncode != 0:
             with open(os.path.join(job_root, "controller_localization.log"), "w") as log:
                 log.write(proc.stdout + proc.stderr)
-            if downloads:
-                canine_logging.info1("localization job {}: bucket not yet populated, and {} input(s) must be "
-                                     "downloaded; submitting it to a node".format(jobId, len(downloads)))
+            if needs_node:
+                canine_logging.info1("localization job {}: bucket not yet populated, and {} input(s) must "
+                                     "be moved by a node; submitting it to a node".format(jobId, len(needs_node)))
             else:
                 canine_logging.warning("localization job {}: localizing on the controller exited {}; "
                                        "submitting it to a node instead (see {})".format(
