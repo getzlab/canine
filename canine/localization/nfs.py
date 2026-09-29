@@ -7,7 +7,7 @@ import re
 import shlex
 import glob
 import subprocess
-from .base import PathType, Localization, STAGED_SCRIPTS, BASH
+from .base import PathType, Localization, STAGED_SCRIPTS, BASH, on_shared_mount
 from .local import BatchedLocalizer
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
@@ -74,10 +74,9 @@ class NFSLocalizer(BatchedLocalizer):
                 if not os.path.isdir(os.path.dirname(dest.localpath)):
                     os.makedirs(os.path.dirname(dest.localpath))
 
-                #
-                # check if self.mount_path, self.staging_dir, and src all exist on the same NFS share
-                # symlink if yes, copy if no
-                if self.same_volume(src):
+                # symlink a file on the NFS share, which workers can follow; copy
+                # any other local path, which is on the controller alone
+                if on_shared_mount(src):
                     os.symlink(src, dest.localpath)
                 else:
                     if os.path.isfile(src):
@@ -100,8 +99,9 @@ class NFSLocalizer(BatchedLocalizer):
         if overrides is None:
             overrides = {}
 
-        # for inputs that are absolute paths residing on the same NFS share,
-        # and are not Canine outputs, treat them as string literals
+        # for inputs that are absolute paths on the NFS share, and are not Canine
+        # outputs, treat them as string literals: workers read them where they are.
+        # Any other local path is on the controller alone, so it is localized.
 
         # XXX: this can be potentially slow, since it has to iterate over every
         #      single input. It would make more sense to do this before the adapter
@@ -113,7 +113,7 @@ class NFSLocalizer(BatchedLocalizer):
 
             for k, v in input_dict.items():
                 if k not in overrides and isinstance(v, str):
-                    if re.match(r"^/", v) is not None and self.same_volume(v) and \
+                    if re.match(r"^/", v) is not None and on_shared_mount(v) and \
                       re.match(r".*/outputs/\d+/.*", v) is None:
                         overrides[k] = None
                         warnings.warn(

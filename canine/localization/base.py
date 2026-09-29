@@ -69,9 +69,61 @@ BUCKET_ALREADY_POPULATED = "already populated"
 BUCKET_WAITING = "another job is uploading into"
 BUCKET_HEARTBEAT_INTERVAL = 60
 BUCKET_HEARTBEAT_STALE = 600
+# Where the controller's NFS share is mounted, on the controller and every worker alike
+# (slurm_gcp_docker). A path under it is the same file on a worker; any other local path
+# is on a disk of the controller that workers cannot see. Decided by this prefix, not by
+# comparing devices: the share is usually on the same block device as /, so a `df` or
+# st_dev comparison calls every controller path shared.
+SHARED_MOUNT = "/mnt/nfs"
+
+def on_shared_mount(path) -> bool:
+    """Whether local `path`, symlinks resolved, is on the NFS share workers see."""
+    return os.path.realpath(path).startswith(SHARED_MOUNT.rstrip("/") + "/")
+
+def shared_mount_path(path) -> str:
+    """
+    `path` as a worker should read it, for a path on_shared_mount() accepts: as given
+    if it already names a place on the share, otherwise the share path it resolves to
+    (a symlink elsewhere on the controller would dangle on a worker).
+    """
+    path = os.path.abspath(path)
+    return path if path.startswith(SHARED_MOUNT.rstrip("/") + "/") else os.path.realpath(path)
+
+def local_copy(item):
+    """
+    Commands uploading "local" UploadItem `item` from the controller, rerun on a lost
+    race. Needs $CANINE_BUCKET_CT, as both scripts that use it set.
+    """
+    # a directory is copied into its parent, or it would land at dest/<name>
+    dest = os.path.dirname(item.dest) + "/" if os.path.isdir(item.fh.path) else item.dest
+    return retried_copy(
+      'gcloud storage cp -r -n --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
+        src = shlex.quote(item.fh.path), dst = shlex.quote(dest))
+    )
+
+def retried_copy(copy):
+    """
+    `copy`, rerun up to three times.
+
+    Two jobs can populate one bucket at once: both find an expired or stale
+    bucket and take it over, since only creation is a mutex. `-n` then does
+    not make the second copy a no-op. It checks for the destination before
+    copying, and a sibling that writes the object in between makes it fail
+    with a 412, which failed localization in production. A rerun sees the
+    object and skips it with exit 0, so retrying settles the race. The
+    gcloud_exp_backoff alias only retries on "Quota exceeded", so it does not.
+    """
+    return [
+      '    for CANINE_COPY_TRY in 1 2 3; do',
+      '      {} && break'.format(copy.strip()),
+      '      if [ $CANINE_COPY_TRY -eq 3 ]; then echo "ERROR: copy failed 3 times" >&2; exit 1; fi',
+      '      echo "WARNING: copy failed (attempt $CANINE_COPY_TRY of 3); another job may be populating this bucket. Retrying; -n skips what is already there" >&2',
+      '      sleep 10',
+      '    done',
+    ]
+
 # types: stream, download, ro_disk, None
 # indicates what kind of action needs to be taken during job startup
-
 PathType = namedtuple(
     'PathType',
     ['localpath', 'remotepath']
@@ -90,9 +142,10 @@ class UploadItem(namedtuple("UploadItem", ["fh", "dest", "kind", "exclude"], def
              * "mount": downloaded through the worker's read-write gcsfuse mount and
                never staged on local disk. This covers remote non-gs:// sources and
                gzip-encoded gs:// objects, which must be decoded.
-             * "copy": the source is already a file on the shared mount (a previous
-               task's output) and is uploaded straight from there, so this adds no NFS
-               traffic that the file's own existence did not.
+             * "local": a local path not on the NFS share, which workers cannot
+               read. The controller uploads it when the job is localized
+               (local_upload_script); the node only checks that it arrived. Paths
+               on the share are not uploaded at all: they pass through as paths.
     exclude: for a "server_side" directory only, the names (relative to the directory)
              left out of its copy because they are gzip-encoded. Each one has its own
              "mount" item.
@@ -1313,13 +1366,13 @@ class AbstractLocalizer(abc.ABC):
             Otherwise False: whether an upload is actually needed is decided
             worker-side, since bucket creation is the mutex and the bucket label
             carries the state (see bucket_upload_script).
-          * bucketmount_paths: dict of input name -> [bucketmount:// URLs],
-            for the caller to save in self.rodisk_paths (same attribute
+          * bucketmount_paths: dict of input name -> [bucketmount:// URLs], with
+            paths on the NFS share passed through unchanged, for the caller to save in self.rodisk_paths (same attribute
             used for disk-backed RODISKs, since wolf.localization.LocalizeToBucket
             reads it generically regardless of backing mechanism).
-          * upload_plan: list of UploadItem for bucket_upload_script() to emit.
-            url-mode inputs only -- "local" inputs are controller-side files that
-            localize_file() copies to the shared mount.
+          * upload_plan: list of UploadItem for bucket_upload_script() to emit,
+            and for upload_local_paths() for its local paths. Paths on the NFS
+            share are not in it: workers read them where they are.
 
         No byte of a url-mode input transits the shared NFS mount: gs:// sources
         are copied server-side and everything else is written through a
@@ -1349,15 +1402,28 @@ class AbstractLocalizer(abc.ABC):
         F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "fh", "path", "hash", "size", "localize", "rdpassthru"])
         F["file_basename"] = F["path"].apply(os.path.basename)
 
-        if len(F) > 0 and (~(F["localize"] | F["rdpassthru"])).all():
+        # A file on the NFS share is already where every worker can read it, so it
+        # passes through as its path, like a bucketmount:// URL, and is left out of
+        # the bucket (and of its content hash). That covers a string literal too:
+        # NFSLocalizer turns share paths that are not canine outputs into those.
+        F["shared"] = F["fh"].apply(lambda fh:
+          fh.localization_mode in ("local", "string")
+          and isinstance(fh.path, str) and fh.path.startswith("/")
+          and on_shared_mount(fh.path)
+        )
+        F.loc[F["shared"], "localize"] = False
+        F.loc[F["shared"], "path"] = F.loc[F["shared"], "path"].apply(shared_mount_path)
+        F["passthru"] = F["rdpassthru"] | F["shared"]
+
+        if len(F) > 0 and (~(F["localize"] | F["passthru"])).all():
             raise ValueError("You requested to localize files to a bucket, but no localizable inputs were given:\n{}\nInputs must be valid local paths or supported remote URLs.".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F[["path", "input"]].itertuples()])))
 
-        if (~(F["localize"] | F["rdpassthru"])).any():
-            canine_logging.warning("You requested to localize files to a bucket, but some inputs cannot be localized. Inputs must be valid local paths or supported remote URLs. The following inputs will be skipped:\n{}".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F.loc[~(F["localize"] | F["rdpassthru"]), ["path", "input"]].itertuples()])))
+        if (~(F["localize"] | F["passthru"])).any():
+            canine_logging.warning("You requested to localize files to a bucket, but some inputs cannot be localized. Inputs must be valid local paths or supported remote URLs. The following inputs will be skipped:\n{}".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F.loc[~(F["localize"] | F["passthru"]), ["path", "input"]].itertuples()])))
 
-        # handle special case if we are only passing through bucketmount/RODISK URLs; this is like a dry run
-        if F["rdpassthru"].any() and not F["localize"].any():
-            return None, True, F.loc[F["rdpassthru"], :].groupby("input")["path"].agg(list).to_dict(), []
+        # handle special case if we are only passing through NFS paths or bucketmount/RODISK URLs; this is like a dry run
+        if F["passthru"].any() and not F["localize"].any():
+            return None, True, F.loc[F["passthru"], :].groupby("input", sort = False)["path"].agg(list).to_dict(), []
 
         # content is addressed by input names, files' basenames, and hashes --
         # same scheme as create_persistent_disk's disk_name, so identical input
@@ -1391,10 +1457,10 @@ class AbstractLocalizer(abc.ABC):
         F.loc[F["localize"], "bucket_path"] = \
           "bucketmount://" + bucket + "/" + F.loc[F["localize"], "object_path"]
 
-        bucketmount_paths = F.loc[F["localize"], :].groupby("input")["bucket_path"].agg(list).to_dict()
-
-        if F["rdpassthru"].any():
-            bucketmount_paths = {**bucketmount_paths, **F.loc[F["rdpassthru"], :].groupby("input")["path"].agg(list).to_dict()}
+        # One list per input, in array order. An input whose array mixes passthrough
+        # paths with localized files keeps both; merging two dicts lost one of them.
+        bucketmount_paths = F.loc[F["localize"] | F["passthru"], :].groupby(
+          "input", sort = False)["bucket_path"].agg(list).to_dict()
 
         if dry_run:
             return None, True, bucketmount_paths, []
@@ -1415,7 +1481,7 @@ class AbstractLocalizer(abc.ABC):
               # Classified here from metadata planning already fetched -- no extra calls.
               "mount" if isinstance(r.fh, file_handlers.HandleGSURL) and r.fh.transport_gzip
               else "server_side" if isinstance(r.fh, file_handlers.HandleGSURL)
-              else "copy" if r.fh.localization_mode == "local"
+              else "local" if r.fh.localization_mode == "local"
               else "mount"
             ),
           )
@@ -1438,7 +1504,19 @@ class AbstractLocalizer(abc.ABC):
                     ]
         return "gs://{}".format(bucket), False, bucketmount_paths, expanded
 
-    def bucket_upload_script(self, upload_plan, bucket_prefix, region):
+    def _lifecycle_file_lines(self):
+        """Commands writing the bucket's lifecycle rule to the file "$CANINE_BUCKET_LC"."""
+        return [
+          'CANINE_BUCKET_LC=$(mktemp)',
+          # the lifecycle rule must be applied at creation: a second call to set
+          # it might never happen if this job dies in between
+          "cat > \"$CANINE_BUCKET_LC\" <<'CANINE_LIFECYCLE_EOF'",
+          '{{"rule":[{{"action":{{"type":"Delete"}},"condition":{{"daysSinceCustomTime":{days}}}}}]}}'.format(
+            days = int(self.localization_expiry_days)),
+          'CANINE_LIFECYCLE_EOF',
+        ]
+
+    def bucket_upload_script(self, upload_plan, bucket_prefix, region, upload_local = False):
         """
         Worker-side commands that place every input in `upload_plan` into the
         localization bucket without any of it transiting the shared NFS mount.
@@ -1474,30 +1552,16 @@ class AbstractLocalizer(abc.ABC):
 
         mount_dir = "/mnt/localize/{}".format(bucket)
 
-        def retried(copy):
-            """
-            `copy`, rerun up to three times.
-
-            Two jobs can populate one bucket at once: both find an expired or stale
-            bucket and take it over, since only creation is a mutex. `-n` then does
-            not make the second copy a no-op. It checks for the destination before
-            copying, and a sibling that writes the object in between makes it fail
-            with a 412, which failed localization in production. A rerun sees the
-            object and skips it with exit 0, so retrying settles the race. The
-            gcloud_exp_backoff alias only retries on "Quota exceeded", so it does not.
-            """
-            return [
-              '    for CANINE_COPY_TRY in 1 2 3; do',
-              '      {} && break'.format(copy.strip()),
-              '      if [ $CANINE_COPY_TRY -eq 3 ]; then echo "ERROR: copy failed 3 times" >&2; exit 1; fi',
-              '      echo "WARNING: copy failed (attempt $CANINE_COPY_TRY of 3); another job may be populating this bucket. Retrying; -n skips what is already there" >&2',
-              '      sleep 10',
-              '    done',
-            ]
+        retried = retried_copy
 
         uploads = []
         for item in upload_plan:
-            if item.kind == "server_side":
+            if item.kind == "local" and upload_local:
+                # Run on the controller (resolve_on_controller), which can read it:
+                # upload it here, under the claim. Normally a no-op, since the
+                # controller uploaded it when the job was localized.
+                uploads += local_copy(item)
+            elif item.kind == "server_side":
                 # -n so a requeued shard does not re-copy. rp_string because the
                 # *source* may be requester-pays even though our bucket is not.
                 # A directory source is copied into its parent: `cp -r gs://a/d
@@ -1533,31 +1597,17 @@ class AbstractLocalizer(abc.ABC):
                     )
                     continue
                 uploads += retried(plain_cp)
-            elif item.kind == "copy":
-                # Already a file on the shared mount -- typically an upstream
-                # task's output. The worker uploads it from where it already
-                # lives, which adds no NFS traffic beyond the read.
-                # Deliberately not pre-validating that the worker can read this
-                # path. The obvious checks do not work: "under self.staging_dir"
-                # is wrong because upstream outputs live in sibling task dirs,
-                # and os.path.ismount()/st_dev cannot see the shared mount at all
-                # when the controller has it on the same block device as / (the
-                # usual layout -- `mountpoint /mnt/nfs` says yes while
-                # os.path.ismount says no). A worker that genuinely cannot read
-                # the file gets a precise "No such file or directory" from the
-                # cp below, which beats a heuristic that rejects valid inputs.
-                #
-                # No Content-Encoding concern here unlike "server_side" above:
-                # this uploads fresh bytes from a local/shared-mount file, not a
-                # server-side rewrite of an existing GCS object, so there's no
-                # pre-existing object metadata for `cp` to inherit.
-                dest = os.path.dirname(item.dest) + "/" if os.path.isdir(item.fh.path) else item.dest
-                uploads += retried(
-                  '    gcloud storage cp -r -n --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
-                    src = shlex.quote(item.fh.path),
-                    dst = shlex.quote(dest),
-                  )
-                )
+            elif item.kind == "local":
+                # A local path this worker cannot read. The controller uploaded it
+                # when the job was localized (local_upload_script), so only check
+                # that it is there. It may be missing if it expired while the job was
+                # queued, which the controller cannot know about. Exit 1, not 5: a
+                # requeue reruns only this script, but a rerun of the task localizes
+                # again, and so uploads it again.
+                uploads += [
+                  '    gcloud storage ls {dst} > /dev/null 2>&1 || {{ echo "ERROR:" {dst} "is missing. It is a local path on the controller, which uploads it when the task is localized; rerun the task to upload it again" >&2; exit 1; }}'.format(
+                    dst = shlex.quote(item.dest)),
+                ]
 
         # Sources with no server-side copy (s3://, drs://, GDC, http) have to be
         # moved by this VM -- but they still never touch the shared NFS mount.
@@ -1623,13 +1673,7 @@ class AbstractLocalizer(abc.ABC):
 
         return [
           'CANINE_BUCKET_CT=$(date -u +%Y-%m-%dT%H:%M:%SZ)',
-          'CANINE_BUCKET_LC=$(mktemp)',
-          # the lifecycle rule must be applied at creation: a second call to set
-          # it might never happen if this job dies in between
-          "cat > \"$CANINE_BUCKET_LC\" <<'CANINE_LIFECYCLE_EOF'",
-          '{{"rule":[{{"action":{{"type":"Delete"}},"condition":{{"daysSinceCustomTime":{days}}}}}]}}'.format(
-            days = int(self.localization_expiry_days)),
-          'CANINE_LIFECYCLE_EOF',
+        ] + self._lifecycle_file_lines() + [
           'CANINE_BUCKET_WAITS=0',
           'CANINE_BUCKET_CLAIM={claim}'.format(claim = shlex.quote("gs://{}/{}".format(bucket, BUCKET_CLAIM_OBJECT))),
           'CANINE_BUCKET_CLAIM_BODY=$(mktemp)',
@@ -1810,6 +1854,55 @@ class AbstractLocalizer(abc.ABC):
           'exit 1',
         ]
 
+    def local_upload_script(self, upload_plan, bucket_prefix, region):
+        """
+        Commands, run on the controller, that upload the "local" inputs in
+        `upload_plan`: local paths that are not on the NFS share, so no worker can
+        read them. The rest of the plan is left to the job's bucket_upload_script.
+
+        No claim is taken. The objects are content-addressed, so every job
+        uploading one uploads the same bytes, and `cp -n` skips what is already
+        there. The bucket is created if absent, as the node would create it; the
+        node's own create then finds it and takes the claim as usual.
+        """
+        bucket = bucket_prefix[len("gs://"):] if bucket_prefix.startswith("gs://") else bucket_prefix
+        burl = shlex.quote("gs://" + bucket)
+        lines = ['CANINE_BUCKET_CT=$(date -u +%Y-%m-%dT%H:%M:%SZ)'] + self._lifecycle_file_lines() + [
+          'if ! gcloud storage buckets describe {burl} > /dev/null 2>&1; then'.format(burl = burl),
+          # A 409 here is another job creating it at the same moment, so wait for
+          # the bucket to become readable rather than failing.
+          '  gcloud storage buckets create {burl} --location={region} --soft-delete-duration=0 --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1 || :'.format(
+            burl = burl, region = shlex.quote(region)),
+          '  CANINE_BUCKET_TRIES=0',
+          '  until gcloud storage buckets describe {burl} > /dev/null 2>&1; do'.format(burl = burl),
+          '    if [ $CANINE_BUCKET_TRIES -gt 30 ]; then echo "ERROR: localization bucket {b} never became readable" >&2; exit 1; fi'.format(b = bucket),
+          '    sleep 2; CANINE_BUCKET_TRIES=$((CANINE_BUCKET_TRIES+1))',
+          '  done',
+          'fi',
+          'rm -f "$CANINE_BUCKET_LC"',
+        ]
+        for item in upload_plan:
+            if item.kind == "local":
+                lines += local_copy(item)
+        return lines
+
+    def upload_local_paths(self, upload_plan, bucket_prefix, region):
+        """
+        Run local_upload_script here on the controller, for a plan with any "local"
+        input. Raises if the upload fails, which fails localizing the task.
+        """
+        local = [item for item in upload_plan if item.kind == "local"]
+        if not local:
+            return
+        canine_logging.info1("Uploading {} local path(s) from the controller into {}".format(
+          len(local), bucket_prefix))
+        proc = subprocess.run(
+          [BASH, "-c", "set -e\n" + "\n".join(self.local_upload_script(upload_plan, bucket_prefix, region)) + "\n"],
+          capture_output = True, text = True)
+        if proc.returncode != 0:
+            raise RuntimeError("Could not upload local path(s) {} into {}:\n{}".format(
+              ", ".join(item.fh.path for item in local), bucket_prefix, proc.stdout + proc.stderr))
+
     def resolve_on_controller(self, jobId) -> bool:
         """
         Settle job `jobId`'s bucket localization here on the controller, and say
@@ -1824,16 +1917,19 @@ class AbstractLocalizer(abc.ABC):
         bytes through the node. With 50-100 workflows sharing reference files, 99
         nodes booted to do nothing.
 
-        **The controller moves no data.** It is shared by every workflow in a large
-        run, so only work that is metadata or a GCS server-side copy happens here:
+        **The controller moves no data here.** It is shared by every workflow in a
+        large run, so only work that is metadata or a GCS server-side copy happens
+        here. (Local paths are the exception, uploaded before this runs, since no
+        worker can read them: see upload_local_paths.)
 
-          * every input is a server-side gs:// copy: run the job's whole emitted
-            claim-and-upload block here. The claim, heartbeat, release trap and
-            retries all apply unchanged, so this competes fairly with uploaders on
-            nodes. It waits on another job's live claim here too, holding a thread
-            rather than a node.
-          * some input moves bytes -- a download onto the mount, or a file on the
-            shared mount uploaded from where it lives: settle only if the bucket is
+          * every input is a server-side gs:// copy or a local path: run the job's
+            whole emitted claim-and-upload block here. The claim, heartbeat, release
+            trap and retries all apply unchanged, so this competes fairly with
+            uploaders on nodes. It waits on another job's live claim here too,
+            holding a thread rather than a node. Local paths are uploaded again
+            under the claim (upload_local), a no-op unless one went missing since
+            localization: a node could only fail on it.
+          * some input is a download onto the mount: settle only if the bucket is
             already populated (bucket_populated_script); otherwise the job goes to a
             node, which moves the bytes.
 
@@ -1860,11 +1956,11 @@ class AbstractLocalizer(abc.ABC):
 
         bucket_prefix, region, upload_plan = self.bucket_plans[jobId]
         # Anything that moves bytes goes to a node: see the docstring.
-        needs_node = [item for item in upload_plan if item.kind in ("mount", "copy")]
+        needs_node = [item for item in upload_plan if item.kind == "mount"]
         if needs_node:
             lines = self.bucket_populated_script(upload_plan, bucket_prefix)
         else:
-            lines = self.bucket_upload_script(upload_plan, bucket_prefix, region)
+            lines = self.bucket_upload_script(upload_plan, bucket_prefix, region, upload_local = True)
         proc = subprocess.run([BASH, "-c", "set -e\n" + "\n".join(lines) + "\n"],
                               capture_output = True, text = True)
 
@@ -1898,7 +1994,10 @@ class AbstractLocalizer(abc.ABC):
         # filled the shared bucket -- and "localized on the controller" would claim a
         # transfer that never happened.
         if BUCKET_ALREADY_POPULATED not in proc.stderr:
-            what = "transferred on the controller into {} (server-side copies)".format(bucket_prefix)
+            how = [label for kind, label in (("server_side", "server-side copies"),
+                                             ("local", "local paths uploaded from the controller"))
+                   if any(item.kind == kind for item in upload_plan)]
+            what = "transferred on the controller into {} ({})".format(bucket_prefix, ", ".join(how))
         elif BUCKET_WAITING in proc.stderr:
             what = "localized in {} by another job, waited for its upload".format(bucket_prefix)
         else:
@@ -2077,6 +2176,8 @@ class AbstractLocalizer(abc.ABC):
             if not self.persistent_disk_dry_run and len(upload_plan):
                 zone = self.backend_zone()
                 self.bucket_plans[jobId] = (bucket_prefix, _zone_to_region(zone), upload_plan)
+                # local paths no worker can read go up now, from here
+                self.upload_local_paths(upload_plan, bucket_prefix, _zone_to_region(zone))
                 localization_tasks += self.bucket_upload_script(
                   upload_plan, bucket_prefix, _zone_to_region(zone)
                 )
@@ -2100,9 +2201,14 @@ class AbstractLocalizer(abc.ABC):
                     if v.localization_mode == "local" and v.localized_path != v.path:
                         localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path)]
 
-                # transform this input into a bucket-mount FileType, to be mounted
+                # transform this input into a bucket-mount FileType, to be mounted.
+                # A path on the NFS share passed through as itself; like any share
+                # path NFSLocalizer sees, it is handed to the task as a string.
                 if not self.persistent_disk_dry_run:
-                    self.inputs[jobId][k] = [file_handlers.HandleBucketMountURL(v) for v in v_array]
+                    self.inputs[jobId][k] = [
+                      file_handlers.HandleBucketMountURL(v) if "://" in v else file_handlers.StringLiteral(v)
+                      for v in v_array
+                    ]
 
                 # if this is a dry run, we are only interested in the bucketmount URL string literals;
                 # we will not actually be attempting to mount it. this is mainly
@@ -2347,8 +2453,8 @@ class AbstractLocalizer(abc.ABC):
                     exportpath = dest.remotepath
 
                     # NB: unreachable under localize_to_persistent_disk -- those
-                    # inputs are uploaded by bucket_upload_script (kind="copy")
-                    # and transformed into bucket_mount FileTypes before this
+                    # inputs are uploaded by upload_local_paths (kind="local") or
+                    # passed through as NFS paths, and transformed before this
                     # loop runs.
 
                     export_writer(

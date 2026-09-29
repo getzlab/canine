@@ -6555,7 +6555,68 @@ controller-side scripts, and the wiring was tested with mocks. Phase 3 is not bu
 job with inputs to download, waiting on another job's live claim from the controller rather
 than on a node.
 
-### 13.89 Summary: speedups versus the original localization
+### 13.89 Local paths: the NFS share passes through, everything else is uploaded by the controller
+
+**The problem.** Every `localization_mode == "local"` input became a `copy` upload item, which the
+node uploaded with `gcloud storage cp` from the input's own path. There were two failures:
+
+* **A path on the NFS share** was copied into the bucket even though every worker could already
+  read it where it was. That meant a full re-upload of an upstream output just to read it back
+  through gcsfuse.
+* **A path anywhere else on the controller,** such as a home directory, was only readable on the
+  controller, so the node's `cp` failed with "No such file or directory". `NFSLocalizer` made
+  this worse. Its `same_volume` check (`df -P` against `staging_dir`) calls every controller path
+  shared when the share is on the same block device as `/`, which is the usual layout. Such paths
+  became string literals, or were symlinked into a job's inputs, and workers couldn't follow
+  either.
+
+**The rule** (the user's): a local path under `/mnt/nfs/` is on the share; any other local path
+is on a disk of the controller that workers can't see. This is `SHARED_MOUNT` and
+`on_shared_mount()` in `base.py`, a prefix test applied after resolving symlinks.
+
+* **On the share:** passed through as the path, with no upload item and no part in the content
+  hash. A string input holding a share path passes through the same way. A symlink into the
+  share passes the resolved share path. An input set with nothing else to localize needs no
+  bucket. An input whose array mixes passthrough paths and bucket objects keeps every element,
+  in order. The old code merged two dicts, so an input with both lost one of the lists.
+* **Anywhere else: `local`.** The controller uploads the path when the job is localized
+  (`upload_local_paths` in `job_setup_teardown`), creating the bucket if absent. It uses
+  `cp -n --custom-time` with the lost-race retry, and takes no claim, because the objects are
+  content-addressed. Local paths are the one exception to "the controller moves no data"; nothing
+  else can read them. When controller settling runs (§13.88), a job of server-side and local
+  inputs needs no node: its claim script uploads the local paths again under the claim (a no-op
+  with `-n`), so an object that went missing since localization is re-uploaded rather than sent
+  to a node that could only fail on it. A node's script only checks that the object is there. If
+  the object is missing, the node exits 1, so wolF's task retry localizes, and uploads, again.
+* **`NFSLocalizer`** uses the same rule for its string-literal pre-pass and for symlink-or-copy
+  in `localize_file`. `same_volume` is kept, but nothing in `nfs.py` calls it any more.
+
+The `copy` kind is gone. §13.88's shared-mount case no longer exists, because those inputs pass
+through.
+
+**Tests** (`test_localizer_bucket_upload_pure.py`: 21 new and 4 rewritten, replacing 4 that tested the `copy` kind):
+
+* the prefix rule, including `/mnt/nfsother` and a symlink in each direction;
+* string-literal passthrough;
+* an array mixing both kinds, kept in order;
+* the content hash ignoring share paths;
+* the controller upload creating the bucket once, copying only local paths, and leaving labels
+  and claim alone;
+* the node script finding the object and labeling the bucket, or exiting 1 and releasing it;
+* a failed upload raising;
+* `job_setup_teardown` uploading before it emits the node script, and passing a share path to the
+  task as a string;
+* settling uploading a missing local path instead of going to a node;
+* the log line;
+* `NFSLocalizer` symlinking a share file and copying a local one.
+
+The full pure suite is 1711 passed, 1 skipped.
+
+**Not covered.** No run on a cluster. `test_localizer_nfs.py` (Docker SLURM, not runnable here)
+keeps its staging directory in a host temp directory, not `/mnt/nfs`, so its local files are now
+copied rather than symlinked. That's correct, but slower.
+
+### 13.90 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

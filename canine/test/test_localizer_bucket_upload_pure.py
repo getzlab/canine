@@ -162,16 +162,16 @@ class TestContentEncoding:
         assert not describes_a_source(script)
         assert "gunzip" not in script
 
-    def test_local_copy_has_no_content_encoding_handling(self):
+    def test_a_local_path_has_no_content_encoding_handling(self):
         """
-        A "copy"-kind upload writes fresh bytes from a local/shared-mount file
-        -- there's no pre-existing GCS object metadata for `cp` to inherit, so
-        there's nothing here for this feature to guard against.
+        A "local" upload writes fresh bytes from a file on the controller -- there's
+        no pre-existing GCS object metadata for `cp` to inherit, so there's nothing
+        here for this feature to guard against.
         """
         fh = MagicMock()
-        fh.path = "/mnt/nfs/workspace/ref.fa"
+        fh.path = "/home/user/ref.fa"
         fh.localization_mode = "local"
-        item = UploadItem(fh=fh, dest="gs://b/reference/ref.fa", kind="copy")
+        item = UploadItem(fh=fh, dest="gs://b/reference/ref.fa", kind="local")
         script = "\n".join(make_localizer().bucket_upload_script([item], "gs://b", "us-central1"))
         assert not describes_a_source(script)
         assert "gunzip" not in script
@@ -536,54 +536,43 @@ class TestCreateBucketMountLayouts:
             names.append(paths["filename"][0].split("/")[2])
         assert names[0] == names[1]
 
-    def test_local_mode_inputs_are_uploaded_not_silently_dropped(self):
+    def test_a_local_path_is_uploaded_not_silently_dropped(self):
         """
-        Regression: a "local" input (typically an upstream task's output) was
-        given a bucketmount:// URL but left out of the upload plan. With an
-        all-local localization the plan came back empty, so bucket_upload_script
-        was skipped entirely, the bucket was never created, and the consumer
-        tried to gcsfuse-mount a bucket that did not exist. This is the ordinary
-        `LocalizeToBucket(files=upstream["out"])` pattern.
+        Regression: a "local" input was given a bucketmount:// URL but left out of
+        the upload plan. With an all-local localization the plan came back empty,
+        so bucket_upload_script was skipped entirely, the bucket was never created,
+        and the consumer tried to gcsfuse-mount a bucket that did not exist.
         """
         loc = make_localizer()
         loc.staging_dir = "/mnt/nfs/workspace"
         loc.backend.config = {"zone": "us-central1-c"}
         loc.project = "proj"
+        fh = self._local_fh()
+        fh.path = "/home/user/ref.fa"
         with patch("canine.localization.base.get_project_number", return_value="406002258908"):
-            _, _, paths, plan = loc.create_bucket_mount(
-                {"reference": [self._local_fh()]}, dry_run=False)
+            _, _, paths, plan = loc.create_bucket_mount({"reference": [fh]}, dry_run=False)
 
         assert len(plan) == 1, "an all-local localization must still produce a plan"
-        assert plan[0].kind == "copy"
-        assert "reference" in paths
+        assert plan[0].kind == "local"
+        assert paths["reference"][0].startswith("bucketmount://")
 
-    def test_local_input_is_uploaded_from_its_existing_path(self):
-        """No re-staging: it is already on the shared mount, so upload from there."""
-        loc = make_localizer()
-        loc.staging_dir = "/mnt/nfs/workspace"
-        item = UploadItem(fh=self._local_fh(), dest="gs://b/reference/ref.fa", kind="copy")
-        script = "\n".join(loc.bucket_upload_script([item], "gs://b", "us-central1"))
-        cp = input_copies(script)
-        assert len(cp) == 1
-        assert "/mnt/nfs/workspace/ref.fa" in cp[0]
-        assert "gs://b/reference/ref.fa" in cp[0]
-        assert "--custom-time=" in cp[0]
-
-    def test_upstream_output_in_a_sibling_task_dir_is_accepted(self):
+    def test_an_upstream_output_on_the_share_passes_through(self):
         """
-        Regression: the reachability guard originally required the path to sit
-        under self.staging_dir -- the *current task's* directory. Upstream
-        outputs live in sibling task dirs on the same shared mount, so the
-        ordinary LocalizeToBucket(files=upstream["out"]) pattern was rejected
-        outright on a live cluster.
+        The ordinary LocalizeToBucket(files=upstream["out"]) pattern. An upstream
+        output lives in a sibling task dir on the NFS share, where every worker can
+        read it, so it is not copied into the bucket: its path is the result.
         """
         loc = make_localizer()
         loc.staging_dir = "/mnt/nfs/ws/run/BatchLocalDisk__2026-09-06--02-05-09_x"
+        loc.backend.config = {"zone": "us-central1-c"}
+        loc.project = "proj"
         fh = self._local_fh()
         fh.path = "/mnt/nfs/ws/run/produce__2026-09-06--02-03-37_y/outputs/0/big/big.txt"
-        item = UploadItem(fh=fh, dest="gs://b/big_file/big.txt", kind="copy")
-        script = "\n".join(loc.bucket_upload_script([item], "gs://b", "us-central1"))
-        assert fh.path in script
+        with patch("canine.localization.base.get_project_number", return_value="406002258908"):
+            prefix, _, paths, plan = loc.create_bucket_mount({"big_file": [fh]}, dry_run=False)
+        assert plan == []
+        assert prefix is None, "nothing to localize, so no bucket"
+        assert paths == {"big_file": [fh.path]}
 
     def test_never_deletes_an_upstream_output_it_did_not_copy(self):
         """
@@ -605,9 +594,9 @@ class TestCreateBucketMountLayouts:
         with patch("canine.localization.base.get_project_number", return_value="406002258908"):
             _, _, paths, plan = loc.create_bucket_mount({"reference": [fh]}, dry_run=False)
 
-        # the file we are about to upload from must not be scheduled for deletion
-        assert plan[0].kind == "copy"
-        assert plan[0].fh.path == "/mnt/nfs/workspace/ref.fa"
+        # passed through, so not uploaded, and its path is what consumers get
+        assert plan == []
+        assert paths == {"reference": ["/mnt/nfs/workspace/ref.fa"]}
 
     @staticmethod
     def _local_fh():
@@ -840,9 +829,7 @@ class TestTwoJobsPopulatingOneBucket:
     @pytest.mark.parametrize("item", [
         gs_item(),
         gs_item(path="gs://src/dir", dest="gs://b/inp/dir", is_dir=True),
-        UploadItem(fh=MagicMock(path="/mnt/nfs/out/ref.fa", localization_mode="local"),
-                   dest="gs://b/reference/ref.fa", kind="copy"),
-    ], ids=["object", "directory", "shared-mount copy"])
+    ], ids=["object", "directory"])
     def test_a_lost_race_is_retried_and_succeeds(self, tmp_path, item):
         body = self.FIRST_COPY_LOSES.replace("{log}", str(tmp_path / "calls.log"))
         proc, calls = run_with_fake_gcloud(self._copy_block(item), tmp_path, body)
@@ -1303,26 +1290,28 @@ class TestSettlingALocalizationOnTheController:
         assert any(c.startswith("storage buckets create") for c in fake_calls(state))
         assert len(input_copy_calls(state)) == 1
 
-    def _shared_mount_item(self):
-        fh = MagicMock(path="/mnt/nfs/workspace/ref.fa", localization_mode="local")
-        return UploadItem(fh=fh, dest=self.PREFIX + "/reference/ref.fa", kind="copy")
+    def _local_item(self):
+        fh = MagicMock(path="/home/user/ref.fa", localization_mode="local")
+        return UploadItem(fh=fh, dest=self.PREFIX + "/reference/ref.fa", kind="local")
 
-    def test_a_shared_mount_file_is_not_uploaded_from_the_controller(self, monkeypatch, tmp_path):
+    def test_a_local_path_settles_without_a_node(self, monkeypatch, tmp_path):
         '''
-        The controller moves no data: it is shared by every workflow in a large run. So
-        an upstream output on the NFS share is uploaded by a node, as it always was.
+        The controller claims and labels the bucket like any uploader, uploading the
+        local path under the claim (-n: a no-op once localization has uploaded it).
         '''
-        loc, state = self._localizer(monkeypatch, tmp_path, [self._shared_mount_item()])
-        assert loc.resolve_on_controller("0") is False
-        assert input_copy_calls(state) == []
-        assert not any(".wolf_claim" in c for c in fake_calls(state))
-
-    def test_a_shared_mount_file_in_a_populated_bucket_settles(self, monkeypatch, tmp_path):
-        '''Metadata only: nothing moves.'''
-        loc, state = self._localizer(monkeypatch, tmp_path, [self._shared_mount_item()],
-                                     exists=True, populated=True, labels={"wolf": "success"})
+        loc, state = self._localizer(monkeypatch, tmp_path, [self._local_item()],
+                                     exists=True, populated=True)
         assert loc.resolve_on_controller("0") is True
-        assert input_copy_calls(state) == []
+        copies = input_copy_calls(state)
+        assert len(copies) == 1 and "/home/user/ref.fa" in copies[0] and "-n" in copies[0].split()
+        assert fake_labels(state) == {"wolf": "success"}
+
+    def test_a_missing_local_path_is_uploaded_again_not_sent_to_a_node(self, monkeypatch, tmp_path):
+        '''A node cannot read it, so it could only fail there.'''
+        loc, state = self._localizer(monkeypatch, tmp_path, [self._local_item()], exists=True)
+        assert loc.resolve_on_controller("0") is True
+        assert len(input_copy_calls(state)) == 1
+        assert fake_labels(state) == {"wolf": "success"}
 
     def test_another_jobs_live_claim_is_waited_on_here(self, monkeypatch, tmp_path):
         '''Waiting holds a controller thread instead of an exclusive node.'''
@@ -1516,3 +1505,231 @@ class TestARequeuedJobTakesBackItsOwnClaim:
         assert proc.returncode == 5
         claims = [c for c in fake_calls(state) if c.startswith("storage cp") and ".wolf_claim" in c]
         assert claims == []
+
+
+class TestLocalPathsAndTheShare:
+    '''
+    A local path under the NFS share (/mnt/nfs) is the same file on every worker, so it
+    passes through as its path and is never copied into a bucket. Any other local path
+    is on the controller alone: no worker can read it, so the controller uploads it when
+    the job is localized, and the node only checks that it arrived.
+    '''
+    PREFIX = "gs://wolf-1-us-central1-abc"
+
+    @staticmethod
+    def _fh(path, mode="local", hash="cafebabe"):
+        fh = MagicMock()
+        fh.path = path
+        fh.hash = hash
+        fh.size = 99
+        fh.localization_mode = mode
+        return fh
+
+    @staticmethod
+    def _plan(inputs):
+        loc = make_localizer()
+        loc.backend.config = {"zone": "us-central1-c"}
+        loc.project = "proj"
+        with patch("canine.localization.base.get_project_number", return_value="406002258908"):
+            return loc.create_bucket_mount(inputs, dry_run=False)
+
+    @pytest.fixture
+    def share(self, monkeypatch, tmp_path):
+        '''A real directory standing in for /mnt/nfs, so symlinks can resolve into it.'''
+        root = (tmp_path / "nfs").resolve()
+        root.mkdir()
+        monkeypatch.setattr("canine.localization.base.SHARED_MOUNT", str(root))
+        return root
+
+    def test_the_share_is_decided_by_prefix(self):
+        from canine.localization.base import on_shared_mount
+        assert on_shared_mount("/mnt/nfs/ws/ref.fa")
+        assert not on_shared_mount("/mnt/nfsother/ref.fa")
+        assert not on_shared_mount("/mnt/nfs")
+        assert not on_shared_mount("/home/user/ref.fa")
+
+    def test_a_string_literal_on_the_share_passes_through(self):
+        '''NFSLocalizer turns share paths that are not canine outputs into these.'''
+        _, _, paths, plan = self._plan({"ref": [self._fh("/mnt/nfs/ref/hg38.fa", mode="string")]})
+        assert plan == []
+        assert paths == {"ref": ["/mnt/nfs/ref/hg38.fa"]}
+
+    def test_a_symlink_into_the_share_passes_the_share_path(self, share, tmp_path):
+        '''The link itself is on the controller, so it would dangle on a worker.'''
+        (share / "hg38.fa").write_text(">chr1\n")
+        link = tmp_path / "home_link.fa"
+        link.symlink_to(share / "hg38.fa")
+        _, _, paths, plan = self._plan({"ref": [self._fh(str(link))]})
+        assert plan == []
+        assert paths == {"ref": [str(share / "hg38.fa")]}
+
+    def test_a_symlink_out_of_the_share_is_uploaded(self, share, tmp_path):
+        '''It names a place on the share, but its bytes are on the controller alone.'''
+        (tmp_path / "hg38.fa").write_text(">chr1\n")
+        (share / "link.fa").symlink_to(tmp_path / "hg38.fa")
+        _, _, _, plan = self._plan({"ref": [self._fh(str(share / "link.fa"))]})
+        assert [item.kind for item in plan] == ["local"]
+
+    def test_an_array_mixing_both_keeps_every_element_in_order(self):
+        _, _, paths, plan = self._plan({"refs": [
+            self._fh("/mnt/nfs/ref/a.fa"), self._fh("/home/user/b.fa"), self._fh("/mnt/nfs/ref/c.fa"),
+        ]})
+        assert [item.kind for item in plan] == ["local"]
+        assert paths["refs"][0] == "/mnt/nfs/ref/a.fa"
+        assert paths["refs"][1].startswith("bucketmount://") and paths["refs"][1].endswith("/refs/b.fa")
+        assert paths["refs"][2] == "/mnt/nfs/ref/c.fa"
+
+    def test_a_share_path_does_not_change_the_bucket(self):
+        '''It is not in the bucket, so it is not in the content hash either.'''
+        alone, _, _, _ = self._plan({"b": [self._fh("/home/user/b.fa")]})
+        mixed, _, _, _ = self._plan({"b": [self._fh("/home/user/b.fa")],
+                                     "a": [self._fh("/mnt/nfs/a.fa", hash="0ddba11")]})
+        assert alone == mixed
+
+    def test_the_controller_run_uploads_a_local_path_itself(self):
+        item = UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local")
+        script = "\n".join(make_localizer().bucket_upload_script(
+            [item], self.PREFIX, "us-central1", upload_local=True))
+        assert len(input_copies(script)) == 1
+        assert "is a local path on the controller" not in script
+
+    def test_the_node_only_checks_that_a_local_path_arrived(self):
+        item = UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local")
+        script = script_for([item])
+        assert input_copies(script) == []
+        assert "/home/user/ref.fa" not in script
+        assert "gcloud storage ls " + self.PREFIX + "/ref/ref.fa" in script
+
+    def _local_upload(self, tmp_path, items, **fake):
+        import os
+        import subprocess
+        path, state = install_fake_gcs(tmp_path, **fake)
+        lines = make_localizer().local_upload_script(items, self.PREFIX, "us-central1")
+        proc = subprocess.run(["bash", "-c", "set -e\n" + "\n".join(lines) + "\necho CANINE_SCRIPT_DONE"],
+                              env=dict(os.environ, PATH=path, FAKE_STATE=str(state)),
+                              capture_output=True, text=True, timeout=60)
+        return proc, state
+
+    def test_the_controller_creates_the_bucket_and_uploads(self, tmp_path):
+        items = [UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local"),
+                 gs_item(dest=self.PREFIX + "/inp/reads.bam")]
+        proc, state = self._local_upload(tmp_path, items)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        calls = fake_calls(state)
+        create = [c for c in calls if c.startswith("storage buckets create")]
+        assert len(create) == 1 and "--lifecycle-file=" in create[0] and "--soft-delete-duration=0" in create[0]
+        copies = input_copy_calls(state)
+        assert len(copies) == 1, "only the local path; the gs:// input is the node's"
+        assert "/home/user/ref.fa" in copies[0] and "-n" in copies[0].split()
+        assert "--custom-time=" in copies[0]
+        assert fake_labels(state) == {}, "labels and the claim stay the node's"
+        assert fake_claim(state) is None
+
+    def test_an_existing_bucket_is_not_created_again(self, tmp_path):
+        items = [UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local")]
+        proc, state = self._local_upload(tmp_path, items, exists=True)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert not any(c.startswith("storage buckets create") for c in fake_calls(state))
+
+    def test_then_the_node_script_finds_it_and_labels_the_bucket(self, tmp_path):
+        item = UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local")
+        proc, state = run_claim_script(tmp_path, items=[item], exists=True, populated=True)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert input_copy_calls(state) == []
+        assert fake_labels(state) == {"wolf": "success"}
+        assert fake_claim(state) is None
+
+    def test_a_node_missing_it_fails_and_releases_the_bucket(self, tmp_path):
+        '''Exit 1, not a requeue: only a rerun of the task localizes, and so uploads, again.'''
+        item = UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local")
+        proc, state = run_claim_script(tmp_path, items=[item], exists=True)
+        assert proc.returncode == 1
+        assert "is a local path on the controller" in proc.stderr
+        assert fake_labels(state).get("wolf") == "stale"
+        assert fake_claim(state) is None
+
+    def test_a_failed_upload_fails_localization(self, monkeypatch, tmp_path):
+        path, state = install_fake_gcs(tmp_path, exists=True)
+        monkeypatch.setenv("PATH", path)
+        monkeypatch.setenv("FAKE_STATE", str(state))
+        monkeypatch.setenv("FAKE_CP", "fail")
+        item = UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local")
+        with pytest.raises(RuntimeError, match="/home/user/ref.fa"):
+            make_localizer().upload_local_paths([item], self.PREFIX, "us-central1")
+
+    def test_a_plan_with_no_local_path_runs_nothing(self, monkeypatch):
+        run = MagicMock()
+        monkeypatch.setattr("canine.localization.base.subprocess.run", run)
+        make_localizer().upload_local_paths([gs_item()], self.PREFIX, "us-central1")
+        run.assert_not_called()
+
+    def test_job_setup_teardown_uploads_before_emitting_the_node_script(self):
+        loc = make_localizer(localize_to_persistent_disk=True)
+        loc.inputs = {"0": {}}
+        loc.clean_on_exit = False
+        item = UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local")
+        order = []
+        with patch.object(loc, "create_bucket_mount",
+                          return_value=(self.PREFIX, False, {"ref": ["bucketmount://x"]}, [item])), \
+             patch.object(loc, "backend_zone", return_value="us-central1-c"), \
+             patch.object(loc, "upload_local_paths", side_effect=lambda *a: order.append("upload")), \
+             patch.object(loc, "bucket_upload_script", side_effect=lambda *a: order.append("script") or []):
+            try:
+                loc.job_setup_teardown("0", {"stdout": "../stdout", "stderr": "../stderr"}, MagicMock())
+            except Exception:
+                pass                                      # only the bucket branch matters here
+        assert order == ["upload", "script"]
+
+    def test_a_share_path_reaches_the_task_as_a_string(self):
+        from canine.localization.file_handlers import HandleBucketMountURL, StringLiteral
+        loc = make_localizer(localize_to_persistent_disk=True)
+        loc.inputs = {"0": {"ref": [self._fh("/mnt/nfs/ref/a.fa"), self._fh("/home/user/b.fa")]}}
+        loc.clean_on_exit = False
+        with patch.object(loc, "create_bucket_mount", return_value=(
+                 self.PREFIX, False, {"ref": ["/mnt/nfs/ref/a.fa", "bucketmount://wolf-1-us-central1-abc/ref/b.fa"]},
+                 [UploadItem(fh=self._fh("/home/user/b.fa"), dest=self.PREFIX + "/ref/b.fa", kind="local")])), \
+             patch.object(loc, "backend_zone", return_value="us-central1-c"), \
+             patch.object(loc, "upload_local_paths"):
+            try:
+                loc.job_setup_teardown("0", {"stdout": "../stdout", "stderr": "../stderr"}, MagicMock())
+            except Exception:
+                pass
+        a, b = loc.inputs["0"]["ref"]
+        assert isinstance(a, StringLiteral) and a.path == "/mnt/nfs/ref/a.fa"
+        assert isinstance(b, HandleBucketMountURL)
+
+    def test_the_log_says_local_paths_were_uploaded(self, monkeypatch, tmp_path):
+        item = UploadItem(fh=self._fh("/home/user/ref.fa"), dest=self.PREFIX + "/ref/ref.fa", kind="local")
+        msg = TestTheLogSaysWhatASettledJobDid()._settle(monkeypatch, tmp_path, [item],
+                                                         exists=True, populated=True)
+        assert "(local paths uploaded from the controller)" in msg
+        assert "server-side" not in msg
+
+
+class TestNFSLocalizerAndTheShare:
+    '''NFSLocalizer symlinks a file workers can follow, and copies one they cannot.'''
+
+    @staticmethod
+    def _localize(src):
+        from canine.localization.base import PathType
+        from canine.localization.nfs import NFSLocalizer
+        loc = NFSLocalizer.__new__(NFSLocalizer)
+        fh = MagicMock(path=str(src), localization_mode="local")
+        dest = src.parent.parent / "inputs" / src.name
+        loc.localize_file(fh, PathType(str(dest), str(dest)))
+        return dest
+
+    def test_a_file_on_the_share_is_symlinked(self, monkeypatch, tmp_path):
+        root = (tmp_path / "nfs").resolve()
+        (root / "ws").mkdir(parents=True)
+        (root / "ws" / "ref.fa").write_text(">chr1\n")
+        monkeypatch.setattr("canine.localization.base.SHARED_MOUNT", str(root))
+        assert self._localize(root / "ws" / "ref.fa").is_symlink()
+
+    def test_a_local_path_is_copied(self, monkeypatch, tmp_path):
+        '''Even on the same device as the share, which is the usual controller layout.'''
+        (tmp_path / "home").mkdir()
+        (tmp_path / "home" / "ref.fa").write_text(">chr1\n")
+        monkeypatch.setattr("canine.localization.base.SHARED_MOUNT", str((tmp_path / "nfs").resolve()))
+        dest = self._localize(tmp_path / "home" / "ref.fa")
+        assert not dest.is_symlink() and dest.read_text() == ">chr1\n"

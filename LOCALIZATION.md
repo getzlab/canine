@@ -70,13 +70,17 @@ the consume half; a `LocalizeToBucket` task (whose `script` is `":"`, a no-op �
 
 3. **Plan the uploads.** Each input becomes an `UploadItem` with a `kind` (§4). No controller-side
    check of whether the bucket exists: the worker decides, because bucket creation *is* the
-   mutex.
+   mutex. A local path on the NFS share (`/mnt/nfs/...`) is not planned at all: it passes through
+   as its path (§4b), and is left out of the content hash.
 
-4. **Worker runs `bucket_upload_script()`** — §3.
+4. **The controller uploads local paths**, if there are any (§4b): files on its own disks, which
+   no worker can read.
 
-5. **Worker mounts and consumes** — §6.
+5. **Worker runs `bucket_upload_script()`** — §3.
 
-6. **Objects age out** under the bucket's lifecycle rule. Nothing deletes them explicitly.
+6. **Worker mounts and consumes** — §6.
+
+7. **Objects age out** under the bucket's lifecycle rule. Nothing deletes them explicitly.
 
 ---
 
@@ -177,7 +181,7 @@ update per second, and `gcloud_exp_backoff` does not retry that 429, because it 
 the pre-claim protocol exists in older canine versions still running. `-n` alone does not
 make that harmless: it checks for the destination before copying, so a sibling that writes
 the object in between makes the second copy fail with HTTP 412 (`GcsPreconditionFailedError`).
-Each server-side and shared-mount copy is therefore rerun up to three times, ten seconds
+Each server-side copy, and each local path the controller uploads, is therefore rerun up to three times, ten seconds
 apart. The rerun sees the object and skips it with exit 0 (`Skipping existing destination item
 (no-clobber)`). Downloads onto the read-write mount need no retry here, since the parallel
 downloader handles two writers on one object itself.
@@ -208,24 +212,28 @@ were all server-side copies moving no bytes through the node. When 50–100 conc
 share reference files, their localization jobs all resolve to the same bucket, so 99 nodes
 booted to do nothing.
 
-**The controller moves no data.** It is shared by every workflow in a large run, so only
-metadata and GCS server-side copies happen there. Any input that moves bytes needs a node:
+**The controller moves no data, except local paths.** It is shared by every workflow in a
+large run, so only metadata, GCS server-side copies, and local paths (§4b), which no worker can
+read, happen there. Any input that is downloaded needs a node:
 
 | upload kind | needs a node? |
 |---|---|
 | `server_side` (gs://, not gzip-encoded) | no: a GCS rewrite, with no bytes through anything |
-| `copy` (a file on the shared mount) | **yes**: uploaded by a node, as always |
+| `local` (a local path, not on the NFS share) | no: the controller uploads it |
 | `mount` (http, S3, GDC, DRS, gzip-encoded gs://) | **yes**: a download onto the read-write mount |
 
 So after localizing and before submitting, wolF's `LocalizeToBucket.after_localize()` asks
 canine to settle each job on the controller (`Orchestrator.resolve_localizations_on_controller`
 → `AbstractLocalizer.resolve_on_controller`):
 
-* **Every input is `server_side`:** the controller runs the job's emitted
-  claim-and-upload block itself, the same `bucket_upload_script` output a node runs. The
+* **Every input is `server_side` or `local`:** the controller runs the job's emitted
+  claim-and-upload block itself, the same `bucket_upload_script` output a node runs, except that
+  it uploads local paths under the claim rather than only checking for them. That is normally a
+  no-op, since they were uploaded when the job was localized. If one has gone missing since, it
+  is uploaded again here, rather than sent to a node that could only fail on it. The
   claim, heartbeat, release trap and retries all apply, so it competes fairly with node-side
   uploaders. Waiting on another job's live claim holds a controller thread, not a node.
-* **Some input is `copy` or `mount`:** the controller checks only whether the bucket is
+* **Some input is `mount`:** the controller checks only whether the bucket is
   already populated (`bucket_populated_script`: `success` plus every object present),
   refreshing customTime if so. That check is read-only, so the node job still does any
   claiming, uploading and downloading.
@@ -241,6 +249,7 @@ happened, so it never claims a transfer that did not occur:
 | `already localized in gs://<bucket>, found complete` | an earlier or concurrent workflow's job had filled the bucket; nothing transferred |
 | `localized in gs://<bucket> by another job, waited for its upload` | another job held a live claim; this one waited on the controller until the bucket was complete |
 | `transferred on the controller into gs://<bucket> (server-side copies)` | this job won the claim and made the copies itself |
+| `transferred on the controller into gs://<bucket> (local paths uploaded from the controller)` | this job won the claim, and its inputs were local paths (with `server-side copies, ` first if it also had those) |
 
 A job whose bucket is not yet complete never returns early. It waits on the other job's live
 claim, on the controller or on its node, until the bucket is labelled `success` with every
@@ -338,18 +347,47 @@ still mount a single path. A directory with no encoded objects keeps the plain `
 the whole directory and then decoding over the top was rejected, because it leaves encoded
 objects readable until each decode lands.
 
-### b. `copy` — files already on the shared mount → `HandleRegularFile` (`localization_mode == "local"`)
+### b. Local paths: on the NFS share, passed through; anywhere else, `local`
 
-Typically an upstream task's output. The worker uploads it from where it already lives, adding
-no NFS traffic beyond the read.
+A local path (`HandleRegularFile`, `localization_mode == "local"`) is either on the NFS share or
+not, and that decides everything. The test is the prefix `SHARED_MOUNT = "/mnt/nfs"` (`base.py`),
+applied after resolving symlinks, because the share is mounted there on the controller and on
+every worker. It is not a device comparison: the controller usually has the share on the same
+block device as `/`. On that layout, `df` and `st_dev` call every controller path shared, and
+`os.path.ismount` cannot see the share at all.
 
-Deliberately **not** pre-validated controller-side. The obvious checks don't work: "under
-`staging_dir`" is wrong because upstream outputs live in sibling task directories, and
-`os.path.ismount()`/`st_dev` cannot see the shared mount at all when the controller has it on
-the same block device as `/` (the usual layout — `mountpoint /mnt/nfs` says yes while
-`os.path.ismount` says no). A worker that genuinely can't read the file gets a precise "No such
-file or directory" from `cp`, which beats a heuristic that rejects valid inputs
-(`base.py:1200`).
+**On the share: passed through.** This is typically an upstream task's output, or a reference
+directory on the share. Every worker already reads it where it is, so it is not copied into a
+bucket and not counted in the content hash. Its path is the result: `LocalizeToBucket` returns it
+instead of a `bucketmount://` URL, and a task localizing to a bucket gets it as a string. A string
+input holding a share path passes through the same way; `NFSLocalizer` turns share paths that are
+not canine outputs into strings. A symlink elsewhere that points into the share passes the share
+path it resolves to, because the link would dangle on a worker. An input set with nothing else
+to localize needs no bucket.
+
+**Anywhere else: `local`, uploaded by the controller.** Any local path not under `/mnt/nfs` is on
+a disk of the controller that workers can't see. That includes a link on the share that points
+off it. So the controller uploads it, in `job_setup_teardown`, when the job is localized and
+before anything is submitted (`upload_local_paths` running `local_upload_script`):
+
+* It creates the bucket if it's absent, with the node's lifecycle and soft-delete settings.
+* It runs `gcloud storage cp -r -n --custom-time`, rerun on a lost race.
+* It takes no claim and sets no label. The object is content-addressed, so every job uploading it
+  uploads the same bytes, and `-n` skips what is already there.
+* A failed upload fails localizing the task.
+
+For a `LocalizeToBucket` whose inputs are all server-side or local, no node is involved: the
+controller settles it (§3). A node runs only when the job also downloads something, when
+controller settling is off, or when the task has its own script to run. That node's
+`bucket_upload_script` only checks that each `local` object is there (`gcloud storage ls`). If
+one expired while the job waited in the queue, the check exits 1, not 5. A requeue reruns only
+the node's script, which can't upload it; wolF's rerun of the task localizes again, and so
+uploads it again.
+
+`NFSLocalizer` uses the same rule outside bucket localization. It symlinks a share path into the
+job's inputs and copies any other local path. Both decisions used to come from `same_volume`
+(`df -P` against `staging_dir`). On the usual layout, that symlinked controller-only files, and
+workers couldn't follow the links.
 
 ### c. `mount` — everything else: `s3://`, `drs://`, GDC, signed URLs, plain http
 
