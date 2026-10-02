@@ -44,7 +44,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
         cluster_name,
         *,
         action_on_stop="delete",
-        image_family="gsfuse-local",
+        image_family="flexible-resize",
         image_project="broad-getzlab-workflows",
         image=None,
         storage_namespace="workspace",
@@ -142,7 +142,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
 
         #
         # check if image exists; pull it if not
-        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.3'
+        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.5'
         try:
             image = self.dkr.images.get(image_ref)
         except docker.errors.ImageNotFound:
