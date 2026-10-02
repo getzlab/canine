@@ -101,6 +101,71 @@ def local_copy(item):
         src = shlex.quote(item.fh.path), dst = shlex.quote(dest))
     )
 
+def _is_dir_item(item):
+    """Whether UploadItem `item` places a directory, whose dest is then a prefix."""
+    if item.kind == "local":
+        return os.path.isdir(item.fh.path)
+    return getattr(item.fh, "is_dir", False) is True
+
+def _expected_members(item):
+    """
+    For a directory item, the names (relative to its dest) of every object it must
+    leave in the bucket, or None where they are not known in advance.
+    """
+    if item.kind == "local":
+        root = item.fh.path
+        return sorted(
+          os.path.relpath(os.path.join(d, f), root)
+          for d, _, files in os.walk(root) for f in files
+        )
+    names = getattr(item.fh, "member_names", None)
+    return list(names) if isinstance(names, (list, tuple)) else None
+
+def bucket_object_patterns(upload_plan):
+    """
+    Every object of `upload_plan`, as URLs for `gcloud storage objects update`: a
+    directory as <prefix>/**. The bare prefix matches no object, so it refreshed
+    nothing, and a directory input expired while still in use.
+    """
+    return " ".join(shlex.quote(x.dest + "/**" if _is_dir_item(x) else x.dest) for x in upload_plan)
+
+def bucket_complete_function(upload_plan):
+    """
+    A shell function, canine_bucket_complete, that returns 0 only if every object of
+    `upload_plan` is in the bucket.
+
+    A file is checked by name: `gcloud storage ls` fails if any of its URLs matches no
+    object. A directory is checked file by file against the names expected under it:
+    `ls` of the prefix alone passes while anything is left there, so a directory part
+    of which had expired (its gzip members carry a later customTime than the rest, and
+    the lifecycle rule deletes gradually) read as complete, and was never repopulated.
+    Only missing names count: extra objects under the prefix are harmless.
+    """
+    files = [x for x in upload_plan if not _is_dir_item(x)]
+    lines = ['canine_bucket_complete() {']
+    if files:
+        lines.append('  gcloud storage ls {} > /dev/null 2>&1 || return 1'.format(
+          " ".join(shlex.quote(x.dest) for x in files)))
+    for x in upload_plan:
+        if not _is_dir_item(x):
+            continue
+        pattern = shlex.quote(x.dest + "/**")
+        names = _expected_members(x)
+        if names is None:
+            lines.append('  gcloud storage ls {} > /dev/null 2>&1 || return 1'.format(pattern))
+            continue
+        lines += (
+          ["  LC_ALL=C comm -23 <(LC_ALL=C sort -u <<'CANINE_EXPECTED_EOF'"]
+          + [n for n in names if "\n" not in n]
+          + ['CANINE_EXPECTED_EOF',
+             # names are cut by byte offset, not matched as a pattern: an input name
+             # may hold regex characters
+             '  ) <(gcloud storage ls {pat} 2> /dev/null | cut -b{off}- | LC_ALL=C sort -u) | grep -q . && return 1'.format(
+               pat = pattern, off = len((x.dest + "/").encode()) + 1)]
+        )
+    lines += ['  return 0', '}']
+    return lines
+
 def retried_copy(copy):
     """
     `copy`, rerun up to three times.
@@ -1679,11 +1744,11 @@ class AbstractLocalizer(abc.ABC):
               '    fi',
             ]
 
-        all_objects = " ".join(shlex.quote(x.dest) for x in upload_plan)
+        all_objects = bucket_object_patterns(upload_plan)
 
         return [
           'CANINE_BUCKET_CT=$(date -u +%Y-%m-%dT%H:%M:%SZ)',
-        ] + self._lifecycle_file_lines() + [
+        ] + self._lifecycle_file_lines() + bucket_complete_function(upload_plan) + [
           'CANINE_BUCKET_WAITS=0',
           'CANINE_BUCKET_CLAIM={claim}'.format(claim = shlex.quote("gs://{}/{}".format(bucket, BUCKET_CLAIM_OBJECT))),
           'CANINE_BUCKET_CLAIM_BODY=$(mktemp)',
@@ -1759,15 +1824,15 @@ class AbstractLocalizer(abc.ABC):
           # "success" with the content present is the only state that needs no
           # upload. The content may have aged out under the lifecycle rule, so the
           # label alone is not enough.
-          '  if [ "$CANINE_BUCKET_STATE" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(objs = all_objects),
+          '  if [ "$CANINE_BUCKET_STATE" == "success" ] && canine_bucket_complete; then',
           '    echo "INFO: localization bucket {b} {populated}" >&2'.format(b = bucket, populated = BUCKET_ALREADY_POPULATED),
           '  elif canine_bucket_claim; then',
           # Look again now that the claim is ours. The label was read before the
           # claim, and an uploader finishing in between sets "success" and then
           # releases its claim -- so a claim won after that release always sees
           # "success" here. Without this, that late job uploaded a second time.
-          '    if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(
-            burl = burl, objs = all_objects),
+          '    if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && canine_bucket_complete; then'.format(
+            burl = burl),
           '      echo "INFO: localization bucket {b} {populated}, by another job, while claiming it" >&2'.format(
             b = bucket, populated = BUCKET_ALREADY_POPULATED),
           '      gcloud storage rm --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || :',
@@ -1856,10 +1921,10 @@ class AbstractLocalizer(abc.ABC):
         """
         bucket = bucket_prefix[len("gs://"):] if bucket_prefix.startswith("gs://") else bucket_prefix
         burl = shlex.quote("gs://" + bucket)
-        all_objects = " ".join(shlex.quote(x.dest) for x in upload_plan)
-        return [
-          'if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && gcloud storage ls {objs} > /dev/null 2>&1; then'.format(
-            burl = burl, objs = all_objects),
+        all_objects = bucket_object_patterns(upload_plan)
+        return bucket_complete_function(upload_plan) + [
+          'if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && canine_bucket_complete; then'.format(
+            burl = burl),
           '  echo "INFO: localization bucket {b} {populated}" >&2'.format(b = bucket, populated = BUCKET_ALREADY_POPULATED),
           # refresh the expiry clock, as the node job this replaces would have
           '  gcloud storage objects update {objs} --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :'.format(objs = all_objects),

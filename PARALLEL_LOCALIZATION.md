@@ -6644,7 +6644,66 @@ and nothing replaced them.
 **Tests:** 4 new (`TestLocalizationBucketsArePrivate`). The full pure suite is 1715 passed,
 1 skipped.
 
-### 13.91 Summary: speedups versus the original localization
+### 13.91 Expired objects in a directory input
+
+**The question.** If one object in a localization bucket expires before the rest, does rerunning
+the localization bring it back? `LocalizeToBucket` never job-avoids (`job_avoid = False`), so a
+rerun always reaches the presence check: label `success` and every planned object present.
+
+**Tested on scratch buckets in `getzlab-wolf-develop`**, all private and deleted afterwards:
+
+* **`gcloud storage ls a b c`** exits 1 ("One or more URLs matched no objects") when any one URL
+  is missing, the middle one included. So for file inputs a single expired object is noticed, and
+  the bucket is repopulated with `-n` copying back only what is gone.
+* **`gcloud storage ls <dir prefix>`** exits 0 with one of a directory's files deleted. It passes
+  while anything at all is left under the prefix.
+* **`gcloud storage objects update <dir prefix> --custom-time=...`** fails with "matched no
+  objects", and leaves the files under it with their old customTime. `<dir prefix>/**` updates
+  them.
+
+That gave two bugs for directory inputs, such as the Funcotator data sources:
+
+1. **No refresh.** All three places that refresh customTime passed the bare prefix and suppressed
+   the error, so a directory's files expired `localization_expiry_days` after their first
+   upload, even while every job since had been reading them. The consumer heartbeat
+   (`gs://<bucket>/**`) refreshed them only during jobs that ran longer than its interval.
+2. **A partly expired directory read as complete.** Its gzip members carry the downloader's
+   later customTime, so they outlive the rest, and lifecycle deletion is gradual anyway. A bucket
+   could then report "already populated" with most of a directory gone, and consumers got
+   missing files.
+
+**Fixes** (`base.py`):
+
+* `bucket_object_patterns` names a directory as `<prefix>/**` in every refresh.
+* `bucket_complete_function` emits `canine_bucket_complete`, used by both the claim script and
+  `bucket_populated_script`:
+  * files are checked by name;
+  * a directory's expected names come from its source listing (`HandleGSURL.member_names`, from
+    the listing sizing already fetches, without the `dir/` placeholder objects) or a walk of a
+    local directory;
+  * those names are compared with one `ls <prefix>/**`, by byte offset, so names with regex
+    characters are safe;
+  * only missing names count;
+  * a directory whose contents aren't known in advance falls back to the prefix.
+
+The emitted check and refresh were run against real GCS. The check passed on a complete
+directory, then failed with one file deleted while a sibling with a longer name (`funco2/`) was
+still there, and failed again with the directory empty. The refresh updated the directory's files
+and not the sibling's.
+
+**Tests:** 16 new (`TestEveryObjectMustBeThere`, `TestADirectoryListsItsMembers`), run against an
+extension of the fake GCS that lists objects the way GCS does. They cover:
+
+* a partly expired directory being repopulated;
+* a complete one not being copied again;
+* sibling prefixes;
+* names with spaces and `+()`;
+* local directories;
+* the refresh patterns in both scripts.
+
+The full pure suite is 1731 passed, 1 skipped.
+
+### 13.92 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

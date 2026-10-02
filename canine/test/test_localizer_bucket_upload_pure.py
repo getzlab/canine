@@ -1012,6 +1012,21 @@ if args[:2] == ["storage", "rm"] and is_claim(args[-1]):
         sys.exit(1)
     os.remove(path("claim.json"))
     sys.exit(0)
+if args[:2] == ["storage", "ls"] and os.path.exists(path("objects.json")):
+    # real listing semantics: an exact URL must name an object, and <prefix>/** lists
+    # every object under it; exit 1 if any URL matched nothing
+    objects = json.load(open(path("objects.json")))
+    missing = False
+    for url in (a for a in args[2:] if a.startswith("gs://")):
+        if url.endswith("/**"):
+            matched = [o for o in objects if o.startswith(url[:-2])]
+            print("\n".join(matched)) if matched else None
+            missing = missing or not matched
+        elif url in objects:
+            print(url)
+        else:
+            missing = True
+    sys.exit(1 if missing else 0)
 if args[:2] == ["storage", "ls"]:
     sys.exit(0 if os.path.exists(path("populated")) else 1)
 sys.exit(0)                                           # the inputs' objects update
@@ -1764,3 +1779,149 @@ class TestLocalizationBucketsArePrivate:
         assert not any("buckets update" in l and "uniform-bucket-level-access" in l
                        for l in script.splitlines())
         assert "canine_bucket_label --update-labels=wolf=working --public-access-prevention" in script
+
+
+class TestEveryObjectMustBeThere:
+    '''
+    A bucket labeled success counts as populated only if every object of its plan is
+    there: a file by name, a directory file by file. Checked against real GCS on a
+    scratch bucket (2026-10-02): `ls` of several URLs fails if any one matches nothing,
+    but `ls` of a directory's prefix passes while anything at all is left under it,
+    and `objects update` of a bare prefix matches no object.
+    '''
+    B = "gs://wolf-1-us-central1-abc"
+
+    @staticmethod
+    def _dir_fh(names):
+        fh = MagicMock(path="gs://src/funcotator", rp_string="", is_dir=True, localization_mode="url")
+        fh.member_names = names
+        return fh
+
+    def _dir_item(self, names=("a.txt", "gencode/x.dict", "odd name+(1).txt")):
+        return UploadItem(fh=self._dir_fh(list(names)), dest=self.B + "/data/funcotator", kind="server_side")
+
+    def _complete(self, tmp_path, items, objects):
+        import json
+        import os
+        import subprocess
+        from canine.localization.base import bucket_complete_function
+        path, state = install_fake_gcs(tmp_path)
+        (state / "objects.json").write_text(json.dumps(sorted(objects)))
+        script = "\n".join(bucket_complete_function(items)) + "\ncanine_bucket_complete"
+        return subprocess.run(["bash", "-c", script], env=dict(os.environ, PATH=path, FAKE_STATE=str(state)),
+                              capture_output=True, text=True, timeout=60).returncode
+
+    def _under(self, item, names):
+        return [item.dest + "/" + n for n in names]
+
+    def test_every_file_present(self, tmp_path):
+        items = [gs_item(dest=self.B + "/a/1.bam"), gs_item(dest=self.B + "/b/2.bai")]
+        assert self._complete(tmp_path, items, [self.B + "/a/1.bam", self.B + "/b/2.bai"]) == 0
+
+    def test_one_file_missing(self, tmp_path):
+        items = [gs_item(dest=self.B + "/a/1.bam"), gs_item(dest=self.B + "/b/2.bai"), gs_item(dest=self.B + "/c/3.fa")]
+        assert self._complete(tmp_path, items, [self.B + "/a/1.bam", self.B + "/c/3.fa"]) == 1
+
+    def test_a_whole_directory(self, tmp_path):
+        item = self._dir_item()
+        assert self._complete(tmp_path, [item], self._under(item, ["a.txt", "gencode/x.dict", "odd name+(1).txt"])) == 0
+
+    def test_a_directory_missing_one_file_is_incomplete(self, tmp_path):
+        '''The bug: `ls` of the prefix passed, so this read as populated.'''
+        item = self._dir_item()
+        assert self._complete(tmp_path, [item], self._under(item, ["a.txt", "odd name+(1).txt"])) == 1
+
+    def test_extra_objects_under_a_directory_are_harmless(self, tmp_path):
+        item = self._dir_item(("a.txt",))
+        assert self._complete(tmp_path, [item], self._under(item, ["a.txt", "b.txt"])) == 0
+
+    def test_an_empty_directory_prefix_is_incomplete(self, tmp_path):
+        assert self._complete(tmp_path, [self._dir_item()], [self.B + "/other/x"]) == 1
+
+    def test_a_sibling_with_a_longer_name_does_not_count(self, tmp_path):
+        '''gs://B/data/funcotator2/a.txt is not under gs://B/data/funcotator/.'''
+        item = self._dir_item(("a.txt",))
+        assert self._complete(tmp_path, [item], [self.B + "/data/funcotator2/a.txt"]) == 1
+
+    def test_a_directory_with_unknown_contents_falls_back_to_the_prefix(self, tmp_path):
+        item = UploadItem(fh=MagicMock(path="gs://src/d", is_dir=True), dest=self.B + "/d/d", kind="server_side")
+        (tmp_path / "x").mkdir()
+        (tmp_path / "y").mkdir()
+        assert self._complete(tmp_path / "x", [item], [self.B + "/d/d/anything"]) == 0
+        assert self._complete(tmp_path / "y", [item], []) == 1
+
+    def test_a_local_directory_is_checked_file_by_file(self, tmp_path):
+        root = tmp_path / "ref"
+        (root / "sub").mkdir(parents=True)
+        (root / "a.fa").write_text("x")
+        (root / "sub" / "b.fai").write_text("x")
+        item = UploadItem(fh=MagicMock(path=str(root)), dest=self.B + "/ref/ref", kind="local")
+        (tmp_path / "x").mkdir()
+        (tmp_path / "y").mkdir()
+        assert self._complete(tmp_path / "x", [item], self._under(item, ["a.fa", "sub/b.fai"])) == 0
+        assert self._complete(tmp_path / "y", [item], self._under(item, ["a.fa"])) == 1
+
+    def test_the_refresh_reaches_every_object_of_a_directory(self):
+        from canine.localization.base import bucket_object_patterns
+        pats = shlex.split(bucket_object_patterns([self._dir_item(), gs_item(dest=self.B + "/a/1.bam")]))
+        assert pats == [self.B + "/data/funcotator/**", self.B + "/a/1.bam"]
+
+    def test_every_refresh_uses_the_patterns(self):
+        loc = make_localizer()
+        item = self._dir_item()
+        for script in ("\n".join(loc.bucket_upload_script([item], self.B, "us-central1")),
+                       "\n".join(loc.bucket_populated_script([item], self.B))):
+            refreshes = [l for l in script.splitlines() if "objects update" in l and ".wolf_claim" not in l
+                         and "CANINE_BUCKET_CLAIM" not in l]
+            assert refreshes and all("/data/funcotator/**" in l for l in refreshes)
+
+    def test_a_partly_expired_directory_is_repopulated(self, tmp_path):
+        import json
+        item = self._dir_item(("a.txt", "b.txt"))
+        path, state = install_fake_gcs(tmp_path, exists=True, labels={"wolf": "success"})
+        (state / "objects.json").write_text(json.dumps([item.dest + "/a.txt"]))
+        import os
+        import subprocess
+        script = script_for([item])
+        proc = subprocess.run(["bash", "-c", "set -e\n" + script + "\necho CANINE_SCRIPT_DONE"],
+                              env=dict(os.environ, PATH=path, FAKE_STATE=str(state)),
+                              capture_output=True, text=True, timeout=120)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert "expired; repopulating" in proc.stderr
+        assert len(input_copy_calls(state)) == 1
+
+    def test_a_complete_directory_is_not_copied_again(self, tmp_path):
+        import json
+        import os
+        import subprocess
+        item = self._dir_item(("a.txt", "b.txt"))
+        path, state = install_fake_gcs(tmp_path, exists=True, labels={"wolf": "success"})
+        (state / "objects.json").write_text(json.dumps(self._under(item, ["a.txt", "b.txt"])))
+        proc = subprocess.run(["bash", "-c", "set -e\n" + script_for([item]) + "\necho CANINE_SCRIPT_DONE"],
+                              env=dict(os.environ, PATH=path, FAKE_STATE=str(state)),
+                              capture_output=True, text=True, timeout=120)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert "already populated" in proc.stderr
+        assert input_copy_calls(state) == []
+
+
+class TestADirectoryListsItsMembers:
+    @staticmethod
+    def _fh(names):
+        fh = object.__new__(HandleGSURL)
+        fh.path = "gs://src/funcotator"
+        fh.is_dir = True
+        fh._size = 1
+        fh._dir_object_names = names
+        return fh
+
+    def test_names_are_relative_to_the_directory(self):
+        assert self._fh(["funcotator/a.txt", "funcotator/sub/b.dict"]).member_names == ["a.txt", "sub/b.dict"]
+
+    def test_placeholder_objects_are_left_out(self):
+        assert self._fh(["funcotator/", "funcotator/sub/", "funcotator/a.txt"]).member_names == ["a.txt"]
+
+    def test_a_single_object_has_none(self):
+        fh = self._fh([])
+        fh.is_dir = False
+        assert fh.member_names == []

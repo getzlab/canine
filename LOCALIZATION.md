@@ -189,7 +189,25 @@ The label still carries the state, for readers and for older canine versions, bu
 
 The `success`-but-empty case is not hypothetical: with a 1-day expiry it is the normal end state
 of any bucket nobody touched for a day. Checking the label alone would mount an empty bucket.
-So the check is label **and** `gcloud storage ls` of the expected objects.
+So the check is label **and** every expected object present (`canine_bucket_complete`, from
+`bucket_complete_function` in `base.py`), and any one missing object means a re-upload:
+
+* **A file** is checked by name. `gcloud storage ls` of several URLs fails if any one of them
+  matches nothing.
+* **A directory** is checked file by file. canine lists every name it should hold (from the
+  source listing planning already fetched for a `gs://` directory, or by walking a local one),
+  then compares that list with `gcloud storage ls <prefix>/**`. Checking only the prefix doesn't
+  work, because `ls` of a prefix passes while anything at all is left under it. A partly expired
+  directory then read as complete and was never repopulated. That's a real case: a directory's
+  gzip members carry the downloader's later customTime, so they outlive the rest, and the
+  lifecycle rule deletes gradually anyway. Extra objects under the prefix don't count against it.
+
+The customTime refresh names a directory as `<prefix>/**`. Given the bare prefix,
+`objects update` matched no object, and its error was suppressed, so a directory input was never
+refreshed and expired `localization_expiry_days` after its first upload even while in use.
+Both behaviors were confirmed on a scratch bucket (`PARALLEL_LOCALIZATION.md` §13.91).
+
+With every copy run with `-n`, re-uploading puts back only what is missing.
 
 **Label writes are retried** with jitter, up to 8 times: GCS allows about one bucket-metadata
 update per second, and `gcloud_exp_backoff` does not retry that 429, because it retries only

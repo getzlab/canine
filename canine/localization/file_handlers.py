@@ -1050,6 +1050,7 @@ class HandleGSURL(FileType):
         """
         total = 0
         gzip_encoded = []
+        object_names = []
         for blob in self.blob():
             size = self._blob_localized_size(blob)
             total += size
@@ -1067,10 +1068,13 @@ class HandleGSURL(FileType):
             }
             if not self.is_dir:
                 self._stored_meta = meta
-            elif meta["encoding"] == "gzip":
-                gzip_encoded.append((blob.name, meta, size))
+            else:
+                object_names.append(blob.name)
+                if meta["encoding"] == "gzip":
+                    gzip_encoded.append((blob.name, meta, size))
         if self.is_dir:
             self._gzip_encoded_meta = gzip_encoded
+            self._dir_object_names = object_names
         return total
 
     @property
@@ -1132,6 +1136,26 @@ class HandleGSURL(FileType):
             member._hash = None
             handlers.append(member)
         return handlers
+
+    @property
+    def member_names(self):
+        """
+        The name, relative to this directory, of every object under it: what a copy of
+        the directory must contain. Empty for a single object.
+
+        From the listing sizing already fetched, like gzip_members. Leaves out the
+        zero-byte "dir/" placeholder objects some tools create, which are not content.
+        """
+        self.size                                  # blob() is what sets is_dir
+        if not self.is_dir:
+            return []
+        names = getattr(self, "_dir_object_names", None)
+        if names is None:
+            self._size = self._get_size()
+            names = self._dir_object_names
+        bucket = re.match(r"^gs://([^/]+)/", self.path)[1]
+        relative = ("gs://{}/{}".format(bucket, name)[len(self.path) + 1:] for name in names)
+        return [r for r in relative if r and not r.endswith("/")]
 
     def relative_name(self, member):
         """`member`'s object name relative to this directory: its path in the copy."""
