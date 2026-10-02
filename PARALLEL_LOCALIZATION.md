@@ -6703,7 +6703,48 @@ extension of the fake GCS that lists objects the way GCS does. They cover:
 
 The full pure suite is 1731 passed, 1 skipped.
 
-### 13.92 Summary: speedups versus the original localization
+### 13.92 A localization with nothing to upload, and a failed sbatch that didn't say why
+
+From a run on `wolf2-east-slw`, 2026-10-02. Every `LocalizeToBucket` failed at submission.
+`LocalizeToBucket` asks for `partition: n1-standard-8`, and this controller's own
+`nodetypes.json` defines only N4 types. Running the same `sbatch` in test mode on the controller
+returned `invalid partition specified: n1-standard-8`. That partition is wolF's, and is left to a
+separate change. The run also exposed two things in canine:
+
+* **A job with nothing to upload still got a node.** All of `Localize_T_bam_char`'s inputs were
+  upstream outputs on the NFS share, so since §13.89 they pass through and no bucket is planned.
+  `resolve_on_controller` then answered "it has no bucket upload" and submitted the job to boot a
+  node that would run the no-op script. Now a job whose bucket localization was planned and
+  passes every input through settles at once: `_passes_everything_through`, logged as "every
+  input passes through as is". This covers NFS paths and existing `bucketmount://` URLs. A dry
+  run and a job bucket localization never planned still go to a node, as before.
+* **The error didn't say why, in the run log.** `check_call` wrote the failed command's stdout
+  and stderr straight to `sys.stdout` and `sys.stderr`, bypassing the logger. Under wolF, that
+  logger is what feeds both the console and the run log. So the `sbatch` error reached the
+  console, unformatted and run onto the end of the previous formatted line, and never reached
+  the run log. The run log showed only a bare `CalledProcessError` ("returned non-zero exit
+  status 1"), a lost job, and two knock-on `KeyError`s from building outputs for a job that was
+  never submitted. Two changes:
+  * `check_call` logs the output through `canine_logging`, stderr as an error, so it's formatted
+    and attributed like every other entry and goes to both places. Standalone canine, with no
+    logger hook, still prints it.
+  * It raises `CommandError`, a `CalledProcessError` subclass, so existing handlers still catch
+    it. Its message ends with the stderr, here
+    `sbatch: error: invalid partition specified: n1-standard-8`, for code that catches the
+    exception rather than reading the log.
+
+**Tests:** 12 new, in `TestAJobWithNothingToUpload` and `test_command_error_pure.py`. The latter
+covers:
+
+* a failed `sbatch` raising with the partition error in its message;
+* the stderr going to the logger and not to raw `sys.stderr`;
+* standalone canine still printing it.
+
+Against the code before the fix, the two settle tests fail and the error-message file can't
+import. The routing test also fails against an intermediate version that raised `CommandError`
+but still wrote raw stderr. The full pure suite is 1743 passed, 1 skipped.
+
+### 13.93 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

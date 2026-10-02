@@ -1925,3 +1925,53 @@ class TestADirectoryListsItsMembers:
         fh = self._fh([])
         fh.is_dir = False
         assert fh.member_names == []
+
+
+class TestAJobWithNothingToUpload:
+    '''
+    Every input of a LocalizeToBucket can pass through as is: upstream outputs on the
+    NFS share, or existing bucketmount:// URLs. Then there is no bucket, and it was
+    still submitted to a node that would only run the no-op script -- seen on
+    wolf2-east-slw 2026-10-02, where Localize_T_bam_char asked for a node for two BAMs
+    already on the share.
+    '''
+    def _localizer(self, monkeypatch, tmp_path, rodisk_paths, **kwargs):
+        monkeypatch.delenv("CANINE_DISABLE_CONTROLLER_LOCALIZATION", raising=False)
+        loc = make_localizer(localize_to_persistent_disk=True, **kwargs)
+        loc.rodisk_paths = rodisk_paths
+        return loc
+
+    @staticmethod
+    def _outputs(loc):
+        import os
+        out = os.path.join(loc.environment("local")["CANINE_OUTPUT"], "0")
+        return {n: os.path.isfile(os.path.join(out, n)) for n in ("stdout", "stderr")}
+
+    def test_it_settles_on_the_controller(self, monkeypatch, tmp_path):
+        loc = self._localizer(monkeypatch, tmp_path, {"0": {"t_bam": ["/mnt/nfs/ws/t.bam"]}})
+        assert loc.resolve_on_controller("0") is True
+        assert self._outputs(loc) == {"stdout": True, "stderr": True}
+
+    def test_the_log_says_why(self, monkeypatch, tmp_path):
+        logged = []
+        monkeypatch.setattr("canine.localization.base.canine_logging.info1", logged.append)
+        loc = self._localizer(monkeypatch, tmp_path, {"0": {"bam": ["bucketmount://b/bam/x.bam"]}})
+        loc.resolve_on_controller("0")
+        assert any("every input passes through" in m and "no node needed" in m for m in logged)
+
+    def test_not_on_a_dry_run(self, monkeypatch, tmp_path):
+        loc = self._localizer(monkeypatch, tmp_path, {"0": {"t_bam": ["/mnt/nfs/ws/t.bam"]}},
+                              persistent_disk_dry_run=True)
+        assert loc.resolve_on_controller("0") is False
+
+    def test_not_for_a_job_bucket_localization_never_planned(self, monkeypatch, tmp_path):
+        loc = self._localizer(monkeypatch, tmp_path, {})
+        assert loc.resolve_on_controller("0") is False
+
+    def test_not_when_turned_off(self, monkeypatch, tmp_path):
+        loc = self._localizer(monkeypatch, tmp_path, {"0": {"t_bam": ["/mnt/nfs/ws/t.bam"]}},
+                              resolve_on_controller=False)
+        assert loc.resolve_on_controller("0") is False
+        loc = self._localizer(monkeypatch, tmp_path, {"0": {"t_bam": ["/mnt/nfs/ws/t.bam"]}})
+        monkeypatch.setenv("CANINE_DISABLE_CONTROLLER_LOCALIZATION", "1")   # after _localizer clears it
+        assert loc.resolve_on_controller("0") is False

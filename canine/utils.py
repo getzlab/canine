@@ -380,19 +380,36 @@ def touch_object(bucket: str, path: str):
     blob.custom_time = datetime.datetime.now(datetime.timezone.utc)
     blob.patch()
 
+class CommandError(subprocess.CalledProcessError):
+    """
+    A CalledProcessError whose message includes the command's stderr.
+
+    The plain one says only "returned non-zero exit status 1". check_call logs the
+    stderr as well; this keeps it with the exception, for code that catches it rather
+    than reading the log. Still a CalledProcessError, so existing handlers catch it.
+    """
+    def __str__(self):
+        message = super().__str__()
+        detail = (self.stderr or "").strip()
+        return message + ("\nstderr: " + detail if detail else "")
+
 def check_call(cmd:str, rc: int, stdout: typing.Optional[typing.BinaryIO] = None, stderr: typing.Optional[typing.BinaryIO] = None):
     """
-    Checks that the rc is 0
-    If not, flush stdout and stderr streams and raise a CalledProcessError
+    Checks that the rc is 0. If not, logs the command's stdout and stderr through
+    canine_logging and raises a CommandError carrying the stderr.
     """
     if rc != 0:
-        if stdout is not None:
-            sys.stdout.write(stdout.read().decode())
-            sys.stdout.flush()
-        if stderr is not None:
-            sys.stderr.write(stderr.read().decode())
-            sys.stderr.flush()
-        raise subprocess.CalledProcessError(rc, cmd)
+        # Through canine_logging, not sys.stdout/sys.stderr: under wolF the logger it
+        # hooks feeds both the console and the run log, and a raw write reached only
+        # the console, unformatted and attributed to no task.
+        out = stdout.read().decode() if stdout is not None else None
+        err = stderr.read().decode() if stderr is not None else None
+        name = cmd.split()[0] if cmd.split() else cmd
+        if out and out.strip():
+            canine_logging.info1("{} exited {}; its stdout:\n{}".format(name, rc, out.rstrip()))
+        if err and err.strip():
+            canine_logging.error("{} exited {}; its stderr:\n{}".format(name, rc, err.rstrip()))
+        raise CommandError(rc, cmd, out, err)
 
 predefined_mtypes = {
     # cost / CPU in each of the predefined tracks

@@ -282,6 +282,7 @@ happened, so it never claims a transfer that did not occur:
 
 | log line (`localization job <id>: ...; no node needed`) | meaning |
 |---|---|
+| `every input passes through as is (paths on the NFS share or existing bucket mounts)` | there was no bucket to fill: every input was already where a worker reads it, so nothing ran |
 | `already localized in gs://<bucket>, found complete` | an earlier or concurrent workflow's job had filled the bucket; nothing transferred |
 | `localized in gs://<bucket> by another job, waited for its upload` | another job held a live claim; this one waited on the controller until the bucket was complete |
 | `transferred on the controller into gs://<bucket> (server-side copies)` | this job won the claim and made the copies itself |

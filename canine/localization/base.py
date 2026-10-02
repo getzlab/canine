@@ -2025,6 +2025,14 @@ class AbstractLocalizer(abc.ABC):
             reason = "CANINE_DISABLE_CONTROLLER_LOCALIZATION is set"
         elif not self.controller_resolution:
             reason = "resolve_on_controller is off"
+        elif jobId not in self.bucket_plans and self._passes_everything_through(jobId):
+            # Every input already is where a worker reads it -- a path on the NFS
+            # share, or an existing bucketmount:// URL -- so there is no bucket and
+            # nothing to do. A node would boot only to run the no-op script.
+            self._write_settled_output(jobId, "", "")
+            canine_logging.info1("localization job {}: every input passes through as is (paths on the "
+                                 "NFS share or existing bucket mounts); no node needed".format(jobId))
+            return True
         elif jobId not in self.bucket_plans:
             reason = "it has no bucket upload"
         else:
@@ -2059,15 +2067,7 @@ class AbstractLocalizer(abc.ABC):
                                          os.path.join(job_root, "controller_localization.log")))
             return False
 
-        out_root = os.path.join(env["CANINE_OUTPUT"], jobId)
-        os.makedirs(out_root, exist_ok = True)
-        for name, text in (("stdout", proc.stdout), ("stderr", proc.stderr)):
-            path = os.path.join(job_root, name)
-            with open(path, "w") as f:
-                f.write(text)
-            link = os.path.join(out_root, name)
-            if not os.path.lexists(link):
-                os.symlink(os.path.relpath(path, out_root), link)
+        self._write_settled_output(jobId, proc.stdout, proc.stderr)
         # Say what happened, not just that no node was needed: most jobs settled here
         # transfer nothing -- another workflow's job, earlier or concurrent, already
         # filled the shared bucket -- and "localized on the controller" would claim a
@@ -2083,6 +2083,35 @@ class AbstractLocalizer(abc.ABC):
             what = "already localized in {}, found complete".format(bucket_prefix)
         canine_logging.info1("localization job {}: {}; no node needed".format(jobId, what))
         return True
+
+    def _passes_everything_through(self, jobId) -> bool:
+        """
+        Whether bucket localization planned job `jobId` and found nothing to upload:
+        every input passed through as is. Not on a dry run, which plans no upload
+        either but has not localized anything.
+        """
+        return (
+          self.localize_to_persistent_disk and not self.persistent_disk_dry_run
+          and bool(self.rodisk_paths.get(jobId))
+        )
+
+    def _write_settled_output(self, jobId, stdout, stderr):
+        """
+        Write a job settled on the controller's stdout and stderr where
+        delocalization.py would put them, so delocalize() sees an ordinary finished job.
+        """
+        env = self.environment("local")
+        job_root = os.path.join(env["CANINE_JOBS"], jobId)
+        out_root = os.path.join(env["CANINE_OUTPUT"], jobId)
+        os.makedirs(job_root, exist_ok = True)
+        os.makedirs(out_root, exist_ok = True)
+        for name, text in (("stdout", stdout), ("stderr", stderr)):
+            path = os.path.join(job_root, name)
+            with open(path, "w") as f:
+                f.write(text)
+            link = os.path.join(out_root, name)
+            if not os.path.lexists(link):
+                os.symlink(os.path.relpath(path, out_root), link)
 
     def bucketmount_lease_register(self):
         """
