@@ -103,3 +103,13 @@ venv.bak/
 
 # mypy
 .mypy_cache/
+
+# Agent-session transcripts used to hand work between tools. Large (tens of MB),
+# and the pasted terminal output in them carries presigned URLs and access key IDs.
+copilot_session_history.jsonl
+*_session_history.jsonl
+
+# PyCharm: its project state, and the lock file for the uv-managed virtualenv it creates.
+# Neither belongs in the repo, and uv.lock would pin every installer to one IDE's env.
+.idea/
+uv.lock

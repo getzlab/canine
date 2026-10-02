@@ -11,6 +11,7 @@ import threading
 import time
 import traceback
 import shutil
+import stat
 import warnings
 import crayons
 import re
@@ -20,7 +21,7 @@ from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
-from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging
+from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging, localization_bucket_name, get_project_number, _zone_to_region
 from hound.client import _getblob_bucket
 import pandas as pd
 import google.cloud.compute_v1, google.api_core.exceptions
@@ -36,17 +37,196 @@ def gcloud_disk_client():
             DISK_CLIENT = google.cloud.compute_v1.DisksClient()
     return DISK_CLIENT
 
-ZONE = get_default_gcp_zone()
 PROJECT = get_default_gcp_project()
 
 Localization = namedtuple("Localization", ['type', 'path'])
+
+# Scripts staged into CANINE_ROOT so the compute node can run them. They ride the shared
+# staging directory rather than the worker image: baking them in would need a fleet-wide
+# rebuild and would version-skew against the installed canine.
+#
+# Mode matters for two of them. debug.sh and parallel_download.py are committed 0755 and
+# are invoked directly; delocalization.py is 0644 with no shebang and is only ever run as
+# `python3 <path>`.
+STAGED_SCRIPTS = ("delocalization.py", "debug.sh", "parallel_download.py")
+
+# Emitted localization commands are authored as bash and use constructs -- [[ ]], process
+# substitution -- that shell=True's default /bin/sh rejects outright. On the controller
+# image /bin/sh is dash, so anything running an emitted command must name bash explicitly.
+BASH = "/bin/bash"
+
+# The object in a localization bucket whose owner is uploading into it (see
+# bucket_upload_script). Its generation is the compare-and-swap token for taking an upload
+# over, and its server-side update time is the owner's heartbeat: refreshed every
+# BUCKET_HEARTBEAT_INTERVAL seconds, and considered dead once BUCKET_HEARTBEAT_STALE seconds
+# old -- long enough that a few failed refreshes cannot look like a dead owner, far
+# shorter than waiting out bucket_upload_wait_tries. Dotted, like the downloader's
+# sidecars, so nothing mistakes it for content.
+BUCKET_CLAIM_OBJECT = ".wolf_claim"
+# Phrases the emitted bucket scripts print, and resolve_on_controller reads back to say
+# what a localization job settled on the controller actually did.
+BUCKET_ALREADY_POPULATED = "already populated"
+BUCKET_WAITING = "another job is uploading into"
+BUCKET_HEARTBEAT_INTERVAL = 60
+BUCKET_HEARTBEAT_STALE = 600
+# Where the controller's NFS share is mounted, on the controller and every worker alike
+# (slurm_gcp_docker). A path under it is the same file on a worker; any other local path
+# is on a disk of the controller that workers cannot see. Decided by this prefix, not by
+# comparing devices: the share is usually on the same block device as /, so a `df` or
+# st_dev comparison calls every controller path shared.
+SHARED_MOUNT = "/mnt/nfs"
+
+def on_shared_mount(path) -> bool:
+    """Whether local `path`, symlinks resolved, is on the NFS share workers see."""
+    return os.path.realpath(path).startswith(SHARED_MOUNT.rstrip("/") + "/")
+
+def shared_mount_path(path) -> str:
+    """
+    `path` as a worker should read it, for a path on_shared_mount() accepts: as given
+    if it already names a place on the share, otherwise the share path it resolves to
+    (a symlink elsewhere on the controller would dangle on a worker).
+    """
+    path = os.path.abspath(path)
+    return path if path.startswith(SHARED_MOUNT.rstrip("/") + "/") else os.path.realpath(path)
+
+def local_copy(item):
+    """
+    Commands uploading "local" UploadItem `item` from the controller, rerun on a lost
+    race. Needs $CANINE_BUCKET_CT, as both scripts that use it set.
+    """
+    # a directory is copied into its parent, or it would land at dest/<name>
+    dest = os.path.dirname(item.dest) + "/" if os.path.isdir(item.fh.path) else item.dest
+    return retried_copy(
+      'gcloud storage cp -r -n --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
+        src = shlex.quote(item.fh.path), dst = shlex.quote(dest))
+    )
+
+def _is_dir_item(item):
+    """Whether UploadItem `item` places a directory, whose dest is then a prefix."""
+    if item.kind == "local":
+        return os.path.isdir(item.fh.path)
+    return getattr(item.fh, "is_dir", False) is True
+
+def _expected_members(item):
+    """
+    For a directory item, the names (relative to its dest) of every object it must
+    leave in the bucket, or None where they are not known in advance.
+    """
+    if item.kind == "local":
+        root = item.fh.path
+        return sorted(
+          os.path.relpath(os.path.join(d, f), root)
+          for d, _, files in os.walk(root) for f in files
+        )
+    names = getattr(item.fh, "member_names", None)
+    return list(names) if isinstance(names, (list, tuple)) else None
+
+def bucket_object_patterns(upload_plan):
+    """
+    Every object of `upload_plan`, as URLs for `gcloud storage objects update`: a
+    directory as <prefix>/**. The bare prefix matches no object, so it refreshed
+    nothing, and a directory input expired while still in use.
+    """
+    return " ".join(shlex.quote(x.dest + "/**" if _is_dir_item(x) else x.dest) for x in upload_plan)
+
+def bucket_complete_function(upload_plan):
+    """
+    A shell function, canine_bucket_complete, that returns 0 only if every object of
+    `upload_plan` is in the bucket.
+
+    A file is checked by name: `gcloud storage ls` fails if any of its URLs matches no
+    object. A directory is checked file by file against the names expected under it:
+    `ls` of the prefix alone passes while anything is left there, so a directory part
+    of which had expired (its gzip members carry a later customTime than the rest, and
+    the lifecycle rule deletes gradually) read as complete, and was never repopulated.
+    Only missing names count: extra objects under the prefix are harmless.
+    """
+    files = [x for x in upload_plan if not _is_dir_item(x)]
+    lines = ['canine_bucket_complete() {']
+    if files:
+        lines.append('  gcloud storage ls {} > /dev/null 2>&1 || return 1'.format(
+          " ".join(shlex.quote(x.dest) for x in files)))
+    for x in upload_plan:
+        if not _is_dir_item(x):
+            continue
+        pattern = shlex.quote(x.dest + "/**")
+        names = _expected_members(x)
+        if names is None:
+            lines.append('  gcloud storage ls {} > /dev/null 2>&1 || return 1'.format(pattern))
+            continue
+        lines += (
+          ["  LC_ALL=C comm -23 <(LC_ALL=C sort -u <<'CANINE_EXPECTED_EOF'"]
+          + [n for n in names if "\n" not in n]
+          + ['CANINE_EXPECTED_EOF',
+             # names are cut by byte offset, not matched as a pattern: an input name
+             # may hold regex characters
+             '  ) <(gcloud storage ls {pat} 2> /dev/null | cut -b{off}- | LC_ALL=C sort -u) | grep -q . && return 1'.format(
+               pat = pattern, off = len((x.dest + "/").encode()) + 1)]
+        )
+    lines += ['  return 0', '}']
+    return lines
+
+def retried_copy(copy):
+    """
+    `copy`, rerun up to three times.
+
+    Two jobs can populate one bucket at once: both find an expired or stale
+    bucket and take it over, since only creation is a mutex. `-n` then does
+    not make the second copy a no-op. It checks for the destination before
+    copying, and a sibling that writes the object in between makes it fail
+    with a 412, which failed localization in production. A rerun sees the
+    object and skips it with exit 0, so retrying settles the race. The
+    gcloud_exp_backoff alias only retries on "Quota exceeded", so it does not.
+    """
+    return [
+      '    for CANINE_COPY_TRY in 1 2 3; do',
+      '      {} && break'.format(copy.strip()),
+      '      if [ $CANINE_COPY_TRY -eq 3 ]; then echo "ERROR: copy failed 3 times" >&2; exit 1; fi',
+      '      echo "WARNING: copy failed (attempt $CANINE_COPY_TRY of 3); another job may be populating this bucket. Retrying; -n skips what is already there" >&2',
+      '      sleep 10',
+      '    done',
+    ]
+
+# Flags every localization bucket is created with, on a node or on the controller.
+# --soft-delete-duration=0 disables GCS soft delete, which new buckets otherwise get at 7
+# days: every expired or deleted object would be retained and *billed* for a further week,
+# for a cache with nothing worth undeleting. --public-access-prevention and
+# --uniform-bucket-level-access keep the bucket private, since localized inputs include
+# protected data such as BAMs. Created that way, the project's owners and editors can still
+# write its objects and its viewers read them (legacyObjectOwner and legacyObjectReader),
+# and project-level storage roles still apply, so nodes and users see no difference.
+BUCKET_CREATE_FLAGS = "--soft-delete-duration=0 --public-access-prevention --uniform-bucket-level-access"
+
 # types: stream, download, ro_disk, None
 # indicates what kind of action needs to be taken during job startup
-
 PathType = namedtuple(
     'PathType',
     ['localpath', 'remotepath']
 )
+
+class UploadItem(namedtuple("UploadItem", ["fh", "dest", "kind", "exclude"], defaults = ((),))):
+    """
+    One input to be placed in a localization bucket by the worker.
+
+    fh:      the FileType handler for the source.
+    dest:    the full gs:// destination URL.
+    kind:    how the bytes get there.
+
+             * "server_side": a gs:// source copied by a GCS rewrite, with no VM in the
+               data path at all.
+             * "mount": downloaded through the worker's read-write gcsfuse mount and
+               never staged on local disk. This covers remote non-gs:// sources and
+               gzip-encoded gs:// objects, which must be decoded.
+             * "local": a local path not on the NFS share, which workers cannot
+               read. The controller uploads it when the job is localized
+               (local_upload_script); the node only checks that it arrived. Paths
+               on the share are not uploaded at all: they pass through as paths.
+    exclude: for a "server_side" directory only, the names (relative to the directory)
+             left out of its copy because they are gzip-encoded. Each one has its own
+             "mount" item.
+    """
+    __slots__ = ()
+
 
 class OverrideValueError(ValueError):
     def __init__(self, override, arg, value):
@@ -69,6 +249,15 @@ class AbstractLocalizer(abc.ABC):
         files_to_copy_to_outputs = {},
         persistent_disk_dry_run = False,
         cleanup_job_workdir = False,
+        parallel_download = True,
+        download_connections = file_handlers.DEFAULT_DOWNLOAD_CONNECTIONS,
+        download_min_chunk = file_handlers.DEFAULT_DOWNLOAD_MIN_CHUNK,
+        check_hash = None,
+        allow_requester_pays: bool = False,
+        bucket_upload_wait_tries: int = 90,
+        localization_expiry_days: int = 1,
+        bucketmount_heartbeat_seconds: int = 3600,
+        resolve_on_controller: bool = True,
         **kwargs
     ):
         """
@@ -96,7 +285,73 @@ class AbstractLocalizer(abc.ABC):
           return the paths to the files on the disk that would be created
         cleanup_job_workdir: remove files in the job working directory that aren't
           denoted as outputs
+        parallel_download: download remote URLs with N simultaneous ranged GETs rather
+          than a single stream. Default True; set False for the legacy single-stream
+          commands, which remain the fallback for anything the chunked path declines.
+        download_connections: how many ranged GETs are in flight per input. Default 16,
+          measured against the real source rather than derived from vCPU count -- the
+          streams are IO-blocked, and throughput is linear to 16 with no knee against the
+          source (13.85x over a single stream, BENCHMARK_RUNBOOK.md §6.2). Raising it
+          further requires raising MAX_CONNECTIONS, and would only pay on a destination
+          faster than the pd-standard localization disk, which binds at ~44 MiB/s (§6.5i).
+          0 or 1 means the legacy single stream. Note this controls concurrency only --
+          the chunk layout deliberately does not depend on it, so a requeued task on a
+          differently-configured node still resumes rather than starting over.
+        download_min_chunk: chunk size in bytes, default 64 MiB. Below this, per-request
+          setup and TLS overhead dominate, so a smaller object is fetched in one piece.
+        check_hash: verify downloaded files against the source's declared hash. A
+          per-input `check_hash`/`check_md5` takes precedence; left as None here so that
+          not setting it does not conflict with an input that does.
+        allow_requester_pays: if False (default), downloading from a requester-pays
+          GCS bucket raises instead of silently billing self.project
+        bucket_upload_wait_tries: how many 60s polls a job waits for a sibling's
+          upload to finish before declaring the claim stale and requeueing (exit 5).
+          Default 90 -- a 1.5 hour ceiling -- and now derived from a measurement rather
+          than guessed.
+
+          Too short and the timeout stops being an error path: a healthy upload is
+          declared dead and taken over mid-flight on every large input, costing a
+          duplicate transfer reported only as a warning. Too long and it is the recovery
+          time when an uploader genuinely dies, which on preemptible workers is routine.
+          The value has to sit above the first and as close to it as that allows.
+
+          It was 60, then briefly 180. 180 was a placeholder chosen on risk asymmetry
+          when this route's throughput was unknown (PARALLEL_LOCALIZATION.md §13.49), and
+          against the pd-standard's 1.62 h it was defensible. The bucket route measured
+          at **0.57 h** for the largest real input (BENCHMARK_RUNBOOK.md §6.6, two runs
+          agreeing to 0.7%), so: 0.57 h + the 60 s bucket-create ceiling, doubled for
+          safety, is 71 polls. 90 rounds that up without turning a preemption into a
+          three-hour stall.
+
+          **Scale it by BYTES if your largest localization is bigger.** The timeout
+          covers a whole `LocalizeToBucket` set, not one object -- `wolf=working` is set
+          once and held until every input is uploaded. But the unit is bytes, not a
+          count of inputs: one 279 GiB BAM plus a 9 MB index is four inputs and ~1.0x
+          the time, while two BAMs is two inputs and 2.0x. And only non-GCS inputs
+          count, since `gs://` sources take the server-side rewrite path and move no
+          bytes through the VM. `pdl claim --localization-bytes` does this arithmetic.
+
+        localization_expiry_days: days since last touch after which a localized
+          object is deleted by the bucket's lifecycle rule. Default 1. Content is
+          re-fetched automatically if something needs it again, and objects still
+          in use have their clock refreshed on every localization, so this bounds
+          idle storage rather than the lifetime of a running workflow. Raise it if
+          you re-run the same inputs over several days and would rather pay for
+          storage than re-transfer.
+
+        resolve_on_controller: let a caller whose job would only localize (wolF's
+          LocalizeToBucket) settle a localization job on the controller instead of submitting
+          it to a worker node, when no node is needed: the bucket is already
+          populated, or every input is a server-side gs:// copy. See
+          resolve_on_controller(). Default True. The environment
+          variable CANINE_DISABLE_CONTROLLER_LOCALIZATION, set on the controller,
+          turns it off without a code change.
         """
+        self.file_handler_defaults = self.build_file_handler_defaults(
+            parallel_download, download_connections, download_min_chunk, check_hash,
+            allow_requester_pays
+        )
+
         self.transfer_bucket = transfer_bucket
         if transfer_bucket is not None and self.transfer_bucket.startswith('gs://'):
             self.transfer_bucket = self.transfer_bucket[5:]
@@ -142,10 +397,32 @@ class AbstractLocalizer(abc.ABC):
 
         self.cleanup_job_workdir = cleanup_job_workdir
 
+        self.allow_requester_pays = allow_requester_pays
+
+        self.bucket_upload_wait_tries = bucket_upload_wait_tries
+        self.localization_expiry_days = localization_expiry_days
+        # A mount held longer than the expiry window would otherwise have its own
+        # lease -- and its data objects -- deleted out from under it, so the
+        # heartbeat has to fire well inside that window. Fail here rather than as
+        # a mid-run deletion.
+        if bucketmount_heartbeat_seconds >= localization_expiry_days * 86400 / 4:
+            raise ValueError(
+              "bucketmount_heartbeat_seconds ({}) must be well inside the {}-day expiry window; "
+              "content held by a long-running job would expire between beats."
+              .format(bucketmount_heartbeat_seconds, localization_expiry_days)
+            )
+        self.bucketmount_heartbeat_seconds = bucketmount_heartbeat_seconds
+
+        self.controller_resolution = resolve_on_controller
+
         # to extract rodisk URLs if we want to re-use disk(s) downstream for
         # other tasks
         # jobId : { input : [RODISK URLs] }
         self.rodisk_paths = {}
+
+        # jobId : (bucket_prefix, region, upload plan), kept from job_setup_teardown so
+        # a job can be settled on the controller without re-planning it
+        self.bucket_plans = {}
 
         # will be removed
         self.disk_key = os.urandom(4).hex()
@@ -169,7 +446,7 @@ class AbstractLocalizer(abc.ABC):
             #
             rc, sout, serr = self.backend.invoke(command)
             text = serr.read()
-            if rc == 0 or b'404' not in text:
+            if rc == 0:
                 self.requester_pays[bucket] = (
                     b'requester pays bucket but no user project provided' in text
                     or sout.read().strip() == b'True'
@@ -177,7 +454,9 @@ class AbstractLocalizer(abc.ABC):
             else:
                 # Try again ls-ing the object itself
                 # sometimes permissions can disallow bucket inspection
-                # but allow object inspection
+                # (e.g. missing storage.buckets.get, as with many third-party
+                # requester-pays buckets) but allow object inspection -- retry
+                # regardless of why the describe call failed, not just on 404
                 command = 'gcloud storage ls gs://{}'.format(path)
                 rc, sout, serr = self.backend.invoke(command)
                 text = serr.read()
@@ -263,8 +542,12 @@ class AbstractLocalizer(abc.ABC):
                 self.backend.invoke('touch {}/.canine_dir_marker'.format(src))
             else:
                 subprocess.run(['touch', '{}/.canine_dir_marker'.format(src)])
+        requester_pays = self.get_requester_pays(gs_obj)
+        if requester_pays and not dest.startswith('gs://') and not self.allow_requester_pays:
+            raise ValueError(f"{gs_obj} resides in a requester-pays bucket, but access to "
+                              "requester-pays buckets is disabled (allow_requester_pays=False)")
         command = "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_THRESHOLD=150M gcloud storage cp -r {} {} {}".format(
-            '--billing-project={}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
+            '--billing-project={}'.format(self.project) if requester_pays else '',
             src,
             dest
         )
@@ -308,8 +591,12 @@ class AbstractLocalizer(abc.ABC):
             # Procede as a regular gs_copy
             traceback.print_exc()
 
+        requester_pays = self.get_requester_pays(gs_obj)
+        if requester_pays and not dest.startswith('gs://') and not self.allow_requester_pays:
+            raise ValueError(f"{gs_obj} resides in a requester-pays bucket, but access to "
+                              "requester-pays buckets is disabled (allow_requester_pays=False)")
         command = "CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_THRESHOLD=150M gcloud storage cp {} {} {}".format(
-            '--billing-project={}'.format(self.project) if self.get_requester_pays(gs_obj) else '',
+            '--billing-project={}'.format(self.project) if requester_pays else '',
             src,
             dest
         )
@@ -534,8 +821,10 @@ class AbstractLocalizer(abc.ABC):
                     paths = [paths] if not isinstance(paths, list) else paths
                     if arg not in overrides:
                         for p in paths:
-                            # TODO: pass through other file handler arguments here
-                            fh = file_handlers.get_file_handler(p, project = self.project, token = self.token)
+                            fh = file_handlers.get_file_handler(
+                                p, project = self.project, token = self.token,
+                                **self.file_handler_defaults
+                            )
 
                             # only pick common inputs that are URLs; it does not
                             # save time for any other input types, and only leads
@@ -615,8 +904,10 @@ class AbstractLocalizer(abc.ABC):
             
             ## if input is a string, convert it to the appropriate FileType object
             if isinstance(value, str):
-                # TODO: pass through other file handler arguments here
-                value = file_handlers.get_file_handler(value, project = self.project, token = self.token)
+                value = file_handlers.get_file_handler(
+                    value, project = self.project, token = self.token,
+                    **self.file_handler_defaults
+                )
             else:
                 assert isinstance(value, file_handlers.FileType)
 
@@ -667,6 +958,162 @@ class AbstractLocalizer(abc.ABC):
 
             for i, v in enumerate(value):
                 self.inputs[jobId][arg][i] = handle_input(v, mode)
+
+    @staticmethod
+    def build_file_handler_defaults(parallel_download, download_connections,
+                                    download_min_chunk, check_hash,
+                                    allow_requester_pays=False):
+        """
+        Options handed to every file handler this localizer constructs.
+
+        A per-input value in extra_args wins over these. check_hash is only included when
+        it was actually set: forwarding False by default would sit alongside an input's own
+        check_md5=True and look like contradictory flags, which is treated as a caller bug
+        and raises.
+
+        allow_requester_pays arrives here rather than being passed at each call site.
+        Both branches' versions of those call sites carried a `TODO: pass through other
+        file handler arguments here`; this is that pass-through, so the next option is
+        added in one place instead of two that can drift.
+        """
+        defaults = {
+            "parallel_download": parallel_download,
+            "download_connections": download_connections,
+            "download_min_chunk": download_min_chunk,
+            "allow_requester_pays": allow_requester_pays,
+        }
+        if check_hash is not None:
+            defaults["check_hash"] = check_hash
+        return defaults
+
+    @staticmethod
+    def staged_script_source(name):
+        return os.path.join(os.path.dirname(__file__), name)
+
+    @staticmethod
+    def copy_staged_scripts(staging_root):
+        """
+        Copy the staged scripts into `staging_root`, preserving the executable bit.
+
+        copyfile copies contents only, so debug.sh and parallel_download.py would land
+        non-executable even though both are committed 0755, and the staged copy is
+        invoked directly. The mode is therefore restored explicitly.
+
+        Note it is copyfile plus an explicit chmod rather than shutil.copy: copy calls
+        copymode internally, i.e. it chmods outside our control. On a mount that cannot
+        represent an exec bit (gcsfuse cannot at all; NFS root_squash may refuse the
+        call) that raises and fails localization -- which is the opposite of what is
+        wanted here. Doing the chmod ourselves lets a refusal degrade to the
+        `python3 <path>` invocation, which is always available.
+        """
+        for script in STAGED_SCRIPTS:
+            source = AbstractLocalizer.staged_script_source(script)
+            destination = os.path.join(staging_root, script)
+            shutil.copyfile(source, destination)
+            if os.stat(source).st_mode & stat.S_IXUSR:
+                try:
+                    os.chmod(destination, 0o755)
+                except OSError as e:
+                    canine_logging.warning(
+                        "Could not make {} executable ({}); it will be invoked via "
+                        "python3 instead.".format(destination, e)
+                    )
+
+    @staticmethod
+    def _disk_resize_daemon_lines(
+      disk_kind: str,
+      poll_interval_sec: int = 10,
+      min_free_pct: int = 30,
+      headroom_sec: int = 0,
+      grow_pct: int = 160,
+      min_grow_gb: int = 0,
+      max_grow_gb: int = 0,
+    ) -> typing.List[str]:
+        """
+        Emit the shell lines that write and background a disk-autoresize daemon on
+        the compute node.
+
+        The daemon grows the disk when either trigger fires:
+          * free space falls below `min_free_pct`, or
+          * (only when `headroom_sec` > 0) the observed write rate projects the disk
+            filling within `headroom_sec` seconds.
+
+        The rate trigger exists for the localization disk. Parallel download streams
+        can consume 30% of a 100GB disk in ~15s, comparable to one poll interval plus
+        a control-plane resize, so a free-percentage trigger alone loses the race.
+        `min_grow_gb`/`max_grow_gb` (0 = unset) bound each step: the localization disk
+        persists as a RODISK for downstream tasks, so overshoot is a permanent storage
+        cost and it is better to resize repeatedly than to over-provision once.
+
+        The heredoc is deliberately unquoted (`<<EOF`) so that GCP_DISK_NAME and
+        GCP_TSNT_DISKS_DIR are baked in at file-write time: they are plain shell
+        assignments rather than exports (see the localization_script preamble above),
+        so a backgrounded child `bash` would not inherit them. Everything the daemon
+        evaluates at run time is therefore escaped as `\\$`.
+        """
+        return [
+          'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
+          'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
+          'POLL={}'.format(poll_interval_sec),
+          'MIN_FREE_PCT={}'.format(min_free_pct),
+          'HEADROOM_SEC={}'.format(headroom_sec),
+          'GROW_PCT={}'.format(grow_pct),
+          'MIN_GROW_GB={}'.format(min_grow_gb),
+          'MAX_GROW_GB={}'.format(max_grow_gb),
+          'PREV_FREE_MB=-1',
+          'while true; do',
+          '  sleep \$POLL',
+          '  if ! mountpoint "\$DISK_DIR" &> /dev/null; then',
+          '    echo "No disk mounted to \$DISK_DIR" >&2',
+          '    PREV_FREE_MB=-1',
+          '    continue',
+          '  fi',
+          '  TOTAL_MB=\$(df -B1M "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
+          '  FREE_MB=\$(df -B1M "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
+          '  if [[ -z \$TOTAL_MB || \$TOTAL_MB -le 0 ]]; then continue; fi',
+          '  NEED_RESIZE=0; REASON=; RATE_MB_S=0',
+          '  if [[ \$((100*FREE_MB/TOTAL_MB)) -lt \$MIN_FREE_PCT ]]; then',
+          '    NEED_RESIZE=1; REASON="free space below \${MIN_FREE_PCT}%"',
+          '  fi',
+          '  if [[ \$HEADROOM_SEC -gt 0 && \$PREV_FREE_MB -ge 0 ]]; then',
+          '    DELTA_MB=\$((PREV_FREE_MB - FREE_MB))',
+          '    if [[ \$DELTA_MB -gt 0 ]]; then',
+          '      RATE_MB_S=\$((DELTA_MB / POLL))',
+          # guarded as a nested if, not `&&` inside [[ ]]: arithmetic expansion happens
+          # during word expansion, before [[ short-circuits, so an inline
+          # $((FREE_MB / RATE_MB_S)) would still divide by zero
+          '      if [[ \$RATE_MB_S -gt 0 ]]; then',
+          '        ETA_SEC=\$((FREE_MB / RATE_MB_S))',
+          '        if [[ \$ETA_SEC -lt \$HEADROOM_SEC ]]; then',
+          '          NEED_RESIZE=1; REASON="projected full in \${ETA_SEC}s at \${RATE_MB_S}MB/s"',
+          '        fi',
+          '      fi',
+          '    fi',
+          '  fi',
+          '  PREV_FREE_MB=\$FREE_MB',
+          '  if [[ \$NEED_RESIZE -eq 1 ]]; then',
+          '    TOTAL_GB=\$(( (TOTAL_MB + 1023) / 1024 ))',
+          '    NEW_GB=\$(( TOTAL_GB * GROW_PCT / 100 ))',
+          '    if [[ \$RATE_MB_S -gt 0 && \$HEADROOM_SEC -gt 0 ]]; then',
+          '      RATE_GB=\$(( TOTAL_GB + (RATE_MB_S * HEADROOM_SEC + 1023) / 1024 ))',
+          '      if [[ \$RATE_GB -gt \$NEW_GB ]]; then NEW_GB=\$RATE_GB; fi',
+          '    fi',
+          '    if [[ \$MIN_GROW_GB -gt 0 && \$((NEW_GB - TOTAL_GB)) -lt \$MIN_GROW_GB ]]; then NEW_GB=\$((TOTAL_GB + MIN_GROW_GB)); fi',
+          '    if [[ \$MAX_GROW_GB -gt 0 && \$((NEW_GB - TOTAL_GB)) -gt \$MAX_GROW_GB ]]; then NEW_GB=\$((TOTAL_GB + MAX_GROW_GB)); fi',
+          '    echo "' + disk_kind + ' disk $GCP_DISK_NAME: \$REASON (\${FREE_MB}MB free of \${TOTAL_MB}MB); resizing \${TOTAL_GB}GB -> \${NEW_GB}GB" >&2',
+          '    if gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$NEW_GB; then',
+          '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
+          '    else',
+          '      echo "' + disk_kind + ' disk $GCP_DISK_NAME: resize failed; retrying next poll" >&2',
+          '    fi',
+          '    PREV_FREE_MB=-1',
+          '  fi',
+          'done',
+          'EOF',
+          'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
+          'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
+          'set -e',
+        ]
 
     def create_persistent_disk(self,
       file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
@@ -754,12 +1201,16 @@ class AbstractLocalizer(abc.ABC):
         disk_mountpoint = mount_prefix + "/" + disk_name
 
         ## Check if the disk already exists
+        # resolved here rather than at import time so that importing canine does
+        # not require a discoverable zone; once outside the retry loop so the
+        # backoff path doesn't re-query the metadata server on every iteration
+        zone = get_default_gcp_zone()
         disk_client = gcloud_disk_client()
         disk_exists = False
         backoff = 60 + random.randint(0, 10)
         while True:
             try:
-                disk_attrs = disk_client.get(disk = disk_name, zone = ZONE, project = PROJECT)
+                disk_attrs = disk_client.get(disk = disk_name, zone = zone, project = PROJECT)
                 disk_exists = True
                 break
             except google.api_core.exceptions.NotFound:
@@ -873,29 +1324,34 @@ class AbstractLocalizer(abc.ABC):
             'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
         ]
 
-        # scratch disks dynamically resize as they get full.
-        # if disk has <30% free space remaining, increase its size by 60%
+        # Disks dynamically resize as they get full.
+        #
+        # Scratch disks have always done this. The *localization* disk needs it too:
+        # it is sized from `disk_size` above with only a 5% margin, and that estimate
+        # comes from GCS `size` metadata — which for an object stored with
+        # `Content-Encoding: gzip` is the *stored, compressed* byte count, while
+        # `gcloud storage cp` writes the object back out decompressed. Genomics text
+        # (VCF/BED/GTF/FASTA) routinely compresses 4-10x, so the margin is nowhere
+        # near enough and localization dies on ENOSPC partway through. Growing on
+        # demand is correct without having to predict the decompressed size at all.
         if is_scratch_disk:
-            localization_script += [
-              'cat <<EOF > $CANINE_JOB_ROOT/.diskresizedaemon.sh',
-              'DISK_DIR=$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME',
-              'while true; do',
-              '  sleep 10',
-              '  if ! mountpoint \$DISK_DIR &> /dev/null; then echo "No disk mounted to \$DISK_DIR" >&2; continue; else',
-              '    DISK_SIZE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
-              '    FREE_SPACE_GB=\$(df -B1G "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
-              '    if [[ \$((100*FREE_SPACE_GB/DISK_SIZE_GB)) -lt 30 ]]; then',
-              '      echo "Scratch disk almost full (\${FREE_SPACE_GB}GB free; \${DISK_SIZE_GB}GB total); resizing +60%" >&2',
-              '      gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$((DISK_SIZE_GB*160/100))',
-              '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
-              '    fi',
-              '  fi',
-              'done',
-              'EOF',
-              'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
-              'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
-              'set -e',
-            ]
+            # Preserves the long-standing scratch-disk tuning: 10s poll, grow 60% when
+            # under 30% free, rate trigger disabled (headroom_sec = 0).
+            localization_script += self._disk_resize_daemon_lines("scratch")
+        else:
+            # The localization disk persists as a RODISK consumed by downstream tasks
+            # (optionally protect=yes), so overshoot is a permanent storage cost:
+            # prefer a smaller step with a faster poll and a per-step cap, resizing
+            # repeatedly rather than over-provisioning once.
+            localization_script += self._disk_resize_daemon_lines(
+              "localization",
+              poll_interval_sec = 5,
+              min_free_pct = 25,
+              headroom_sec = 60,
+              grow_pct = 125,
+              min_grow_gb = 20,
+              max_grow_gb = 100,
+            )
 
         # * disk unmount or deletion script (to append to teardown_script)
         #   -> need to be able to pass option to not delete, if using as a RODISK later
@@ -925,7 +1381,12 @@ class AbstractLocalizer(abc.ABC):
           # TODO: add command to optionally delete disk
 
           ## kill disk resizing daemon, if running
-          'kill $(cat .diskresizedaemon_pid) || : &> /dev/null'
+          # NB: absolute path. The daemon writes $CANINE_JOB_ROOT/.diskresizedaemon_pid,
+          # but this kill used a bare relative path, so it only ever worked if the
+          # teardown script happened to be running with $CANINE_JOB_ROOT as its cwd —
+          # which the scratch-disk path arranges ('cd $CANINE_JOB_ROOT' is prepended
+          # below) but the localization-disk path does not.
+          'kill $(cat $CANINE_JOB_ROOT/.diskresizedaemon_pid) || : &> /dev/null'
         ]
 
         # scratch disks get labeled "finalized" if the task ran OK.
@@ -943,6 +1404,840 @@ class AbstractLocalizer(abc.ABC):
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
 
+    def backend_zone(self):
+        """
+        Zone this cluster's nodes live in, used to pick the localization bucket's
+        region. gcpTransient records it under "zone"; imageTransient -- and
+        therefore DockerTransient -- under "compute_zone", so both keys have to
+        be consulted or the configured zone is silently ignored. Auto-detection
+        is the last resort and raises if it can't determine one.
+        """
+        return (
+          self.backend.config.get("zone")
+          or self.backend.config.get("compute_zone")
+          or get_default_gcp_zone()
+        )
+
+    def create_bucket_mount(self,
+      file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
+      dry_run = False
+    ):
+        """
+        Replaces create_persistent_disk() for the localize_to_persistent_disk
+        case only (use_scratch_disk is unaffected and continues to use
+        create_persistent_disk()). Each localization gets its own regional
+        bucket, named wolf-<project_number>-<region>-<content hash> -- the direct
+        analogue of the old content-addressed RODISK, created on demand, labelled
+        with its state, consumed via a read-only gcsfuse mount, and never
+        explicitly deleted (objects age out under the lifecycle rule applied at
+        creation).
+
+        Emits no script commands of its own; bucket_upload_script() turns the
+        returned plan into the worker-side commands. Returns
+        (bucket_prefix, skip_upload, bucketmount_paths, upload_plan):
+          * bucket_prefix: "gs://<bucket>". None on a dry run.
+          * skip_upload: True only on a dry run, where the caller wants the
+            bucketmount URLs as string literals and will not mount anything.
+            Otherwise False: whether an upload is actually needed is decided
+            worker-side, since bucket creation is the mutex and the bucket label
+            carries the state (see bucket_upload_script).
+          * bucketmount_paths: dict of input name -> [bucketmount:// URLs], with
+            paths on the NFS share passed through unchanged, for the caller to save in self.rodisk_paths (same attribute
+            used for disk-backed RODISKs, since wolf.localization.LocalizeToBucket
+            reads it generically regardless of backing mechanism).
+          * upload_plan: list of UploadItem for bucket_upload_script() to emit,
+            and for upload_local_paths() for its local paths. Paths on the NFS
+            share are not in it: workers read them where they are.
+
+        No byte of a url-mode input transits the shared NFS mount: gs:// sources
+        are copied server-side and everything else is written through a
+        read-write gcsfuse mount on the worker. Sending them across the
+        controller's disk twice -- once on download, once on re-upload -- is the
+        regression this replaced.
+        """
+        # flatten file_paths dict (same scheme as create_persistent_disk).
+        # NB: reading x.size here is load-bearing beyond the size itself --
+        # HandleGSURL._get_size() goes through blob(), which is also what sets
+        # x.is_dir, and the upload destination shaping below depends on it.
+        file_paths = []
+        for k, v in file_paths_arrays.items():
+            n_suff = 0
+            for x in v:
+                file_paths.append([
+                  k, n_suff, x, x.path, x.hash, x.size,
+                  not (
+                    isinstance(x, file_handlers.StringLiteral)
+                    or isinstance(x, (file_handlers.HandleRODISKURL, file_handlers.HandleBucketMountURL))
+                    or x.localization_mode == "stream"
+                  ),
+                  isinstance(x, (file_handlers.HandleRODISKURL, file_handlers.HandleBucketMountURL))
+                ])
+                n_suff += 1
+
+        F = pd.DataFrame(file_paths, columns = ["input", "array_idx", "fh", "path", "hash", "size", "localize", "rdpassthru"])
+        F["file_basename"] = F["path"].apply(os.path.basename)
+
+        # A file on the NFS share is already where every worker can read it, so it
+        # passes through as its path, like a bucketmount:// URL, and is left out of
+        # the bucket (and of its content hash). That covers a string literal too:
+        # NFSLocalizer turns share paths that are not canine outputs into those.
+        F["shared"] = F["fh"].apply(lambda fh:
+          fh.localization_mode in ("local", "string")
+          and isinstance(fh.path, str) and fh.path.startswith("/")
+          and on_shared_mount(fh.path)
+        )
+        F.loc[F["shared"], "localize"] = False
+        F.loc[F["shared"], "path"] = F.loc[F["shared"], "path"].apply(shared_mount_path)
+        F["passthru"] = F["rdpassthru"] | F["shared"]
+
+        if len(F) > 0 and (~(F["localize"] | F["passthru"])).all():
+            raise ValueError("You requested to localize files to a bucket, but no localizable inputs were given:\n{}\nInputs must be valid local paths or supported remote URLs.".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F[["path", "input"]].itertuples()])))
+
+        if (~(F["localize"] | F["passthru"])).any():
+            canine_logging.warning("You requested to localize files to a bucket, but some inputs cannot be localized. Inputs must be valid local paths or supported remote URLs. The following inputs will be skipped:\n{}".format(", ".join([f"{input} : \"{path}\"" for _, path, input in F.loc[~(F["localize"] | F["passthru"]), ["path", "input"]].itertuples()])))
+
+        # handle special case if we are only passing through NFS paths or bucketmount/RODISK URLs; this is like a dry run
+        if F["passthru"].any() and not F["localize"].any():
+            return None, True, F.loc[F["passthru"], :].groupby("input", sort = False)["path"].agg(list).to_dict(), []
+
+        # content is addressed by input names, files' basenames, and hashes --
+        # same scheme as create_persistent_disk's disk_name, so identical input
+        # sets converge on the same location
+        content_hash = file_handlers.hash_set(set(
+          F.loc[F["localize"], "input"] + "_" + \
+          F.loc[F["localize"], "file_basename"] + "_" + \
+          F.loc[F["localize"], "hash"]
+        ))
+
+        # one bucket per localization, treated the way a RODISK used to be:
+        # created on demand, labelled with its state, mounted read-only by
+        # consumers, never explicitly deleted (objects age out via the lifecycle
+        # rule applied at creation).
+        zone = self.backend_zone()
+        bucket = localization_bucket_name(
+          get_project_number(self.project), _zone_to_region(zone), content_hash
+        )
+        canine_logging.info1("Localization bucket is {}".format(bucket))
+
+        # relative path of each object within its bucket. Both the
+        # bucketmount:// URL and the upload destination are built from this one
+        # column, so they cannot disagree -- the destination used to be built
+        # from the possibly-mangled basename in job_setup_teardown while the URL
+        # used the unmangled one.
+        F["object_path"] = F["path"]
+        F.loc[F["localize"], "object_path"] = \
+          F.loc[F["localize"], ["input", "file_basename"]].apply(lambda x: "/".join(x), axis = 1)
+
+        F["bucket_path"] = F["path"]
+        F.loc[F["localize"], "bucket_path"] = \
+          "bucketmount://" + bucket + "/" + F.loc[F["localize"], "object_path"]
+
+        # One list per input, in array order. An input whose array mixes passthrough
+        # paths with localized files keeps both; merging two dicts lost one of them.
+        bucketmount_paths = F.loc[F["localize"] | F["passthru"], :].groupby(
+          "input", sort = False)["bucket_path"].agg(list).to_dict()
+
+        if dry_run:
+            return None, True, bucketmount_paths, []
+
+        # nothing is checked controller-side: the worker decides whether to
+        # upload, since bucket creation is the mutex and the bucket label carries
+        # the state. Emitting the plan unconditionally is what makes a concurrent
+        # sibling wait rather than re-upload.
+        upload_plan = [
+          UploadItem(
+            fh = r.fh,
+            dest = "gs://{}/{}".format(bucket, r.object_path),
+            kind = (
+              # A gzip-encoded gs:// object cannot take the server-side copy: a rewrite
+              # copies the stored bytes and metadata verbatim and cannot decode, so every
+              # reader of the mount would get the gzip stream. It needs a node, and gets
+              # the downloader's streaming, verified decode (HandleGSURL.transport_gzip).
+              # Classified here from metadata planning already fetched -- no extra calls.
+              "mount" if isinstance(r.fh, file_handlers.HandleGSURL) and r.fh.transport_gzip
+              else "server_side" if isinstance(r.fh, file_handlers.HandleGSURL)
+              else "local" if r.fh.localization_mode == "local"
+              else "mount"
+            ),
+          )
+          for r in F.loc[F["localize"], :].itertuples()
+        ]
+        # The same holds one level down: a directory's gzip-encoded objects are cut out of
+        # its server-side copy (`exclude`) and each takes the decode as its own item, at
+        # its path within the copy.
+        expanded = []
+        for item in upload_plan:
+            expanded.append(item)
+            if item.kind == "server_side" and item.fh.is_dir:
+                gzip_encoded = list(item.fh.gzip_members)
+                if gzip_encoded:
+                    names = tuple(item.fh.relative_name(m) for m in gzip_encoded)
+                    expanded[-1] = item._replace(exclude = names)
+                    expanded += [
+                      UploadItem(fh = m, dest = item.dest + "/" + name, kind = "mount")
+                      for m, name in zip(gzip_encoded, names)
+                    ]
+        return "gs://{}".format(bucket), False, bucketmount_paths, expanded
+
+    def _lifecycle_file_lines(self):
+        """Commands writing the bucket's lifecycle rule to the file "$CANINE_BUCKET_LC"."""
+        return [
+          'CANINE_BUCKET_LC=$(mktemp)',
+          # the lifecycle rule must be applied at creation: a second call to set
+          # it might never happen if this job dies in between
+          "cat > \"$CANINE_BUCKET_LC\" <<'CANINE_LIFECYCLE_EOF'",
+          '{{"rule":[{{"action":{{"type":"Delete"}},"condition":{{"daysSinceCustomTime":{days}}}}}]}}'.format(
+            days = int(self.localization_expiry_days)),
+          'CANINE_LIFECYCLE_EOF',
+        ]
+
+    def bucket_upload_script(self, upload_plan, bucket_prefix, region, upload_local = False):
+        """
+        Worker-side commands that place every input in `upload_plan` into the
+        localization bucket without any of it transiting the shared NFS mount.
+
+        gs:// sources are copied server-side (a GCS rewrite -- no bytes touch
+        any VM at all). Everything else is downloaded straight into a read-write
+        gcsfuse mount of the same bucket, so the bytes stream up as they arrive
+        instead of being staged on local disk. Both paths keep the shared NFS
+        mount entirely out of the data path, which is the point of this method.
+
+        The rw mount relies on gcsfuse streaming writes (--enable-streaming-writes,
+        default true since gcsfuse 3.x; the worker image pins 3.11.2). Without
+        them gcsfuse buffers the whole object under --temp-dir on the 25GB boot
+        disk and ENOSPCs on a large input. Streaming writes are append-only from
+        offset 0, so the download must be sequential -- canine's handlers are
+        (`aws s3api get-object --range` piped through `cat >>`, `curl -C - -o`),
+        but a multipart/parallel writer would silently fall back to staging.
+
+        Concurrency is coordinated entirely through the bucket itself:
+
+          * `buckets create` is the mutex. Bucket names are globally unique, so
+            of N racers exactly one creates it and the rest get HTTP 409. No
+            compare-and-swap on an object is needed (and `gcloud storage buckets
+            update` has no --if-metageneration-match to offer one anyway).
+          * The `wolf` bucket label carries the state: "working" while an upload
+            is in flight, "success" once every object has landed.
+          * Objects are written with --custom-time so the daysSinceCustomTime
+            lifecycle rule applied at creation can actually match them; without
+            it the rule never fires and the bucket grows forever.
+        """
+        bucket = bucket_prefix[len("gs://"):] if bucket_prefix.startswith("gs://") else bucket_prefix
+        burl = shlex.quote("gs://" + bucket)
+
+        mount_dir = "/mnt/localize/{}".format(bucket)
+
+        retried = retried_copy
+
+        uploads = []
+        for item in upload_plan:
+            if item.kind == "local" and upload_local:
+                # Run on the controller (resolve_on_controller), which can read it:
+                # upload it here, under the claim. Normally a no-op, since the
+                # controller uploaded it when the job was localized.
+                uploads += local_copy(item)
+            elif item.kind == "server_side":
+                # -n so a requeued shard does not re-copy. rp_string because the
+                # *source* may be requester-pays even though our bucket is not.
+                # A directory source is copied into its parent: `cp -r gs://a/d
+                # gs://B/k/d` would otherwise produce gs://B/k/d/d/...
+                is_dir = getattr(item.fh, "is_dir", False)
+                dest = os.path.dirname(item.dest) + "/" if is_dir else item.dest
+                plain_cp = '    gcloud storage cp -r -n{rp} --custom-time="$CANINE_BUCKET_CT" {src} {dst}'.format(
+                  rp = item.fh.rp_string, src = shlex.quote(item.fh.path), dst = shlex.quote(dest),
+                )
+                # Plain server-side copy, always. A gzip-ENCODED single object never
+                # reaches this branch: the planner routes it to the "mount" kind, where the
+                # downloader streams the stored bytes through a verified decode
+                # (HandleGSURL.transport_gzip). That replaced a runtime `describe` +
+                # `gcloud storage cat | gunzip > $(mktemp)` + re-upload here, which staged
+                # the whole decompressed object on the boot disk (ENOSPC at gnomAD scale),
+                # decoded mislabelled .vcf.gz files into plain text, fell through to this
+                # plain copy -- reproducing the bug -- whenever the describe call failed,
+                # and relied on `gcloud storage cat` never transcoding.
+                #
+                # A directory's gzip-encoded objects arrive here as `exclude`, each with
+                # its own "mount" item (HandleGSURL.gzip_members). `cp` has no exclusion,
+                # so that copy is an rsync -- also server-side between buckets -- into the
+                # directory itself; its --exclude is a Python regex over names relative
+                # to the source. Copying everything and decoding over the top would
+                # instead leave encoded objects readable until the decode lands.
+                if item.exclude:
+                    pattern = "^(?:{})$".format("|".join(re.escape(n) for n in item.exclude))
+                    uploads += retried(
+                      '    gcloud storage rsync -r -n{rp} --custom-time="$CANINE_BUCKET_CT" --exclude={pat} {src} {dst}'.format(
+                        rp = item.fh.rp_string, pat = shlex.quote(pattern),
+                        src = shlex.quote(item.fh.path), dst = shlex.quote(item.dest),
+                      )
+                    )
+                    continue
+                uploads += retried(plain_cp)
+            elif item.kind == "local":
+                # A local path this worker cannot read. The controller uploaded it
+                # when the job was localized (local_upload_script), so only check
+                # that it is there. It may be missing if it expired while the job was
+                # queued, which the controller cannot know about. Exit 1, not 5: a
+                # requeue reruns only this script, but a rerun of the task localizes
+                # again, and so uploads it again.
+                uploads += [
+                  '    gcloud storage ls {dst} > /dev/null 2>&1 || {{ echo "ERROR:" {dst} "is missing. It is a local path on the controller, which uploads it when the task is localized; rerun the task to upload it again" >&2; exit 1; }}'.format(
+                    dst = shlex.quote(item.dest)),
+                ]
+
+        # Sources with no server-side copy (s3://, drs://, GDC, http) have to be
+        # moved by this VM -- but they still never touch the shared NFS mount.
+        # The bucket is mounted read-write and the download is written straight
+        # into it, so gcsfuse streams the bytes up as they arrive rather than
+        # staging a copy on local disk.
+        indirect = [x for x in upload_plan if x.kind == "mount"]
+        if indirect:
+            uploads += [
+              '    sudo mkdir -p {md}'.format(md = shlex.quote(mount_dir)),
+              '    sudo chown $(id -u):$(id -g) {md}'.format(md = shlex.quote(mount_dir)),
+              # NO `--o ro` here, unlike the consumer mount. Kept on its own
+              # mountpoint (/mnt/localize/...) rather than reusing
+              # /mnt/bucketmounts: the consumer loop's "mount if not already
+              # mounted, no backoff" logic is only safe because those mounts are
+              # read-only, and nothing writable should outlive this block.
+              '    timeout -k 60 60 gcsfuse --implicit-dirs {b} {md} || {{ echo "ERROR: rw bucket mount failed!" >&2; exit 1; }}'.format(
+                b = shlex.quote(bucket), md = shlex.quote(mount_dir)),
+            ]
+            for item in indirect:
+                in_mount = os.path.join(mount_dir, item.dest[len("gs://" + bucket + "/"):])
+                # A gs:// input only lands here when it is gzip-encoded; its ordinary
+                # localization_command is a `gcloud storage cp`, whose sliced download
+                # is not sequential and would stage the whole object on local disk.
+                command = (item.fh.downloader_command(in_mount)
+                           if isinstance(item.fh, file_handlers.HandleGSURL)
+                           else item.fh.localization_command(in_mount))
+                uploads += ["    " + line for line in command.split("\n")]
+            uploads += [
+              # unmount before anything else runs: finalizes every object, and
+              # leaves no writable mount exposed to the task script
+              '    fusermount -u {md} || {{ echo "ERROR: could not unmount rw bucket mount" >&2; exit 1; }}'.format(
+                md = shlex.quote(mount_dir)),
+            ]
+            # objects are only visible after the unmount finalizes them, so this
+            # is what makes the wolf=success label mean "the content is there"
+            uploads += [
+              '    gcloud storage ls {obj} > /dev/null || {{ echo "ERROR: {obj} missing after upload" >&2; exit 1; }}'.format(
+                obj = shlex.quote(x.dest)) for x in indirect
+            ]
+            # gcsfuse cannot set customTime on write, and an object without it is
+            # invisible to the daysSinceCustomTime lifecycle rule -- it would
+            # never expire and the bucket would grow forever. The gs:// path gets
+            # this from `cp --custom-time`; this path has to set it afterwards.
+            #
+            # What matters is that every object HAS a customTime, not that it is
+            # $CANINE_BUCKET_CT. The parallel downloader stamps its own, at compose
+            # time, which is later than $CANINE_BUCKET_CT, and GCS refuses to move a
+            # customTime earlier ("Custom time cannot be decreased", HTTP 400). So a
+            # failed update is only an error for an object left with no customTime at
+            # all. gcloud still updates the other objects in the batch when one fails.
+            objs = " ".join(shlex.quote(x.dest) for x in indirect)
+            uploads += [
+              '    if ! gcloud storage objects update {objs} --custom-time="$CANINE_BUCKET_CT" > /dev/null 2>&1; then'.format(objs = objs),
+              '      echo "INFO: not every object took customTime $CANINE_BUCKET_CT; the downloader stamps a later one of its own. Checking that each has one" >&2',
+              '      for CANINE_OBJ in {objs}; do'.format(objs = objs),
+              '        [ -n "$(gcloud storage objects describe "$CANINE_OBJ" --format="value(custom_time)" 2>/dev/null)" ] || { echo "ERROR: $CANINE_OBJ has no customTime, so the lifecycle rule would never expire it" >&2; exit 1; }',
+              '      done',
+              '    fi',
+            ]
+
+        all_objects = bucket_object_patterns(upload_plan)
+
+        return [
+          'CANINE_BUCKET_CT=$(date -u +%Y-%m-%dT%H:%M:%SZ)',
+        ] + self._lifecycle_file_lines() + bucket_complete_function(upload_plan) + [
+          'CANINE_BUCKET_WAITS=0',
+          'CANINE_BUCKET_CLAIM={claim}'.format(claim = shlex.quote("gs://{}/{}".format(bucket, BUCKET_CLAIM_OBJECT))),
+          'CANINE_BUCKET_CLAIM_BODY=$(mktemp)',
+          # Who holds the claim. A SLURM requeue keeps SLURM_JOB_ID, so a requeued
+          # attempt can recognize the claim its dead predecessor left. Job IDs
+          # restart on every cluster, hence the submitting controller's host too. A
+          # controller-side run is never requeued, and gets an owner no job matches.
+          'CANINE_BUCKET_OWNER=${SLURM_JOB_ID:+${SLURM_SUBMIT_HOST:-}:${SLURM_JOB_ID}}',
+          'CANINE_BUCKET_OWNER=${CANINE_BUCKET_OWNER:-controller-$(hostname)-$$}',
+          # Label writes are rate-limited per bucket (about one a second), and at
+          # 50-100 jobs sharing a bucket they returned HTTP 429 -- which
+          # gcloud_exp_backoff does not retry, since it looks only for "Quota
+          # exceeded". So they are retried here, with jitter.
+          'canine_bucket_label() {',
+          '  local try',
+          '  for try in 1 2 3 4 5 6 7 8; do',
+          '    gcloud storage buckets update {burl} "$@" > /dev/null 2>&1 && return 0'.format(burl = burl),
+          '    sleep $(( RANDOM % 5 + try ))',
+          '  done',
+          '  echo "WARNING: could not update the labels of {b}: $*" >&2'.format(b = bucket),
+          '  return 1',
+          '}',
+          # Take the upload over, exclusively. Only bucket creation used to be a
+          # mutex, so an expired or stale bucket was taken over by every job that
+          # saw it at once: at 100 jobs, 40-50 uploaded the same inputs and a
+          # tenth failed on label rate limits. The claim object is a
+          # compare-and-swap instead: its write is conditional on the generation
+          # just read (0 if absent), so exactly one racer wins. A claim is held
+          # while its server-side update time is under BUCKET_HEARTBEAT_STALE
+          # old; the owner refreshes it every BUCKET_HEARTBEAT_INTERVAL. A failed
+          # describe reads as "absent", which is safe: the conditional write then
+          # fails against the object that is there.
+          'canine_bucket_claim() {',
+          '  local gen updated owner',
+          '  read -r gen updated owner < <(gcloud storage objects describe "$CANINE_BUCKET_CLAIM" --format="value(generation,update_time.date(%s),custom_fields.canine_owner)" 2> /dev/null || :)',
+          '  updated=${updated%%.*}',
+          '  case "$gen" in ""|*[!0-9]*) gen=0;; esac',
+          '  case "$updated" in ""|*[!0-9]*) updated=0;; esac',
+          '  if [ "$gen" != "0" ] && [ $(( $(date +%s) - updated )) -le {stale} ]; then'.format(stale = BUCKET_HEARTBEAT_STALE),
+          # A live-looking claim that is this job's own was left by an attempt a
+          # requeue replaced -- SLURM runs one attempt at a time -- and its heartbeat
+          # has only not aged out yet. Waiting for that cost up to
+          # BUCKET_HEARTBEAT_STALE per preemption whenever the trap did not run.
+          '    [ "$owner" == "$CANINE_BUCKET_OWNER" ] || return 1',
+          '    echo "INFO: the claim on {b} is this job\'s own, left by an attempt before a requeue; taking it back" >&2'.format(b = bucket),
+          '  fi',
+          '  echo "$(hostname) ${SLURM_JOB_ID:-$$}.${SLURM_ARRAY_TASK_ID:-0} $(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$CANINE_BUCKET_CLAIM_BODY"',
+          '  gcloud storage cp --if-generation-match=$gen --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" --custom-metadata=canine_owner="$CANINE_BUCKET_OWNER" "$CANINE_BUCKET_CLAIM_BODY" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || return 1',
+          '  CANINE_BUCKET_CLAIM_GEN=$(gcloud storage objects describe "$CANINE_BUCKET_CLAIM" --format="value(generation)" 2> /dev/null)',
+          '}',
+          'while :; do',
+          '  CANINE_BUCKET_UPLOAD=0',
+          # BUCKET_CREATE_FLAGS: no soft delete, and private
+          '  if gcloud storage buckets create {burl} --location={region} {flags} --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1; then'.format(
+            burl = burl, region = shlex.quote(region), flags = BUCKET_CREATE_FLAGS),
+          # Creating the bucket makes this job the natural uploader, but it still
+          # takes the claim like anyone else: a waiter that finds a new, unlabelled
+          # bucket with no claim may otherwise take it first.
+          '    CANINE_BUCKET_STATE=created',
+          '  else',
+          # Two different 409s land here, and under real contention the transient
+          # one dominates: "A conflicting operation is currently in progress ...
+          # Please try again" means the create is still in flight, NOT that the
+          # bucket is readable yet. So wait for it to resolve before reading the
+          # label, rather than racing straight to describe.
+          '    CANINE_BUCKET_TRIES=0',
+          '    until gcloud storage buckets describe {burl} > /dev/null 2>&1; do'.format(burl = burl),
+          '      if [ $CANINE_BUCKET_TRIES -gt 30 ]; then echo "ERROR: localization bucket {b} never became readable" >&2; exit 5; fi'.format(b = bucket),
+          '      sleep 2; CANINE_BUCKET_TRIES=$((CANINE_BUCKET_TRIES+1))',
+          '    done',
+          '    CANINE_BUCKET_STATE=$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)'.format(burl = burl),
+          '  fi',
+          # "success" with the content present is the only state that needs no
+          # upload. The content may have aged out under the lifecycle rule, so the
+          # label alone is not enough.
+          '  if [ "$CANINE_BUCKET_STATE" == "success" ] && canine_bucket_complete; then',
+          '    echo "INFO: localization bucket {b} {populated}" >&2'.format(b = bucket, populated = BUCKET_ALREADY_POPULATED),
+          '  elif canine_bucket_claim; then',
+          # Look again now that the claim is ours. The label was read before the
+          # claim, and an uploader finishing in between sets "success" and then
+          # releases its claim -- so a claim won after that release always sees
+          # "success" here. Without this, that late job uploaded a second time.
+          '    if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && canine_bucket_complete; then'.format(
+            burl = burl),
+          '      echo "INFO: localization bucket {b} {populated}, by another job, while claiming it" >&2'.format(
+            b = bucket, populated = BUCKET_ALREADY_POPULATED),
+          '      gcloud storage rm --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || :',
+          '    else',
+          '      case "$CANINE_BUCKET_STATE" in',
+          '        created) ;;',
+          '        success) echo "INFO: localization bucket {b} expired; repopulating" >&2 ;;'.format(b = bucket),
+          '        stale) echo "INFO: taking over stale localization bucket {b}" >&2 ;;'.format(b = bucket),
+          '        *) echo "INFO: the upload into {b} has no live claim; taking it over" >&2 ;;'.format(b = bucket),
+          '      esac',
+          '      CANINE_BUCKET_UPLOAD=1',
+          '    fi',
+          '  else',
+          # Another job holds a live claim, so wait for it. Timing out requeues
+          # this job, but no longer marks the bucket stale: a live claim is a live
+          # uploader, and taking it over would only duplicate the work.
+          '    if [ $CANINE_BUCKET_WAITS -ge {tries} ]; then'.format(tries = self.bucket_upload_wait_tries),
+          '      echo "WARNING: timed out waiting for {b}; retrying elsewhere" >&2'.format(b = bucket),
+          '      exit 5',
+          '    fi',
+          '    [ $CANINE_BUCKET_WAITS -gt 0 ] || echo "INFO: {waiting} {b}; waiting" >&2'.format(waiting = BUCKET_WAITING, b = bucket),
+          '    sleep 60; CANINE_BUCKET_WAITS=$((CANINE_BUCKET_WAITS+1))',
+          '    continue',
+          '  fi',
+          '  if [ "$CANINE_BUCKET_UPLOAD" == "1" ]; then',
+          # Informational now, for older canine versions still reading labels:
+          # the claim decides who uploads.
+          #
+          # The same call enforces public access prevention, so a bucket created
+          # before BUCKET_CREATE_FLAGS made buckets private becomes so the next
+          # time it is populated. Buckets are never deleted, only their objects.
+          # Not uniform access: turned on for an existing bucket, it drops the
+          # object ACLs that project editors and viewers read through, and adds no
+          # IAM role in their place (tested: a 403 reading the bucket's own object).
+          '    canine_bucket_label --update-labels=wolf=working --public-access-prevention || :',
+          # The heartbeat. It refreshes the claim's update time, conditional on
+          # this job's generation, so it can never keep someone else's claim alive.
+          '    ( while sleep {interval}; do gcloud storage objects update "$CANINE_BUCKET_CLAIM" --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :; done ) &'.format(
+            interval = BUCKET_HEARTBEAT_INTERVAL),
+          '    CANINE_BUCKET_HB_PID=$!',
+          # A failed or cancelled upload used to leave the bucket "working", so the
+          # next job waited out the whole limit before taking over -- seen in
+          # production when a workflow was cancelled and restarted. scancel sends
+          # SIGTERM with KillWait (300 s) before SIGKILL, so the trap has time to
+          # run. Releasing the claim lets exactly one waiter take over at once. It
+          # does not change the exit code: the requeue-vs-fail meaning of 5 and 1
+          # survives.
+          '    canine_bucket_release() {',
+          '      kill $CANINE_BUCKET_HB_PID 2> /dev/null || :',
+          '      if [ "${CANINE_BUCKET_DONE:-0}" != "1" ]; then',
+          '        echo "WARNING: the upload into {b} did not finish; releasing it so the next job takes over at once" >&2'.format(b = bucket),
+          '        canine_bucket_label --update-labels=wolf=stale || :',
+          '        gcloud storage rm --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || :',
+          '      fi',
+          '    }',
+          '    trap canine_bucket_release EXIT',
+          # So that a signal ends the script through the EXIT trap, with the
+          # conventional 128+N code.
+          '    trap "exit 143" TERM',
+          '    trap "exit 130" INT',
+        ] + uploads + [
+          '    kill $CANINE_BUCKET_HB_PID 2> /dev/null || :',
+          '    wait $CANINE_BUCKET_HB_PID 2> /dev/null || :',
+          '    canine_bucket_label --update-labels=wolf=success',
+          '    CANINE_BUCKET_DONE=1',
+          '    trap - EXIT TERM INT',
+          # Only after "success": released first, a waiter could find no claim and
+          # the bucket still "working", and upload it again.
+          '    gcloud storage rm --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" "$CANINE_BUCKET_CLAIM" > /dev/null 2>&1 || :',
+          '  else',
+          # refresh the expiry clock so content still in use is not reclaimed
+          '    gcloud storage objects update {objs} --custom-time="$CANINE_BUCKET_CT" > /dev/null 2>&1 || :'.format(objs = all_objects),
+          '  fi',
+          '  break',
+          'done',
+          'rm -f "$CANINE_BUCKET_LC" "$CANINE_BUCKET_CLAIM_BODY"',
+        ]
+
+    def bucket_populated_script(self, upload_plan, bucket_prefix):
+        """
+        Commands that exit 0 only if the localization bucket is already populated,
+        refreshing its objects' customTime as a node job finding it populated would.
+
+        Read-only apart from that refresh, so it is safe to run for a job with inputs
+        a node must move: they need one only when the bucket still has to be filled.
+        """
+        bucket = bucket_prefix[len("gs://"):] if bucket_prefix.startswith("gs://") else bucket_prefix
+        burl = shlex.quote("gs://" + bucket)
+        all_objects = bucket_object_patterns(upload_plan)
+        return bucket_complete_function(upload_plan) + [
+          'if [ "$(gcloud storage buckets describe {burl} --format="value(labels.wolf)" 2>/dev/null)" == "success" ] && canine_bucket_complete; then'.format(
+            burl = burl),
+          '  echo "INFO: localization bucket {b} {populated}" >&2'.format(b = bucket, populated = BUCKET_ALREADY_POPULATED),
+          # refresh the expiry clock, as the node job this replaces would have
+          '  gcloud storage objects update {objs} --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :'.format(objs = all_objects),
+          '  exit 0',
+          'fi',
+          'exit 1',
+        ]
+
+    def local_upload_script(self, upload_plan, bucket_prefix, region):
+        """
+        Commands, run on the controller, that upload the "local" inputs in
+        `upload_plan`: local paths that are not on the NFS share, so no worker can
+        read them. The rest of the plan is left to the job's bucket_upload_script.
+
+        No claim is taken. The objects are content-addressed, so every job
+        uploading one uploads the same bytes, and `cp -n` skips what is already
+        there. The bucket is created if absent, as the node would create it; the
+        node's own create then finds it and takes the claim as usual.
+        """
+        bucket = bucket_prefix[len("gs://"):] if bucket_prefix.startswith("gs://") else bucket_prefix
+        burl = shlex.quote("gs://" + bucket)
+        lines = ['CANINE_BUCKET_CT=$(date -u +%Y-%m-%dT%H:%M:%SZ)'] + self._lifecycle_file_lines() + [
+          'if ! gcloud storage buckets describe {burl} > /dev/null 2>&1; then'.format(burl = burl),
+          # A 409 here is another job creating it at the same moment, so wait for
+          # the bucket to become readable rather than failing.
+          '  gcloud storage buckets create {burl} --location={region} {flags} --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1 || :'.format(
+            burl = burl, region = shlex.quote(region), flags = BUCKET_CREATE_FLAGS),
+          '  CANINE_BUCKET_TRIES=0',
+          '  until gcloud storage buckets describe {burl} > /dev/null 2>&1; do'.format(burl = burl),
+          '    if [ $CANINE_BUCKET_TRIES -gt 30 ]; then echo "ERROR: localization bucket {b} never became readable" >&2; exit 1; fi'.format(b = bucket),
+          '    sleep 2; CANINE_BUCKET_TRIES=$((CANINE_BUCKET_TRIES+1))',
+          '  done',
+          'fi',
+          'rm -f "$CANINE_BUCKET_LC"',
+        ]
+        for item in upload_plan:
+            if item.kind == "local":
+                lines += local_copy(item)
+        return lines
+
+    def upload_local_paths(self, upload_plan, bucket_prefix, region):
+        """
+        Run local_upload_script here on the controller, for a plan with any "local"
+        input. Raises if the upload fails, which fails localizing the task.
+        """
+        local = [item for item in upload_plan if item.kind == "local"]
+        if not local:
+            return
+        canine_logging.info1("Uploading {} local path(s) from the controller into {}".format(
+          len(local), bucket_prefix))
+        proc = subprocess.run(
+          [BASH, "-c", "set -e\n" + "\n".join(self.local_upload_script(upload_plan, bucket_prefix, region)) + "\n"],
+          capture_output = True, text = True)
+        if proc.returncode != 0:
+            raise RuntimeError("Could not upload local path(s) {} into {}:\n{}".format(
+              ", ".join(item.fh.path for item in local), bucket_prefix, proc.stdout + proc.stderr))
+
+    def resolve_on_controller(self, jobId) -> bool:
+        """
+        Settle job `jobId`'s bucket localization here on the controller, and say
+        whether it worked. A job settled here needs no worker node at all.
+
+        **Only for a job that does nothing but localize** -- wolF's LocalizeToBucket.
+        The caller drops a settled job from the batch, so for any other task this
+        would skip the task's own script.
+
+        Every LocalizeToBucket used to take an exclusive n1-standard-8, even to find
+        the bucket already populated, or to copy gs:// objects server-side with no
+        bytes through the node. With 50-100 workflows sharing reference files, 99
+        nodes booted to do nothing.
+
+        **The controller moves no data here.** It is shared by every workflow in a
+        large run, so only work that is metadata or a GCS server-side copy happens
+        here. (Local paths are the exception, uploaded before this runs, since no
+        worker can read them: see upload_local_paths.)
+
+          * every input is a server-side gs:// copy or a local path: run the job's
+            whole emitted claim-and-upload block here. The claim, heartbeat, release
+            trap and retries all apply unchanged, so this competes fairly with
+            uploaders on nodes. It waits on another job's live claim here too,
+            holding a thread rather than a node. Local paths are uploaded again
+            under the claim (upload_local), a no-op unless one went missing since
+            localization: a node could only fail on it.
+          * some input is a download onto the mount: settle only if the bucket is
+            already populated (bucket_populated_script); otherwise the job goes to a
+            node, which moves the bytes.
+
+        Any failure returns False and the job goes to a node as before, which runs
+        the same protocol with the node path's requeue behavior. Turned off by
+        resolve_on_controller=False, or by CANINE_DISABLE_CONTROLLER_LOCALIZATION set
+        on the controller.
+
+        A settled job's stdout and stderr are the script's output, written where
+        delocalization.py would put them, so delocalize() and callers building
+        results from it see an ordinary finished job.
+        """
+        if os.environ.get("CANINE_DISABLE_CONTROLLER_LOCALIZATION"):
+            reason = "CANINE_DISABLE_CONTROLLER_LOCALIZATION is set"
+        elif not self.controller_resolution:
+            reason = "resolve_on_controller is off"
+        elif jobId not in self.bucket_plans and self._passes_everything_through(jobId):
+            # Every input already is where a worker reads it -- a path on the NFS
+            # share, or an existing bucketmount:// URL -- so there is no bucket and
+            # nothing to do. A node would boot only to run the no-op script.
+            self._write_settled_output(jobId, "", "")
+            canine_logging.info1("localization job {}: every input passes through as is (paths on the "
+                                 "NFS share or existing bucket mounts); no node needed".format(jobId))
+            return True
+        elif jobId not in self.bucket_plans:
+            reason = "it has no bucket upload"
+        else:
+            reason = None
+        if reason:
+            canine_logging.info1("localization job {}: submitting it to a node: {}".format(jobId, reason))
+            return False
+
+        bucket_prefix, region, upload_plan = self.bucket_plans[jobId]
+        # Anything that moves bytes goes to a node: see the docstring.
+        needs_node = [item for item in upload_plan if item.kind == "mount"]
+        if needs_node:
+            lines = self.bucket_populated_script(upload_plan, bucket_prefix)
+        else:
+            lines = self.bucket_upload_script(upload_plan, bucket_prefix, region, upload_local = True)
+        proc = subprocess.run([BASH, "-c", "set -e\n" + "\n".join(lines) + "\n"],
+                              capture_output = True, text = True)
+
+        env = self.environment("local")
+        job_root = os.path.join(env["CANINE_JOBS"], jobId)
+        os.makedirs(job_root, exist_ok = True)
+        if proc.returncode != 0:
+            with open(os.path.join(job_root, "controller_localization.log"), "w") as log:
+                log.write(proc.stdout + proc.stderr)
+            if needs_node:
+                canine_logging.info1("localization job {}: bucket not yet populated, and {} input(s) must "
+                                     "be moved by a node; submitting it to a node".format(jobId, len(needs_node)))
+            else:
+                canine_logging.warning("localization job {}: localizing on the controller exited {}; "
+                                       "submitting it to a node instead (see {})".format(
+                                         jobId, proc.returncode,
+                                         os.path.join(job_root, "controller_localization.log")))
+            return False
+
+        self._write_settled_output(jobId, proc.stdout, proc.stderr)
+        # Say what happened, not just that no node was needed: most jobs settled here
+        # transfer nothing -- another workflow's job, earlier or concurrent, already
+        # filled the shared bucket -- and "localized on the controller" would claim a
+        # transfer that never happened.
+        if BUCKET_ALREADY_POPULATED not in proc.stderr:
+            how = [label for kind, label in (("server_side", "server-side copies"),
+                                             ("local", "local paths uploaded from the controller"))
+                   if any(item.kind == kind for item in upload_plan)]
+            what = "transferred on the controller into {} ({})".format(bucket_prefix, ", ".join(how))
+        elif BUCKET_WAITING in proc.stderr:
+            what = "localized in {} by another job, waited for its upload".format(bucket_prefix)
+        else:
+            what = "already localized in {}, found complete".format(bucket_prefix)
+        canine_logging.info1("localization job {}: {}; no node needed".format(jobId, what))
+        return True
+
+    def _passes_everything_through(self, jobId) -> bool:
+        """
+        Whether bucket localization planned job `jobId` and found nothing to upload:
+        every input passed through as is. Not on a dry run, which plans no upload
+        either but has not localized anything.
+        """
+        return (
+          self.localize_to_persistent_disk and not self.persistent_disk_dry_run
+          and bool(self.rodisk_paths.get(jobId))
+        )
+
+    def _write_settled_output(self, jobId, stdout, stderr):
+        """
+        Write a job settled on the controller's stdout and stderr where
+        delocalization.py would put them, so delocalize() sees an ordinary finished job.
+        """
+        env = self.environment("local")
+        job_root = os.path.join(env["CANINE_JOBS"], jobId)
+        out_root = os.path.join(env["CANINE_OUTPUT"], jobId)
+        os.makedirs(job_root, exist_ok = True)
+        os.makedirs(out_root, exist_ok = True)
+        for name, text in (("stdout", stdout), ("stderr", stderr)):
+            path = os.path.join(job_root, name)
+            with open(path, "w") as f:
+                f.write(text)
+            link = os.path.join(out_root, name)
+            if not os.path.lexists(link):
+                os.symlink(os.path.relpath(path, out_root), link)
+
+    def bucketmount_lease_register(self):
+        """
+        Commands registering this job as a live consumer of the bucket it just
+        mounted, so DeleteLocalizedFiles will refuse to delete content another
+        worker is still reading.
+
+        GCS has no server-side notion of "who has this gcsfuse-mounted" --
+        gcsfuse is just a client -- so the bucket itself is the only state every
+        VM can see. Each consumer drops a marker under _MOUNTS/ and removes it
+        during teardown (see bucketmount_lease_release).
+
+        Written with --custom-time so a lease orphaned by a crashed job is
+        reaped by the same lifecycle rule as everything else, rather than
+        blocking deletion of that content forever. Failure to write one is a
+        warning, never fatal: this is bookkeeping, and losing it costs a
+        redundant re-localization at worst.
+
+        MUST be emitted unconditionally, outside the "mount if not already
+        mounted" block. A second job landing on a node where the bucket is
+        already mounted does no mounting of its own, but is every bit as much a
+        consumer -- if it skipped taking a lease, the first job's teardown would
+        free the content while the second was still reading it.
+
+        The key is hostname + job + array task so it is unique across VMs and
+        across array shards co-scheduled on one VM; teardown removes the exact
+        URLs it recorded, never a pattern, so it can only ever free its own.
+        """
+        return [
+          'CANINE_BUCKETMOUNT_LEASE=gs://${CANINE_BUCKETMOUNT}/_MOUNTS/$(hostname)-${SLURM_JOB_ID:-$$}-${SLURM_ARRAY_TASK_ID:-0}',
+          'gcloud storage cp --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" /dev/null "${CANINE_BUCKETMOUNT_LEASE}" > /dev/null 2>&1 || echo "WARNING: could not register mount lease for ${CANINE_BUCKETMOUNT}" >&2',
+          'echo "${CANINE_BUCKETMOUNT_LEASE}" >> ${CANINE_JOB_INPUTS}/.bucketmount_leases',
+        ]
+
+    def bucketmount_heartbeat_start(self):
+        """
+        Commands starting a background loop that re-stamps customTime on this
+        bucket's contents for as long as the job holds the mount.
+
+        customTime is otherwise written once and never renewed, so a job holding
+        a mount longer than localization_expiry_days loses two things at once:
+
+          * its own _MOUNTS/ lease, after which a sibling flow's
+            DeleteLocalizedFiles sees no holder and deletes content that is
+            actively mounted; and
+          * the data objects themselves -- the lifecycle rule carries no prefix
+            filter, so GCS deletes the inputs out from under gcsfuse with no
+            second flow involved at all. gcsfuse pins the object generation at
+            open(), so an in-flight read fails rather than returning wrong
+            bytes, but it fails.
+
+        One bucket-wide update covers the lease and the data objects together.
+        Failure to refresh is never fatal -- same reasoning as the lease write --
+        and if the worker dies the loop dies with it, so content expires on the
+        normal schedule rather than being pinned forever.
+        """
+        return [
+          'CANINE_BUCKETMOUNT_HB=${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_${CANINE_BUCKETMOUNT}.sh',
+          # Quoted heredoc: the body is written verbatim, so $(date) is evaluated
+          # per beat rather than frozen at write time. That also means the bucket
+          # cannot come from CANINE_BUCKETMOUNT -- it is a plain shell variable,
+          # never exported, so the child would see an empty string and update
+          # "gs:///**". Pass it as $1 instead.
+          "cat > \"${CANINE_BUCKETMOUNT_HB}\" <<'CANINE_HEARTBEAT_EOF'",
+          'while true; do',
+          '  sleep {}'.format(int(self.bucketmount_heartbeat_seconds)),
+          '  gcloud storage objects update "gs://$1/**" --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :',
+          'done',
+          'CANINE_HEARTBEAT_EOF',
+          'set +e; bash "${CANINE_BUCKETMOUNT_HB}" "${CANINE_BUCKETMOUNT}" & echo $! >> ${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids; set -e',
+        ]
+
+    def bucketmount_heartbeat_stop(self):
+        """
+        Teardown counterpart to bucketmount_heartbeat_start(): stops this job's
+        refresh loops so the content resumes ageing normally once nobody holds it.
+        """
+        return [
+          'if [ -f ${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids ]; then',
+          '  while read -r pid; do',
+          '    kill $pid 2> /dev/null || :',
+          '  done < ${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids',
+          '  rm -f ${CANINE_JOB_INPUTS}/.bucketmount_heartbeat_pids',
+          'fi',
+        ]
+
+    def bucketmount_lease_release(self):
+        """
+        Teardown counterpart to bucketmount_lease_register(): drops this job's
+        mount leases so the content becomes deletable once no worker holds it.
+        """
+        return [
+          'if [ -f ${CANINE_JOB_INPUTS}/.bucketmount_leases ]; then',
+          '  while read -r CANINE_LEASE; do',
+          '    gcloud storage rm "${CANINE_LEASE}" > /dev/null 2>&1 || :',
+          '  done < ${CANINE_JOB_INPUTS}/.bucketmount_leases',
+          '  rm -f ${CANINE_JOB_INPUTS}/.bucketmount_leases',
+          'fi',
+        ]
+
+    def bucketmount_reachability_check(self):
+        """
+        Commands verifying that every input symlinked into the bucket mount
+        currently being processed actually resolves.
+
+        A mounted-but-empty bucket is gcsfuse's nastiest failure mode: the mount
+        succeeds, `mountpoint -q` passes, and reads come back ENOENT far away
+        from the cause. Two ways to land there -- the objects were never written,
+        or this node already had the bucket mounted from before they were (the
+        loop skips remounting an existing mountpoint) and its metadata cache is
+        stale.
+
+        Exits 5 rather than 1: both causes are node-local or transient, so the
+        shard is worth retrying elsewhere rather than failing the workflow.
+        Expects CANINE_JOB_INPUTS, CANINE_BUCKETMOUNT and CANINE_BUCKETMOUNT_DIR
+        to be set -- i.e. this belongs inside the per-bucket mount loop.
+        """
+        return [
+          'for CANINE_BM_LINK in $(find ${CANINE_JOB_INPUTS} -maxdepth 1 -type l 2> /dev/null); do',
+          '  if [[ "$(readlink "$CANINE_BM_LINK")" == ${CANINE_BUCKETMOUNT_DIR}/* && ! -e "$CANINE_BM_LINK" ]]; then',
+          '    echo "ERROR: $CANINE_BM_LINK does not resolve inside bucket mount ${CANINE_BUCKETMOUNT}; retrying on another node" >&2',
+          '    exit 5',
+          '  fi',
+          'done',
+        ]
+
     def job_setup_teardown(self, jobId: str, patterns: typing.Dict[str, str], transport = None) -> typing.Tuple[str, str, str, typing.Dict[str, typing.List[str]]]:
         """
         Returns a tuple of (setup script, localization script, teardown script) for the given job id.
@@ -959,6 +2254,7 @@ class AbstractLocalizer(abc.ABC):
         ]
         array_exports = {}
         canine_rodisks = []
+        canine_bucketmounts = []
         docker_args = ['-v $CANINE_ROOT:$CANINE_ROOT']
         localization_tasks = [
             'if [[ -d $CANINE_JOB_INPUTS ]]; then cd $CANINE_JOB_INPUTS; fi'
@@ -972,49 +2268,64 @@ class AbstractLocalizer(abc.ABC):
         if self.localize_to_persistent_disk:
             # FIXME: we don't have an easy way of parsing which inputs are common
             #        to all shards at this point. if every localizable input is
-            #        common to each shard, then we'll create the same disk
+            #        common to each shard, then we'll upload the same content
             #        multiple times, once per shard. thus, for now we suboptimally
             #        just localize the same file multiple times.
-            # NOTE:  we are still able to create scratch disks for scatter jobs,
-            #        one per shard. we do this by appending the shard number to the
-            #        scratch disk name
 
-            disk_prefix, disk_creation_script, disk_teardown_script, rodisk_paths = self.create_persistent_disk(self.inputs[jobId], dry_run = self.persistent_disk_dry_run)
+            bucket_prefix, _, bucketmount_paths, upload_plan = self.create_bucket_mount(self.inputs[jobId], dry_run = self.persistent_disk_dry_run)
 
-            # add commands to create/mount the disk
-            localization_tasks += disk_creation_script
+            # save bucketmount:// URLs for files saved to the bucket for later use
+            self.rodisk_paths[jobId] = bucketmount_paths
 
-            # save rodisk:// URLs for files saved to the disk for later use
-            self.rodisk_paths[jobId] = rodisk_paths
+            # The worker decides for itself whether to upload -- bucket creation
+            # is the mutex and the bucket label carries the state -- so the
+            # script is emitted unconditionally. That is exactly what makes a
+            # concurrent sibling wait instead of re-uploading the same content.
+            if not self.persistent_disk_dry_run and len(upload_plan):
+                zone = self.backend_zone()
+                self.bucket_plans[jobId] = (bucket_prefix, _zone_to_region(zone), upload_plan)
+                # local paths no worker can read go up now, from here
+                self.upload_local_paths(upload_plan, bucket_prefix, _zone_to_region(zone))
+                localization_tasks += self.bucket_upload_script(
+                  upload_plan, bucket_prefix, _zone_to_region(zone)
+                )
 
-            # if disk already exists and is finalized (as indicated by blank disk creation script),
-            # treat each localizable input as a RODISK that already exists (to be mounted),
-            # rather than as a RODISK (to be created and localized to)
-            # note that this does not apply to scratch disks that already exist;
-            # these have a special disk creation script that cause the localizer to
-            # exit early.
-            localization_disk_already_exists = False
-            if len(disk_creation_script) == 0:
-                localization_disk_already_exists = True
-                for k, v_array in self.rodisk_paths[jobId].items():
-                    # if this input had previously been localized in prepare_job_inputs,
-                    # delete it
-                    for v in self.inputs[jobId][k]:
-                        if v.localization_mode == "local": 
-                            localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path)]
+            # every localizable input is now bucket-resident (or will be, by the
+            # time the script above finishes), so consume them all through the
+            # read-only mount rather than as files to download
+            for k, v_array in self.rodisk_paths[jobId].items():
+                # If prepare_job_inputs already made a redundant copy of this
+                # input, drop it -- the content is going to the bucket instead.
+                #
+                # The localized_path != path guard is load-bearing:
+                # FileType.__init__ seeds localized_path with the *original*
+                # path, and localize_file() is what later repoints it at the
+                # copy. Under this flow local inputs are turned into bucket
+                # mounts before that ever runs, so an unguarded rm here deletes
+                # the upstream task's own output -- which is exactly how a
+                # previous run destroyed its produce/ outputs and left only the
+                # .crc32c sidecars behind.
+                for v in self.inputs[jobId][k]:
+                    if v.localization_mode == "local" and v.localized_path != v.path:
+                        localization_tasks += ["if [ -f {0} -o -d {0} ]; then rm -f {0}; fi".format(v.localized_path)]
 
-                    # transform this input into a RODISK FileType, to be mounted
-                    if not self.persistent_disk_dry_run:
-                        self.inputs[jobId][k] = [file_handlers.HandleRODISKURL(v) for v in v_array]
+                # transform this input into a bucket-mount FileType, to be mounted.
+                # A path on the NFS share passed through as itself; like any share
+                # path NFSLocalizer sees, it is handed to the task as a string.
+                if not self.persistent_disk_dry_run:
+                    self.inputs[jobId][k] = [
+                      file_handlers.HandleBucketMountURL(v) if "://" in v else file_handlers.StringLiteral(v)
+                      for v in v_array
+                    ]
 
-                    # if this is a dry run, we are only interested in the RODISK URL string literals;
-                    # we will not actually be attempting to mount it. this is mainly
-                    # for wolf.LocalizeToDisk, which returns RODISK path inputs
-                    # as its outputs. this would likely not be useful for most others
-                    # tasks, since they would have no idea what to do with a RODISK string
-                    # literal
-                    else:
-                        self.inputs[jobId][k] = [file_handlers.StringLiteral(v) for v in v_array]
+                # if this is a dry run, we are only interested in the bucketmount URL string literals;
+                # we will not actually be attempting to mount it. this is mainly
+                # for wolf.LocalizeToBucket, which returns bucketmount path inputs
+                # as its outputs. this would likely not be useful for most others
+                # tasks, since they would have no idea what to do with a bucketmount string
+                # literal
+                else:
+                    self.inputs[jobId][k] = [file_handlers.StringLiteral(v) for v in v_array]
 
         #
         # create creation/teardown scripts for scratch disk, if specified
@@ -1147,19 +2458,15 @@ class AbstractLocalizer(abc.ABC):
 
                     exportpath = self.reserve_path('jobs', jobId, 'inputs', basename)
 
-                    # localize this file to a persistent disk, if specified
-                    if self.localize_to_persistent_disk:
-                        # localize to persistent disk mountpoint; symlink into inputs folder
-                        disk_path = os.path.join(disk_prefix, key, basename)
-                        file_handler.localized_path = disk_path
-                        localization_tasks += [
-                          file_handler.localization_command(disk_path),
-                          "if [[ -e {path} && ! -L {path} ]]; then echo 'Warning: task overwrote symlink to {disk_path} on RODISK' >&2; elif [[ ! -L {path} ]]; then ln -s {disk_path} {path}; fi".format(disk_path=disk_path, path=exportpath.remotepath),
-                        ]
-                    else:
-                        # set dest to path on NFS
-                        localization_tasks += [file_handler.localization_command(exportpath.remotepath)]
-                        file_handler.localized_path = exportpath
+                    # download to the shared mount. Note this branch is NOT
+                    # reached under localize_to_persistent_disk: those inputs are
+                    # placed in their localization bucket by bucket_upload_script
+                    # and then transformed into bucket_mount FileTypes, so they
+                    # take the bucket_mount branch above instead. Routing them
+                    # through here is what used to send every byte across the
+                    # controller's disk twice.
+                    localization_tasks += [file_handler.localization_command(exportpath.remotepath)]
+                    file_handler.localized_path = exportpath
 
                     export_writer(key, exportpath.remotepath, is_array)
 
@@ -1194,6 +2501,45 @@ class AbstractLocalizer(abc.ABC):
 
                     export_writer(key, dest.remotepath, is_array)
 
+                # this is a bucket-mounted (RODISK-replacement) URL; export
+                # variables for subsequent gcsfuse mounting and a command to
+                # symlink the future mount path into the inputs directory
+                elif file_handler.localization_mode == 'bucket_mount':
+                    assert file_handler.path.startswith("bucketmount://")
+
+                    job_vars.add(shlex.quote(key))
+
+                    # bucketmount://<bucket>/<object path>. The whole bucket is
+                    # mounted and the symlink carries the object path, so one
+                    # gcsfuse process serves every input from a given bucket --
+                    # previously the second URL segment was consumed as an
+                    # --only-dir, which under the one-bucket-per-localization
+                    # layout would mount the bucket once per *input key*.
+                    dgrp = re.search(r"bucketmount://([^/]+)/(.+)", file_handler.path)
+                    bkt = dgrp[1]
+                    file = dgrp[2]
+
+                    bucketmount_key = bkt
+                    mount_dir = "/mnt/bucketmounts/{}".format(bucketmount_key)
+
+                    if bucketmount_key not in canine_bucketmounts:
+                        canine_bucketmounts.append(bucketmount_key)
+                        exports += ["export CANINE_BUCKETMOUNT_{}={}".format(len(canine_bucketmounts), bucketmount_key)]
+                        exports += ["export CANINE_BUCKETMOUNT_DIR_{}={}".format(len(canine_bucketmounts), mount_dir)]
+
+                    dest = self.reserve_path('jobs', jobId, 'inputs', basename)
+
+                    localization_tasks += [
+                      # symlink the future bucket-mount path into the Canine inputs directory
+                      # NOTE: it will be broken upon creation, since the bucket will
+                      #   be mounted subsequently.
+                      # NOTE: it might already exist if we are retrying this task
+                      # NOTE: the task also might have overwritten the symlink with its own file
+                      "if [[ -e {path} && ! -L {path} ]]; then echo 'Warning: task overwrote symlink to {file} on bucket mount' >&2; elif [[ ! -L {path} ]]; then ln -s {mount_dir}/{file} {path}; fi".format(mount_dir=mount_dir, file=file, path=dest.remotepath),
+                    ]
+
+                    export_writer(key, dest.remotepath, is_array)
+
                 # this is a local file; copy or symlink it to the inputs directory.
                 # if we are localizing to a persistent disk, create commands
                 # to copy it there.
@@ -1212,16 +2558,12 @@ class AbstractLocalizer(abc.ABC):
                     # update localized_path
                     file_handler.localized_path = dest.remotepath
 
-                    # add commands to copy file from NFS to persistent disk, if specified
-                    if self.localize_to_persistent_disk:
-                        exportpath = os.path.join(disk_prefix, key, basename)
-                        localization_tasks += [
-                          "[ ! -d {0} ] && mkdir -p {0} || :".format(os.path.join(disk_prefix, key)),
-                          "cp -r {} {}".format(dest.remotepath, exportpath)
-                        ]
-                        file_handler.localized_path = exportpath
-                    else:
-                        exportpath = dest.remotepath
+                    exportpath = dest.remotepath
+
+                    # NB: unreachable under localize_to_persistent_disk -- those
+                    # inputs are uploaded by upload_local_paths (kind="local") or
+                    # passed through as NFS paths, and transformed before this
+                    # loop runs.
 
                     export_writer(
                       key,
@@ -1325,6 +2667,155 @@ class AbstractLocalizer(abc.ABC):
               "done",
             ]
 
+        #
+        # Mount bucket-mounted (RODISK-replacement) inputs, if any
+        exports += ["export CANINE_N_BUCKETMOUNTS={}".format(len(canine_bucketmounts))]
+        if len(canine_bucketmounts):
+            localization_tasks += [
+              "for i in `seq ${CANINE_N_BUCKETMOUNTS}`; do",
+              "CANINE_BUCKETMOUNT=CANINE_BUCKETMOUNT_${i}",
+              "CANINE_BUCKETMOUNT=${!CANINE_BUCKETMOUNT}",
+              "CANINE_BUCKETMOUNT_DIR=CANINE_BUCKETMOUNT_DIR_${i}",
+              "CANINE_BUCKETMOUNT_DIR=${!CANINE_BUCKETMOUNT_DIR}",
+
+              'echo "INFO: Mounting bucket ${CANINE_BUCKETMOUNT} ..." >&2',
+
+              # Bucket mounts are node-lifetime: once mounted, a bucket stays
+              # mounted until the VM is deleted and no job ever unmounts it. Any
+              # unmount in teardown races the other shards sharing the mount on
+              # this node, and no lock closes that race cheaply.
+              #
+              # The lock file lives beside the mountpoint, not inside it, so it
+              # stays openable whatever state the mount is in. mkdir -p/touch/
+              # chown are idempotent under concurrent shards, so no lock needed.
+              "sudo mkdir -p $(dirname ${CANINE_BUCKETMOUNT_DIR})",
+              "CANINE_BUCKETMOUNT_MOUNTLOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).mountlock",
+              "sudo touch ${CANINE_BUCKETMOUNT_MOUNTLOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_MOUNTLOCK}",
+
+              # Fast path: already mounted and live on this node, so skip the
+              # lock entirely. timeout guards stat against a hung FUSE daemon.
+              "if ! { mountpoint -q ${CANINE_BUCKETMOUNT_DIR} && timeout 10 stat ${CANINE_BUCKETMOUNT_DIR} > /dev/null 2>&1; }; then",
+
+              # Multiple shards of the same scatter job routinely start on the
+              # same node in the same instant, and each independently checks
+              # "is this already mounted?" -- everything from here through the
+              # gcsfuse invocation must run under this lock so only one shard
+              # ever actually mounts; every other shard just waits briefly here,
+              # then finds mountpoint -q already true once it gets the lock.
+              # This only serializes that brief setup race, not any actual job
+              # work -- once mounted, every shard reads from the same mount
+              # fully concurrently for the rest of its run. No shard ever
+              # holds CANINE_BUCKETMOUNT_MOUNTLOCK past this subshell, so a
+              # fresh shard's exclusive acquisition here only ever contends
+              # with other shards currently IN this same setup race, never
+              # with ones already past it and running their own job -- and
+              # since the lock is scoped to this subshell's own fd, it's
+              # released automatically the instant the holder exits for any
+              # reason, including a crash or preemption, so there's no
+              # scenario where it's held forever by a dead process. -w is
+              # purely a defensive bound against a holder that's genuinely
+              # still alive but hung; it is NOT there to bound normal
+              # contention, so it errs generous rather than tight.
+              #
+              # Confirmed live: without this lock, several shards starting
+              # together on one node raced to run gcsfuse on the identical
+              # path concurrently, and every one of them failed --
+              # fusermount3 reported "the user doesn't have write-access on
+              # the mount point: read-only file system" for all of them,
+              # which has nothing to do with the mountpoint's real permissions
+              # or a stale mount; it's what a racing concurrent mount attempt
+              # looks like from the losing side. Also confirmed live: an
+              # earlier, tighter 90s bound was itself too tight -- one shard
+              # among just 8 contenders on one node still timed out waiting,
+              # even though another shard on the same node mounted the same
+              # bucket in under a second, moments earlier. flock gives no
+              # fairness guarantee among waiters, so real wait times under
+              # ordinary contention can run well past what a single mount's
+              # own duration would suggest.
+              "(",
+              'flock -x -w 300 200 || { echo "ERROR: timed out waiting for bucketmount lock" >&2; exit 1; }',
+
+              # The mountpoint must be WRITABLE BY THE USER THAT RUNS gcsfuse.
+              # fusermount3 refuses otherwise ("the user doesn't have
+              # write-access on the mount point: permission denied"), and
+              # gcsfuse below runs unprivileged.
+              #
+              # This differs from the RODISK path above, which `sudo mount`s and
+              # so can leave the mountpoint owned by root. The bucketmount path
+              # inherited the `sudo mkdir` from it but not the `sudo` on the
+              # mount itself, which made every bucket mount fail.
+              #
+              # Deliberately NOT fixed by running `sudo gcsfuse`: mounting as
+              # the invoking user keeps the mount readable by that user without
+              # needing `-o allow_other`, and podman maps the task container's
+              # root to this same UID (--uidmap in wolf/task.py), so the task
+              # container can read it too.
+              # A job that finished on this node moments ago may have unmounted
+              # this same path from under us, leaving a stale FUSE endpoint.
+              # Every subsequent operation on it -- stat, mkdir, even flock --
+              # then fails with ENOTCONN or EACCES rather than ENOENT, so it must
+              # be cleared before the path is touched at all. Observed live as
+              # "mkdir: cannot stat ...: Permission denied" followed by
+              # "flock: ...: Transport endpoint is not connected".
+              'if ! stat ${CANINE_BUCKETMOUNT_DIR} > /dev/null 2>&1 && mount | grep -qF " ${CANINE_BUCKETMOUNT_DIR} "; then',
+              '  echo "WARNING: clearing stale FUSE mount at ${CANINE_BUCKETMOUNT_DIR}" >&2',
+              '  fusermount -uz ${CANINE_BUCKETMOUNT_DIR} 2> /dev/null || sudo umount -l ${CANINE_BUCKETMOUNT_DIR} 2> /dev/null || :',
+              'fi',
+
+              "if [[ ! -d ${CANINE_BUCKETMOUNT_DIR} ]]; then",
+              "sudo mkdir -p ${CANINE_BUCKETMOUNT_DIR}",
+              "fi",
+              "sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_DIR}",
+
+              # unlike RODISK, mounting has no cross-node attach race to
+              # protect against: gcsfuse supports many concurrent read-only
+              # mounts of the same bucket/prefix, so we can just mount if
+              # not already mounted, with no backoff/retry dance
+              "if ! mountpoint -q ${CANINE_BUCKETMOUNT_DIR}; then",
+              # CANINE_BUCKETMOUNT is the bucket name; the whole bucket is
+              # mounted and each input's object path lives in its symlink, so
+              # one gcsfuse process serves every input from this bucket
+              "CANINE_BUCKETMOUNT_BUCKET=${CANINE_BUCKETMOUNT}",
+              # gcsfuse resolves credentials via ADC and does NOT read
+              # CLOUDSDK_CONFIG, so point it explicitly at the credentials the
+              # image stages there. Without this the authenticating identity
+              # depends on whatever ADC happens to resolve to (metadata-server
+              # SA vs. the copied user credentials), which silently works in
+              # one project and fails in another. Mirrors the rclone path in
+              # backends/dockerTransient.py. Scoped to this subshell only --
+              # nothing else in this script reads GOOGLE_APPLICATION_CREDENTIALS.
+              'if [ -z "${GOOGLE_APPLICATION_CREDENTIALS:-}" ] && [ -f "${CLOUDSDK_CONFIG}/application_default_credentials.json" ]; then export GOOGLE_APPLICATION_CREDENTIALS=${CLOUDSDK_CONFIG}/application_default_credentials.json; fi',
+              # 200>&-: the gcsfuse daemon must not inherit the mountlock fd. It
+              # lives for the node's lifetime, so an inherited fd would hold the
+              # lock forever and every other shard waiting here would time out.
+              "timeout -k 60 60 gcsfuse -o ro --implicit-dirs ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} 200>&- || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
+
+              # Slurm (proctrack/cgroup) kills every process in a job's cgroup
+              # when the job ends, including this gcsfuse daemon -- which would
+              # leave every other shard on the node reading a dead mount
+              # ("Transport endpoint is not connected"). Move the daemon to the
+              # root cgroup of each controller Slurm tracks so it outlives the
+              # job that started it. Confirmed live: without this the mount dies
+              # with its first job; with it, a later job still reads it.
+              'for CANINE_GCSFUSE_PID in $(pgrep -f -- "gcsfuse.* ${CANINE_BUCKETMOUNT_DIR}$"); do',
+              '  for CANINE_CG in freezer cpuset memory devices; do',
+              '    [ -f /sys/fs/cgroup/${CANINE_CG}/cgroup.procs ] && echo ${CANINE_GCSFUSE_PID} | sudo tee /sys/fs/cgroup/${CANINE_CG}/cgroup.procs > /dev/null || :',
+              '  done',
+              '  [ -f /sys/fs/cgroup/cgroup.controllers ] && echo ${CANINE_GCSFUSE_PID} | sudo tee /sys/fs/cgroup/cgroup.procs > /dev/null || :',
+              'done',
+              "fi",
+
+              'mountpoint -q ${CANINE_BUCKETMOUNT_DIR} || { echo "ERROR: Bucket mount did not appear!" >&2; exit 1; }',
+              ") 200>${CANINE_BUCKETMOUNT_MOUNTLOCK} || exit 1",
+              "fi",
+
+            ] + self.bucketmount_reachability_check() + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + [
+
+              'echo "INFO: Successfully mounted bucket ${CANINE_BUCKETMOUNT}." >&2',
+
+              "done",
+            ]
+
         ## Symlink common inputs to job inputs
         localization_tasks += [
             'find "$CANINE_COMMON"/ -mindepth 1 -maxdepth 1 -exec sh -c "ln -s {} "$CANINE_JOB_INPUTS"/ || echo \'Could not symlink common input {}\' >&2" \;'
@@ -1360,12 +2851,7 @@ class AbstractLocalizer(abc.ABC):
             "set -e",
             "shopt -s expand_aliases #DEBUG_OMIT",
             "alias gcloud=gcloud_exp_backoff #DEBUG_OMIT"
-          ] + localization_tasks + 
-          (
-            ['gcloud compute disks add-labels "$GCP_DISK_NAME" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}'.format(
-              protect_string = (",protect=yes" if self.protect_disk else "")
-            )] if self.localize_to_persistent_disk and not localization_disk_already_exists else []
-          ) +
+          ] + localization_tasks +
           ( # skip running task script if finished scratch disk already exists via special localizer exit code
             ["exit 15 #DEBUG_OMIT"] if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else []
           )
@@ -1424,9 +2910,13 @@ class AbstractLocalizer(abc.ABC):
                 '  else',
                 '    echo "Read-only disk ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
                 '  fi',
-                'done)'
-            ] + ( disk_teardown_script if self.localize_to_persistent_disk else [] )
-              + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
+                'done)',
+
+                # Bucket mounts are node-lifetime and are never unmounted here
+                # (see the mount loop). Only this job's own bookkeeping is undone:
+                # stop refreshing customTime, then drop its mount leases.
+            ] + self.bucketmount_heartbeat_stop() + self.bucketmount_lease_release() + [
+            ] + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
         return setup_script, localization_script, teardown_script, array_exports
 
