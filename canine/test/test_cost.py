@@ -1268,6 +1268,22 @@ class TestGetLiveDiskInfo:
         assert size_gb == pytest.approx(50.0)
         assert disk_type == "pd-ssd"
 
+    def test_get_live_disk_includes_labels(self):
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.return_value = {
+          "sizeGb": "100", "type": "https://www.googleapis.com/compute/v1/projects/p/zones/z/diskTypes/pd-standard",
+          "labels": {"wolf": "canine", "finished": "yes", "protect": "yes"},
+        }
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            disk = cost.get_live_disk("canine-ref-labels", "us-central1-a", "my-project")
+        assert disk == {"size_gb": 100.0, "type": "pd-standard", "labels": {"wolf": "canine", "finished": "yes", "protect": "yes"}}
+
+    def test_get_live_disk_failure_returns_none(self):
+        fake_client = MagicMock()
+        fake_client.disks.return_value.get.return_value.execute.side_effect = RuntimeError("disk not found")
+        with patch("canine.cost.get_gce_disk_client", return_value=fake_client):
+            assert cost.get_live_disk("canine-gone-labels", "us-central1-a", "my-project") is None
+
     def test_api_failure_returns_none_none(self):
         fake_client = MagicMock()
         fake_client.disks.return_value.get.return_value.execute.side_effect = RuntimeError("disk not found")

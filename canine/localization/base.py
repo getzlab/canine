@@ -147,7 +147,7 @@ class AbstractLocalizer(abc.ABC):
         # jobId : { input : [RODISK URLs] }
         self.rodisk_paths = {}
 
-        # jobId : { "input" / "scratch" / "temporary" : [GCE disk names] },
+        # jobId : { "input" / "scratch" : [GCE disk names] },
         # filled in by job_setup_teardown()
         self.job_disks = {}
 
@@ -1434,15 +1434,17 @@ class AbstractLocalizer(abc.ABC):
         )
 
         # every GCE disk this job's scripts create or mount, for billing-grounded
-        # cost reconciliation (wolf.cost_reconciliation) -- the temporary disk's
-        # name in particular is random and recorded nowhere else
-        scratch_disks = [os.path.basename(scratch_disk_prefix)] if self.use_scratch_disk else []
-        created_input_disks = [os.path.basename(disk_prefix)] if self.localize_to_persistent_disk and disk_prefix is not None else []
-        self.job_disks[jobId] = {
-          "input": sorted(set(created_input_disks) | (set(canine_rodisks) - set(scratch_disks))),
-          "scratch": scratch_disks,
-          "temporary": [disk_name] if disk_name is not None else [],
-        }
+        # cost reconciliation (wolf.cost_reconciliation)
+        # -- bookkeeping only, so never allowed to break job localization
+        try:
+            scratch_disks = [os.path.basename(scratch_disk_prefix)] if self.use_scratch_disk else []
+            created_input_disks = [os.path.basename(disk_prefix)] if self.localize_to_persistent_disk and disk_prefix is not None else []
+            self.job_disks[jobId] = {
+              "input": sorted(set(created_input_disks) | (set(canine_rodisks) - set(scratch_disks))),
+              "scratch": scratch_disks,
+            }
+        except Exception:
+            canine_logging.warning("Could not record disks for job {} (cost tracking only): {}".format(jobId, traceback.format_exc()))
 
         return setup_script, localization_script, teardown_script, array_exports
 

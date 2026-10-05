@@ -829,15 +829,21 @@ def _parse_gce_disk_type(disk_type_url):
 
 
 def get_live_disk_info(disk_name, zone, project, ttl_seconds = 300):
+    """(size_gb, disk_type) from get_live_disk(), or (None, None) on failure."""
+    disk = get_live_disk(disk_name, zone, project, ttl_seconds = ttl_seconds)
+    return (disk["size_gb"], disk["type"]) if disk is not None else (None, None)
+
+
+def get_live_disk(disk_name, zone, project, ttl_seconds = 300):
     """
-    Live (size_gb, disk_type) for a disk resource, via the Compute Engine
-    API -- used to get a worker node's *actual current* boot-disk size,
+    Live {"size_gb", "type", "labels"} for a disk resource, via the Compute
+    Engine API -- used to get a worker node's *actual current* boot-disk size,
     since worker_boot_disk_resize.sh auto-grows it well past its
     provisioning-time default over a long-lived node's lifetime, and that
     growth is recorded nowhere static (not in host_LuT.pickle/nodetypes.json).
 
-    Returns (None, None) on any failure (disk not found, API error, node
-    already torn down) -- never guesses a fallback size.
+    Returns None on any failure (disk not found, API error, node already torn
+    down) -- never guesses a fallback size.
 
     Cached in-process only (not persisted to PRICE_CACHE_PATH like
     get_price()/get_disk_price_per_gb_month(), since a disk's size can
@@ -878,13 +884,13 @@ def get_live_disk_info(disk_name, zone, project, ttl_seconds = 300):
             if cached is not None and now - cached[0] < ttl_seconds:
                 return cached[1]
 
-        result = (None, None)
+        result = None
         last_exc = None
         for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
             try:
                 client = get_gce_disk_client()
                 disk = client.disks().get(project = project, zone = zone, disk = disk_name).execute()
-                result = (float(disk["sizeGb"]), _parse_gce_disk_type(disk.get("type")))
+                result = {"size_gb": float(disk["sizeGb"]), "type": _parse_gce_disk_type(disk.get("type")), "labels": disk.get("labels") or {}}
                 break
             except _TRANSIENT_FETCH_ERRORS as e:
                 last_exc = e
