@@ -1229,7 +1229,13 @@ def estimate_window_cost_usd(price_per_hour, window_start, window_end):
     return price_per_hour * elapsed_hours
 
 
-def estimate_node_undersubscription(node_sacct_snapshot, price_source, host_lut = None, node_types = None):
+# slurm_gcp_docker's slurm.conf SuspendTime: a worker idle this long is deleted
+# (slurm_suspend.sh), and a later job on the same name gets a new VM
+IDLE_NODE_SUSPEND_SECONDS = 240
+
+
+def estimate_node_undersubscription(node_sacct_snapshot, price_source, host_lut = None, node_types = None,
+                                    idle_gap_cap_seconds = IDLE_NODE_SUSPEND_SECONDS):
     """
     node_sacct_snapshot: DataFrame as returned by
       Orchestrator.query_sacct_for_nodes -- one row per job attempt on some set
@@ -1243,6 +1249,11 @@ def estimate_node_undersubscription(node_sacct_snapshot, price_source, host_lut 
     any job while the node was actively hosting work. Does NOT cover time before
     a node's first observed job or after its last (that's only recoverable from
     real node lifetime data, i.e. the reconciliation tool's true_wasted_cost).
+
+    A stretch with no jobs at all on a node counts for at most
+    idle_gap_cap_seconds: past that, Slurm has deleted the idle node, so the
+    rest of the gap cost nothing -- the same node name in use again later is a
+    new VM. node_cost_usd is priced over the same capped time.
 
     Returns a DataFrame, one row per node: node_name, vcpus, mem_mb,
     observed_start, observed_end, node_cost_usd, wasted_cost_usd,
@@ -1301,22 +1312,25 @@ def estimate_node_undersubscription(node_sacct_snapshot, price_source, host_lut 
 
         breakpoints = sorted({iv[0] for iv in intervals} | {iv[1] for iv in intervals})
         wasted_seconds_weighted = 0.0
+        billed_seconds = 0.0
         for t0, t1 in zip(breakpoints[:-1], breakpoints[1:]):
             duration = (t1 - t0).total_seconds()
             if duration <= 0:
                 continue
             active = [iv for iv in intervals if iv[0] <= t0 < iv[1]]
+            if not active:
+                duration = min(duration, idle_gap_cap_seconds)
+            billed_seconds += duration
             alloc_cpu_sum = sum(iv[2] for iv in active)
             alloc_mem_sum = sum(iv[3] for iv in active)
             utilization = max(alloc_cpu_sum / vcpus, alloc_mem_sum / mem_mb)
             waste_fraction = max(0.0, 1.0 - min(utilization, 1.0))
             wasted_seconds_weighted += waste_fraction * duration
 
-        node_window_seconds = (observed_end - observed_start).total_seconds()
         results.append({
           "node_name": node_name, "vcpus": vcpus, "mem_mb": mem_mb,
           "observed_start": observed_start, "observed_end": observed_end,
-          "node_cost_usd": (price_per_hour / 3600) * node_window_seconds,
+          "node_cost_usd": (price_per_hour / 3600) * billed_seconds,
           "wasted_cost_usd": (price_per_hour / 3600) * wasted_seconds_weighted,
           "missing_capacity_data": False, "is_provisional": False,
         })

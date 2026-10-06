@@ -894,6 +894,27 @@ class TestEstimateNodeUndersubscription:
         # wasted = 100s * (1-0.5) + 100s * (1-1.0) = 50 + 0 = 50
         assert row["wasted_cost_usd"] == pytest.approx(50.0)
 
+    def test_short_idle_gap_between_jobs_is_fully_wasted(self):
+        # 60s with no jobs: the node is still up (under SuspendTime), so it's billed and idle
+        snapshot = make_node_snapshot([
+          {"NodeList": "workerX", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T00:01:40", "AllocTRES": "cpu=4,mem=8192M"},
+          {"NodeList": "workerX", "Start": "2026-01-01T00:02:40", "End": "2026-01-01T00:04:20", "AllocTRES": "cpu=4,mem=8192M"},
+        ])
+        row = cost.estimate_node_undersubscription(snapshot, self.price_source, host_lut=self.host_lut, node_types=self.node_types).iloc[0]
+        assert row["wasted_cost_usd"] == pytest.approx(60.0)
+        assert row["node_cost_usd"] == pytest.approx(260.0)
+
+    def test_long_idle_gap_capped_at_suspend_time(self):
+        # 2h with no jobs: Slurm deleted the node after 240s idle; the later
+        # job on the same name ran on a new VM, so only 240s was ever billed idle
+        snapshot = make_node_snapshot([
+          {"NodeList": "workerX", "Start": "2026-01-01T00:00:00", "End": "2026-01-01T00:01:40", "AllocTRES": "cpu=4,mem=8192M"},
+          {"NodeList": "workerX", "Start": "2026-01-01T02:01:40", "End": "2026-01-01T02:03:20", "AllocTRES": "cpu=4,mem=8192M"},
+        ])
+        row = cost.estimate_node_undersubscription(snapshot, self.price_source, host_lut=self.host_lut, node_types=self.node_types).iloc[0]
+        assert row["wasted_cost_usd"] == pytest.approx(240.0)
+        assert row["node_cost_usd"] == pytest.approx(440.0)  # 200s of jobs + 240s idle
+
     def test_overlapping_jobs_hand_calculated(self):
         # job C: [0,100) cpu=1,mem=1024M (frac 0.25/0.125 -> util 0.25)
         # job D: [50,150) cpu=1,mem=1024M (same fracs)
