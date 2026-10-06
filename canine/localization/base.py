@@ -1692,6 +1692,34 @@ class AbstractLocalizer(abc.ABC):
         indirect = [x for x in upload_plan if x.kind == "mount"]
         if indirect:
             uploads += [
+              # Clear a mount a previous job left at this path. A cancelled or
+              # killed upload leaves its gcsfuse mount behind with the daemon dead,
+              # and every later job for this bucket on this node then failed at the
+              # mkdir below: FUSE mounts refuse other users, root included, so it
+              # got "cannot stat ... Permission denied" (wolf2 tonly-dih,
+              # 2026-10-06, 15 such mounts across 13 nodes after a run was stopped).
+              #
+              # canine_rw_unmount unmounts the upload mount at $CANINE_BUCKET_RW_MOUNT,
+              # if one is there; the release trap calls it too. Found through
+              # mountinfo, not mountpoint or stat, which the FUSE mount refuses.
+              # Lazy, so a dead daemon or a process still in the directory can't
+              # block it.
+              #
+              # Whatever is mounted here is always cleared, even with a gcsfuse
+              # still attached. Only the job holding this bucket's upload claim gets
+              # this far, and it took the claim only after the previous holder's
+              # heartbeat had been dead for BUCKET_HEARTBEAT_STALE, so nothing still
+              # mounted here owns the upload. LocalizeToBucket's jobs are also
+              # exclusive, so there no other job is even on the node.
+              '    canine_rw_unmount() {',
+              '      local mp="${CANINE_BUCKET_RW_MOUNT:-}"',
+              '      [ -n "$mp" ] || return 0',
+              '      awk -v m="$mp" \'$5 == m {f = 1} END {exit !f}\' "${CANINE_MOUNTINFO:-/proc/self/mountinfo}" || return 0',
+              '      [ "$1" == "leftover" ] && echo "INFO: unmounting $mp, left by an earlier job" >&2',
+              '      fusermount -zu "$mp" 2> /dev/null || sudo umount -l "$mp" 2> /dev/null || :',
+              '    }',
+              '    CANINE_BUCKET_RW_MOUNT={md}'.format(md = shlex.quote(mount_dir)),
+              '    canine_rw_unmount leftover',
               '    sudo mkdir -p {md}'.format(md = shlex.quote(mount_dir)),
               '    sudo chown $(id -u):$(id -g) {md}'.format(md = shlex.quote(mount_dir)),
               # NO `--o ro` here, unlike the consumer mount. Kept on its own
@@ -1701,6 +1729,8 @@ class AbstractLocalizer(abc.ABC):
               # read-only, and nothing writable should outlive this block.
               '    timeout -k 60 60 gcsfuse --implicit-dirs {b} {md} || {{ echo "ERROR: rw bucket mount failed!" >&2; exit 1; }}'.format(
                 b = shlex.quote(bucket), md = shlex.quote(mount_dir)),
+              # from here on the mount is this job's, for the release trap to undo
+              '    CANINE_BUCKET_RW_MOUNTED=1',
             ]
             for item in indirect:
                 in_mount = os.path.join(mount_dir, item.dest[len("gs://" + bucket + "/"):])
@@ -1882,6 +1912,13 @@ class AbstractLocalizer(abc.ABC):
           # survives.
           '    canine_bucket_release() {',
           '      kill $CANINE_BUCKET_HB_PID 2> /dev/null || :',
+          # Before anything else: a mount left behind blocks every later upload
+          # of this bucket on this node (see canine_rw_unmount). Only one this job
+          # made: a job requeueing because another job's mount is live must not
+          # take that one down on its way out. Best effort: SIGKILL, which scancel
+          # sends once KillWait runs out, skips the trap, which is why the next
+          # job also clears a leftover before it mounts.
+          '      [ "${CANINE_BUCKET_RW_MOUNTED:-0}" != "1" ] || canine_rw_unmount',
           '      if [ "${CANINE_BUCKET_DONE:-0}" != "1" ]; then',
           '        echo "WARNING: the upload into {b} did not finish; releasing it so the next job takes over at once" >&2'.format(b = bucket),
           '        canine_bucket_label --update-labels=wolf=stale || :',

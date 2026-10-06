@@ -432,6 +432,7 @@ No server-side copy exists, so this VM has to move the bytes — but still not v
 is mounted **read-write** on its own mountpoint and the download is written straight into it:
 
 ```bash
+canine_rw_unmount leftover                            # clear a mount an earlier job left here
 sudo mkdir -p /mnt/localize/<bucket>
 sudo chown $(id -u):$(id -g) /mnt/localize/<bucket>
 timeout -k 60 60 gcsfuse --implicit-dirs <bucket> /mnt/localize/<bucket>
@@ -440,6 +441,15 @@ fusermount -u /mnt/localize/<bucket>
 gcloud storage ls <each object>                       # objects only exist after the unmount
 gcloud storage objects update <objects> --custom-time="$CANINE_BUCKET_CT"
 ```
+
+**A mount left at that path is cleared first.** A cancelled or killed upload leaves its gcsfuse
+mount behind, with the daemon dead. FUSE refuses every user but the mount's owner, root
+included, so the `mkdir` then fails with `cannot stat … Permission denied`. That failure
+repeated for every later upload of that bucket on that node. `canine_rw_unmount` finds the mount
+through `mountinfo` and unmounts it lazily, even with a gcsfuse still attached: only the claim
+holder reaches this point, so nothing mounted there owns the upload. The release trap also
+unmounts this job's own mount when the job is cancelled. That's best effort, since `SIGKILL`
+skips the trap, so the next job clears leftovers too (`PARALLEL_LOCALIZATION.md` §13.93).
 
 Four things worth knowing:
 

@@ -6744,7 +6744,59 @@ Against the code before the fix, the two settle tests fail and the error-message
 import. The routing test also fails against an intermediate version that raised `CommandError`
 but still wrote raw stderr. The full pure suite is 1743 passed, 1 skipped.
 
-### 13.93 Summary: speedups versus the original localization
+### 13.93 Upload mounts left behind by a cancelled run
+
+**Seen on `tonly-dih`, 2026-10-06.** A run was stopped mid-localization, and its tumor-BAM
+uploads were cancelled (`CANCELLED by 1002`). After the restart, uploads of those same samples
+failed on the same nodes at the first step of the read-write mount:
+
+```
+sudo mkdir -p /mnt/localize/<bucket>
+mkdir: cannot stat '/mnt/localize/<bucket>': Permission denied
+```
+
+The cancelled jobs' gcsfuse mounts were still in `mountinfo`, with no gcsfuse process behind
+them. A FUSE mount refuses every user but its owner, root included unless `allow_other` is set,
+so even `sudo` couldn't `stat` the path. The release trap gave up the claim and labeled the
+bucket `stale`, but never unmounted. One bucket per sample means the same path each time, so
+every retry of that sample that landed on the same node failed the same way.
+
+There were 15 such mounts across workers 3001–3013, which were cleared by hand: a lazy unmount
+of each mount no gcsfuse served, leaving live ones alone.
+
+**The fix** (`bucket_upload_script`):
+
+* `canine_rw_unmount` is emitted only when the plan has an upload mount. It finds the mount
+  through `mountinfo`, not `mountpoint` or `stat` (which the FUSE mount refuses), and unmounts it
+  lazily: `fusermount -zu`, then `sudo umount -l`.
+* **Before mounting,** it clears anything at the path. Even a mount with gcsfuse still attached
+  is cleared. Only the job holding the upload claim gets this far, and it took the claim only
+  after the previous holder's heartbeat had been dead for `BUCKET_HEARTBEAT_STALE`. A mount still
+  there owns nothing, and `LocalizeToBucket`'s jobs are exclusive anyway. A first version
+  requeued (exit 5) when a live process served the mount; that would have left a node with an
+  orphaned daemon unable to localize that bucket, and was dropped.
+* **The release trap** also unmounts, but only a mount this job made (`CANINE_BUCKET_RW_MOUNTED`).
+  It's best effort: `SIGKILL`, which `scancel` sends once `KillWait` runs out, skips it, which is
+  why the next job clears leftovers too. The read-only consumer mounts already had the equivalent
+  handling (`fusermount -uz` of a dead mount, under the mount lock).
+
+**Tests:** 4 new (`TestALeftoverUploadMount`), against a stubbed `fusermount`/`pgrep` and a fake
+`mountinfo`:
+
+* a dead leftover unmounted before this job mounts;
+* nothing unmounted when nothing is there;
+* a leftover with gcsfuse still attached cleared too;
+* a cancelled upload unmounting on its way out.
+
+Three of the four fail against the code before the fix. The cancel test signals only once the
+download process is running. Signaling in the instant between two commands is a separate,
+test-only race, in which macOS's bash 3.2 skipped the `EXIT` trap in 3 of 20 runs.
+
+The emitted script also passed `bash -n` under bash 5.1 on a worker, and the function behaved
+correctly there against a fake `mountinfo`, including leaving alone a sibling path
+(`…abcd`) that shares the prefix. The full pure suite is 1747 passed, 1 skipped.
+
+### 13.94 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

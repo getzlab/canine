@@ -1975,3 +1975,89 @@ class TestAJobWithNothingToUpload:
         loc = self._localizer(monkeypatch, tmp_path, {"0": {"t_bam": ["/mnt/nfs/ws/t.bam"]}})
         monkeypatch.setenv("CANINE_DISABLE_CONTROLLER_LOCALIZATION", "1")   # after _localizer clears it
         assert loc.resolve_on_controller("0") is False
+
+
+class TestALeftoverUploadMount:
+    '''
+    A cancelled or killed upload left its read-write gcsfuse mount behind, with the
+    daemon dead, and every later job for that bucket on that node failed at
+    `sudo mkdir -p /mnt/localize/<bucket>`: a FUSE mount refuses other users, root
+    included, so it got "cannot stat ... Permission denied". Seen on tonly-dih,
+    2026-10-06: 15 such mounts across 13 nodes after a run was stopped.
+    '''
+    B = "wolf-1-us-central1-abc"
+    MP = "/mnt/localize/" + B
+
+    def _run(self, tmp_path, mounted=False, live=False, background=False,
+             command='touch "$FAKE_STATE/populated"', **fake):
+        import os
+        import subprocess
+        path, state = install_fake_gcs(tmp_path, **fake)
+        bin_dir = tmp_path / "bin"
+        (bin_dir / "fusermount").write_text('#!/bin/bash\necho "$@" >> "$FAKE_STATE/fusermount.log"\n')
+        (bin_dir / "pgrep").write_text("#!/bin/bash\nexit {}\n".format(0 if live else 1))
+        for stub in ("fusermount", "pgrep"):
+            os.chmod(str(bin_dir / stub), 0o755)
+        mountinfo = tmp_path / "mountinfo"
+        mountinfo.write_text(
+            "25 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+            + ("900 25 0:61 / {} rw,nosuid - fuse.gcsfuse {} rw,user_id=1002\n".format(self.MP, self.B) if mounted else ""))
+        item = s3_item(dest="gs://{}/inp/reads.bam".format(self.B), command=command)
+        argv = ["bash", "-c", "set -e\n" + script_for([item]) + "\necho CANINE_SCRIPT_DONE"]
+        env = dict(os.environ, PATH=path, FAKE_STATE=str(state), CANINE_MOUNTINFO=str(mountinfo))
+        if background:
+            return subprocess.Popen(argv, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, start_new_session=True), state
+        return subprocess.run(argv, env=env, capture_output=True, text=True, timeout=120), state
+
+    @staticmethod
+    def _unmounts(state):
+        log = state / "fusermount.log"
+        return log.read_text().splitlines() if log.exists() else []
+
+    def test_a_dead_leftover_is_unmounted_before_mounting(self, tmp_path):
+        proc, state = self._run(tmp_path, mounted=True)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert "left by an earlier job" in proc.stderr
+        unmounts = self._unmounts(state)
+        assert unmounts[0] == "-zu " + self.MP, unmounts          # before this job's own mount
+
+    def test_nothing_is_unmounted_when_nothing_is_there(self, tmp_path):
+        proc, state = self._run(tmp_path, mounted=False)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert "left by an earlier job" not in proc.stderr
+        assert not any(u.startswith("-zu") for u in self._unmounts(state))
+
+    def test_a_leftover_with_its_gcsfuse_still_attached_is_cleared_too(self, tmp_path):
+        '''
+        Only the claim holder mounts, and it took the claim after the previous holder's
+        heartbeat died, so an attached daemon (e.g. orphaned by a cancel) owns nothing.
+        LocalizeToBucket's jobs are exclusive, too. Requeueing instead left the node
+        unable to localize that bucket.
+        '''
+        proc, state = self._run(tmp_path, mounted=True, live=True)
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        assert self._unmounts(state)[0] == "-zu " + self.MP
+
+    def test_a_cancelled_upload_unmounts_on_its_way_out(self, tmp_path):
+        '''scancel sends SIGTERM; the release trap now unmounts as well as releasing the claim.'''
+        import os
+        import signal
+        import time
+        proc, state = self._run(tmp_path, mounted=False, background=True, command='touch "$FAKE_STATE/downloading"; /bin/sleep 30')
+        mountinfo = tmp_path / "mountinfo"
+        import subprocess
+        deadline = time.time() + 60
+        # mounted, and the download running: signalling in the instant between two
+        # commands is a different, test-only race (bash 3.2 then skips the EXIT trap)
+        while time.time() < deadline and subprocess.run(
+                ["pgrep", "-g", str(proc.pid), "-f", "^/bin/sleep 30$"], capture_output=True).returncode:
+            time.sleep(0.1)
+        assert (state / "downloading").exists(), "the download never started"
+        mountinfo.write_text(mountinfo.read_text()                 # this job's own mount is up
+                             + "900 25 0:61 / {} rw - fuse.gcsfuse {} rw\n".format(self.MP, self.B))
+        os.killpg(proc.pid, signal.SIGTERM)
+        _, err = proc.communicate(timeout=30)
+        assert proc.returncode != 0
+        assert "-zu " + self.MP in self._unmounts(state), err
+        assert fake_labels(state).get("wolf") == "stale"
