@@ -2543,7 +2543,11 @@ class BucketChunkSink(PartHashingSink):
             tracker = self._digests.get(index)
             if tracker is None and offset == start:
                 tracker = self._digests[index] = {"md5": hashlib.md5(), "next": start}
-            if tracker is not None:
+            # Truthy, not "is not None": a part that stopped being contiguous is
+            # marked False, and indexing that crashed the download on the part's next
+            # write -- after every PUT GCS persisted only part of (a broken pipe), which
+            # rewinds the chunk to the persisted offset.
+            if tracker:
                 if tracker["next"] == offset:
                     tracker["md5"].update(buf)
                     tracker["next"] = offset + len(buf)

@@ -54,6 +54,9 @@ class FakeGcs:
         self.commit_granularity = GRANULARITY
         self.fail_next_upload = 0    # return 503 for the next N uploads
         self.truncate_uploads_to = None   # commit only this many bytes per PUT
+        # ...but only for this many PUTs, if set: a single broken pipe rather than a
+        # connection that never gets a whole PUT through
+        self.truncate_uploads_remaining = None
         # Succeed for this many uploads, then fail everything after. This is the knob
         # that models "the attempt died partway through": some parts are genuinely
         # partially persisted, which fail_next_upload cannot produce because it refuses
@@ -350,7 +353,9 @@ def make_handler(state):
                 buf[start:end + 1] = body
 
                 sent_to = end + 1
-                if state.truncate_uploads_to is not None:
+                if state.truncate_uploads_to is not None and state.truncate_uploads_remaining != 0:
+                    if sent_to > start + state.truncate_uploads_to and state.truncate_uploads_remaining:
+                        state.truncate_uploads_remaining -= 1
                     sent_to = min(sent_to, start + state.truncate_uploads_to)
 
                 if total is not None and sent_to >= total:

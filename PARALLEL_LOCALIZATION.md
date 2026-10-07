@@ -6796,7 +6796,48 @@ The emitted script also passed `bash -n` under bash 5.1 on a worker, and the fun
 correctly there against a fake `mountinfo`, including leaving alone a sibling path
 (`…abcd`) that shares the prefix. The full pure suite is 1747 passed, 1 skipped.
 
-### 13.94 Summary: speedups versus the original localization
+### 13.94 A partly persisted PUT crashed the bucket-compose route
+
+**Seen on `tonly-dih`, 2026-10-06.** Two of the run's 28 tumor-BAM localizations (`B6FE`, `B6OZ`;
+365 GB each) died about 30 minutes in, at 17–19%, with an "unexpected failure" and ran out of
+task retries:
+
+```
+[k9pdl] chunk 252: PUT https://storage.googleapis.com/upload/... -> <urlopen error [Errno 32] Broken pipe> -- retrying
+...
+  File "parallel_download.py", line 2547, in write
+    if tracker["next"] == offset:
+TypeError: 'bool' object is not subscriptable
+```
+
+**The cause.** `BucketChunkSink.write` keeps a running md5 of each part while its writes stay
+contiguous from the part's start. A PUT that GCS persisted only part of (here a broken pipe)
+rewinds the chunk to the persisted offset, and that write isn't contiguous, so hashing stops
+for the part by storing `False`. The guard was `if tracker is not None`, which `False` passes,
+so the part's next write indexed `False["next"]` and the download crashed. That turned a
+transient error into a permanent failure. `PartHashingSink._hash`, the S3-part hashing, already
+used `if tracker:`.
+
+**The fix:** `if tracker:`. A rewound part has no running digest (`part_digest` returns
+`None`), so verification falls back to the read-back pass, as it already did for a part resumed
+from an earlier attempt.
+
+**Why no test caught it:** the fake GCS could already persist only part of each PUT
+(`truncate_uploads_to`), but no test used it. It now also has `truncate_uploads_remaining`, to
+cut short only the first N PUTs, which is one broken pipe rather than a connection that never
+gets a PUT through.
+
+**Tests:** 3 new (`TestAPartlyPersistedPutResumesInProcess`):
+
+* a full run with the first 3 PUTs cut short completes with the right bytes, and checks that a
+  PUT really was cut short;
+* a rewound part has no digest, and writes after the rewind go on;
+* a contiguous part still gets its digest.
+
+The first two fail against the code before the fix with the production `TypeError`. The full
+pure suite is 1750 passed, 1 skipped.
+
+### 13.95 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

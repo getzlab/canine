@@ -3961,3 +3961,72 @@ class TestDecodeSlicesStartFromTheCompressedSize:
         assert seen == [(len(body), 4)], "not given the compressed size"
         assert built == [1 * MIB], "the uploader did not start at the size it was given"
         assert gcs.state.objects["c.txt"] == plain
+
+
+class TestAPartlyPersistedPutResumesInProcess:
+    """
+    A PUT that GCS persists only part of -- a broken pipe mid-upload -- makes the chunk
+    rewind to the offset GCS reports and carry on. That rewound write is no longer
+    contiguous with the chunk's running md5, so hashing stops for the chunk. It used to
+    stop by storing False and then index it on the next write
+    (`'bool' object is not subscriptable`), crashing the download as an unexpected
+    failure instead of resuming. Seen on tonly-dih, 2026-10-06: two 365 GB tumor BAMs
+    failed this way after a `Broken pipe` on one PUT, and ran out of task retries.
+    """
+
+    def test_the_download_completes_with_the_right_bytes(
+            self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        force_bucket_route(monkeypatch)
+        # the first PUTs to go out each persist one 256 KiB granule of a 1 MiB block,
+        # so those chunks rewind mid-part and carry on, as after a broken pipe
+        gcs.state.truncate_uploads_to = pdl.GCS_UPLOAD_GRANULARITY
+        gcs.state.truncate_uploads_remaining = 3
+        with Server(payload) as source:
+            rc = pdl.run(options_for(
+                str(tmp_path / "sample.bam"), source.url(), len(payload),
+                check_md5=payload_md5, upload_block=MIB, min_chunk=4 * MIB))
+        assert rc == pdl.EXIT_OK
+        assert gcs.state.truncate_uploads_remaining == 0, "no PUT was cut short"
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+
+    def test_the_rewound_part_has_no_digest_and_writes_go_on(self):
+        """The unit: a non-contiguous write ends hashing for the part, nothing else."""
+        class Client:
+            def start_resumable_upload(self, bucket, name):
+                return "session"
+
+            def upload_range(self, session, buf, rel, total):
+                return None, rel + len(buf)
+
+        class Manifest:
+            def session_uri(self, index):
+                return None
+
+            def record_session(self, index, session):
+                pass
+
+        sink = pdl.BucketChunkSink(Client(), BUCKET, "p", Manifest(), [(0, 4 * MIB)])
+        sink.write(0, 0, b"a" * MIB)
+        sink.write(0, MIB // 2, b"b" * MIB)             # rewound: not contiguous
+        sink.write(0, MIB // 2 + MIB, b"c" * MIB)       # crashed here before
+        assert sink.part_digest(0) is None
+
+    def test_a_contiguous_part_still_gets_its_digest(self):
+        class Client:
+            def start_resumable_upload(self, bucket, name):
+                return "session"
+
+            def upload_range(self, session, buf, rel, total):
+                return None, rel + len(buf)
+
+        class Manifest:
+            def session_uri(self, index):
+                return None
+
+            def record_session(self, index, session):
+                pass
+
+        sink = pdl.BucketChunkSink(Client(), BUCKET, "p", Manifest(), [(0, 2 * MIB)])
+        sink.write(0, 0, b"a" * MIB)
+        sink.write(0, MIB, b"b" * MIB)
+        assert sink.part_digest(0) == hashlib.md5(b"a" * MIB + b"b" * MIB).hexdigest()
