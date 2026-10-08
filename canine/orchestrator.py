@@ -947,7 +947,14 @@ class Orchestrator(object):
                           sep = "\t"
                         )
 
-                        if o_df.set_index("output").loc[:, "pattern"].to_dict() == self.raw_outputs:
+                        # the manifest records patterns as the job saw them, with
+                        # $CANINE_JOB_ROOT (stdout/stderr's default) expanded
+                        job_root = os.path.join(localizer.environment("remote")["CANINE_JOBS"], i)
+                        declared = {
+                          k : v.replace("${CANINE_JOB_ROOT}", job_root).replace("$CANINE_JOB_ROOT", job_root)
+                          for k, v in self.raw_outputs.items()
+                        }
+                        if o_df.set_index("output").loc[:, "pattern"].to_dict() == declared:
                             js_df.at[i, "output_ok"] = True
 
                         # ...and for a scratch-disk job, only if its copies are really there.

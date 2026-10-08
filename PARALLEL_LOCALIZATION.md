@@ -6876,6 +6876,19 @@ way a finished job leaves it:
 
 The two new behaviors fail against the old code. The full pure suite is 1758 passed, 1 skipped.
 
+**Correction: the manifest check never passed.** On the next rerun, the same `dRangerRun` was
+still not avoided, though its exit codes were 0 and both copies were present. `job_avoid`
+compared the manifest's patterns with the declared ones, and the manifest records
+`stdout`/`stderr` with `$CANINE_JOB_ROOT` expanded (`/mnt/nfs/.../jobs/0/stdout`), so the two
+never matched, for any job. An ordinary job was unaffected: a finished job that fails the check
+is marked `re_deloc` instead of `noop`, and both are skipped alike; nothing else reads
+`re_deloc`. The scratch-disk branch above treated the mismatch as a failure, so it marked
+every such job failed, and deleted its `jobs/<id>` with its logs. The check now expands
+`$CANINE_JOB_ROOT` to the job's directory before comparing. The tests had missed it because
+their manifest recorded `stdout` unexpanded; it now records it as a real one does, and a test
+that a manifest with a changed pattern still reruns the job was added. The full pure suite is
+1759 passed, 1 skipped.
+
 ### 13.96 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream

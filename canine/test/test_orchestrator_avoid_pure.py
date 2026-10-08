@@ -17,8 +17,8 @@ PathType = namedtuple("PathType", ["localpath", "remotepath"])
 OUTPUTS = {
     "mat_file": "*.dRanger_results.mat",
     "forBP_file": "*.dRanger_results.forBP.txt",
-    "stdout": "../stdout",
-    "stderr": "../stderr",
+    "stdout": "$CANINE_JOB_ROOT/stdout",
+    "stderr": "$CANINE_JOB_ROOT/stderr",
 }
 
 
@@ -80,15 +80,16 @@ def finished_job(root, job="0", workspace=False, exit_codes=(0, 0, 0), copied=("
         if name in copied:
             (root / "outputs" / rel).parent.mkdir(parents=True, exist_ok=True)
             (root / "outputs" / rel).write_text("x")
+    # The delocalizer records stdout/stderr's pattern expanded, not as declared.
     for name in ("stdout", "stderr"):
-        rows.append("{}\t{}\t{}\t{}/{}".format(job, name, OUTPUTS[name], job, name))
+        rows.append("{}\t{}\t{}\t{}/{}".format(job, name, jobs / name, job, name))
     (out / ".canine_job_manifest").write_text("\n".join(rows) + "\n")
 
 
-def avoid(root, **localizer):
+def avoid(root, outputs=OUTPUTS, **localizer):
     orch = object.__new__(Orchestrator)
     orch.job_spec = {"0": {"individual": "S"}}
-    orch.raw_outputs = dict(OUTPUTS)
+    orch.raw_outputs = dict(outputs)
     n, _ = orch.job_avoid(Localizer(root, **localizer))
     return n, orch.job_spec
 
@@ -112,6 +113,12 @@ class TestAScratchDiskJobWithEveryOutputOnNfs:
                         files_to_copy_to_outputs={"mat_file", "forBP_file"})
         assert n == 0 and spec["0"] is not None
         assert not (tmp_path / "jobs" / "0").exists(), "a failed job's directory is purged"
+
+    def test_is_rerun_when_its_declared_outputs_changed(self, tmp_path):
+        finished_job(tmp_path)
+        n, spec = avoid(tmp_path, outputs={**OUTPUTS, "mat_file": "*.mat"}, use_scratch_disk=True,
+                        files_to_copy_to_outputs={"mat_file", "forBP_file"})
+        assert n == 0 and spec["0"] is not None
 
     def test_is_rerun_when_it_failed(self, tmp_path):
         finished_job(tmp_path, exit_codes=(1, 0, 0))
