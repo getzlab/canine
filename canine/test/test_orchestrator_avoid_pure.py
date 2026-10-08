@@ -145,6 +145,32 @@ class TestUnchangedCases:
         assert n == 1 and spec["0"] is None
 
 
+class TestOverwrite:
+    """With avoidance off, previous jobs are cleared; the warning is the caller's choice."""
+
+    @staticmethod
+    def _overwrite(tmp_path, monkeypatch, **kwargs):
+        finished_job(tmp_path, workspace=True)
+        logged = {"warning": [], "info1": []}
+        for level in logged:
+            monkeypatch.setattr("canine.orchestrator.canine_logging." + level, logged[level].append)
+        orch = object.__new__(Orchestrator)
+        orch.job_spec = {"0": {"individual": "S"}}
+        orch.raw_outputs = dict(OUTPUTS)
+        n, _ = orch.job_avoid(Localizer(tmp_path, use_scratch_disk=False), overwrite=True, **kwargs)
+        assert n == 0 and not (tmp_path / "jobs").exists()
+        return logged
+
+    def test_warns_by_default(self, tmp_path, monkeypatch):
+        logged = self._overwrite(tmp_path, monkeypatch)
+        assert any("rerunning them" in m for m in logged["warning"])
+
+    def test_only_logs_when_the_caller_avoids_its_own_way(self, tmp_path, monkeypatch):
+        logged = self._overwrite(tmp_path, monkeypatch, warn_overwrite=False)
+        assert logged["warning"] == []
+        assert any("Clearing staging directory" in m for m in logged["info1"])
+
+
 class TestAJobStoppedAtThePreemptionLimit:
     """
     The entrypoint stops a job preempted CANINE_PREEMPT_LIMIT times with exit 123,

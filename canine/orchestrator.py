@@ -876,10 +876,13 @@ class Orchestrator(object):
                                  settled, len(self.job_spec)))
         return settled
 
-    def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)
+    def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False, warn_overwrite: bool = True) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)
         """
         Detects jobs which have previously been run in this staging directory.
         Succeeded jobs are skipped. Failed jobs are reset and rerun
+        warn_overwrite: warn when overwrite clears previous jobs. A caller that
+          avoids jobs its own way (wolF's LocalizeToBucket checks its bucket)
+          passes False, since its jobs may not rerun.
         """
         old_job_spec = copy.deepcopy(self.job_spec)
         n_avoided = 0
@@ -887,7 +890,11 @@ class Orchestrator(object):
         with localizer.transport_context() as transport:
             # remove all output if specified
             if overwrite:
-                canine_logging.warning("Job avoidance disabled for this task; overwriting output.")
+                (canine_logging.warning if warn_overwrite else canine_logging.info1)(
+                  "Job avoidance disabled for this task; clearing its previous jobs and rerunning them."
+                  if warn_overwrite else
+                  "Clearing staging directory {}; its previous jobs are not reused.".format(localizer.staging_dir)
+                )
                 if transport.isdir(localizer.staging_dir):
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
