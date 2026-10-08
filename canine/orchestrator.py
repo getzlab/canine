@@ -745,9 +745,25 @@ class Orchestrator(object):
             # dict with blanks
             missing_outputs = job_spec.keys() - outputs.keys()
             if missing_outputs:
-                canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
-                  len(missing_outputs), len(job_spec)
-                ))
+                # A job stopped by the entrypoint for exceeding CANINE_PREEMPT_LIMIT
+                # (exit 123) never reaches delocalization either, but it isn't lost:
+                # say so, rather than leave the real cause to the next log line.
+                array_ids = { job_id : i for i, job_id in enumerate(job_spec) }
+                def exit_code(job_id):
+                    try:
+                        return str(acct['ExitCode'][str(batch_id) + '_' + str(array_ids[job_id])]).split(":")[0]
+                    except Exception:
+                        return ""
+                over_limit = sorted(j for j in missing_outputs if exit_code(j) == "123")
+                lost = len(missing_outputs) - len(over_limit)
+                if over_limit:
+                    canine_logging.error("{}/{} job(s) stopped after reaching the preemption limit (exit 123), before producing outputs: {}".format(
+                      len(over_limit), len(job_spec), ", ".join(over_limit)
+                    ))
+                if lost:
+                    canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
+                      lost, len(job_spec)
+                    ))
                 outputs = { **outputs, **{ k : {} for k in missing_outputs } }
 
             batch_id = str(batch_id) # in case it's set to special value -2
@@ -893,12 +909,21 @@ class Orchestrator(object):
                     # if everything succeeded, with matching outputs, we're done
                     # TODO
 
-                    # check for failed shards 
+                    # A scratch-disk job's workspace is on its disk, so jobs/<id>/workspace
+                    # never exists on NFS, and such a job used to be avoidable only while
+                    # its disk survived -- which the lab's cost-monitoring app deletes about
+                    # a day after last use, so a later rerun redid the work. If every
+                    # output it declares is copied back to NFS (files_to_copy_to_outputs),
+                    # those copies are a complete record of it: avoid it on them instead.
+                    scratch_outputs_on_nfs = bool(getattr(localizer, "use_scratch_disk", False)) and \
+                      set(self.raw_outputs) - {"stdout", "stderr"} <= set(getattr(localizer, "files_to_copy_to_outputs", None) or ())
+
+                    # check for failed shards
                     for i in js_df.index:
                         # if workspace directory is missing, consider shard failed
                         # this is to disable job avoidance for jobs that write to scratch
                         # directories, which do not generate a workspace directory.
-                        if not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
+                        if not scratch_outputs_on_nfs and not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
                             js_df.at[i, "failed"] = True
 
                         # otherwise, make sure all three exit code are OK
@@ -924,6 +949,16 @@ class Orchestrator(object):
 
                         if o_df.set_index("output").loc[:, "pattern"].to_dict() == self.raw_outputs:
                             js_df.at[i, "output_ok"] = True
+
+                        # ...and for a scratch-disk job, only if its copies are really there.
+                        # Its delocalizer cannot be rerun without the disk, so one with
+                        # anything missing is rerun in full rather than re-delocalized.
+                        if scratch_outputs_on_nfs:
+                            copies = o_df.loc[~o_df["output"].isin(["stdout", "stderr"]), "path"]
+                            if not (js_df.at[i, "output_ok"] and all(
+                              transport.exists(os.path.join(output_dir, p)) for p in copies)):
+                                js_df.at[i, "output_ok"] = False
+                                js_df.at[i, "failed"] = True
 
                     # shards that both succeeded and have matching outputs can be noop'd
                     # in the job spec

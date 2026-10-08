@@ -6837,7 +6837,46 @@ gets a PUT through.
 The first two fail against the code before the fix with the production `TypeError`. The full
 pure suite is 1750 passed, 1 skipped.
 
-### 13.95 Summary: speedups versus the original localization
+### 13.95 Avoiding a scratch-disk job without its disk; naming the preemption limit
+
+From the same run on `tonly-dih`, 2026-10-08. Neither change is about localization, but both
+came out of it.
+
+**A scratch-disk job reran because its disk was gone.** `dRangerRun` for `B6OS` finished on
+Oct 7, and both its outputs were copied to NFS (`files_to_copy_to_outputs`). At 6:08 PM EDT
+that day, `cost-monitoring-app@broad-getzlab-cost-monitoring` deleted its scratch disk, as it
+does to any idle `canine-*` disk not labeled `protect=yes`. When the workflow ran again the next
+day, `dRangerRun` was redone from scratch. `job_avoid` marks a job failed when
+`jobs/<id>/workspace` doesn't exist, and a scratch-disk job's workspace lives on the disk, so
+such a job could only be skipped through the disk itself.
+
+Now, when a task uses a scratch disk and every output it declares except `stdout`/`stderr` is
+in `files_to_copy_to_outputs`, a missing workspace no longer counts as a failure. The job is
+avoided on its NFS copies, provided all three exit codes are 0, the output manifest matches,
+and every copied path exists. A job missing any copy is rerun in full rather than
+re-delocalized, because its delocalizer would need the disk. A task with an output left only on
+the disk keeps the old behavior.
+
+**A job stopped at the preemption limit was reported as "catastrophically lost".** The
+entrypoint stops a job preempted `CANINE_PREEMPT_LIMIT` (5) times with exit 123, before
+delocalization, so it has no outputs. `make_output_DF` reported every job without outputs as
+"catastrophically lost (no stdout/stderr available)", and the real cause appeared only in wolF's
+next log line. Seen for `B6OS`'s Manta, preempted 5 times over 27 hours. It now reads each
+missing job's exit code from `acct`, and reports exit 123 as stopped after reaching the
+preemption limit, by job. Anything else is still reported as lost.
+
+**Tests:** 8 new (`test_orchestrator_avoid_pure.py`), on a task directory laid out on disk the
+way a finished job leaves it:
+
+* a scratch-disk job with every output on NFS is avoided without its disk;
+* one missing a copy, or with a failed exit code, is rerun;
+* the unchanged cases still hold: an output left on the disk, no scratch disk and no
+  workspace, an ordinary finished job;
+* the exit-123 message, and the "lost" message for any other job without outputs.
+
+The two new behaviors fail against the old code. The full pure suite is 1758 passed, 1 skipped.
+
+### 13.96 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

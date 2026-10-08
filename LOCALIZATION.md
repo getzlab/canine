@@ -516,7 +516,7 @@ Pass from wolF via `LocalizeToBucket(files=..., <kwarg>=...)`, or workflow-wide 
 | `scratch_disk_name` | random |
 | `scratch_disk_job_avoid` | `True` |
 | `protect_disk` | `False` — adds label `protect:yes`, blocking automatic deletion |
-| `files_to_copy_to_outputs` | `{}` — output keys copied from the scratch disk back to NFS |
+| `files_to_copy_to_outputs` | `{}` — output keys copied from the scratch disk back to NFS. If it covers every output the task declares, a finished job is avoided on those NFS copies, with no need for its disk, which the lab's cost-monitoring app deletes about a day after last use |
 | `persistent_disk_type` | `"standard"` |
 
 ### 5b. Backend options that affect localization
