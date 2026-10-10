@@ -6889,7 +6889,41 @@ their manifest recorded `stdout` unexpanded; it now records it as a real one doe
 that a manifest with a changed pattern still reruns the job was added. The full pure suite is
 1759 passed, 1 skipped.
 
-### 13.96 Summary: speedups versus the original localization
+### 13.96 Riding out a source that refuses connections for minutes
+
+From the CTSP DLBCL tumor-only runs, 2026-10-10. Seven controllers started about 350
+localizations together, all from one GDC object-store endpoint, and it reset connections (and
+now and then answered 503) for minutes. 302 of the 356 tumor BAMs failed, in two places, and
+each place gave up far sooner than the outage lasted:
+
+* **The downloader's range probe**, on the node, retried a transient failure 6 times with
+  backoff capped at 30 s: about 45 s in all. It then exits 1, deliberately not 5 (an exit-5
+  requeue is uncapped, and no bytes have moved). Most jobs had waited over an hour for a node
+  and got one at about the same time, so they all probed into the same refusal.
+* **`HandleAWSURL`'s `head-object`**, on the controller when wolF builds the task, had no retry
+  at all. Each of wolF's three retries, a minute apart, died on the first dropped connection
+  ("Connection was closed before we received a valid response") without reaching a node.
+
+The probe now retries for a time budget instead of a count: `PROBE_RETRY_BUDGET` (15 min),
+backing off to `PROBE_MAX_DELAY` (2 min) with jitter, which also spreads a batch of jobs that
+start together. It still ends in exit 1. The node idles meanwhile, cents on a preemptible
+standard-8. `--probe-budget` sets it per run, as `--retries` does for chunks; canine leaves it
+at the default. `head-object` (and the other `s3api` calls in `HandleAWSURL`) go through
+`_s3api`, which retries exit 255 (any failure but an error response, a dropped connection
+included) and exit 254 for 5xx and throttling, for `S3API_RETRY_BUDGET` (10 min). A 403 or 404
+still fails at once. The command carries the AWS keys in its environment prefix, so it is never
+logged; the retry log names the call and the object only.
+
+**Tests:** 8 new (`test_transient_retry_pure.py`) on a fake clock: a probe that fails 10 times
+then succeeds proceeds, one that never succeeds fails within its budget, a permanent failure is
+not retried; `head-object` retries a dropped connection and a 503, not a 403, gives up within
+its budget, and never logs the secret key. Six fail against the old code; the two that pass
+there check behavior that did not change. Two subprocess tests in
+`test_parallel_download_resume.py` run against a server that always fails and relied on
+`--retries 1` to bound the probe; they now pass `--probe-budget 5`. The full pure suite is
+1771 passed, 1 skipped.
+
+### 13.97 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

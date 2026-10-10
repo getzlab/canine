@@ -784,7 +784,8 @@ class TestExitCodeContract:
         with Server(payload) as server:
             server.state.fail_next = 10_000   # every request 500s, forever
             proc = run_downloader(server.url(), dest, len(payload), "--min-chunk", MIB,
-                                  "--connections", 2, "--retries", 1, timeout=300)
+                                  "--connections", 2, "--retries", 1,
+                                  "--probe-budget", 5, timeout=300)
         assert proc.returncode in (pdl.EXIT_FAIL, pdl.EXIT_REQUEUE), proc.stderr
         if proc.returncode == pdl.EXIT_REQUEUE:
             pytest.fail(
@@ -803,7 +804,7 @@ class TestExitCodeContract:
             url = server.url()
             server.close()   # nothing listening now
             proc = run_downloader(url, dest, 4 * MIB, "--min-chunk", MIB,
-                                  "--retries", 1, "--timeout", 2)
+                                  "--retries", 1, "--timeout", 2, "--probe-budget", 5)
         assert proc.returncode != 0
         assert proc.returncode in (pdl.EXIT_FAIL, pdl.EXIT_REQUEUE)
 

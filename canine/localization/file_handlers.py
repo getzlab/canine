@@ -1,7 +1,7 @@
 import abc
 import google.cloud.storage
 import google.auth
-import copy, glob, google_crc32c, json, hashlib, base64, binascii, os, re, requests, shlex, subprocess, threading
+import copy, glob, google_crc32c, json, hashlib, base64, binascii, os, random, re, requests, shlex, subprocess, threading, time
 import pandas as pd
 import urllib.parse
 
@@ -1367,6 +1367,41 @@ def gcp_auth_session():
 
 ## AWS S3 {{{
 
+# A transient `aws s3api` failure is retried, backing off to S3API_MAX_DELAY with jitter,
+# for up to S3API_RETRY_BUDGET seconds. The handler runs head-object when the task is
+# built, on the controller, so one dropped connection used to fail that task attempt
+# outright -- and wolF's three retries, a minute apart, all fell inside the same outage
+# of an overloaded GDC endpoint (2026-10-10).
+S3API_RETRY_BUDGET = 10 * 60
+S3API_MAX_DELAY = 120
+
+# AWS CLI exit codes: 254 is an error response from the service, 255 any other failure,
+# a dropped or refused connection included. A 254 is transient only for these.
+_S3API_TRANSIENT_ERRORS = (b"(500)", b"(502)", b"(503)", b"(504)", b"SlowDown",
+                           b"Throttl", b"RequestTimeout", b"InternalError", b"ServiceUnavailable")
+
+def _s3api(command, what):
+    """
+    Run an `aws s3api` command, retrying transient failures, and return the last
+    CompletedProcess. `command` carries the AWS keys in its environment prefix, so it
+    is never logged.
+    """
+    started = time.monotonic()
+    attempt = 0
+    while True:
+        resp = subprocess.run(command, shell = True, capture_output = True)
+        transient = resp.returncode == 255 or (
+          resp.returncode == 254 and any(e in resp.stderr for e in _S3API_TRANSIENT_ERRORS))
+        if not transient:
+            return resp
+        attempt += 1
+        delay = min(2 ** attempt, S3API_MAX_DELAY) * (0.5 + random.random())
+        if time.monotonic() - started + delay > S3API_RETRY_BUDGET:
+            return resp
+        reason = (resp.stderr.decode(errors = "replace").strip().splitlines() or ["exit {}".format(resp.returncode)])[-1]
+        canine_logging.warning("{} failed ({}); retrying in {:.0f}s".format(what, reason[:200], delay))
+        time.sleep(delay)
+
 class HandleAWSURL(FileType):
     localization_mode = "url"
 
@@ -1425,29 +1460,27 @@ class HandleAWSURL(FileType):
         except:
             raise ValueError(f"{self.path} is not a valid s3:// URL!")
 
-        head_resp = subprocess.run(
+        head_resp = _s3api(
           "{env} aws s3api {extra_args} head-object --bucket {bucket} --key {obj}".format(
             env = self.command_env_str,
             extra_args = self.s3_extra_args_str,
             bucket = bucket,
             obj = obj
           ),
-          shell = True,
-          capture_output = True
+          "head-object for {}".format(self.path)
         )
 
         if head_resp.returncode == 254:
             if b"(404)" in head_resp.stderr:
                 # check if it's truly a 404 or a directory; we do not yet support these
-                ls_resp = subprocess.run(
+                ls_resp = _s3api(
                   "{env} aws s3api {extra_args} list-objects-v2 --bucket {bucket} --prefix {obj} --max-items 2".format(
                     env = self.command_env_str,
                     extra_args = self.s3_extra_args_str,
                     bucket = bucket,
                     obj = obj
                   ),
-                  shell = True,
-                  capture_output = True
+                  "list-objects-v2 for {}".format(self.path)
                 )
                 if len(ls_resp.stdout) == 0:
                     raise ValueError(f"Object {self.path} does not exist in bucket!")
@@ -1466,15 +1499,14 @@ class HandleAWSURL(FileType):
 
         # Check for multiple parts to enable local hash calculation
         if self.headers.get("PartsCount", 1) > 1:
-            part1_head_resp = subprocess.run(
+            part1_head_resp = _s3api(
               "{env} aws s3api {extra_args} head-object --bucket {bucket} --key {obj} --part-number 1".format(
                 env = self.command_env_str,
                 extra_args = self.s3_extra_args_str,
                 bucket = bucket,
                 obj = obj
               ),
-              shell = True,
-              capture_output = True
+              "head-object (part 1) for {}".format(self.path)
             )
             if part1_head_resp.returncode == 254:
                 raise ValueError(f"Error accessing S3 file:\n{part1_head_resp.stderr.decode()}")

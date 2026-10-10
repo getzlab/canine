@@ -298,6 +298,15 @@ ASSUMED_BLOCK_SIZE = 64 * 1024
 DEFAULT_RETRIES = 5
 DEFAULT_TIMEOUT = 60
 
+# The range probe keeps retrying a transient failure (reset, timeout, 5xx) for this
+# long, backing off to PROBE_MAX_DELAY with jitter, before it exits 1. A source
+# refusing connections under load can stay that way for minutes, and a batch of jobs
+# that start together all meet it at once: six tries in ~45 s failed 302 of 356
+# localizations against an overloaded GDC endpoint (2026-10-10). The jitter also
+# spreads such a batch out. Still bounded: no bytes have moved, so it never requeues.
+PROBE_RETRY_BUDGET = 15 * 60
+PROBE_MAX_DELAY = 120
+
 # ENOSPC is retryable, not fatal: sparse ftruncate does not reserve blocks, so an
 # undersized localization disk fails on a pwrite deep into the transfer -- and the
 # disk-resize daemon makes that condition temporary.
@@ -4868,6 +4877,8 @@ def run(options):
 
     # The probe is retried rather than allowed to fail the attempt: a single 5xx or
     # reset here would otherwise cost a whole job requeue before any bytes moved.
+    # Retried for a time budget, not a count (see PROBE_RETRY_BUDGET).
+    probe_started = time.monotonic()
     attempt = 0
     while True:
         try:
@@ -4884,15 +4895,16 @@ def run(options):
             return EXIT_FAIL
         except TransientError as e:
             attempt += 1
-            if attempt > options.retries:
+            delay = min(2 ** attempt, PROBE_MAX_DELAY) * (0.5 + random.random())
+            elapsed = time.monotonic() - probe_started
+            if elapsed + delay > getattr(options, "probe_budget", PROBE_RETRY_BUDGET):
                 # No bytes have moved, so this is the "no forward progress" case: exit
                 # 1 rather than 5. Exit-5 requeues are excluded from the preemption
                 # limit, so requeueing here would loop forever against a server that
                 # is never going to answer.
-                log("could not probe range support after {} attempts: {}".format(
-                    attempt, e))
+                log("could not probe range support after {} attempts over {:.0f}s: {}".format(
+                    attempt, elapsed, e))
                 return EXIT_FAIL
-            delay = min(2 ** attempt, 30) * (0.5 + random.random())
             log("probe failed ({}); retrying in {:.1f}s".format(e, delay))
             time.sleep(delay)
 
@@ -5227,6 +5239,9 @@ def build_parser():
     parser.add_argument("--no-resume", action="store_true", dest="no_resume",
                         help="discard any existing partial file")
     parser.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    parser.add_argument("--probe-budget", type=float, default=PROBE_RETRY_BUDGET,
+                        dest="probe_budget",
+                        help="seconds to keep retrying a transient range-probe failure")
     parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     return parser
 
