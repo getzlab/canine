@@ -637,7 +637,9 @@ def ready_for_docker():
         ["munged", "Munge"],
     ]
 
-    all_procs = {x.name(): x.pid for x in psutil.process_iter()}
+    # names are fetched by process_iter itself, which skips a process that exits
+    # mid-scan; calling x.name() afterwards raised NoSuchProcess for it
+    all_procs = {x.info["name"]: x.pid for x in psutil.process_iter(["name"])}
 
     for proc, desc in already_running:
         # is the process is running at all?
