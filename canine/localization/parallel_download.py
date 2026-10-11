@@ -64,6 +64,7 @@ import argparse
 import base64
 import collections
 import binascii
+import calendar
 import errno
 import hashlib
 import json
@@ -1725,6 +1726,8 @@ def gcs_custom_time():
     finds its parts expired and re-downloads, since the stale-manifest handling in
     run_bucket_route drops the manifest when parts are missing. That is the same bound
     the lifecycle rule already puts on idle storage for everything else in the bucket.
+    While a download runs, PartKeepAlive moves its parts' stamps forward: a part's stamp
+    is its session's start, which a long download outlives.
     """
     return time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime())
 METADATA_TOKEN_URL = (
@@ -2012,12 +2015,22 @@ class GcsClient:
         This is the bucket-compose route's frontier oracle, exactly analogous to SEEK_HOLE:
         the answer comes from the storage rather than from a counter we kept. `None` means
         the upload already finished; 0 means nothing is persisted yet.
+
+        A 400 means GCS rejects the session itself, so it raises PermanentError, which
+        resume_offset takes as "start this part over". Seen on a session left from an
+        earlier run: "The number of bytes uploaded is required to be equal or greater
+        than 262144, except for the final request", on every query. As a TransientError
+        it failed every attempt of the job within a second, since resume_offset is
+        outside the chunk's retry loop.
         """
-        status, headers, _ = self.request(
+        status, headers, body = self.request(
             "PUT", session_uri,
             headers={"Content-Range": "bytes */{}".format(total), "Content-Length": "0"},
-            expect=(200, 201, 308),
+            expect=(200, 201, 308, 400),
         )
+        if status == 400:
+            raise PermanentError("session status query -> HTTP 400: {}".format(
+                body[:200].decode("utf-8", "replace")))
         if status in (200, 201):
             return None
         header_range = headers.get("Range") or headers.get("range")
@@ -2119,6 +2132,22 @@ class GcsClient:
         )
         _, _, body = self.request("GET", url)
         return json.loads(body.decode("utf-8"))
+
+    def refresh_custom_time(self, bucket, name):
+        """
+        Move the object's customTime to now; see PartKeepAlive. Returns False if the
+        object is gone, True otherwise. A 400 is GCS refusing to move customTime back,
+        which means it is already newer -- another writer stamped it -- so it counts.
+        """
+        url = "{}/b/{}/o/{}".format(
+            GCS_API_ROOT, urllib.parse.quote(bucket, safe=""),
+            urllib.parse.quote(name, safe=""),
+        )
+        status, _, _ = self.request(
+            "PATCH", url, body=json.dumps({"customTime": gcs_custom_time()}).encode("utf-8"),
+            headers={"Content-Type": "application/json; charset=UTF-8"},
+            expect=(200, 400, 404))
+        return status != 404
 
     def delete_object(self, bucket, name):
         url = "{}/b/{}/o/{}".format(
@@ -2572,6 +2601,15 @@ class BucketChunkSink(PartHashingSink):
         if metadata is not None:
             with self._lock:
                 self._completed.add(index)
+            # Its customTime is the session's start, which can be from an earlier run;
+            # PartKeepAlive would reach it only at its next beat.
+            age = custom_time_age(metadata.get("customTime"))
+            if age is not None and age > PART_KEEPALIVE_SECONDS:
+                try:
+                    self.client.refresh_custom_time(self.bucket, self.part_name(index))
+                except (TransientError, PermanentError) as e:
+                    log("chunk {}: could not refresh its customTime ({}); the keepalive "
+                        "will retry".format(index, e))
         # Report GCS's own view of how far it has persisted. The caller must not
         # advance on the local byte count: if a PUT was interrupted, fewer bytes are
         # durable than were sent, and treating the chunk as finished would compose a
@@ -4055,6 +4093,79 @@ def best_effort_delete(client, bucket, names):
     return orphaned
 
 
+# How often PartKeepAlive refreshes customTime, well inside the bucket's lifecycle rule
+# (daysSinceCustomTime, localization_expiry_days, at least 1).
+PART_KEEPALIVE_SECONDS = 3 * 3600
+
+
+def custom_time_age(value, now=None):
+    """Seconds since an RFC 3339 customTime, or None if it can't be read."""
+    try:
+        stamp = calendar.timegm(time.strptime(value[:19], "%Y-%m-%dT%H:%M:%S"))
+    except (TypeError, ValueError):
+        return None
+    return (time.time() if now is None else now) - stamp
+
+
+class PartKeepAlive:
+    """
+    Keeps a bucket-compose download's manifest and finished parts from the bucket's
+    lifecycle rule while the relay runs.
+
+    customTime is set once, when a part's upload session starts, and the rule deletes
+    anything whose customTime is more than localization_expiry_days old. A download that
+    outlives that -- a 300 GB BAM from a slow source takes more than a day, and a resumed
+    one carries parts from earlier runs -- lost its first parts before it could compose
+    them: CTSP-B6LZ's manifest marked 300 of 301 parts done with only 57 left in the
+    bucket. A part finished late is no better off, since its customTime is still the
+    session's start; BucketChunkSink.write refreshes those as they finish.
+
+    The first refresh runs at once, so a resumed download's parts are covered before
+    anything else happens. Failures are logged and never fatal: the next beat retries,
+    and a part that is lost anyway sends the download through the stale-manifest path.
+    """
+
+    def __init__(self, client, bucket, manifest_object, sink, manifest, chunks,
+                 interval=PART_KEEPALIVE_SECONDS):
+        self.client, self.bucket = client, bucket
+        self.manifest_object, self.sink, self.manifest = manifest_object, sink, manifest
+        self.chunks, self.interval = chunks, interval
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="k9pdl-keepalive", daemon=True)
+
+    def beat(self):
+        names = [self.manifest_object] + [
+            self.sink.part_name(i) for i in range(len(self.chunks)) if self.manifest.is_complete(i)]
+        failed = gone = 0
+        for name in names:
+            if self._stop.is_set():
+                return
+            try:
+                if not self.client.refresh_custom_time(self.bucket, name):
+                    gone += 1
+            except (TransientError, PermanentError):
+                failed += 1
+        log("k9pdl-keepalive refreshed customTime on {} objects ({} failed, {} gone)".format(
+            len(names) - failed - gone, failed, gone))
+
+    def _run(self):
+        while not self._stop.is_set():
+            try:
+                self.beat()
+            except Exception as e:                              # noqa: BLE001
+                log("k9pdl-keepalive failed: {}".format(e))
+            self._stop.wait(self.interval)
+
+    def __enter__(self):
+        self._thread.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        self._thread.join(timeout=60)
+        return False
+
+
 def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_path,
                      marker_path):
     """
@@ -4108,7 +4219,8 @@ def run_bucket_route(options, decision, source, size, chunks, plan_id, manifest_
     downloader = Downloader(source, sink, manifest, chunks, options, Progress(size))
 
     try:
-        with phase("relay", size):
+        with PartKeepAlive(client, bucket, manifest_object, sink, manifest, chunks), \
+                phase("relay", size):
             downloader.run()
     except PermanentError as e:
         log("permanent failure: {}".format(e))

@@ -312,6 +312,33 @@ class TestSessionResumability:
         assert rc == pdl.EXIT_OK, "an expired session should not be fatal"
         assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
 
+    def test_a_session_gcs_rejects_with_400_restarts_only_that_part(
+        self, tmp_path, monkeypatch, gcs, payload, payload_md5
+    ):
+        """
+        A session left from an earlier run answered its status query with 400 on real
+        GCS. Taken as transient, it failed every attempt of the job within a second
+        (CTSP-B6LZ, CTSP-B6L8), since resume_offset is outside the chunk's retry loop.
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+
+        with Server(payload) as source:
+            self._interrupted_run(dest, source, payload, payload_md5, gcs,
+                                  succeed_uploads=6)
+            state = read_manifest(gcs)
+            broken = [r["session"].rsplit("/", 1)[-1] for i, r in state["chunks"].items()
+                      if r.get("session") and not r.get("done")]
+            assert broken, "test left no unfinished session to break"
+            gcs.state.break_session(broken[0])
+
+            rc = pdl.run(options_for(dest, source.url(), len(payload),
+                                     check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
+
+        assert rc == pdl.EXIT_OK, "a session GCS rejects should cost only its part"
+        assert hashlib.md5(gcs.state.objects[OBJECT]).hexdigest() == payload_md5
+
     def test_incomplete_part_is_never_visible_as_an_object(
         self, tmp_path, monkeypatch, gcs, payload, payload_md5
     ):
@@ -359,6 +386,124 @@ class TestSessionResumability:
 
         assert rc == pdl.EXIT_OK
         assert gcs.state.objects[OBJECT] == replacement
+
+
+OLD_CUSTOM_TIME = "2026-01-01T00:00:00.000Z"
+
+
+class TestPartsAreKeptAlive:
+    """
+    The bucket's lifecycle rule deletes anything whose customTime is more than
+    localization_expiry_days old, and a part's customTime was its upload session's start,
+    never refreshed. CTSP-B6LZ's manifest marked 300 of 301 parts done with 57 left.
+    """
+
+    def _resume_after_an_old_attempt(self, tmp_path, monkeypatch, gcs, payload, payload_md5):
+        """
+        An interrupted attempt whose every object was stamped long ago, then a resume.
+        Returns (rc, parts complete when the resume began, parts it finished itself).
+        """
+        force_bucket_route(monkeypatch)
+        dest = str(tmp_path / "sample.bam")
+        with Server(payload) as source:
+            with monkeypatch.context() as m:
+                m.setattr(pdl, "gcs_custom_time", lambda: OLD_CUSTOM_TIME)
+                # each 1 MiB part is 4 uploads of 256 KiB across 4 connections: 14 lets
+                # some parts finish and leaves others partway
+                TestSessionResumability._interrupted_run(
+                    self, dest, source, payload, payload_md5, gcs, succeed_uploads=14)
+            state = read_manifest(gcs)
+            done = {int(i) for i, r in state["chunks"].items() if r.get("done")}
+            unfinished = {int(i) for i, r in state["chunks"].items()
+                          if r.get("session") and not r.get("done")}
+            assert done and unfinished, "test needs both finished and unfinished parts"
+            rc = pdl.run(options_for(dest, source.url(), len(payload), check_md5=payload_md5,
+                                     upload_block=pdl.GCS_UPLOAD_GRANULARITY))
+        return rc, done, unfinished
+
+    @staticmethod
+    def _refreshed(gcs):
+        return {name for name, wanted, status in gcs.state.patches
+                if status == 200 and wanted > OLD_CUSTOM_TIME}
+
+    @staticmethod
+    def _part(index):
+        return "{}.k9pdl.parts/{:05d}".format(OBJECT, index)
+
+    def test_a_resume_refreshes_the_parts_an_earlier_attempt_finished(
+        self, tmp_path, monkeypatch, gcs, payload, payload_md5
+    ):
+        rc, done, _ = self._resume_after_an_old_attempt(
+            tmp_path, monkeypatch, gcs, payload, payload_md5)
+        assert rc == pdl.EXIT_OK
+        refreshed = self._refreshed(gcs)
+        assert {self._part(i) for i in done} <= refreshed
+        assert MANIFEST_OBJECT in refreshed
+
+    def test_a_part_finishing_on_an_old_session_is_refreshed_as_it_finishes(
+        self, tmp_path, monkeypatch, gcs, payload, payload_md5
+    ):
+        """Its customTime is the session's start, from the earlier attempt."""
+        rc, _, unfinished = self._resume_after_an_old_attempt(
+            tmp_path, monkeypatch, gcs, payload, payload_md5)
+        assert rc == pdl.EXIT_OK
+        assert {self._part(i) for i in unfinished} <= self._refreshed(gcs)
+
+    def test_the_refresh_repeats_while_the_relay_runs(self):
+        beats = []
+
+        class Client:
+            def refresh_custom_time(self, bucket, name):
+                beats.append(name)
+                return True
+
+        class Manifest:
+            def is_complete(self, index):
+                return True
+
+        class Sink:
+            def part_name(self, index):
+                return "part/{}".format(index)
+
+        with pdl.PartKeepAlive(Client(), "b", "obj.k9pdl.json", Sink(), Manifest(),
+                               [(0, 1), (1, 2)], interval=0.05):
+            time.sleep(0.3)
+        count = len(beats)
+        assert count >= 3 * 3, "expected several beats of 3 objects, got {}".format(beats)
+        time.sleep(0.15)
+        assert len(beats) == count, "the keepalive kept running after the relay ended"
+
+    def test_a_failed_refresh_is_not_fatal(self):
+        class Client:
+            def refresh_custom_time(self, bucket, name):
+                raise pdl.TransientError("503")
+
+        class Manifest:
+            def is_complete(self, index):
+                return True
+
+        class Sink:
+            def part_name(self, index):
+                return "part/{}".format(index)
+
+        with pdl.PartKeepAlive(Client(), "b", "m", Sink(), Manifest(), [(0, 1)],
+                               interval=0.05):
+            time.sleep(0.1)
+
+    def test_refresh_custom_time_accepts_a_newer_stamp_and_reports_a_gone_object(self, gcs):
+        client = pdl.GcsClient()
+        gcs.state.objects["a"] = b"x"
+        gcs.state.custom_time["a"] = "2999-01-01T00:00:00.000Z"
+        assert client.refresh_custom_time(BUCKET, "a") is True    # GCS refused: newer
+        assert client.refresh_custom_time(BUCKET, "missing") is False
+
+    def test_custom_time_age(self):
+        assert pdl.custom_time_age("2026-01-01T00:00:00.000Z",
+                                   now=pdl.calendar.timegm((2026, 1, 1, 3, 0, 0))) == 3 * 3600
+        assert pdl.custom_time_age("2026-01-01T00:00:00+00:00",
+                                   now=pdl.calendar.timegm((2026, 1, 1, 0, 0, 1))) == 1
+        assert pdl.custom_time_age(None) is None
+        assert pdl.custom_time_age("garbage") is None
 
 
 # ---------------------------------------------------------------------------

@@ -92,6 +92,8 @@ class FakeGcs:
         # as an expired access token does (measured, §13.77). Counted per token.
         self.rejected_tokens = set()
         self.rejections = {}
+        # Every metadata PATCH: (name, customTime asked for, status returned).
+        self.patches = []
 
     def new_session(self, name, custom_time=None):
         with self.lock:
@@ -107,6 +109,16 @@ class FakeGcs:
         with self.lock:
             if session_id in self.sessions:
                 self.sessions[session_id]["expired"] = True
+
+    def break_session(self, session_id):
+        """
+        Make the session answer every request with 400, as one left from an earlier run
+        did on real GCS: "The number of bytes uploaded is required to be equal or greater
+        than 262144, except for the final request ...", status queries included.
+        """
+        with self.lock:
+            if session_id in self.sessions:
+                self.sessions[session_id]["broken"] = True
 
     def object_names(self):
         with self.lock:
@@ -278,6 +290,12 @@ def make_handler(state):
                     # a lost or expired session: only this part has to start over
                     self._json(410, {"error": {"message": "session gone"}})
                     return
+                if session.get("broken"):
+                    self._send(400, "Invalid request.  The number of bytes uploaded is "
+                               "required to be equal or greater than 262144, except for "
+                               "the final request (it's recommended to be the exact "
+                               "multiple of 262144).")
+                    return
 
             body = self._body()
             content_range = (self.headers.get("Content-Range") or "").strip()
@@ -442,6 +460,33 @@ def make_handler(state):
 
             self._json(200, self._object_metadata(
                 name, data, components if components > 1 else None))
+
+        def do_PATCH(self):
+            if self._rejected():
+                return
+            parsed = urllib.parse.urlsplit(self.path)
+            match = re.match(r"^/storage/v1/b/([^/]+)/o/(.+)$", parsed.path)
+            if not match:
+                self._json(404, {"error": {"message": "unhandled PATCH " + parsed.path}})
+                return
+            name = urllib.parse.unquote(match.group(2))
+            wanted = json.loads(self._body().decode("utf-8") or "{}").get("customTime")
+            with state.lock:
+                if name not in state.objects:
+                    status = 404
+                elif wanted and state.custom_time.get(name, "") > wanted:
+                    # real GCS: "Custom time cannot be decreased"
+                    status = 400
+                else:
+                    status = 200
+                    if wanted:
+                        state.custom_time[name] = wanted
+                state.patches.append((name, wanted, status))
+                data = state.objects.get(name)
+            if status == 200:
+                self._json(200, self._object_metadata(name, data))
+            else:
+                self._json(status, {"error": {"code": status, "message": "patch refused"}})
 
         def do_DELETE(self):
             if self._rejected():

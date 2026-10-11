@@ -644,10 +644,16 @@ class TestDurationsSurviveAClockStep:
             value = getattr(downloader, name)
             assert 0 <= value < 600, "{} = {} after a clock step".format(name, value)
 
-    def test_the_only_wall_clock_read_is_the_attempt_timestamp(self):
-        """landed_during() compares against GCS's timeCreated, so that one must stay."""
+    def test_the_only_wall_clock_reads_are_timestamps(self):
+        """
+        landed_during() compares against GCS's timeCreated, and custom_time_age against
+        an object's customTime, so those must stay; nothing else may read the wall clock.
+        """
         import inspect
         source = inspect.getsource(pdl)
         uses = [l.strip() for l in source.splitlines() if "time.time()" in l
                 and not l.strip().startswith("#")]
-        assert uses == ["attempt_started = time.time()"], uses
+        assert uses == [
+            "return (time.time() if now is None else now) - stamp",
+            "attempt_started = time.time()",
+        ], uses

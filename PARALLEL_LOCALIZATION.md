@@ -6923,7 +6923,52 @@ there check behavior that did not change. Two subprocess tests in
 `--retries 1` to bound the probe; they now pass `--probe-budget 5`. The full pure suite is
 1771 passed, 1 skipped.
 
-### 13.97 Summary: speedups versus the original localization
+### 13.97 Keeping a long download's parts alive
+
+From the same runs, 2026-10-11. The localization bucket's only deletion mechanism is its
+lifecycle rule, `daysSinceCustomTime` = `localization_expiry_days` (1 here). Every object the
+downloader writes is stamped with customTime, but only once: a part gets it when its upload
+session starts. At the GDC endpoint's ~8 MiB/s per object a 300 GB BAM takes more than a day,
+and the downloads that resumed from the first run carried parts started the day before. Two of
+them failed every attempt in under a second:
+
+* CTSP-B6LZ's manifest marked 300 of 301 parts done; 57 remained in the bucket. CTSP-B6L8's
+  marked 291 of 292; 155 remained. A surviving part finished that morning carried customTime
+  from the previous night, when its session started.
+* Neither reached the missing parts: the one unfinished part's session answered its status
+  query with `400 Invalid request. The number of bytes uploaded is required to be equal or
+  greater than 262144, except for the final request`. `request()` made a 400 a `TransientError`,
+  and `resume_offset` runs outside the chunk's retry loop, so the attempt failed at once.
+
+Had they got past it, the check before compose would have found the parts missing and dropped
+the manifest, restarting the download, whose parts would expire the same way.
+
+**`PartKeepAlive`** runs for the length of the relay. It refreshes customTime on the manifest
+and every finished part at once, so a resumed download's parts are covered before anything
+else happens, and every `PART_KEEPALIVE_SECONDS` (3 h) after. A part that finishes on a session
+whose customTime is already older than that is refreshed as it finishes. Failures are logged
+and never fatal; `refresh_custom_time` counts GCS refusing to move customTime back as success,
+since another writer has stamped it later.
+
+**A 400 from a session status query** is now a `PermanentError`, which `resume_offset` already
+takes as "start this part over", as for 404 and 410.
+
+The runs themselves were saved by refreshing customTime on every part and manifest from the
+controllers, hourly, until the canine fix is installed. The two broken downloads had their
+manifests and parts deleted, so they start over.
+
+**Tests:** 7 new in `test_parallel_download_bucket.py`, against the fake GCS, which gains
+object PATCH (refusing to move customTime back, as GCS does) and a session that answers 400. A
+resume refreshes the parts an earlier attempt finished, and the manifest; a part finishing on
+an old session is refreshed as it finishes; the refresh repeats, stops with the relay, and
+survives failures; a session that answers 400 costs only its part. Breaking each of the
+keepalive's start, its repeat, the manifest refresh, the refresh on finishing and the 400
+handling fails a test. The test pinning the module's one wall-clock read (now
+`test_the_only_wall_clock_reads_are_timestamps`) also allows `custom_time_age`, which compares
+against customTime, a wall-clock timestamp. The full
+pure suite is 1806 passed, 1 skipped.
+
+### 13.98 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by
