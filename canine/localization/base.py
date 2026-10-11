@@ -46,9 +46,9 @@ Localization = namedtuple("Localization", ['type', 'path'])
 # rebuild and would version-skew against the installed canine.
 #
 # Mode matters for two of them. debug.sh and parallel_download.py are committed 0755 and
-# are invoked directly; delocalization.py is 0644 with no shebang and is only ever run as
-# `python3 <path>`.
-STAGED_SCRIPTS = ("delocalization.py", "debug.sh", "parallel_download.py")
+# are invoked directly; delocalization.py and bucketmount_check.py are 0644 with no
+# shebang and are only ever run as `python3 <path>`.
+STAGED_SCRIPTS = ("delocalization.py", "debug.sh", "parallel_download.py", "bucketmount_check.py")
 
 # Emitted localization commands are authored as bash and use constructs -- [[ ]], process
 # substitution -- that shell=True's default /bin/sh rejects outright. On the controller
@@ -2252,7 +2252,8 @@ class AbstractLocalizer(abc.ABC):
     def bucketmount_log_mark(self):
         """
         Commands recording where this bucket's gcsfuse log ends as this job
-        starts, so teardown can report what gcsfuse logged while the job ran.
+        starts, for bucketmount_check.py to read what gcsfuse logged while the
+        job ran.
 
         A read gcsfuse cannot serve reaches the job as an I/O error, which a tool
         may swallow and exit 0 with partial output: getdRangerSupportingReads
@@ -2260,37 +2261,28 @@ class AbstractLocalizer(abc.ABC):
         bam, and the half-finished file failed a later task on every retry.
         gcsfuse runs as a daemon with nowhere to log by default, and the node is
         deleted afterwards, so its account of the error was lost. The log lives
-        on the node; teardown copies this job's part of it into the job's stderr,
-        which is kept.
+        on the node. After the job exits 0, the entrypoint runs the check, which
+        copies this job's part of the log into the job's stderr and fails the
+        job if gcsfuse failed a read of one of its inputs.
 
         Emitted unconditionally, like the lease: a job reusing a mount reads
         through it just the same.
         """
         return [
-          'echo "${CANINE_BUCKETMOUNT} ${CANINE_BUCKETMOUNT_LOG} $([ -f ${CANINE_BUCKETMOUNT_LOG} ] && wc -c < ${CANINE_BUCKETMOUNT_LOG} | tr -d " " || echo 0)" >> ${CANINE_JOB_INPUTS}/.bucketmount_logs',
+          'echo "${CANINE_BUCKETMOUNT} ${CANINE_BUCKETMOUNT_LOG} $([ -f ${CANINE_BUCKETMOUNT_LOG} ] && wc -c < ${CANINE_BUCKETMOUNT_LOG} | tr -d " " || echo 0) ${CANINE_BUCKETMOUNT_DIR}" >> ${CANINE_JOB_INPUTS}/.bucketmount_logs',
         ]
 
-    def bucketmount_log_report(self):
+    @staticmethod
+    def bucketmount_log_report(canine_root):
         """
-        Teardown counterpart to bucketmount_log_mark(): copies whatever gcsfuse
-        logged (warnings and errors) since this job marked its logs into the
-        job's stderr. Reporting only; it never fails the job. The mount is shared
-        by every job on the node, so some of what it reports may concern other
-        jobs' reads.
+        Teardown counterpart to bucketmount_log_mark(), for a job that failed
+        and so never reached the entrypoint's check: copies what gcsfuse logged
+        while it ran into the job's stderr, without changing its outcome.
         """
         return [
           'if [ -f ${CANINE_JOB_INPUTS}/.bucketmount_logs ]; then',
-          '  while read -r CANINE_LOG_BUCKET CANINE_LOG_FILE CANINE_LOG_OFFSET; do',
-          '    [ -f "${CANINE_LOG_FILE}" ] || continue',
-          '    CANINE_LOG_SIZE=$(wc -c < "${CANINE_LOG_FILE}" | tr -d " ")',
-          # smaller than at the mark: gcsfuse rotated it, so all of it is newer
-          '    [ ${CANINE_LOG_SIZE} -ge ${CANINE_LOG_OFFSET} ] || CANINE_LOG_OFFSET=0',
-          '    if [ ${CANINE_LOG_SIZE} -gt ${CANINE_LOG_OFFSET} ]; then',
-          '      echo "WARNING: gcsfuse logged the following for bucket ${CANINE_LOG_BUCKET} while this job ran (the mount is shared by every job on this node):" >&2',
-          '      tail -c +$((CANINE_LOG_OFFSET + 1)) "${CANINE_LOG_FILE}" | head -n 200 >&2 || :',
-          '    fi',
-          '  done < ${CANINE_JOB_INPUTS}/.bucketmount_logs',
-          '  rm -f ${CANINE_JOB_INPUTS}/.bucketmount_logs',
+          '  python3 {} ${{CANINE_JOB_INPUTS}} --report-only || :'.format(
+            os.path.join(canine_root, 'bucketmount_check.py')),
           'fi',
         ]
 
@@ -3001,7 +2993,7 @@ class AbstractLocalizer(abc.ABC):
                 # Bucket mounts are node-lifetime and are never unmounted here
                 # (see the mount loop). Only this job's own bookkeeping is undone:
                 # stop refreshing customTime, then drop its mount leases.
-            ] + self.bucketmount_heartbeat_stop() + self.bucketmount_lease_release() + self.bucketmount_log_report() + [
+            ] + self.bucketmount_heartbeat_stop() + self.bucketmount_lease_release() + self.bucketmount_log_report(compute_env['CANINE_ROOT']) + [
             ] + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
         return setup_script, localization_script, teardown_script, array_exports

@@ -79,6 +79,11 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     echo '======================' >&2
     {{pipeline_script}}
     export CANINE_JOB_RC=$?
+    # a tool can exit 0 after gcsfuse failed one of its reads; see bucketmount_check.py
+    if [ $CANINE_JOB_RC == 0 ] && [ -f $CANINE_JOB_INPUTS/.bucketmount_logs ]; then
+      python3 $CANINE_ROOT/bucketmount_check.py $CANINE_JOB_INPUTS >&2
+      [ $? == 3 ] && export CANINE_JOB_RC=74 || : # EX_IOERR
+    fi
     if [ $CANINE_JOB_RC == 0 ]; then
       echo '====================================' >&2
       echo '==== JOB COMPLETED SUCCESSFULLY ====' >&2
