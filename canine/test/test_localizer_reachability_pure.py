@@ -293,3 +293,100 @@ class TestMountHeartbeat:
             proc = subprocess.run([BASH, "-n"], input=("set -e\n" + script).encode(),
                                   capture_output=True)
             assert proc.returncode == 0, proc.stderr.decode()
+
+
+class TestMountLog:
+    """
+    gcsfuse logs beside the mountpoint, and teardown copies what it logged while
+    the job ran into the job's stderr. A tool can swallow the I/O error of a read
+    gcsfuse failed, and the node holding gcsfuse's account of it is deleted.
+    """
+
+    def _run(self, tmp_path, before, during, after_mark=None):
+        """
+        Mark with `before` already in the log, append `during`, then report.
+        after_mark, if given, replaces the log instead (a rotation).
+        """
+        inputs = tmp_path / "inputs"
+        inputs.mkdir(exist_ok=True)
+        log = tmp_path / ".wolf-1-us-east1-abc.gcsfuse.log"
+        if before is not None:
+            log.write_text(before)
+        loc = BatchedLocalizer(MagicMock())
+        mark = subprocess.run([BASH], capture_output=True, input="\n".join([
+            "set -e",
+            'CANINE_JOB_INPUTS="{}"'.format(inputs),
+            'CANINE_BUCKETMOUNT="wolf-1-us-east1-abc"',
+            'CANINE_BUCKETMOUNT_LOG="{}"'.format(log),
+        ] + loc.bucketmount_log_mark()).encode())
+        assert mark.returncode == 0, mark.stderr.decode()
+        if after_mark is not None:
+            log.write_text(after_mark)
+        elif during:
+            with open(log, "a") as f:
+                f.write(during)
+        report = subprocess.run([BASH], capture_output=True, input="\n".join([
+            "set -e",
+            'CANINE_JOB_INPUTS="{}"'.format(inputs),
+        ] + loc.bucketmount_log_report()).encode())
+        return report, inputs
+
+    def test_reports_only_what_was_logged_during_the_job(self, tmp_path):
+        proc, _ = self._run(tmp_path, "old error from an earlier job\n",
+                            "ReadFile: t_bam/x.bam: read failed\n")
+        assert proc.returncode == 0, proc.stderr.decode()
+        err = proc.stderr.decode()
+        assert "read failed" in err and "wolf-1-us-east1-abc" in err
+        assert "earlier job" not in err
+
+    def test_quiet_when_nothing_was_logged(self, tmp_path):
+        proc, _ = self._run(tmp_path, "old error\n", "")
+        assert proc.returncode == 0 and proc.stderr.decode() == ""
+
+    def test_a_mount_without_a_log_is_skipped(self, tmp_path):
+        """A mount made before logging was added has no log file."""
+        proc, _ = self._run(tmp_path, None, "")
+        assert proc.returncode == 0 and proc.stderr.decode() == ""
+
+    def test_a_rotated_log_is_reported_whole(self, tmp_path):
+        proc, _ = self._run(tmp_path, "x" * 1000 + "\n", None, after_mark="new error\n")
+        assert proc.returncode == 0
+        assert "new error" in proc.stderr.decode()
+
+    def test_never_fails_the_job_and_clears_its_record(self, tmp_path):
+        proc, inputs = self._run(tmp_path, "", "ERROR something\n")
+        assert proc.returncode == 0
+        assert not (inputs / ".bucketmount_logs").exists()
+
+    def test_output_is_bounded(self, tmp_path):
+        proc, _ = self._run(tmp_path, "", "".join("line {}\n".format(i) for i in range(1000)))
+        assert proc.returncode == 0
+        assert len(proc.stderr.decode().splitlines()) <= 201
+
+    def test_mark_is_taken_even_when_reusing_an_existing_mount(self):
+        """Same reason as the lease: a job reusing a mount reads through it too."""
+        import inspect
+        from canine.localization import base
+        src = inspect.getsource(base.AbstractLocalizer.job_setup_teardown)
+        conditional_mount = src.index("if ! mountpoint -q ${CANINE_BUCKETMOUNT_DIR}")
+        after_block = src.index("Bucket mount did not appear")
+        mark = src.index("bucketmount_log_mark()")
+        assert conditional_mount < after_block < mark
+        assert src.index("bucketmount_log_report()") > mark
+
+    def test_gcsfuse_writes_the_log(self):
+        import inspect
+        from canine.localization import base
+        src = inspect.getsource(base.AbstractLocalizer.job_setup_teardown)
+        line = [l for l in src.splitlines() if "gcsfuse -o ro" in l][0]
+        assert "--log-file ${CANINE_BUCKETMOUNT_LOG}" in line
+        assert "--log-severity warning" in line
+        # slurm moves the daemon out of the job's cgroup by matching this
+        assert line.index("${CANINE_BUCKETMOUNT_DIR} 200>&-") > line.index("--log-format")
+
+    def test_generated_shell_is_valid(self):
+        loc = BatchedLocalizer(MagicMock())
+        for script in (loc.bucketmount_log_mark(), loc.bucketmount_log_report()):
+            proc = subprocess.run([BASH, "-n"], input=("set -e\n" + "\n".join(script)).encode(),
+                                  capture_output=True)
+            assert proc.returncode == 0, proc.stderr.decode()

@@ -2249,6 +2249,51 @@ class AbstractLocalizer(abc.ABC):
           'fi',
         ]
 
+    def bucketmount_log_mark(self):
+        """
+        Commands recording where this bucket's gcsfuse log ends as this job
+        starts, so teardown can report what gcsfuse logged while the job ran.
+
+        A read gcsfuse cannot serve reaches the job as an I/O error, which a tool
+        may swallow and exit 0 with partial output: getdRangerSupportingReads
+        reported success after pysam's "IOError: truncated file" on a mounted
+        bam, and the half-finished file failed a later task on every retry.
+        gcsfuse runs as a daemon with nowhere to log by default, and the node is
+        deleted afterwards, so its account of the error was lost. The log lives
+        on the node; teardown copies this job's part of it into the job's stderr,
+        which is kept.
+
+        Emitted unconditionally, like the lease: a job reusing a mount reads
+        through it just the same.
+        """
+        return [
+          'echo "${CANINE_BUCKETMOUNT} ${CANINE_BUCKETMOUNT_LOG} $([ -f ${CANINE_BUCKETMOUNT_LOG} ] && wc -c < ${CANINE_BUCKETMOUNT_LOG} | tr -d " " || echo 0)" >> ${CANINE_JOB_INPUTS}/.bucketmount_logs',
+        ]
+
+    def bucketmount_log_report(self):
+        """
+        Teardown counterpart to bucketmount_log_mark(): copies whatever gcsfuse
+        logged (warnings and errors) since this job marked its logs into the
+        job's stderr. Reporting only; it never fails the job. The mount is shared
+        by every job on the node, so some of what it reports may concern other
+        jobs' reads.
+        """
+        return [
+          'if [ -f ${CANINE_JOB_INPUTS}/.bucketmount_logs ]; then',
+          '  while read -r CANINE_LOG_BUCKET CANINE_LOG_FILE CANINE_LOG_OFFSET; do',
+          '    [ -f "${CANINE_LOG_FILE}" ] || continue',
+          '    CANINE_LOG_SIZE=$(wc -c < "${CANINE_LOG_FILE}" | tr -d " ")',
+          # smaller than at the mark: gcsfuse rotated it, so all of it is newer
+          '    [ ${CANINE_LOG_SIZE} -ge ${CANINE_LOG_OFFSET} ] || CANINE_LOG_OFFSET=0',
+          '    if [ ${CANINE_LOG_SIZE} -gt ${CANINE_LOG_OFFSET} ]; then',
+          '      echo "WARNING: gcsfuse logged the following for bucket ${CANINE_LOG_BUCKET} while this job ran (the mount is shared by every job on this node):" >&2',
+          '      tail -c +$((CANINE_LOG_OFFSET + 1)) "${CANINE_LOG_FILE}" | head -n 200 >&2 || :',
+          '    fi',
+          '  done < ${CANINE_JOB_INPUTS}/.bucketmount_logs',
+          '  rm -f ${CANINE_JOB_INPUTS}/.bucketmount_logs',
+          'fi',
+        ]
+
     def bucketmount_reachability_check(self):
         """
         Commands verifying that every input symlinked into the bucket mount
@@ -2728,6 +2773,10 @@ class AbstractLocalizer(abc.ABC):
               "sudo mkdir -p $(dirname ${CANINE_BUCKETMOUNT_DIR})",
               "CANINE_BUCKETMOUNT_MOUNTLOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).mountlock",
               "sudo touch ${CANINE_BUCKETMOUNT_MOUNTLOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_MOUNTLOCK}",
+              # gcsfuse's log, beside the mountpoint for the same reason as the
+              # lock; read by bucketmount_log_mark and _report
+              "CANINE_BUCKETMOUNT_LOG=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).gcsfuse.log",
+              "sudo touch ${CANINE_BUCKETMOUNT_LOG} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_LOG}",
 
               # Fast path: already mounted and live on this node, so skip the
               # lock entirely. timeout guards stat against a hung FUSE daemon.
@@ -2825,7 +2874,7 @@ class AbstractLocalizer(abc.ABC):
               # 200>&-: the gcsfuse daemon must not inherit the mountlock fd. It
               # lives for the node's lifetime, so an inherited fd would hold the
               # lock forever and every other shard waiting here would time out.
-              "timeout -k 60 60 gcsfuse -o ro --implicit-dirs ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} 200>&- || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
+              "timeout -k 60 60 gcsfuse -o ro --implicit-dirs --log-file ${CANINE_BUCKETMOUNT_LOG} --log-severity warning --log-format text ${CANINE_BUCKETMOUNT_BUCKET} ${CANINE_BUCKETMOUNT_DIR} 200>&- || { echo 'ERROR: Bucket mount failed!' >&2; exit 1; }",
 
               # Slurm (proctrack/cgroup) kills every process in a job's cgroup
               # when the job ends, including this gcsfuse daemon -- which would
@@ -2846,7 +2895,7 @@ class AbstractLocalizer(abc.ABC):
               ") 200>${CANINE_BUCKETMOUNT_MOUNTLOCK} || exit 1",
               "fi",
 
-            ] + self.bucketmount_reachability_check() + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + [
+            ] + self.bucketmount_reachability_check() + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + self.bucketmount_log_mark() + [
 
               'echo "INFO: Successfully mounted bucket ${CANINE_BUCKETMOUNT}." >&2',
 
@@ -2952,7 +3001,7 @@ class AbstractLocalizer(abc.ABC):
                 # Bucket mounts are node-lifetime and are never unmounted here
                 # (see the mount loop). Only this job's own bookkeeping is undone:
                 # stop refreshing customTime, then drop its mount leases.
-            ] + self.bucketmount_heartbeat_stop() + self.bucketmount_lease_release() + [
+            ] + self.bucketmount_heartbeat_stop() + self.bucketmount_lease_release() + self.bucketmount_log_report() + [
             ] + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
         )
         return setup_script, localization_script, teardown_script, array_exports
