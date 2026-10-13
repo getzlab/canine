@@ -135,6 +135,21 @@ echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=_pkg_version("canine"))
 
+def _numeric_sacct_columns(acct):
+    """
+    sacct's counts as nullable integers, and PlannedCPURAW (where queried) as a float.
+    A row can come back with a count missing: at the end of a CTSP run a plain int cast
+    raised "cannot convert float NaN to integer" and the whole cost summary was lost.
+    Such a row keeps <NA>, which resolve_job_resources() treats as unknown.
+    """
+    for column in ("CPUTimeRAW", "ReqCPUS", "NCPUS"):
+        if column in acct.columns:
+            acct[column] = pd.to_numeric(acct[column], errors = "coerce").astype("Int64")
+    if "PlannedCPURAW" in acct.columns:
+        acct["PlannedCPURAW"] = pd.to_numeric(acct["PlannedCPURAW"], errors = "coerce")
+    return acct
+
+
 def _job_indices_to_array_str(indices: typing.List[int]) -> str:
     """Convert a sorted list of job indices into a compact SLURM array range string.
 
@@ -372,9 +387,20 @@ class Orchestrator(object):
         # this query can see other tools'/accounts' jobs sharing the same node.
         # Start/End are left as raw sacct strings (may be "Unknown" for jobs
         # still running/pending), same reasoning as wait_for_jobs_to_finish().
-        return acct.loc[~acct.index.str.endswith("batch")].astype({
-          'CPUTimeRAW': int, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int
-        }).copy()
+        #
+        # The counts are nullable: a row can come back with no ReqCPUS (seen at the
+        # end of a CTSP run, where the plain int cast raised "cannot convert float
+        # NaN to integer" and the whole cost summary was lost). Such a row stays,
+        # with <NA>, and resolve_job_resources() treats it as unknown.
+        acct = acct.loc[~acct.index.str.endswith("batch")].astype({"Submit" : "datetime64[ns]"})
+        return _numeric_sacct_columns(acct).copy()
+
+    def _batch_in_queue(self, batch_id):
+        """True if squeue still has any job of the batch; False if not, or if it fails."""
+        try:
+            return len(self.backend.squeue(jobs = batch_id)) > 0
+        except Exception:
+            return False
 
     def __init__(self, config: typing.Union[
       str,
@@ -666,11 +692,22 @@ class Orchestrator(object):
             backoff_factor = 1
             while True:
                 time.sleep(30*backoff_factor)
-                acct = self.backend.sacct(
-                  "D",
-                  job = batch_id,
-                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem,Start,End,Elapsed,AllocTRES,Account"
-                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int})
+                # A failed sacct is no answer, like an empty one, so it takes the same
+                # backoff. It used to propagate at once: on a CTSP controller sacct
+                # briefly could not reach slurmdbd ("Resource temporarily
+                # unavailable"), wolF fell back to reading the jobs' state from disk,
+                # declared two running downloads "catastrophically lost", and retried
+                # the task while they were still running.
+                try:
+                    acct = _numeric_sacct_columns(self.backend.sacct(
+                      "D",
+                      job = batch_id,
+                      format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem,Start,End,Elapsed,AllocTRES,Account"
+                      ).astype({"Submit" : "datetime64[ns]"}))
+                except CalledProcessError as e:
+                    canine_logging.warning("sacct failed ({}); retrying".format(
+                      " ".join(str(e.stderr or "").split())[:300]))
+                    acct = pd.DataFrame()
                 # Start/End/Elapsed are deliberately NOT cast to datetime here: sacct
                 # reports "Unknown" for jobs that haven't started/finished yet, and this
                 # query includes still-in-progress jobs from the same batch on every
@@ -679,14 +716,20 @@ class Orchestrator(object):
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
-                # corresponds to a five minute backoff
                 elif backoff_factor >= 31:
+                    # Out of patience with the accounting database, but the scheduler
+                    # answers separately: while it still has jobs of this batch, they
+                    # are not lost, so keep waiting rather than give up on them.
+                    if self._batch_in_queue(batch_id):
+                        canine_logging.warning("Still no job accounting information for batch {}, but its jobs are in the queue; still waiting".format(batch_id))
+                        backoff_factor = 1
+                        continue
                     raise Exception("Timeout exceeded waiting to query job accounting information; cluster is likely under extreme load!")
                 else:
                     backoff_factor *= 1.1
             acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))].copy()
             acct.loc[acct["PlannedCPURAW"].isna(), "PlannedCPURAW"] = 0
-            acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "PlannedCPURAW"].astype(int)
+            acct.loc[:, "CPUTimeRAW"] = acct.loc[:, "CPUTimeRAW"].fillna(0) + acct.loc[:, "PlannedCPURAW"].astype(int)
             acct = acct.drop(columns = ["PlannedCPURAW"])
             acct = acct.groupby(acct.index).apply(grouper)
 

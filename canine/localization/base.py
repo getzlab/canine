@@ -68,6 +68,9 @@ BUCKET_CLAIM_OBJECT = ".wolf_claim"
 BUCKET_ALREADY_POPULATED = "already populated"
 BUCKET_WAITING = "another job is uploading into"
 BUCKET_HEARTBEAT_INTERVAL = 60
+# How many heartbeats between refreshes of the uploaded objects' customTime: hourly,
+# well inside the lifecycle rule's localization_expiry_days.
+BUCKET_CONTENT_REFRESH_BEATS = 60
 BUCKET_HEARTBEAT_STALE = 600
 # Where the controller's NFS share is mounted, on the controller and every worker alike
 # (slurm_gcp_docker). A path under it is the same file on a worker; any other local path
@@ -1900,8 +1903,20 @@ class AbstractLocalizer(abc.ABC):
           '    canine_bucket_label --update-labels=wolf=working --public-access-prevention || :',
           # The heartbeat. It refreshes the claim's update time, conditional on
           # this job's generation, so it can never keep someone else's claim alive.
-          '    ( while sleep {interval}; do gcloud storage objects update "$CANINE_BUCKET_CLAIM" --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :; done ) &'.format(
-            interval = BUCKET_HEARTBEAT_INTERVAL),
+          #
+          # Every BUCKET_CONTENT_REFRESH_BEATS beats it also refreshes customTime on
+          # the upload's objects that already exist. An input finished by an earlier
+          # attempt is skipped, not rewritten, so its customTime is that attempt's,
+          # and a long download alongside it can outlast the lifecycle rule: a .bai
+          # finished on the first run was deleted while its 340 GB BAM downloaded,
+          # failing the upload's final check ("missing after upload"). One object per
+          # command, so one that does not exist yet cannot stop the rest.
+          '    ( CANINE_BEATS=0; while sleep {interval}; do'.format(interval = BUCKET_HEARTBEAT_INTERVAL),
+          '      gcloud storage objects update "$CANINE_BUCKET_CLAIM" --if-generation-match="$CANINE_BUCKET_CLAIM_GEN" --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :',
+          '      CANINE_BEATS=$((CANINE_BEATS+1)); [ $((CANINE_BEATS % {n})) -eq 0 ] || continue'.format(n = BUCKET_CONTENT_REFRESH_BEATS),
+          '      for CANINE_OBJ in {objs}; do gcloud storage objects update "$CANINE_OBJ" --custom-time="$(date -u +%Y-%m-%dT%H:%M:%SZ)" > /dev/null 2>&1 || :; done'.format(
+            objs = bucket_object_patterns(upload_plan)),
+          '    done ) &',
           '    CANINE_BUCKET_HB_PID=$!',
           # A failed or cancelled upload used to leave the bucket "working", so the
           # next job waited out the whole limit before taking over -- seen in

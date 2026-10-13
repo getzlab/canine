@@ -6968,7 +6968,25 @@ handling fails a test. The test pinning the module's one wall-clock read (now
 against customTime, a wall-clock timestamp. The full
 pure suite is 1806 passed, 1 skipped.
 
-### 13.98 Summary: speedups versus the original localization
+### 13.98 Keeping an upload's finished inputs alive
+
+§13.97 keeps the parts of the download in progress alive, but not the other inputs of the
+same bucket. An input an earlier attempt finished is skipped by the next, not rewritten, so its
+customTime stays the earlier attempt's. CTSP-B6K8's `.bai` finished on the first run; on the
+second its 340 GB BAM took 11.4 hours to download, the lifecycle rule deleted the `.bai`
+meanwhile, and the upload's final check failed: `….bai missing after upload`. The task's retry
+re-fetched only the `.bai`, so it cost a retry rather than the sample.
+
+The upload's heartbeat, which refreshes its claim every `BUCKET_HEARTBEAT_INTERVAL` (60 s), now
+also refreshes customTime on each of the upload's objects every `BUCKET_CONTENT_REFRESH_BEATS`
+beats (hourly), one object per command so that one not yet written stops nothing.
+
+**Tests:** 3 new in `test_localizer_bucket_upload_pure.py`, against the fake gcloud: the
+objects are refreshed while the upload runs, only on their interval while the claim still
+beats every interval, and one object per command. Removing the refresh, refreshing every beat,
+and refreshing all objects in one command each fail a test.
+
+### 13.99 Summary: speedups versus the original localization
 
 "Original" means canine before this work. Each object was fetched by a single stream
 (`curl` or `aws s3api get-object`) onto the pd-standard localization disk, then verified by

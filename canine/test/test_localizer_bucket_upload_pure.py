@@ -1191,6 +1191,49 @@ class TestAnUnfinishedUploadReleasesItsClaim:
         assert all("--if-generation-match=" in b for b in beats)
 
 
+class TestTheHeartbeatKeepsTheUploadsObjectsAlive:
+    '''
+    An input an earlier attempt finished is skipped, not rewritten, so its customTime is
+    that attempt's. A .bai finished on the first run was deleted by the lifecycle rule
+    while its 340 GB BAM downloaded, and the upload failed "missing after upload".
+    '''
+
+    TWO = [gs_item(path="gs://src-bucket/reads.bam", dest="gs://wolf-1-us-central1-abc/t_bam/reads.bam"),
+           gs_item(path="gs://src-bucket/reads.bai", dest="gs://wolf-1-us-central1-abc/t_bai/reads.bai")]
+
+    def _content_refreshes(self, state):
+        return [c for c in fake_calls(state)
+                if c.startswith("storage objects update") and ".wolf_claim" not in c]
+
+    def test_the_objects_are_refreshed_while_uploading(self, tmp_path, monkeypatch):
+        from canine.localization import base
+        monkeypatch.setattr(base, "BUCKET_CONTENT_REFRESH_BEATS", 2)
+        proc, state = run_claim_script(tmp_path, items=self.TWO, FAKE_CP="hang",
+                                       FAKE_CP_SECONDS="1")
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        refreshes = self._content_refreshes(state)
+        for dest in ("t_bam/reads.bam", "t_bai/reads.bai"):
+            hits = [c for c in refreshes if dest in c]
+            assert len(hits) >= 2, refreshes
+            # one object per command, so one that does not exist yet stops nothing
+            assert all(c.count("gs://") == 1 for c in hits), hits
+
+    def test_the_claim_still_beats_every_interval(self, tmp_path, monkeypatch):
+        from canine.localization import base
+        monkeypatch.setattr(base, "BUCKET_CONTENT_REFRESH_BEATS", 1000)
+        proc, state = run_claim_script(tmp_path, items=self.TWO, FAKE_CP="hang",
+                                       FAKE_CP_SECONDS="1")
+        assert "CANINE_SCRIPT_DONE" in proc.stdout, proc.stderr
+        beats = [c for c in fake_calls(state)
+                 if c.startswith("storage objects update") and ".wolf_claim" in c]
+        assert len(beats) >= 3
+        assert self._content_refreshes(state) == [], "refreshed before its interval"
+
+    def test_the_refresh_is_hourly(self):
+        from canine.localization.base import BUCKET_CONTENT_REFRESH_BEATS, BUCKET_HEARTBEAT_INTERVAL
+        assert BUCKET_CONTENT_REFRESH_BEATS * BUCKET_HEARTBEAT_INTERVAL == 3600
+
+
 class TestTheClaimMakesTakeoverExclusive:
     '''
     Only bucket creation used to be a mutex. At 100 jobs sharing a bucket, an expired,
