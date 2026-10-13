@@ -2780,10 +2780,16 @@ class AbstractLocalizer(abc.ABC):
               "sudo mkdir -p $(dirname ${CANINE_BUCKETMOUNT_DIR})",
               "CANINE_BUCKETMOUNT_MOUNTLOCK=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).mountlock",
               "sudo touch ${CANINE_BUCKETMOUNT_MOUNTLOCK} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_MOUNTLOCK}",
-              # gcsfuse's log, beside the mountpoint for the same reason as the
-              # lock; read by bucketmount_log_mark and _report
-              "CANINE_BUCKETMOUNT_LOG=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.$(basename ${CANINE_BUCKETMOUNT_DIR}).gcsfuse.log",
-              "sudo touch ${CANINE_BUCKETMOUNT_LOG} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_LOG}",
+              # gcsfuse's log, read by bucketmount_log_mark and _report, beside the
+              # mountpoints for the same reason as the lock -- but in a directory of
+              # its own that the mounting user owns. Daemonized, gcsfuse also creates
+              # <log>.stderr next to the log, and the mountpoints' directory is root's:
+              # with the log there, every mount failed "open ....gcsfuse.log.stderr:
+              # permission denied".
+              "CANINE_BUCKETMOUNT_LOGDIR=$(dirname ${CANINE_BUCKETMOUNT_DIR})/.gcsfuse-logs",
+              "sudo mkdir -p ${CANINE_BUCKETMOUNT_LOGDIR} && sudo chown $(id -u):$(id -g) ${CANINE_BUCKETMOUNT_LOGDIR}",
+              "CANINE_BUCKETMOUNT_LOG=${CANINE_BUCKETMOUNT_LOGDIR}/$(basename ${CANINE_BUCKETMOUNT_DIR}).log",
+              "touch ${CANINE_BUCKETMOUNT_LOG}",
 
               # Fast path: already mounted and live on this node, so skip the
               # lock entirely. timeout guards stat against a hung FUSE daemon.

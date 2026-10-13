@@ -333,3 +333,66 @@ class TestMountLogWiring:
             proc = subprocess.run([BASH, "-n"], input=("set -e\n" + "\n".join(script)).encode(),
                                   capture_output=True)
             assert proc.returncode == 0, proc.stderr.decode()
+
+
+class TestTheMountCanWriteItsLog:
+    """
+    Daemonized, gcsfuse creates <log-file>.stderr beside its log. The log sat in the
+    mountpoints' directory, which is root's, so every mount failed with "open
+    ....gcsfuse.log.stderr: permission denied" -- on the first real runs, not on a test VM
+    whose log was in the home directory.
+
+    Runs canine's own commands, from the log path through the gcsfuse call, with the
+    mountpoints' directory unwritable except through sudo, and a gcsfuse that writes
+    beside its log the way the real one does.
+    """
+
+    @staticmethod
+    def _mount_commands():
+        import ast
+        import inspect
+        from canine.localization import base
+        import warnings
+        src = inspect.getsource(base.AbstractLocalizer.job_setup_teardown)
+        with warnings.catch_warnings():
+            # base.py's shell strings carry escapes like "\$" that Python warns about
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse("if 1:\n" + src)
+        strings = [n.value for n in ast.walk(tree)
+                   if isinstance(n, ast.Constant) and isinstance(n.value, str)]
+        start = next(i for i, s in enumerate(strings) if s.startswith("CANINE_BUCKETMOUNT_LOGDIR="))
+        end = next(i for i, s in enumerate(strings) if "gcsfuse -o ro" in s)
+        return [s for s in strings[start:end + 1]
+                if s.startswith(("CANINE_BUCKETMOUNT_LOG", "sudo mkdir -p ${CANINE_BUCKETMOUNT_LOGDIR}",
+                                 "touch ${CANINE_BUCKETMOUNT_LOG}", "timeout -k 60 60 gcsfuse"))]
+
+    def test_gcsfuse_can_create_its_stderr_file_beside_the_log(self, tmp_path):
+        import os
+        import stat
+        mounts = tmp_path / "bucketmounts"
+        (mounts / "wolf-1-us-east1-abc").mkdir(parents=True)
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        # sudo: may write in the mountpoints' directory, as root may
+        (bin_dir / "sudo").write_text(
+            '#!/bin/bash\nchmod u+w {m}; "$@"; rc=$?; chmod u-w {m}; exit $rc\n'.format(m=mounts))
+        (bin_dir / "timeout").write_text('#!/bin/bash\nshift 3; exec "$@"\n')   # -k 60 60
+        (bin_dir / "gcsfuse").write_text(
+            '#!/bin/bash\nwhile [ $# -gt 0 ]; do [ "$1" = --log-file ] && log=$2; shift; done\n'
+            ': > "$log.stderr" || { echo "open $log.stderr: permission denied" >&2; exit 1; }\n')
+        for name in ("sudo", "timeout", "gcsfuse"):
+            os.chmod(str(bin_dir / name), 0o755)
+        os.chmod(str(mounts), stat.S_IRUSR | stat.S_IXUSR)       # root's, as far as we are concerned
+        try:
+            script = "\n".join(["set -e",
+                                'export PATH="{}:$PATH"'.format(bin_dir),
+                                'CANINE_BUCKETMOUNT_DIR="{}/wolf-1-us-east1-abc"'.format(mounts),
+                                "CANINE_BUCKETMOUNT_BUCKET=wolf-1-us-east1-abc"]
+                               + self._mount_commands() + ['echo "LOG=$CANINE_BUCKETMOUNT_LOG"'])
+            proc = subprocess.run([BASH], input=script, capture_output=True, text=True)
+        finally:
+            os.chmod(str(mounts), 0o755)
+        assert proc.returncode == 0, proc.stderr
+        log = proc.stdout.strip().split("LOG=", 1)[1]
+        assert os.path.exists(log + ".stderr")
+        assert os.path.dirname(log) != str(mounts), "the log must not sit in root's directory"
