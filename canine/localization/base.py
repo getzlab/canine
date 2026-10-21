@@ -431,6 +431,11 @@ class AbstractLocalizer(abc.ABC):
         # a job can be settled on the controller without re-planning it
         self.bucket_plans = {}
 
+        # jobId : {"bucket", "region", "items": [{"source", "dest", "kind"}]}, the
+        # localization bucket each job's inputs went to, filled in by
+        # job_setup_teardown() for cost tracking (wolf.Task._estimate_cost())
+        self.job_buckets = {}
+
         # will be removed
         self.disk_key = os.urandom(4).hex()
         local_download_dir = None
@@ -2377,6 +2382,11 @@ class AbstractLocalizer(abc.ABC):
             if not self.persistent_disk_dry_run and len(upload_plan):
                 zone = self.backend_zone()
                 self.bucket_plans[jobId] = (bucket_prefix, _zone_to_region(zone), upload_plan)
+                self.job_buckets[jobId] = {
+                  "bucket": bucket_prefix[5:].split("/", 1)[0],
+                  "region": _zone_to_region(zone),
+                  "items": [{"source": str(item.fh.path), "dest": item.dest, "kind": item.kind} for item in upload_plan],
+                }
                 # local paths no worker can read go up now, from here
                 self.upload_local_paths(upload_plan, bucket_prefix, _zone_to_region(zone))
                 localization_tasks += self.bucket_upload_script(

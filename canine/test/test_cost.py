@@ -1773,3 +1773,254 @@ class TestEstimateWindowCostUsd:
     def test_negative_window_clamped_to_zero(self):
         result = cost.estimate_window_cost_usd(2.0, "2026-01-01T02:00:00", "2026-01-01T00:00:00")
         assert result == pytest.approx(0.0)
+
+
+# ---------------------------------------------------------------------------
+# Localization buckets (GCS pricing, upload/heartbeat operations, bucket listing)
+# ---------------------------------------------------------------------------
+
+def make_gcs_sku(description, regions, resource_group, tiered_rate_usd, usage_type="OnDemand", free_tier=False):
+    sku = make_sku(description, regions[0], family="Storage", tiered_rate_usd=tiered_rate_usd)
+    sku["serviceRegions"] = regions
+    sku["category"].update({"resourceGroup": resource_group, "usageType": usage_type})
+    if free_tier:
+        # e.g. "Standard Storage US Regional": a free first tier, then the real rate
+        sku["pricingInfo"][0]["pricingExpression"]["tieredRates"].insert(0, {"unitPrice": {"units": "0", "nanos": 0}})
+    return sku
+
+
+# descriptions as they appear in a live Cloud Storage Catalog API pull
+GCS_SKUS = [
+  make_gcs_sku("Standard Storage Iowa Dual-region", ["us-central1"], "MultiRegionalStorage", 0.022),
+  make_gcs_sku("Autoclass Standard Storage Iowa", ["us-central1"], "Storage", 0.02),
+  make_gcs_sku("Nearline Storage Iowa", ["us-central1"], "NearlineStorage", 0.01),
+  make_gcs_sku("Standard Storage US Regional", ["us-west1", "us-central1", "us-east1"], "RegionalStorage", 0.02, free_tier=True),
+  make_gcs_sku("Standard Storage Northern Virginia", ["us-east4"], "RegionalStorage", 0.023),
+  make_gcs_sku("Regional HNS Standard Class A Operations", ["global"], "Ops", 0.0000065),
+  make_gcs_sku("Region Standard Tagging Class A Operations", ["global"], "StandardOps", 0.000005),
+  make_gcs_sku("Regional Standard Class A Operations", ["global"], "RegionalOps", 0.000005, free_tier=True),
+  make_gcs_sku("Regional Standard Class B Operations", ["global"], "RegionalOps", 0.0000004),
+  make_gcs_sku("Network Data Transfer GCP Inter Region within Northern America", ["global"], "InterregionEgress", 0.02, free_tier=True),
+  make_gcs_sku("Network Data Transfer GCP Multi-region within Northern America", ["global"], "InterregionEgress", 0.02),
+  make_gcs_sku("Network Data Transfer GCP Replication within Northern America", ["global"], "InterregionEgress", 0.02),
+  make_gcs_sku("GCP Storage Data Transfer between Northern America and Europe", ["global"], "InterregionEgress", 0.05),
+]
+
+
+class TestMatchGcsPrices:
+    def test_storage_is_the_single_region_standard_sku(self):
+        assert cost.match_gcs_storage_price(GCS_SKUS, "us-central1") == pytest.approx(0.02)
+        assert cost.match_gcs_storage_price(GCS_SKUS, "us-east4") == pytest.approx(0.023)
+
+    def test_storage_unknown_region_is_none(self):
+        assert cost.match_gcs_storage_price(GCS_SKUS, "europe-west4") is None
+
+    def test_class_a_is_the_plain_regional_standard_sku(self):
+        # not the HNS or Tagging variants, priced differently
+        assert cost.match_gcs_class_a_price(GCS_SKUS) == pytest.approx(0.000005)
+
+    @pytest.mark.parametrize("route, price", [
+      (None, 0.0),
+      (("inter-region", "Northern America"), 0.02),
+      (("multi-region", "Northern America"), 0.02),
+      (("between", "Northern America", "Europe"), 0.05),
+      (("between", "Europe", "Northern America"), 0.05),  # either order
+      (("inter-region", "Asia"), None),
+    ])
+    def test_transfer(self, route, price):
+        result = cost.match_gcs_transfer_price(GCS_SKUS, route)
+        assert result == (pytest.approx(price) if price is not None else None)
+
+
+class TestGcsTransferRoute:
+    @pytest.mark.parametrize("location, location_type, data_locations, route", [
+      ("us-central1", "region", None, None),
+      ("US-CENTRAL1", "region", None, None),
+      ("nam4", "dual-region", None, None),  # predefined dual-region containing us-central1
+      ("us", "dual-region", ["US-CENTRAL1", "US-EAST4"], None),  # custom dual-region
+      ("eur4", "dual-region", None, ("between", "Europe", "Northern America")),
+      ("us-east1", "region", None, ("inter-region", "Northern America")),
+      ("us", "multi-region", None, ("multi-region", "Northern America")),
+      ("europe-west4", "region", None, ("between", "Europe", "Northern America")),
+      ("asia-southeast2", "region", None, ("between", "Indonesia", "Northern America")),
+    ])
+    def test_routes_into_us_central1(self, location, location_type, data_locations, route):
+        assert cost.gcs_transfer_route(location, location_type, "us-central1", data_locations) == route
+
+    def test_unplaceable_location_raises(self):
+        with pytest.raises(ValueError):
+            cost.gcs_transfer_route("mars-north1", "region", "us-central1")
+
+
+class TestEstimateUploadClassAOps:
+    def test_server_side_and_local_are_one_per_object(self):
+        assert cost.estimate_upload_class_a_ops([10, 20, 30 * cost.GIB], "server_side") == 3
+        assert cost.estimate_upload_class_a_ops([10, 20], "local") == 2
+
+    def test_small_mount_upload_is_one_part(self):
+        # one part, no compose, customTime update, done marker (upload + rename copy)
+        assert cost.estimate_upload_class_a_ops([1024], "mount") == 4
+
+    def test_large_mount_upload_counts_parts_and_composes(self):
+        # 10 GiB: parts of 10/32 GiB -> 32 parts, joined by one compose
+        assert cost.estimate_upload_class_a_ops([10 * cost.GIB], "mount") == 32 + 1 + 3
+        # 100 GiB: 100/32 GiB is over the 1 GiB cap -> 100 parts, composed in
+        # 4 calls and then 1
+        assert cost.estimate_upload_class_a_ops([100 * cost.GIB], "mount") == 100 + 5 + 3
+        # 2000 GiB: parts capped at 1 GiB -> 2000 parts, composed 32 at a time
+        # (63 calls) and then those 63 (2 calls), then the last 2 (1 call)
+        assert cost.estimate_upload_class_a_ops([2000 * cost.GIB], "mount") == 2000 + 63 + 2 + 1 + 3
+
+
+class TestEstimateHeartbeatClassAOps:
+    def test_one_update_per_object_per_heartbeat(self):
+        assert cost.estimate_heartbeat_class_a_ops(10, 3 * 3600 + 5, 3600) == 30
+
+    @pytest.mark.parametrize("n_objects, running_seconds, heartbeat_seconds", [(0, 7200, 3600), (10, 0, 3600), (10, 7200, None), (10, 1800, 3600)])
+    def test_none_when_nothing_to_beat(self, n_objects, running_seconds, heartbeat_seconds):
+        assert cost.estimate_heartbeat_class_a_ops(n_objects, running_seconds, heartbeat_seconds) == 0
+
+
+def make_blob(name, size, time_created):
+    blob = MagicMock()
+    blob.name = name
+    blob.size = size
+    blob.time_created = pd.Timestamp(time_created).to_pydatetime()
+    return blob
+
+
+class TestDescribeLocalizationBucket:
+    def make_client(self, blobs):
+        client = MagicMock()
+        bucket = MagicMock()
+        bucket.project_number = 1234
+        bucket.location = "US-CENTRAL1"
+        client.get_bucket.return_value = bucket
+        client.list_blobs.return_value = blobs
+        return client
+
+    def test_splits_objects_by_item_and_by_whether_they_are_new(self):
+        client = self.make_client([
+          make_blob("bam/a.bam", 100, "2026-10-01T10:00:00Z"),
+          make_blob("ref/genome.fa", 50, "2026-10-01T08:00:00Z"),
+          make_blob("ref/genome.fa.fai", 5, "2026-10-01T08:00:00Z"),
+          make_blob("_MOUNTS/lease", 0, "2026-10-01T10:00:00Z"),  # bookkeeping, not data
+        ])
+        items = [
+          {"source": "gs://src/a.bam", "dest": "gs://wolf-b/bam/a.bam", "kind": "server_side"},
+          {"source": "gs://refs/genome", "dest": "gs://wolf-b/ref", "kind": "server_side"},
+        ]
+        with patch("canine.utils.gcloud_storage_client", return_value=client):
+            desc = cost.describe_localization_bucket("wolf-b", items, pd.Timestamp("2026-10-01T09:00:00Z"))
+
+        assert desc["project_number"] == "1234"
+        assert desc["location"] == "us-central1"
+        assert desc["bytes"] == 155
+        assert desc["n_objects"] == 3
+        assert pd.Timestamp(desc["first_created"]) == pd.Timestamp("2026-10-01T08:00:00Z")
+        bam, ref = desc["items"]
+        assert (bam["bytes"], bam["n_objects"], bam["new_bytes"], bam["new_sizes"]) == (100, 1, 100, [100])
+        assert (ref["bytes"], ref["n_objects"], ref["new_bytes"], ref["new_sizes"]) == (55, 2, 0, [])
+
+    def test_naive_since_is_taken_as_utc(self):
+        client = self.make_client([make_blob("x", 1, "2026-10-01T10:00:00Z")])
+        items = [{"source": "/local/x", "dest": "gs://wolf-b/x", "kind": "local"}]
+        with patch("canine.utils.gcloud_storage_client", return_value=client):
+            desc = cost.describe_localization_bucket("wolf-b", items, pd.Timestamp("2026-10-01T09:00:00"))
+        assert desc["items"][0]["new_sizes"] == [1]
+
+    def test_failure_returns_none(self):
+        client = MagicMock()
+        client.get_bucket.side_effect = RuntimeError("404")
+        with patch("canine.utils.gcloud_storage_client", return_value=client):
+            assert cost.describe_localization_bucket("wolf-b", [], pd.Timestamp("2026-10-01T09:00:00Z")) is None
+
+
+class TestEstimateBucketUploadCost:
+    def desc(self, *items):
+        return {"items": list(items)}
+
+    def item(self, source, kind, new_sizes):
+        return {"source": source, "dest": "gs://wolf-b/x", "kind": kind, "new_sizes": new_sizes, "new_bytes": sum(new_sizes)}
+
+    def test_nothing_new_costs_nothing(self):
+        result = cost.estimate_bucket_upload_cost(
+          self.desc(self.item("gs://src/a", "server_side", [])), "us-central1", 0.000005, lambda route: 0.02,
+          location_source=lambda b: pytest.fail("no lookup for a bucket this task didn't upload to"),
+        )
+        assert result == {"ops_usd": 0.0, "transfer_usd": 0.0, "class_a_ops": 0, "transfer_gib": 0.0, "unpriced": []}
+
+    def test_ops_and_cross_region_transfer(self):
+        locations = {"same": ("us-central1", "region", []), "east": ("us-east1", "region", [])}
+        result = cost.estimate_bucket_upload_cost(
+          self.desc(
+            self.item("gs://same/a", "server_side", [2 * cost.GIB]),
+            self.item("gs://east/b", "server_side", [4 * cost.GIB]),
+            self.item("https://example.org/c", "mount", [1024]),
+          ),
+          "us-central1", 0.000005, lambda route: {("inter-region", "Northern America"): 0.02}[route],
+          location_source=lambda b: locations[b],
+        )
+        ops = cost.UPLOAD_CLAIM_CLASS_A_OPS + 1 + 1 + 4
+        assert result["class_a_ops"] == ops
+        assert result["ops_usd"] == pytest.approx(ops * 0.000005)
+        assert result["transfer_gib"] == pytest.approx(4)
+        assert result["transfer_usd"] == pytest.approx(4 * 0.02)
+        assert result["unpriced"] == []
+
+    def test_unknown_source_location_and_ops_price_are_flagged_not_guessed(self):
+        result = cost.estimate_bucket_upload_cost(
+          self.desc(self.item("gs://private/a", "server_side", [cost.GIB])), "us-central1", None, lambda route: 0.02,
+          location_source=lambda b: None,
+        )
+        assert result["ops_usd"] == 0.0 and result["transfer_usd"] == 0.0
+        assert result["unpriced"] == ["operations", "transfer from gs://private/a"]
+
+
+class TestGetGcsPrices:
+    def fake_client(self, skus):
+        fake_client = MagicMock()
+        services = fake_client.services.return_value
+        list_request = MagicMock()
+        services.list.return_value = list_request
+        list_request.execute.return_value = {"services": [
+          {"displayName": "Compute Engine", "name": "services/compute"},
+          {"displayName": "Cloud Storage", "name": "services/gcs"},
+        ]}
+        services.list_next.return_value = None
+        skus_request = MagicMock()
+        services.skus.return_value.list.return_value = skus_request
+        skus_request.execute.return_value = {"skus": skus}
+        services.skus.return_value.list_next.return_value = None
+        return fake_client
+
+    def test_storage_price_from_the_cloud_storage_service_and_cached(self, tmp_path):
+        cache_path = tmp_path / "price_cache.json"
+        fake_client = self.fake_client(GCS_SKUS)
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client", return_value=fake_client), \
+             patch("canine.cost._SERVICE_NAMES", {}):
+            result = cost.get_gcs_storage_price_per_gib_hour("us-central1")
+
+        assert result == pytest.approx(0.02 / cost.AVG_HOURS_PER_MONTH)
+        fake_client.services.return_value.skus.return_value.list.assert_called_with(parent="services/gcs", currencyCode="USD")
+        assert json.loads(cache_path.read_text())["gcs-storage|us-central1"] == pytest.approx(0.02)
+
+    def test_cache_hit_skips_api_call(self, tmp_path):
+        cache_path = tmp_path / "price_cache.json"
+        cache_path.write_text(json.dumps({"gcs-class-a": 0.000005}))
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client") as mock_client:
+            assert cost.get_gcs_class_a_price() == 0.000005
+        mock_client.assert_not_called()
+
+    def test_free_route_needs_no_lookup(self):
+        with patch("canine.cost.get_billing_client") as mock_client:
+            assert cost.get_gcs_transfer_price_per_gib(None) == 0.0
+        mock_client.assert_not_called()
+
+    def test_no_matching_sku_is_none(self, tmp_path):
+        with patch("canine.cost.PRICE_CACHE_PATH", str(tmp_path / "price_cache.json")), \
+             patch("canine.cost.get_billing_client", return_value=self.fake_client([])), \
+             patch("canine.cost._SERVICE_NAMES", {}):
+            assert cost.get_gcs_transfer_price_per_gib(("inter-region", "Northern America")) is None

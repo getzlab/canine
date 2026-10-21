@@ -1375,3 +1375,388 @@ def estimate_node_undersubscription(node_sacct_snapshot, price_source, host_lut 
         })
 
     return pd.DataFrame(results)
+
+
+############ localization buckets (gcsfuse) ############
+#
+# canine stages inputs into per-input-set GCS buckets (see
+# localization/base.py's create_bucket_mount) instead of persistent disks. Their
+# cost has three parts, priced here from the Cloud Storage service's Catalog API
+# SKUs: storage (GiB x time, from upload until the lifecycle rule deletes the
+# objects localization_expiry_days after their last touch), Class A operations
+# (uploads, composes, metadata/customTime updates), and data transfer when a
+# gs:// source in another location is copied in. Reads by workers are
+# same-region, so their transfer is free; their Class B operations are left to
+# the billing reconciliation. SKU wording below was checked against a live
+# Catalog API pull (2026-10).
+
+def _fetch_service_name(client, display_name):
+    """Catalog API service name ("services/...") for a service's display name."""
+    if display_name == "Compute Engine":
+        return _fetch_compute_engine_service_name(client)
+    if display_name in _SERVICE_NAMES:
+        return _SERVICE_NAMES[display_name]
+    request = client.services().list()
+    while request is not None:
+        response = request.execute()
+        for service in response.get("services", []):
+            if service.get("displayName") == display_name:
+                _SERVICE_NAMES[display_name] = service["name"]
+                return service["name"]
+        request = client.services().list_next(request, response)
+    raise RuntimeError("Could not find {} in Cloud Billing Catalog services".format(display_name))
+
+
+_SERVICE_NAMES = {}
+
+
+def match_gcs_storage_price(skus, region):
+    """$/GiB-month for Standard storage in a single-region bucket, or None.
+    Single-region SKUs are resourceGroup "RegionalStorage" and described
+    "Standard Storage <place>" (e.g. "Standard Storage US Regional" for
+    us-central1/us-east1/us-west1, "Standard Storage Northern Virginia")."""
+    for sku in skus:
+        category = sku.get("category", {})
+        if category.get("resourceGroup") != "RegionalStorage" or category.get("usageType", "OnDemand") != "OnDemand":
+            continue
+        if region in sku.get("serviceRegions", []) and sku.get("description", "").startswith("Standard Storage"):
+            return _sku_unit_price_usd(sku)
+    return None
+
+
+def match_gcs_class_a_price(skus):
+    """$/operation for Class A operations on a Standard, single-region,
+    flat-namespace bucket (what canine creates), or None. The SKU is global,
+    not per region; HNS/Autoclass/Tagging variants are priced differently."""
+    for sku in skus:
+        if sku.get("description") == "Regional Standard Class A Operations":
+            return _sku_unit_price_usd(sku)
+    return None
+
+
+# Catalog API names for the continents Cloud Storage data transfer is priced
+# between. Inter-region SKUs say "within Northern America"; cross-continent
+# ones "between Northern America and Europe" (either order).
+def _region_continent(region):
+    region = (region or "").lower()
+    if region in ("us", "nam4") or region.startswith(("us-", "northamerica-")):
+        return "Northern America"
+    if region.startswith("southamerica-"):
+        return "Latin America"
+    if region in ("eu", "eur4", "eur5", "eur7", "eur8") or region.startswith("europe-"):
+        return "Europe"
+    if region == "asia-southeast2":
+        return "Indonesia"
+    if region in ("asia", "asia1") or region.startswith("asia-"):
+        return "Asia"
+    if region.startswith("australia-"):
+        return "Oceania"
+    if region.startswith("me-"):
+        return "Middle East"
+    if region.startswith("africa-"):
+        return "Africa"
+    return None
+
+
+# regions in each predefined dual-region (custom dual-regions list theirs in
+# the bucket's data_locations instead)
+_PREDEFINED_DUAL_REGIONS = {
+  "nam4": {"us-central1", "us-east1"},
+  "eur4": {"europe-north1", "europe-west4"},
+  "asia1": {"asia-northeast1", "asia-northeast2"},
+}
+
+
+def gcs_transfer_route(source_location, source_location_type, dest_region, source_data_locations = None):
+    """
+    How copying from a bucket at source_location into dest_region is priced:
+    None if it's free (same region, or a dual-region containing dest_region),
+    else ("inter-region", continent), ("multi-region", continent), or
+    ("between", continent_a, continent_b). Raises ValueError if a location
+    can't be placed on a continent.
+    """
+    source = (source_location or "").lower()
+    dest = (dest_region or "").lower()
+    location_type = (source_location_type or "region").lower()
+    if source == dest:
+        return None
+    if location_type == "dual-region":
+        members = {l.lower() for l in (source_data_locations or [])} or _PREDEFINED_DUAL_REGIONS.get(source, set())
+        if dest in members:
+            return None
+    source_continent, dest_continent = _region_continent(source), _region_continent(dest)
+    if source_continent is None or dest_continent is None:
+        raise ValueError("Cannot place {} or {} on a continent".format(source_location, dest_region))
+    if source_continent != dest_continent:
+        return ("between", source_continent, dest_continent)
+    return ("multi-region", source_continent) if location_type == "multi-region" else ("inter-region", source_continent)
+
+
+def match_gcs_transfer_price(skus, route):
+    """$/GiB for a gcs_transfer_route() route, or None."""
+    if route is None:
+        return 0.0
+    if route[0] == "between":
+        wanted = {"GCP Storage Data Transfer between {} and {}".format(route[1], route[2]),
+                  "GCP Storage Data Transfer between {} and {}".format(route[2], route[1])}
+    elif route[0] == "multi-region":
+        wanted = {"Network Data Transfer GCP Multi-region within {}".format(route[1])}
+    else:
+        wanted = {"Network Data Transfer GCP Inter Region within {}".format(route[1])}
+    for sku in skus:
+        if sku.get("category", {}).get("resourceGroup") == "InterregionEgress" and sku.get("description") in wanted:
+            return _sku_unit_price_usd(sku)
+    return None
+
+
+def _get_cached_catalog_price(key, display_name, matcher, what):
+    """
+    A price from the Catalog API's `display_name` service, via
+    matcher(skus) -> price or None, cached in PRICE_CACHE_PATH under `key`.
+    Same locking/retry behavior as get_disk_price_per_gb_month(). Returns None
+    (never a guess) if it can't be determined.
+    """
+    cache = load_price_cache()
+    if key in cache:
+        return cache[key]
+
+    with _PRICE_FETCH_LOCK:
+        cache = load_price_cache()
+        if key in cache:
+            return cache[key]
+
+        last_exc = None
+        for attempt in range(1, _MAX_FETCH_ATTEMPTS + 1):
+            try:
+                client = get_billing_client()
+                skus = _fetch_all_skus(client, _fetch_service_name(client, display_name))
+                price = matcher(skus)
+                if price is None:
+                    canine_logging.warning("Could not fetch live price for {}: no matching SKU found".format(what))
+                    return None
+                break
+            except _TRANSIENT_FETCH_ERRORS as e:
+                last_exc = e
+                canine_logging.warning(
+                  "Transient error fetching live price for {} (attempt {}/{}): {} -- retrying with a fresh client".format(
+                    what, attempt, _MAX_FETCH_ATTEMPTS, e))
+                _invalidate_billing_client()
+                if attempt < _MAX_FETCH_ATTEMPTS:
+                    time.sleep(attempt)
+            except Exception as e:
+                canine_logging.warning("Could not fetch live price for {}: {}".format(what, e))
+                return None
+        else:
+            canine_logging.warning("Could not fetch live price for {} after {} attempts: {}".format(what, _MAX_FETCH_ATTEMPTS, last_exc))
+            return None
+
+        cache[key] = price
+        _save_price_cache(cache)
+        return price
+
+
+def get_gcs_storage_price_per_gib_hour(region):
+    """Live $/GiB-hour for Standard storage in a single-region bucket, or None."""
+    per_month = _get_cached_catalog_price(
+      "gcs-storage|{}".format(region), "Cloud Storage",
+      lambda skus: match_gcs_storage_price(skus, region), "GCS storage in {}".format(region),
+    )
+    return None if per_month is None else per_month / AVG_HOURS_PER_MONTH
+
+
+def get_gcs_class_a_price():
+    """Live $/Class A operation (Standard, single-region), or None."""
+    return _get_cached_catalog_price("gcs-class-a", "Cloud Storage", match_gcs_class_a_price, "GCS Class A operations")
+
+
+def get_gcs_transfer_price_per_gib(route):
+    """Live $/GiB for a gcs_transfer_route() route (0.0 if free), or None."""
+    if route is None:
+        return 0.0
+    return _get_cached_catalog_price(
+      "gcs-transfer|" + "|".join(route), "Cloud Storage",
+      lambda skus: match_gcs_transfer_price(skus, route), "GCS data transfer {}".format(" ".join(route)),
+    )
+
+
+GIB = 1024 ** 3
+
+# mirrors parallel_download.py's chunk sizing for the bucket-compose route
+# (size/32, clamped to [64 MiB, 1 GiB]) and its compose fan-in (32 sources
+# per call), which decide how many parts -- each one completed resumable
+# upload, i.e. one Class A operation -- a "mount" upload costs
+_PDL_MIN_PART_BYTES = 64 * 1024 ** 2
+_PDL_MAX_PART_BYTES = 1024 ** 3
+_PDL_PARTS_TARGET = 32
+_COMPOSE_MAX_SOURCES = 32
+
+# Class A operations per bucket for the upload claim protocol (create, label
+# updates, the claim object and its once-a-minute heartbeat for a short
+# upload, completeness listings) -- a rough constant, not measured per upload
+UPLOAD_CLAIM_CLASS_A_OPS = 30
+
+
+def estimate_upload_class_a_ops(object_sizes, kind):
+    """
+    Class A operations to upload objects of these sizes by canine's upload
+    route `kind` (UploadItem.kind): "server_side" is one rewrite per object
+    (copied with --custom-time set, so no separate update); "local" one upload
+    per object; "mount" goes through parallel_download's bucket-compose route
+    -- one upload per part, the composes that join them, a customTime update,
+    and the done marker (written through gcsfuse: an upload plus a rename's
+    copy). Rough by design; the reconciliation measures the real number.
+    """
+    ops = 0
+    for size in object_sizes:
+        if kind != "mount":
+            ops += 1
+            continue
+        part = min(max(size / _PDL_PARTS_TARGET, _PDL_MIN_PART_BYTES), _PDL_MAX_PART_BYTES)
+        parts = max(1, -(-int(size) // int(part)))
+        composes = 0
+        while parts > 1:
+            calls = -(-parts // _COMPOSE_MAX_SOURCES)
+            composes += calls
+            parts = calls
+        ops += max(1, -(-int(size) // int(part))) + composes + 1 + 2
+    return ops
+
+
+def estimate_heartbeat_class_a_ops(n_objects, running_seconds, heartbeat_seconds):
+    """Class A operations from a consuming job's customTime heartbeat, which
+    updates every object in the bucket once per heartbeat_seconds while the job
+    runs (localization/base.py's bucketmount_heartbeat_start)."""
+    if not n_objects or not running_seconds or not heartbeat_seconds:
+        return 0
+    return int(n_objects) * int(running_seconds // heartbeat_seconds)
+
+
+def _dest_prefix(dest_url):
+    # "gs://bucket/key/..." -> "key/..."
+    return dest_url.split("/", 3)[3] if dest_url.count("/") >= 3 else ""
+
+
+def describe_localization_bucket(bucket_name, items, since):
+    """
+    What's in a localization bucket now, for cost tracking: {"project_number",
+    "location", "bytes", "n_objects", "first_created", "items": [...]}, one item
+    per `items` entry ({"source", "dest", "kind"}, as recorded in a localizer's
+    job_buckets) with its objects' "bytes"/"n_objects", and "new_bytes"/
+    "new_sizes" for the objects created at or after `since` (a UTC Timestamp)
+    -- i.e. the ones this task uploaded, rather than found already there.
+
+    One bucket metadata read and one object listing (Class A list operations,
+    paginated). Returns None on any failure -- e.g. the objects have already
+    expired -- never a guess.
+    """
+    from .utils import gcloud_storage_client
+    try:
+        client = gcloud_storage_client()
+        bucket = client.get_bucket(bucket_name)
+        blobs = [b for b in client.list_blobs(bucket_name) if not b.name.startswith("_")]
+    except Exception as e:
+        canine_logging.warning("Could not describe localization bucket {}: {}".format(bucket_name, e))
+        return None
+
+    since = pd.Timestamp(since)
+    since = since.tz_localize("UTC") if since.tzinfo is None else since
+    described = []
+    for item in items:
+        prefix = _dest_prefix(item["dest"])
+        mine = [b for b in blobs if b.name == prefix or b.name.startswith(prefix.rstrip("/") + "/")]
+        new = [b for b in mine if b.time_created is not None and pd.Timestamp(b.time_created) >= since]
+        described.append({
+          **item,
+          "bytes": sum(b.size or 0 for b in mine), "n_objects": len(mine),
+          "new_bytes": sum(b.size or 0 for b in new), "new_sizes": [b.size or 0 for b in new],
+        })
+    created = [pd.Timestamp(b.time_created) for b in blobs if b.time_created is not None]
+    return {
+      "project_number": str(bucket.project_number) if bucket.project_number is not None else None,
+      "location": (bucket.location or "").lower(),
+      "bytes": sum(b.size or 0 for b in blobs),
+      "n_objects": len(blobs),
+      "first_created": min(created).isoformat() if created else None,
+      "items": described,
+    }
+
+
+_SOURCE_LOCATION_CACHE = {}
+_SOURCE_LOCATION_CACHE_LOCK = threading.Lock()
+
+
+def get_gcs_bucket_location(bucket_name, user_project = None):
+    """
+    (location, location_type, data_locations) of a source bucket, cached
+    in-process, or None if it can't be read -- reading a bucket's metadata
+    needs storage.buckets.get, which a user who can only read its objects
+    doesn't have.
+    """
+    from .utils import gcloud_storage_client
+    with _SOURCE_LOCATION_CACHE_LOCK:
+        if bucket_name in _SOURCE_LOCATION_CACHE:
+            return _SOURCE_LOCATION_CACHE[bucket_name]
+    try:
+        import google.cloud.storage
+        bucket = google.cloud.storage.Bucket(gcloud_storage_client(), bucket_name, user_project = user_project)
+        bucket.reload()
+        result = ((bucket.location or "").lower(), (bucket.location_type or "region").lower(), list(bucket.data_locations or []))
+    except Exception as e:
+        canine_logging.warning("Could not read the location of source bucket {} (transfer cost left unpriced): {}".format(bucket_name, e))
+        result = None
+    with _SOURCE_LOCATION_CACHE_LOCK:
+        _SOURCE_LOCATION_CACHE[bucket_name] = result
+    return result
+
+
+def estimate_bucket_upload_cost(bucket_desc, region, class_a_price, transfer_price_source, location_source = get_gcs_bucket_location):
+    """
+    Cost of what this task uploaded into one localization bucket (from
+    describe_localization_bucket(); only its "new_*" objects count -- a bucket
+    already populated by an earlier task or run costs this task no upload).
+
+    Returns {"ops_usd", "transfer_usd", "class_a_ops", "transfer_gib",
+    "unpriced": [reason, ...]}. Transfer is charged for gs:// sources outside
+    `region` (via gcs_transfer_route()), on the uploaded bytes -- for a
+    gzip-encoded source decoded on the way in ("mount" kind) that's the decoded
+    size, an overestimate of what crossed the wire. A cross-location copy's
+    transfer is billed to the source bucket's project unless it's
+    requester-pays, so it may not appear in this project's billing.
+    transfer_price_source(route) -> $/GiB or None, location_source(bucket) ->
+    (location, location_type, data_locations) or None.
+    """
+    result = {"ops_usd": 0.0, "transfer_usd": 0.0, "class_a_ops": 0, "transfer_gib": 0.0, "unpriced": []}
+    uploaded = [item for item in bucket_desc["items"] if item["new_sizes"]]
+    if not uploaded:
+        return result
+
+    ops = UPLOAD_CLAIM_CLASS_A_OPS + sum(estimate_upload_class_a_ops(item["new_sizes"], item["kind"]) for item in uploaded)
+    result["class_a_ops"] = ops
+    if class_a_price is None:
+        result["unpriced"].append("operations")
+    else:
+        result["ops_usd"] = ops * class_a_price
+
+    for item in uploaded:
+        source = str(item.get("source") or "")
+        if not source.startswith("gs://"):
+            continue
+        location = location_source(source[5:].split("/", 1)[0])
+        if location is None:
+            result["unpriced"].append("transfer from {}".format(source))
+            continue
+        try:
+            route = gcs_transfer_route(location[0], location[1], region, location[2])
+        except ValueError:
+            result["unpriced"].append("transfer from {}".format(source))
+            continue
+        if route is None:
+            continue
+        price = transfer_price_source(route)
+        gib = item["new_bytes"] / GIB
+        result["transfer_gib"] += gib
+        if price is None:
+            result["unpriced"].append("transfer from {}".format(source))
+        else:
+            result["transfer_usd"] += gib * price
+    return result

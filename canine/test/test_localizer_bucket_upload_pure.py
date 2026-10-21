@@ -1447,6 +1447,25 @@ class TestSettlingALocalizationOnTheController:
                 pass                                      # only the bucket branch matters here
         assert loc.bucket_plans.get("0") == (self.PREFIX, "us-central1", [item])
 
+    def test_job_setup_teardown_records_the_bucket_for_cost_tracking(self):
+        loc = make_localizer(localize_to_persistent_disk=True)
+        loc.inputs = {"0": {}}
+        loc.clean_on_exit = False
+        item = gs_item()
+        with patch.object(loc, "create_bucket_mount",
+                          return_value=(self.PREFIX, False, {"inp": ["bucketmount://x"]}, [item])), \
+             patch.object(loc, "backend_zone", return_value="us-central1-c"):
+            try:
+                loc.job_setup_teardown("0", {"stdout": "../stdout", "stderr": "../stderr"},
+                                       MagicMock())
+            except Exception:
+                pass                                      # only the bucket branch matters here
+        assert loc.job_buckets.get("0") == {
+            "bucket": "wolf-1-us-central1-abc", "region": "us-central1",
+            "items": [{"source": "gs://src-bucket/reads.bam",
+                       "dest": "gs://wolf-1-us-central1-abc/inp/reads.bam", "kind": item.kind}],
+        }
+
 
 class TestTheOrchestratorDropsSettledJobs:
 
