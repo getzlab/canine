@@ -8,11 +8,25 @@ Stubs out packages that are either:
 This allows pure unit tests to run without the full canine installation.
 The integration/backend tests still require the full environment.
 """
+import os
 import sys
 import types
 from unittest.mock import MagicMock
 
+# Emitted localization commands run the parallel downloader as `python3`, whichever one
+# is first on PATH -- on a worker, the image's, which has canine's dependencies (among
+# them google_crc32c, which the downloader imports). Put the interpreter running the tests
+# first, so the commands tests execute get the same: a python3 with this venv's packages,
+# not whatever the invoking shell happens to have.
+os.environ["PATH"] = os.path.dirname(sys.executable) + os.pathsep + os.environ.get("PATH", "")
+
 _STUB_MODULES = [
+    # NOT slurm_gcp_docker -- see the real-module stub below. Both branches hit the
+    # same ModuleNotFoundError and fixed it differently: this branch registered the
+    # parent and the submodule as two separate MagicMocks, fuse-localize built a real
+    # package with a __path__. Either works alone, but listing it here ALSO defeats the
+    # other one, because `if "slurm_gcp_docker" not in sys.modules` is then false and
+    # the real stub never installs.
     # dalmatian / firecloud-dalmatian requires Terra account setup to install
     "dalmatian",
     "firecloud_dalmatian",

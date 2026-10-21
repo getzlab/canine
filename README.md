@@ -82,6 +82,31 @@ This localizer stages the pipeline directory directly on the Slurm controller us
 * `NFS`: Choose this backend if the current system has an active NFS mount to the Slurm controller.
 The canine pipeline will be staged locally, within the NFS mount point, allowing NFS to take care of transferring the pipeline directory to the controller.
 
+#### Parallel chunked downloads
+
+Every localizer downloads remote URLs — GCS signed URLs, S3, GDC, DRS — through a parallel,
+resumable chunked downloader rather than a single `curl`. It is on by default with 16
+connections per input, and it is resumable across preemption: a requeued task picks up
+from the bytes already on disk instead of starting the object again.
+
+Turn it off per node without redeploying:
+
+```bash
+export CANINE_DISABLE_PARALLEL_DOWNLOAD=1
+```
+
+or per pipeline, via `localizer_args`:
+
+```python
+canine.Orchestrator(..., localizer_args = {"parallel_download": False})
+```
+
+Tuning, log formats, exit codes and troubleshooting are in the operator's guide,
+[canine/localization/PARALLEL_DOWNLOAD.md](canine/localization/PARALLEL_DOWNLOAD.md).
+The short version: the connection count is worth changing only when the destination is
+faster than a size-matched `pd-standard`, which sustains about 44 MiB/s and is what binds
+on the `LocalizeToDisk` path.
+
 
 ### Examples
 

@@ -16,6 +16,7 @@ same NFS mount wolF/canine already use. Nothing in this module writes to either.
 import http.client
 import json
 import os
+import re
 import threading
 import time
 
@@ -61,6 +62,34 @@ def load_node_types(path = None):
     return node_types.astype({"cpus": int, "realmemory": float}).set_index("type")[["cpus", "realmemory"]]
 
 
+def canonical_machine_type(machine_type, node_types):
+    """
+    host_LuT.pickle's "machine_type" column is actually a Slurm partition label
+    (see provision_server.py's `partition1`), not a bare GCE machine type:
+    non-preemptible nodes get a "-nonp" suffix, and GPU nodes get a further
+    "-{accelerator_count}-{accelerator_type}" suffix -- either, both, or
+    neither may be present. host_LuT already tracks preemptibility correctly
+    in its own separate "preemptible" column, so this only needs to recover
+    the bare type for a node_types lookup, not re-derive preemptibility from
+    the suffix.
+
+    Matches against node_types' own (small, known) vocabulary of base type
+    strings, rather than blindly splitting on "-", since accelerator_type
+    names (e.g. "nvidia-tesla-t4") themselves contain hyphens and would make a
+    positional split ambiguous.
+
+    Returns `machine_type` unchanged if it's already a bare type, or if no
+    known base type matches -- callers' existing "not in node_types.index"
+    handling covers that case the same as before this normalization existed.
+    """
+    if machine_type in node_types.index:
+        return machine_type
+    for base in node_types.index:
+        if re.fullmatch(re.escape(base) + r"(-nonp)?(-\d+-.+)?", machine_type):
+            return base
+    return machine_type
+
+
 def node_capacity(node_name, host_lut, node_types):
     """
     Returns (vcpus, mem_mb) for a node, or (None, None) if the node isn't in
@@ -69,7 +98,7 @@ def node_capacity(node_name, host_lut, node_types):
     """
     if node_name not in host_lut.index:
         return None, None
-    machine_type = host_lut.loc[node_name, "machine_type"]
+    machine_type = canonical_machine_type(host_lut.loc[node_name, "machine_type"], node_types)
     if machine_type not in node_types.index:
         return None, None
     row = node_types.loc[machine_type]
@@ -332,7 +361,13 @@ def _machine_family(machine_type):
     return machine_type.split("-", 1)[0]
 
 
-_FAMILY_SKU_WORD = {"n1": "N1", "n2": "N2", "n2d": "N2D", "e2": "E2"}
+# Maps our own machine-type family prefix to its Catalog API SKU family word.
+# Fixed-shape SKUs are worded either "<FAMILY> Predefined Instance Core/Ram" or
+# plain "<FAMILY> Instance Core/Ram" (N4 never says "Predefined"; live pulls
+# have also shown N2/N2D/E2 on-demand SKUs without it), so matches() below
+# accepts both and instead excludes "Custom"/"Sole Tenancy" SKUs explicitly,
+# since those also just say "... Instance Core"/"Ram".
+_FAMILY_SKU_WORD = {"n1": "N1", "n2": "N2", "n2d": "N2D", "e2": "E2", "n4": "N4"}
 
 
 def _fetch_compute_engine_service_name(client):
@@ -387,18 +422,24 @@ def match_compute_engine_price(skus, machine_type, region, preemptible):
     review alone.
 
     Confirmed live against a real Catalog API response: the "Predefined
-    Instance" wording only holds for N1 ("N1 Predefined Instance Core
-    running in Americas") -- N2/N2D/E2's real, plain on-demand SKUs read
-    "N2 Instance Core running in Americas"/"N2D AMD Instance Core running in
-    Americas" etc, with no "Predefined" at all. Requiring that literal
-    phrase made every non-N1 family silently unmatchable (get_price()
-    returning None with no error, since the API call itself succeeds --
-    see get_price()'s own "no matching SKU found" warning, added
-    specifically because this failure mode used to be invisible).
+    Instance" wording does not hold for every family (e.g. N4, and N2/N2D/E2
+    on-demand SKUs reading "N2 Instance Core running in Americas"/"N2D AMD
+    Instance Core running in Americas"). Requiring that literal phrase made
+    those families silently unmatchable (get_price() returning None with no
+    error, since the API call itself succeeds -- see get_price()'s own "no
+    matching SKU found" warning, added specifically because this failure mode
+    used to be invisible).
     """
     family_word = _FAMILY_SKU_WORD.get(_machine_family(machine_type))
     if family_word is None:
         return None  # unrecognized family -- not enough info to match confidently
+    # word-boundary, not plain substring: "N2" is a literal substring of "N2D"
+    # (and "N4" of "N4A"/"N4D"), so a bare `family_word in desc` would also
+    # match a *different* family's SKUs whenever one family name prefixes
+    # another's -- \b relies on the SKU word immediately following the family
+    # word always being non-alphanumeric (a space, confirmed above), so it
+    # doesn't match inside "N2D"/"N4A"/"N4D" the way plain substring search would.
+    family_word_re = re.compile(r"\b" + re.escape(family_word) + r"\b")
 
     def matches(sku, resource_word):
         if sku.get("category", {}).get("resourceFamily") != "Compute":
@@ -417,10 +458,7 @@ def match_compute_engine_price(skus, machine_type, region, preemptible):
         # (non-custom, non-sole-tenancy) machine types.
         if "Custom" in desc or "Sole Tenancy" in desc:
             return False
-        # family_word must match as a whole word, not a substring: "N2" is
-        # a substring of "N2D", so a plain `"N2" in desc` check would let an
-        # N2 query silently match (and mis-price against) an N2D SKU.
-        return family_word in desc.split() and "Instance" in desc and resource_word in desc
+        return bool(family_word_re.search(desc)) and "Instance" in desc and resource_word in desc
 
     cpu_skus = [s for s in skus if matches(s, "Core")]
     ram_skus = [s for s in skus if matches(s, "Ram")]
@@ -508,6 +546,7 @@ def get_price(machine_type, zone, preemptible, accelerator_type = None, accelera
     threads that can finish concurrently.
     """
     node_types = load_node_types() if node_types is None else node_types
+    machine_type = canonical_machine_type(machine_type, node_types)
     capacity = _resolve_machine_type_capacity(machine_type, zone, project, node_types)
     if capacity is None:
         return None

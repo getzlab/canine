@@ -194,6 +194,52 @@ class TestNodeCapacity:
         host_lut = pd.DataFrame({"machine_type": ["unknown-type"]}, index = pd.Index(["worker1"]))
         assert cost.node_capacity("worker1", host_lut, self.node_types) == (None, None)
 
+    def test_nonpreemptible_partition_label_suffix_is_recognized(self):
+        # provision_server.py stores the Slurm partition label (not the bare GCE
+        # machine type) in host_LuT's "machine_type" column -- non-preemptible
+        # nodes get a "-nonp" suffix appended. Confirmed live on wolf2-east-slw:
+        # every non-preemptible node's capacity lookup silently failed and
+        # contributed $0 to cost estimation before this was handled.
+        host_lut = pd.DataFrame(
+          {"machine_type": ["n1-highcpu-8-nonp"], "preemptible": [False]},
+          index = pd.Index(["worker5101"], name = "idx"),
+        )
+        assert cost.node_capacity("worker5101", host_lut, self.node_types) == (8, 7000.0)
+
+    def test_nonpreemptible_gpu_partition_label_suffix_is_recognized(self):
+        # non-preemptible GPU nodes get both suffixes: "-nonp-{count}-{accel_type}".
+        # accelerator_type names (e.g. "nvidia-tesla-t4") themselves contain
+        # hyphens, so this specifically exercises that the match isn't done by
+        # blindly splitting on "-".
+        host_lut = pd.DataFrame(
+          {"machine_type": ["n1-highcpu-8-nonp-1-nvidia-tesla-t4"], "preemptible": [False]},
+          index = pd.Index(["worker9001"], name = "idx"),
+        )
+        assert cost.node_capacity("worker9001", host_lut, self.node_types) == (8, 7000.0)
+
+
+class TestCanonicalMachineType:
+    def setup_method(self):
+        self.node_types = pd.DataFrame(
+          {"cpus": [8], "realmemory": [7000.0]},
+          index = pd.Index(["n1-highcpu-8"], name = "type"),
+        )
+
+    def test_bare_type_returned_unchanged(self):
+        assert cost.canonical_machine_type("n1-highcpu-8", self.node_types) == "n1-highcpu-8"
+
+    def test_nonp_suffix_stripped(self):
+        assert cost.canonical_machine_type("n1-highcpu-8-nonp", self.node_types) == "n1-highcpu-8"
+
+    def test_preemptible_gpu_suffix_stripped_without_nonp(self):
+        assert cost.canonical_machine_type("n1-highcpu-8-1-nvidia-tesla-t4", self.node_types) == "n1-highcpu-8"
+
+    def test_nonpreemptible_gpu_suffix_stripped(self):
+        assert cost.canonical_machine_type("n1-highcpu-8-nonp-1-nvidia-tesla-t4", self.node_types) == "n1-highcpu-8"
+
+    def test_unrecognized_type_returned_unchanged(self):
+        assert cost.canonical_machine_type("totally-unknown-type", self.node_types) == "totally-unknown-type"
+
 
 # ---------------------------------------------------------------------------
 # Catalog API SKU matching (synthetic fixtures -- no live network access)
@@ -322,6 +368,62 @@ class TestMatchComputeEnginePrice:
         ]
         assert cost.match_compute_engine_price(skus, "n2-standard-16", "us-east1", preemptible=False) is None
 
+    def test_n2_family_does_not_match_n2d_skus(self):
+        # "N2" is a literal substring of "N2D" -- confirm the word-boundary match
+        # doesn't let an n2-* lookup pick up N2D's (differently-priced) SKUs.
+        skus = [
+          make_sku("N2D Predefined Instance Core running in Americas", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N2D Predefined Instance Ram running in Americas", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N2 Predefined Instance Core running in Americas", "us-central1", tiered_rate_usd=0.033174),
+          make_sku("N2 Predefined Instance Ram running in Americas", "us-central1", tiered_rate_usd=0.004446),
+        ]
+        result = cost.match_compute_engine_price(skus, "n2-standard-8", "us-central1", preemptible=False)
+        assert result == pytest.approx((0.033174, 0.004446))
+
+    def test_matches_on_demand_n4_with_no_predefined_wording(self):
+        # Confirmed via a live Cloud Billing Catalog API pull: N4's fixed-shape
+        # SKUs are described as plain "N4 Instance Core"/"N4 Instance Ram", with
+        # no "Predefined" anywhere -- unlike N1/N2/N2D/E2.
+        skus = [
+          make_sku("N4 Instance Core running in Netherlands", "us-central1", tiered_rate_usd=0.0387),
+          make_sku("N4 Instance Ram running in Netherlands", "us-central1", tiered_rate_usd=0.0052),
+        ]
+        result = cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=False)
+        assert result == pytest.approx((0.0387, 0.0052))
+
+    def test_matches_preemptible_n4(self):
+        skus = [
+          make_sku("Spot Preemptible N4 Instance Core running in Frankfurt", "us-central1", tiered_rate_usd=0.0116),
+          make_sku("Spot Preemptible N4 Instance Ram running in Frankfurt", "us-central1", tiered_rate_usd=0.0016),
+          make_sku("N4 Instance Core running in Frankfurt", "us-central1", tiered_rate_usd=0.0387),
+        ]
+        result = cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=True)
+        assert result == pytest.approx((0.0116, 0.0016))
+
+    def test_n4_excludes_custom_shape_skus(self):
+        skus = [
+          make_sku("N4 Custom Instance Core running in Virginia", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4 Custom Instance Ram running in Virginia", "us-central1", tiered_rate_usd=0.999),
+        ]
+        assert cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=False) is None
+
+    def test_n4_excludes_sole_tenancy_skus(self):
+        skus = [
+          make_sku("N4 Sole Tenancy Instance Core running in Santiago", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4 Sole Tenancy Instance Ram running in Santiago", "us-central1", tiered_rate_usd=0.999),
+        ]
+        assert cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=False) is None
+
+    def test_n4_family_does_not_match_n4a_or_n4d_skus(self):
+        # "N4" is a literal substring of both "N4A" and "N4D".
+        skus = [
+          make_sku("N4A Instance Core running in London", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4A Instance Ram running in London", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4D Instance Core running in Zurich", "us-central1", tiered_rate_usd=0.999),
+          make_sku("N4D Instance Ram running in Zurich", "us-central1", tiered_rate_usd=0.999),
+        ]
+        assert cost.match_compute_engine_price(skus, "n4-standard-8", "us-central1", preemptible=False) is None
+
 
 class TestMatchAcceleratorPrice:
     def test_matches_gpu_model(self):
@@ -434,6 +536,22 @@ class TestGetPrice:
         with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
              patch("canine.cost.get_billing_client") as mock_client:
             result = cost.get_price("n1-highcpu-8", "us-central1-a", False, node_types=self.node_types)
+        assert result == 1.23
+        mock_client.assert_not_called()
+
+    def test_nonp_partition_label_hits_same_cache_entry_as_bare_type(self, tmp_path):
+        # host_LuT.pickle passes the raw partition label (e.g. "n1-highcpu-8-nonp")
+        # as machine_type for non-preemptible nodes -- this must resolve to the
+        # same cached price as the bare type, not miss the cache (or the API)
+        # entirely. Confirmed live: before this normalization, get_price()'s own
+        # "machine_type not in node_types.index" check rejected every
+        # non-preemptible node outright.
+        cache_path = tmp_path / "price_cache.json"
+        key = cost._price_cache_key("n1-highcpu-8", "us-central1-a", False, None, 0)
+        cache_path.write_text(json.dumps({key: 1.23}))
+        with patch("canine.cost.PRICE_CACHE_PATH", str(cache_path)), \
+             patch("canine.cost.get_billing_client") as mock_client:
+            result = cost.get_price("n1-highcpu-8-nonp", "us-central1-a", False, node_types=self.node_types)
         assert result == 1.23
         mock_client.assert_not_called()
 

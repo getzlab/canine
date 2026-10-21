@@ -264,6 +264,69 @@ class TestAttemptSortKey:
         assert sorted_index[2:] == [3, 0]  # then real timestamps, in chronological order
 
 
+def _completed_row(jid, **overrides):
+    row = { "_index": jid, "State": "COMPLETED", "ExitCode": "0:0", "CPUTimeRAW": 50, "PlannedCPURAW": 0,
+            "Submit": "2026-01-01 00:00:00", "NodeList": "worker3", "Partition": "main", "ReqCPUS": 1, "NCPUS": 1, "ReqMem": "1G",
+            "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:01:00", "Elapsed": "00:00:55", "AllocTRES": "cpu=1,mem=1G,node=1", "Account": "abcd" }
+    row.update(overrides)
+    return row
+
+
+class TestWaitingThroughAnAccountingOutage:
+    """
+    On a CTSP controller sacct briefly could not reach slurmdbd ("Resource temporarily
+    unavailable"). The error propagated at once; wolF fell back to reading job state from
+    disk, declared two running downloads "catastrophically lost", and retried the task
+    while they still ran.
+    """
+
+    DBD_DOWN = "sacct: error: Problem talking to the database: Resource temporarily unavailable"
+
+    def _orch(self, sacct_effects, squeue=None):
+        from canine.utils import CommandError
+        orch = object.__new__(Orchestrator)
+        orch.backend = MagicMock()
+        orch.backend.sacct.side_effect = [
+          CommandError(1, "sacct", "", self.DBD_DOWN) if isinstance(e, str) else e for e in sacct_effects]
+        if squeue is not None:
+            orch.backend.squeue.side_effect = squeue
+        orch.job_spec = {"2": {"some": "spec"}}
+        return orch
+
+    def test_a_failed_sacct_is_retried(self):
+        done = make_raw_sacct_df([_completed_row("999_2")])
+        orch = self._orch(["down", "down", done])
+        with patch("canine.orchestrator.time.sleep"):
+            completed, _, acct = orch.wait_for_jobs_to_finish(999, localizer=None)
+        assert completed == [("2", "999_2")]
+        assert orch.backend.sacct.call_count == 3
+
+    def test_jobs_still_in_the_queue_are_waited_for_past_the_backoff(self):
+        """Out of patience with slurmdbd, but slurmctld still has the jobs: not lost."""
+        done = make_raw_sacct_df([_completed_row("999_2")])
+        outage = ["down"] * 40          # longer than one full backoff
+        orch = self._orch(outage + [done], squeue=lambda **kw: pd.DataFrame({"x": [1]}))
+        with patch("canine.orchestrator.time.sleep"):
+            completed, _, _ = orch.wait_for_jobs_to_finish(999, localizer=None)
+        assert completed == [("2", "999_2")]
+        assert orch.backend.squeue.called
+
+    def test_it_still_gives_up_when_nothing_is_in_the_queue(self):
+        orch = self._orch(["down"] * 80, squeue=lambda **kw: pd.DataFrame())
+        with patch("canine.orchestrator.time.sleep"), pytest.raises(Exception, match="Timeout exceeded"):
+            orch.wait_for_jobs_to_finish(999, localizer=None)
+
+    def test_a_row_missing_its_counts_does_not_crash_the_poll(self):
+        import numpy as np
+        raw = make_raw_sacct_df([_completed_row("999_2", ReqCPUS=np.nan, NCPUS=np.nan, CPUTimeRAW=np.nan)])
+        orch = self._orch([raw])
+        with patch("canine.orchestrator.time.sleep"):
+            completed, _, acct = orch.wait_for_jobs_to_finish(999, localizer=None)
+        assert completed == [("2", "999_2")]
+        import json
+        json.dumps(acct.loc["999_2", "attempts"])     # saved to .sacct as JSON
+
+
 class TestQuerySacctForNodes:
     """
     Orchestrator.query_sacct_for_nodes -- the cluster-wide, node/time-scoped query
@@ -315,6 +378,35 @@ class TestQuerySacctForNodes:
         assert set(result.index) == {"555_3", "777"}
         assert result.loc["777", "Account"] == "otherteam"
         assert result.loc["777", "End"] == "Unknown"  # left unparsed, per Start/End convention elsewhere
+
+    def test_a_row_with_no_cpu_count_is_kept_and_does_not_crash(self):
+        """
+        A row came back with no ReqCPUS at the end of a CTSP run; the int cast raised
+        "cannot convert float NaN to integer" and the cost summary was lost.
+        """
+        import numpy as np
+        from canine.cost import resolve_job_resources
+        raw = make_raw_sacct_df([
+          { "_index": "555_3", "State": "COMPLETED", "ExitCode": "0:0", "CPUTimeRAW": 100, "Submit": "2026-01-01 00:00:00",
+            "NodeList": "worker1", "Partition": "main", "ReqCPUS": 2, "NCPUS": 2, "ReqMem": "4G",
+            "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:02:00", "Elapsed": "00:01:55", "AllocTRES": "cpu=2,mem=4G", "Account": "abcd" },
+          { "_index": "556_0", "State": "CANCELLED", "ExitCode": "0:0", "CPUTimeRAW": np.nan, "Submit": "2026-01-01 00:00:00",
+            "NodeList": "worker1", "Partition": "main", "ReqCPUS": np.nan, "NCPUS": np.nan, "ReqMem": "",
+            "Start": "Unknown", "End": "Unknown", "Elapsed": "00:00:00", "AllocTRES": "", "Account": "abcd" },
+        ])
+        backend = MagicMock()
+        backend.sacct.return_value = raw
+
+        result = Orchestrator.query_sacct_for_nodes(backend, ["worker1"], "2026-01-01", "2026-01-02")
+
+        assert set(result.index) == {"555_3", "556_0"}
+        assert result.loc["555_3", "ReqCPUS"] == 2 and result.loc["555_3", "NCPUS"] == 2
+        # still integer counts, not floats, with the missing one as <NA>
+        for column in ("CPUTimeRAW", "ReqCPUS", "NCPUS"):
+            assert str(result[column].dtype) == "Int64", (column, result[column].dtype)
+        assert pd.isna(result.loc["556_0", "ReqCPUS"])
+        row = result.loc["556_0"]
+        assert resolve_job_resources(row["AllocTRES"], row["NCPUS"], row["ReqMem"])[0] is None
 
     def test_empty_sacct_result_does_not_crash(self):
         backend = MagicMock()

@@ -79,6 +79,11 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     echo '======================' >&2
     {{pipeline_script}}
     export CANINE_JOB_RC=$?
+    # a tool can exit 0 after gcsfuse failed one of its reads; see bucketmount_check.py
+    if [ $CANINE_JOB_RC == 0 ] && [ -f $CANINE_JOB_INPUTS/.bucketmount_logs ]; then
+      python3 $CANINE_ROOT/bucketmount_check.py $CANINE_JOB_INPUTS >&2
+      [ $? == 3 ] && export CANINE_JOB_RC=74 || : # EX_IOERR
+    fi
     if [ $CANINE_JOB_RC == 0 ]; then
       echo '====================================' >&2
       echo '==== JOB COMPLETED SUCCESSFULLY ====' >&2
@@ -129,6 +134,21 @@ DELOC_RC=$?
 echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=_pkg_version("canine"))
+
+def _numeric_sacct_columns(acct):
+    """
+    sacct's counts as nullable integers, and PlannedCPURAW (where queried) as a float.
+    A row can come back with a count missing: at the end of a CTSP run a plain int cast
+    raised "cannot convert float NaN to integer" and the whole cost summary was lost.
+    Such a row keeps <NA>, which resolve_job_resources() treats as unknown.
+    """
+    for column in ("CPUTimeRAW", "ReqCPUS", "NCPUS"):
+        if column in acct.columns:
+            acct[column] = pd.to_numeric(acct[column], errors = "coerce").astype("Int64")
+    if "PlannedCPURAW" in acct.columns:
+        acct["PlannedCPURAW"] = pd.to_numeric(acct["PlannedCPURAW"], errors = "coerce")
+    return acct
+
 
 def _job_indices_to_array_str(indices: typing.List[int]) -> str:
     """Convert a sorted list of job indices into a compact SLURM array range string.
@@ -367,9 +387,20 @@ class Orchestrator(object):
         # this query can see other tools'/accounts' jobs sharing the same node.
         # Start/End are left as raw sacct strings (may be "Unknown" for jobs
         # still running/pending), same reasoning as wait_for_jobs_to_finish().
-        return acct.loc[~acct.index.str.endswith("batch")].astype({
-          'CPUTimeRAW': int, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int
-        }).copy()
+        #
+        # The counts are nullable: a row can come back with no ReqCPUS (seen at the
+        # end of a CTSP run, where the plain int cast raised "cannot convert float
+        # NaN to integer" and the whole cost summary was lost). Such a row stays,
+        # with <NA>, and resolve_job_resources() treats it as unknown.
+        acct = acct.loc[~acct.index.str.endswith("batch")].astype({"Submit" : "datetime64[ns]"})
+        return _numeric_sacct_columns(acct).copy()
+
+    def _batch_in_queue(self, batch_id):
+        """True if squeue still has any job of the batch; False if not, or if it fails."""
+        try:
+            return len(self.backend.squeue(jobs = batch_id)) > 0
+        except Exception:
+            return False
 
     def __init__(self, config: typing.Union[
       str,
@@ -661,11 +692,22 @@ class Orchestrator(object):
             backoff_factor = 1
             while True:
                 time.sleep(30*backoff_factor)
-                acct = self.backend.sacct(
-                  "D",
-                  job = batch_id,
-                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem,Start,End,Elapsed,AllocTRES,Account"
-                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int})
+                # A failed sacct is no answer, like an empty one, so it takes the same
+                # backoff. It used to propagate at once: on a CTSP controller sacct
+                # briefly could not reach slurmdbd ("Resource temporarily
+                # unavailable"), wolF fell back to reading the jobs' state from disk,
+                # declared two running downloads "catastrophically lost", and retried
+                # the task while they were still running.
+                try:
+                    acct = _numeric_sacct_columns(self.backend.sacct(
+                      "D",
+                      job = batch_id,
+                      format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem,Start,End,Elapsed,AllocTRES,Account"
+                      ).astype({"Submit" : "datetime64[ns]"}))
+                except CalledProcessError as e:
+                    canine_logging.warning("sacct failed ({}); retrying".format(
+                      " ".join(str(e.stderr or "").split())[:300]))
+                    acct = pd.DataFrame()
                 # Start/End/Elapsed are deliberately NOT cast to datetime here: sacct
                 # reports "Unknown" for jobs that haven't started/finished yet, and this
                 # query includes still-in-progress jobs from the same batch on every
@@ -674,14 +716,20 @@ class Orchestrator(object):
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
-                # corresponds to a five minute backoff
                 elif backoff_factor >= 31:
+                    # Out of patience with the accounting database, but the scheduler
+                    # answers separately: while it still has jobs of this batch, they
+                    # are not lost, so keep waiting rather than give up on them.
+                    if self._batch_in_queue(batch_id):
+                        canine_logging.warning("Still no job accounting information for batch {}, but its jobs are in the queue; still waiting".format(batch_id))
+                        backoff_factor = 1
+                        continue
                     raise Exception("Timeout exceeded waiting to query job accounting information; cluster is likely under extreme load!")
                 else:
                     backoff_factor *= 1.1
             acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))].copy()
             acct.loc[acct["PlannedCPURAW"].isna(), "PlannedCPURAW"] = 0
-            acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "PlannedCPURAW"].astype(int)
+            acct.loc[:, "CPUTimeRAW"] = acct.loc[:, "CPUTimeRAW"].fillna(0) + acct.loc[:, "PlannedCPURAW"].astype(int)
             acct = acct.drop(columns = ["PlannedCPURAW"])
             acct = acct.groupby(acct.index).apply(grouper)
 
@@ -745,9 +793,25 @@ class Orchestrator(object):
             # dict with blanks
             missing_outputs = job_spec.keys() - outputs.keys()
             if missing_outputs:
-                canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
-                  len(missing_outputs), len(job_spec)
-                ))
+                # A job stopped by the entrypoint for exceeding CANINE_PREEMPT_LIMIT
+                # (exit 123) never reaches delocalization either, but it isn't lost:
+                # say so, rather than leave the real cause to the next log line.
+                array_ids = { job_id : i for i, job_id in enumerate(job_spec) }
+                def exit_code(job_id):
+                    try:
+                        return str(acct['ExitCode'][str(batch_id) + '_' + str(array_ids[job_id])]).split(":")[0]
+                    except Exception:
+                        return ""
+                over_limit = sorted(j for j in missing_outputs if exit_code(j) == "123")
+                lost = len(missing_outputs) - len(over_limit)
+                if over_limit:
+                    canine_logging.error("{}/{} job(s) stopped after reaching the preemption limit (exit 123), before producing outputs: {}".format(
+                      len(over_limit), len(job_spec), ", ".join(over_limit)
+                    ))
+                if lost:
+                    canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
+                      lost, len(job_spec)
+                    ))
                 outputs = { **outputs, **{ k : {} for k in missing_outputs } }
 
             batch_id = str(batch_id) # in case it's set to special value -2
@@ -840,10 +904,33 @@ class Orchestrator(object):
 
         return batch_id
 
-    def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)
+    def resolve_localizations_on_controller(self, localizer: AbstractLocalizer) -> int:
+        """
+        Drop from the batch every job whose bucket localization the localizer could
+        settle on the controller (AbstractLocalizer.resolve_on_controller), marking it
+        None the way job avoidance does, so it is never submitted. Returns how many.
+
+        Call after localize_inputs_and_script, and only for a task whose job does
+        nothing but localize (wolF's LocalizeToBucket): a dropped job's script never
+        runs.
+        """
+        settled = 0
+        for jobId, spec in self.job_spec.items():
+            if spec is not None and localizer.resolve_on_controller(jobId):
+                self.job_spec[jobId] = None
+                settled += 1
+        if settled:
+            canine_logging.info1("{} of {} localization job(s) needed no worker node".format(
+                                 settled, len(self.job_spec)))
+        return settled
+
+    def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False, warn_overwrite: bool = True) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)
         """
         Detects jobs which have previously been run in this staging directory.
         Succeeded jobs are skipped. Failed jobs are reset and rerun
+        warn_overwrite: warn when overwrite clears previous jobs. A caller that
+          avoids jobs its own way (wolF's LocalizeToBucket checks its bucket)
+          passes False, since its jobs may not rerun.
         """
         old_job_spec = copy.deepcopy(self.job_spec)
         n_avoided = 0
@@ -851,7 +938,11 @@ class Orchestrator(object):
         with localizer.transport_context() as transport:
             # remove all output if specified
             if overwrite:
-                canine_logging.warning("Job avoidance disabled for this task; overwriting output.")
+                (canine_logging.warning if warn_overwrite else canine_logging.info1)(
+                  "Job avoidance disabled for this task; clearing its previous jobs and rerunning them."
+                  if warn_overwrite else
+                  "Clearing staging directory {}; its previous jobs are not reused.".format(localizer.staging_dir)
+                )
                 if transport.isdir(localizer.staging_dir):
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
@@ -873,12 +964,21 @@ class Orchestrator(object):
                     # if everything succeeded, with matching outputs, we're done
                     # TODO
 
-                    # check for failed shards 
+                    # A scratch-disk job's workspace is on its disk, so jobs/<id>/workspace
+                    # never exists on NFS, and such a job used to be avoidable only while
+                    # its disk survived -- which the lab's cost-monitoring app deletes about
+                    # a day after last use, so a later rerun redid the work. If every
+                    # output it declares is copied back to NFS (files_to_copy_to_outputs),
+                    # those copies are a complete record of it: avoid it on them instead.
+                    scratch_outputs_on_nfs = bool(getattr(localizer, "use_scratch_disk", False)) and \
+                      set(self.raw_outputs) - {"stdout", "stderr"} <= set(getattr(localizer, "files_to_copy_to_outputs", None) or ())
+
+                    # check for failed shards
                     for i in js_df.index:
                         # if workspace directory is missing, consider shard failed
                         # this is to disable job avoidance for jobs that write to scratch
                         # directories, which do not generate a workspace directory.
-                        if not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
+                        if not scratch_outputs_on_nfs and not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
                             js_df.at[i, "failed"] = True
 
                         # otherwise, make sure all three exit code are OK
@@ -902,8 +1002,25 @@ class Orchestrator(object):
                           sep = "\t"
                         )
 
-                        if o_df.set_index("output").loc[:, "pattern"].to_dict() == self.raw_outputs:
+                        # the manifest records patterns as the job saw them, with
+                        # $CANINE_JOB_ROOT (stdout/stderr's default) expanded
+                        job_root = os.path.join(localizer.environment("remote")["CANINE_JOBS"], i)
+                        declared = {
+                          k : v.replace("${CANINE_JOB_ROOT}", job_root).replace("$CANINE_JOB_ROOT", job_root)
+                          for k, v in self.raw_outputs.items()
+                        }
+                        if o_df.set_index("output").loc[:, "pattern"].to_dict() == declared:
                             js_df.at[i, "output_ok"] = True
+
+                        # ...and for a scratch-disk job, only if its copies are really there.
+                        # Its delocalizer cannot be rerun without the disk, so one with
+                        # anything missing is rerun in full rather than re-delocalized.
+                        if scratch_outputs_on_nfs:
+                            copies = o_df.loc[~o_df["output"].isin(["stdout", "stderr"]), "path"]
+                            if not (js_df.at[i, "output_ok"] and all(
+                              transport.exists(os.path.join(output_dir, p)) for p in copies)):
+                                js_df.at[i, "output_ok"] = False
+                                js_df.at[i, "failed"] = True
 
                     # shards that both succeeded and have matching outputs can be noop'd
                     # in the job spec

@@ -9,7 +9,7 @@ import shutil
 from uuid import uuid4
 from collections import namedtuple
 from contextlib import ExitStack, contextmanager
-from .base import AbstractLocalizer, PathType, Localization
+from .base import AbstractLocalizer, PathType, Localization, STAGED_SCRIPTS, BASH
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
 from ..utils import get_default_gcp_project, check_call
@@ -134,23 +134,14 @@ class BatchedLocalizer(AbstractLocalizer):
                     with open(export_path.localpath, 'w') as w:
                         w.write("\n".join(v) + "\n")
 
-            # symlink delocalization script
-            os.symlink(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    'delocalization.py'
-                ),
-                os.path.join(self.environment('local')['CANINE_ROOT'], 'delocalization.py')
-            )
-
-            # symlink debug script
-            os.symlink(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    'debug.sh'
-                ),
-                os.path.join(self.environment('local')['CANINE_ROOT'], 'debug.sh')
-            )
+            # Symlink the scripts the compute node runs. Mode follows the link
+            # target here, so unlike the NFS localizer there is no exec bit to carry.
+            staging_root = self.environment('local')['CANINE_ROOT']
+            for script in STAGED_SCRIPTS:
+                os.symlink(
+                    self.staged_script_source(script),
+                    os.path.join(staging_root, script)
+                )
 
             self.sendtree(
                 self.local_dir,
@@ -192,7 +183,10 @@ class LocalLocalizer(BatchedLocalizer):
         # it's a remote URL; get localization command and execute
         if src.localization_mode == "url":
             cmd = src.localization_command(dest.localpath)
-            subprocess.check_call(cmd, shell = True)
+            # bash explicitly: the emitted command is authored as bash and uses
+            # constructs like [[ ]] and process substitution, which shell=True's
+            # default /bin/sh rejects (dash on the controller image)
+            subprocess.check_call(cmd, shell = True, executable = BASH)
 
         # it's a local file
         elif os.path.exists(src.path):
