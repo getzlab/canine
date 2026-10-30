@@ -41,6 +41,10 @@ PROJECT = get_default_gcp_project()
 
 Localization = namedtuple("Localization", ['type', 'path'])
 
+# A file at the root of each scratch disk naming the job that wrote it (see
+# _scratch_disk_provenance_lines). Dot-named, so output globs don't match it.
+SCRATCH_DISK_PROVENANCE = ".canine_provenance"
+
 # Scripts staged into CANINE_ROOT so the compute node can run them. They ride the shared
 # staging directory rather than the worker image: baking them in would need a fleet-wide
 # rebuild and would version-skew against the installed canine.
@@ -1118,6 +1122,18 @@ class AbstractLocalizer(abc.ABC):
           'set -e',
         ]
 
+    @staticmethod
+    def _scratch_disk_provenance_lines(disk_dir):
+        """
+        Shell lines that record, at the root of a scratch disk (disk_dir, a
+        shell expression), the root of the job writing to it: its task's
+        directory and shard, <task dir>/jobs/<shard>. Whatever later reads the
+        disk, e.g. to copy its files elsewhere, can tell where they came from.
+        """
+        return [
+          'echo "$CANINE_JOB_ROOT" > {}/{}'.format(disk_dir, SCRATCH_DISK_PROVENANCE),
+        ]
+
     def create_persistent_disk(self,
       file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
       disk_name: str = None,
@@ -1325,7 +1341,7 @@ class AbstractLocalizer(abc.ABC):
             # will be unlocked during teardown script (or if script crashes). this
             # is a way of other processes surveying if this is a hanging disk.
             'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
-        ]
+        ] + (self._scratch_disk_provenance_lines('"$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"') if is_scratch_disk else [])
 
         # Disks dynamically resize as they get full.
         #
