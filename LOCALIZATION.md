@@ -519,6 +519,12 @@ Pass from wolF via `LocalizeToBucket(files=..., <kwarg>=...)`, or workflow-wide 
 | `files_to_copy_to_outputs` | `{}` — output keys copied from the scratch disk back to NFS. If it covers every output the task declares, a finished job is avoided on those NFS copies, with no need for its disk, which the lab's cost-monitoring app deletes about a day after last use |
 | `persistent_disk_type` | `"standard"` |
 
+**Read-only disks (a job's `rodisk://` inputs, such as upstream scratch disks):**
+
+| Option | Default | Effect |
+|---|---|---|
+| `rodisk_max_parallel_calls` | `16` | The most `gcloud` calls a job makes at once to attach, or detach, its read-only disks: one per CPU the job has, at least 4, up to this. Each call is a `gcloud` process, so a small node shouldn't run many; lower it if a cluster hits the Compute API's rate limits. GCE works through one VM's calls roughly in turn, but concurrent calls still finish sooner: 120 disks took about 780 s to attach one at a time, 373 s 4 at once, 252 s 8 at once and 165 s 16 at once (detach 272, 182, 120 s). A call waits its turn, so each is allowed 120 s (`RODISK_CALL_TIMEOUT`); up to 53 s was seen. |
+
 ### 5b. Backend options that affect localization
 
 | Option | Where | Default | Effect |

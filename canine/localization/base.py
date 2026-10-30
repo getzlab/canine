@@ -265,6 +265,7 @@ class AbstractLocalizer(abc.ABC):
         localization_expiry_days: int = 1,
         bucketmount_heartbeat_seconds: int = 3600,
         resolve_on_controller: bool = True,
+        rodisk_max_parallel_calls: int = 16,
         **kwargs
     ):
         """
@@ -353,7 +354,16 @@ class AbstractLocalizer(abc.ABC):
           resolve_on_controller(). Default True. The environment
           variable CANINE_DISABLE_CONTROLLER_LOCALIZATION, set on the controller,
           turns it off without a code change.
+
+        rodisk_max_parallel_calls: the most gcloud calls a job makes at once to
+          attach or detach its read-only disks. A job makes one per CPU it has,
+          but at least 4, up to this. Default 16. Each call is a gcloud process,
+          so a small node shouldn't run many; lower this if a cluster hits the
+          Compute API's rate limits.
         """
+        if rodisk_max_parallel_calls < 1:
+            raise ValueError("rodisk_max_parallel_calls must be at least 1")
+        self.rodisk_max_parallel_calls = rodisk_max_parallel_calls
         self.file_handler_defaults = self.build_file_handler_defaults(
             parallel_download, download_connections, download_min_chunk, check_hash,
             allow_requester_pays
@@ -1120,6 +1130,62 @@ class AbstractLocalizer(abc.ABC):
           'set +e; bash $CANINE_JOB_ROOT/.diskresizedaemon.sh &',
           'echo $! > $CANINE_JOB_ROOT/.diskresizedaemon_pid',
           'set -e',
+        ]
+
+    # A job's read-only disks are attached, and detached, by concurrent gcloud
+    # calls. GCE works through one VM's attach/detach calls roughly in turn, but
+    # concurrent calls still finish sooner: 120 disks on one VM (2026-10-30) took
+    # about 780 s to attach one call at a time, 373 s 4 at once, 252 s 8 at
+    # once and 165 s 16 at once (detach: 272, 182 and 120 s). A call waits its
+    # turn, so a single call can take far longer than it does alone (up to 53 s
+    # seen); RODISK_CALL_TIMEOUT allows for that, and still catches a hung call.
+    RODISK_CALL_TIMEOUT = 120
+
+    def rodisk_parallel_calls(self):
+        """
+        Shell lines setting CANINE_RODISK_CALLS: how many attach/detach calls to
+        make at once. Each is a gcloud process, so one per CPU the job has, but at
+        least 4 (or rodisk_max_parallel_calls, if less), up to
+        rodisk_max_parallel_calls.
+        """
+        return [
+          "CANINE_RODISK_CALLS=${SLURM_CPUS_PER_TASK:-1}",
+          "[ $CANINE_RODISK_CALLS -ge 4 ] || CANINE_RODISK_CALLS=4",
+          "[ $CANINE_RODISK_CALLS -le {cap} ] || CANINE_RODISK_CALLS={cap}".format(
+            cap = self.rodisk_max_parallel_calls),
+        ]
+
+    def rodisk_attach(self):
+        """
+        Shell lines that attach every read-only disk (CANINE_RODISK_1..N) not
+        already attached, CANINE_RODISK_CALLS at a time. Each disk's gcloud
+        output goes to ${CANINE_RODISK_DIAG_DIR}/<disk>, for the mount loop's
+        error messages. As when they were attached one at a time:
+        - another job may be attaching the same disk, so a failed attach isn't
+          an error here; the mount loop fails if the device never appears;
+        - but quota exhaustion (gcloud exit 5) or a hung attach (timeout's 124)
+          requeues the job (exit 5).
+        """
+        return self.rodisk_parallel_calls() + [
+          "CANINE_RODISK_DIAG_DIR=$(mktemp -d)",
+          "for i in $(seq ${CANINE_N_RODISKS}); do",
+          "  CANINE_RODISK=CANINE_RODISK_${i}",
+          "  [[ -e /dev/disk/by-id/google-${!CANINE_RODISK} ]] || echo ${!CANINE_RODISK}",
+          "done | xargs -r -P $CANINE_RODISK_CALLS -I {{}} bash -c 'timeout -k 30 {t} gcloud compute instances attach-disk \"$0\" --zone \"$1\" --disk \"$2\" --device-name \"$2\" --mode ro >> \"$3/$2\" 2>&1; ec=$?; [[ $ec == 5 || $ec == 124 ]] && exit 1 || exit 0' \"$CANINE_NODE_NAME\" \"$CANINE_NODE_ZONE\" {{}} \"$CANINE_RODISK_DIAG_DIR\" || {{ echo 'ERROR: attaching read-only disks hit a quota limit or timed out; retrying.' >&2; exit 5; }}".format(
+            t = self.RODISK_CALL_TIMEOUT),
+        ]
+
+    def rodisk_detach(self):
+        """
+        Shell lines that detach the read-only disks named in the
+        CANINE_RODISKS_TO_DETACH array, CANINE_RODISK_CALLS at a time. A failed
+        detach is logged with gcloud's output, and isn't fatal.
+        """
+        return self.rodisk_parallel_calls() + [
+          'if [ ${#CANINE_RODISKS_TO_DETACH[@]} -gt 0 ]; then',
+          '  printf "%s\\n" "${{CANINE_RODISKS_TO_DETACH[@]}}" | xargs -P $CANINE_RODISK_CALLS -I {{}} bash -c \'out=$(timeout -k 30 {t} gcloud compute instances detach-disk "$0" --zone "$1" --disk "$2" 2>&1) && echo "Unmounted $2" >&2 || echo "Error detaching disk $2 (exit $?): $out" >&2\' "$CANINE_NODE_NAME" "$CANINE_NODE_ZONE" {{}}'.format(
+            t = self.RODISK_CALL_TIMEOUT),
+          'fi',
         ]
 
     @staticmethod
@@ -2720,31 +2786,21 @@ class AbstractLocalizer(abc.ABC):
         if len(canine_rodisks):
             localization_tasks += [
               "[ -f .rodisk_lock_pids ] && rm .rodisk_lock_pids || :",
+              'echo "INFO: Attaching ${CANINE_N_RODISKS} read-only disk(s) ..." >&2',
+            ] + self.rodisk_attach() + [
+              # then wait for each disk's device, and mount it
               "for i in `seq ${CANINE_N_RODISKS}`; do",
               "CANINE_RODISK=CANINE_RODISK_${i}",
               "CANINE_RODISK=${!CANINE_RODISK}",
               "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
               "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
 
-              'echo "INFO: Attaching read-only disk ${CANINE_RODISK} ..." >&2',
-
               "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then",
               "sudo mkdir -p ${CANINE_RODISK_DIR}",
               "fi",
 
-              # create tempfile to hold diagnostic information
-              "DIAG_FILE=$(mktemp)",
-
-              # attach the disk if it's not already
-              "if [[ ! -e /dev/disk/by-id/google-${CANINE_RODISK} ]]; then",
-              # we can run into a race condition here if other tasks are
-              # attempting to mount the same disk simultaneously, so we
-              # force a 0 exit, unless gcloud returned exit code 5 (quota exceeded),
-              # which we explicitly propagate to cause localization to be retried.
-              # mounting the disk can also hang (exit 124), in which case we
-              # also cause localization to be retried by returning exit 5
-              "timeout -k 30 30 gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || { ec=$?; [[ $ec == 5 || $ec == 124 ]] && exit 5 || true; }",
-              "fi",
+              # this disk's attach output, if it needed attaching
+              "DIAG_FILE=${CANINE_RODISK_DIAG_DIR}/${CANINE_RODISK}",
 
               # mount the disk if it's not already
               # as before, we can run into a race condition here, so we again
@@ -3031,7 +3087,9 @@ class AbstractLocalizer(abc.ABC):
                 '  done < ${CANINE_JOB_INPUTS}/.rodisk_lock_pids',
                 '  rm -f ${CANINE_JOB_INPUTS}/.rodisk_lock_pids',
                 'fi',
+                # unmount each, then detach the unmounted ones together
                 '(cd /',
+                'CANINE_RODISKS_TO_DETACH=()',
                 'for i in $(seq ${CANINE_N_RODISKS}); do',
                 '  CANINE_RODISK=CANINE_RODISK_${i}',
                 '  CANINE_RODISK=${!CANINE_RODISK}',
@@ -3039,11 +3097,13 @@ class AbstractLocalizer(abc.ABC):
                 '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
                 '  echo "Unmounting read-only disk ${CANINE_RODISK}" >&2',
                 '  if flock -n ${CANINE_RODISK_DIR} true && mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
-                '    timeout -k 30 30 gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK && echo "Unmounted ${CANINE_RODISK}" >&2 || echo "Error detaching disk ${CANINE_RODISK}" >&2',
+                '    CANINE_RODISKS_TO_DETACH+=(${CANINE_RODISK})',
                 '  else',
                 '    echo "Read-only disk ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
                 '  fi',
-                'done)',
+                'done',
+            ] + self.rodisk_detach() + [
+                ')',
 
                 # Bucket mounts are node-lifetime and are never unmounted here
                 # (see the mount loop). Only this job's own bookkeeping is undone:
