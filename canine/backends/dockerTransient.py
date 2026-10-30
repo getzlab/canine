@@ -471,6 +471,11 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
                 canine_logging.error(stderr.read().decode())
                 raise RuntimeError()
 
+        ## no bucket or disk: results go in a directory on /mnt/nfs itself,
+        # which nothing else creates before it's used below
+        else:
+            os.makedirs(f"/mnt/nfs/{self.config['storage_namespace']}", exist_ok=True)
+
         ## Check disk usage and warn user if it is small
         free_space_gb = int(
             shutil.disk_usage(f"/mnt/nfs/{self.config['storage_namespace']}").free
