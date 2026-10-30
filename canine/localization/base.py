@@ -2329,14 +2329,27 @@ class AbstractLocalizer(abc.ABC):
         loop skips remounting an existing mountpoint) and its metadata cache is
         stale.
 
-        Exits 5 rather than 1: both causes are node-local or transient, so the
-        shard is worth retrying elsewhere rather than failing the workflow.
+        Those causes are node-local or transient, so the shard exits 5 and is
+        retried elsewhere. But a link also fails to resolve when its object is
+        gone from the bucket itself, e.g. deleted by another workflow's
+        DeleteLocalizedFiles while this job waited. No node can fix that, and
+        exit 5 isn't counted against the preemption limit, so the shard would
+        requeue forever. So the bucket is asked directly: an object it doesn't
+        have exits 1, failing the shard; one it has, or a lookup that itself
+        fails, exits 5 as before. The whole bucket is mounted, so a link's path
+        under the mount is its object's name in the bucket.
         Expects CANINE_JOB_INPUTS, CANINE_BUCKETMOUNT and CANINE_BUCKETMOUNT_DIR
         to be set -- i.e. this belongs inside the per-bucket mount loop.
         """
         return [
           'for CANINE_BM_LINK in $(find ${CANINE_JOB_INPUTS} -maxdepth 1 -type l 2> /dev/null); do',
-          '  if [[ "$(readlink "$CANINE_BM_LINK")" == ${CANINE_BUCKETMOUNT_DIR}/* && ! -e "$CANINE_BM_LINK" ]]; then',
+          '  CANINE_BM_TARGET=$(readlink "$CANINE_BM_LINK")',
+          '  if [[ "$CANINE_BM_TARGET" == ${CANINE_BUCKETMOUNT_DIR}/* && ! -e "$CANINE_BM_LINK" ]]; then',
+          '    CANINE_BM_OBJECT="gs://${CANINE_BUCKETMOUNT}/${CANINE_BM_TARGET#${CANINE_BUCKETMOUNT_DIR}/}"',
+          '    if ! CANINE_BM_LS_ERR=$(gcloud storage ls "$CANINE_BM_OBJECT" 2>&1 > /dev/null) && [[ "$CANINE_BM_LS_ERR" == *"matched no objects"* ]]; then',
+          '      echo "ERROR: $CANINE_BM_LINK: $CANINE_BM_OBJECT is not in the bucket (deleted, or never written); no node can resolve it" >&2',
+          '      exit 1',
+          '    fi',
           '    echo "ERROR: $CANINE_BM_LINK does not resolve inside bucket mount ${CANINE_BUCKETMOUNT}; retrying on another node" >&2',
           '    exit 5',
           '  fi',
@@ -2456,8 +2469,12 @@ class AbstractLocalizer(abc.ABC):
                 exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), finished_scratch_disk_url[9:])] # strip 'rodisk://' prefix
                 exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), scratch_disk_prefix)]
 
-                # we also need to bypass running the script if scratch_disk_job_avoid 
+                # we also need to bypass running the script if scratch_disk_job_avoid
                 # is True. this will happen later
+
+        # the job's output is already on its finished scratch disk, so
+        # localization ends with exit 15 and the job is skipped
+        skips_job = self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid
 
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
@@ -2924,7 +2941,8 @@ class AbstractLocalizer(abc.ABC):
               ") 200>${CANINE_BUCKETMOUNT_MOUNTLOCK} || exit 1",
               "fi",
 
-            ] + self.bucketmount_reachability_check() + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + self.bucketmount_log_mark() + [
+            # a skipped job doesn't read its inputs, so one that's gone mustn't fail it
+            ] + (self.bucketmount_reachability_check() if not skips_job else []) + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + self.bucketmount_log_mark() + [
 
               'echo "INFO: Successfully mounted bucket ${CANINE_BUCKETMOUNT}." >&2',
 
@@ -2968,7 +2986,7 @@ class AbstractLocalizer(abc.ABC):
             "alias gcloud=gcloud_exp_backoff #DEBUG_OMIT"
           ] + localization_tasks +
           ( # skip running task script if finished scratch disk already exists via special localizer exit code
-            ["exit 15 #DEBUG_OMIT"] if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else []
+            ["exit 15 #DEBUG_OMIT"] if skips_job else []
           )
         ) + "\nset +e\n"
 
