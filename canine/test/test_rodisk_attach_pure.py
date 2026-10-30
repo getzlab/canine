@@ -29,7 +29,7 @@ def loc(**kwargs):
 def calls_at_once(lines, cpus = None):
     """CANINE_RODISK_CALLS as the generated lines set it, for a job with cpus CPUs."""
     script = "\n".join((["SLURM_CPUS_PER_TASK={}".format(cpus)] if cpus is not None else [])
-                       + lines[:3] + ["echo $CANINE_RODISK_CALLS"])
+                       + lines[:1] + ["echo $CANINE_RODISK_CALLS"])
     return int(subprocess.run([BASH], input = script, capture_output = True, text = True, check = True).stdout)
 
 
@@ -146,26 +146,32 @@ class TestDetach:
 
 class TestHowManyCallsAtOnce:
     """
-    One gcloud call per CPU the job has, at least 4, up to rodisk_max_parallel_calls
-    (default 16): each call is a gcloud process, so a small node shouldn't run many.
+    rodisk_max_parallel_calls (default 16) calls at once, whatever the job's size:
+    the jobs with the most disks may have only 2 CPUs.
     """
 
-    @pytest.mark.parametrize("cpus, expected", [(None, 4), (1, 4), (2, 4), (8, 8), (14, 14), (32, 16)])
-    def test_one_per_cpu_between_4_and_the_cap(self, cpus, expected):
+    @pytest.mark.parametrize("cpus", [None, 1, 2, 8, 32])
+    def test_16_whatever_the_jobs_cpus(self, cpus):
         for lines in (loc().rodisk_attach(), loc().rodisk_detach()):
-            assert calls_at_once(lines, cpus) == expected
+            assert calls_at_once(lines, cpus) == 16
 
-    def test_the_cap_is_a_localizer_setting(self):
+    def test_it_is_a_localizer_setting(self):
         assert calls_at_once(loc(rodisk_max_parallel_calls = 6).rodisk_attach(), 32) == 6
-        assert calls_at_once(loc(rodisk_max_parallel_calls = 2).rodisk_detach(), 8) == 2
+        assert calls_at_once(loc(rodisk_max_parallel_calls = 2).rodisk_detach(), 1) == 2
 
-    def test_a_cap_below_1_is_refused(self):
+    def test_below_1_is_refused(self):
         with pytest.raises(ValueError):
             loc(rodisk_max_parallel_calls = 0)
 
-    def test_a_small_job_makes_4_calls_at_once(self, tmp_path):
-        """Eight one-second attaches, 4 at a time, take about two seconds."""
+    def test_a_1_cpu_job_attaches_together(self, tmp_path):
+        """Eight one-second attaches on a 1-CPU job take about a second, not two or eight."""
         proc, calls, elapsed = run(tmp_path, loc().rodisk_attach(), TestAttach.DISKS, setup = ["SLURM_CPUS_PER_TASK=1"])
+        assert proc.returncode == 0, proc.stderr
+        assert len(calls) == 8 and elapsed < 1.9
+
+    def test_a_setting_of_4_makes_4_at_once(self, tmp_path):
+        """Eight one-second attaches, 4 at a time, take about two seconds."""
+        proc, calls, elapsed = run(tmp_path, loc(rodisk_max_parallel_calls = 4).rodisk_attach(), TestAttach.DISKS)
         assert proc.returncode == 0, proc.stderr
         assert len(calls) == 8 and 1.9 < elapsed < 4
 

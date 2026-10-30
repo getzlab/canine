@@ -356,10 +356,10 @@ class AbstractLocalizer(abc.ABC):
           turns it off without a code change.
 
         rodisk_max_parallel_calls: the most gcloud calls a job makes at once to
-          attach or detach its read-only disks. A job makes one per CPU it has,
-          but at least 4, up to this. Default 16. Each call is a gcloud process,
-          so a small node shouldn't run many; lower this if a cluster hits the
-          Compute API's rate limits.
+          attach or detach its read-only disks, whatever the job's size.
+          Default 16. Each call uses a few seconds of CPU, but even a 2-CPU job
+          finishes sooner making 16 at once than 4; lower it if a cluster hits
+          the Compute API's rate limits.
         """
         if rodisk_max_parallel_calls < 1:
             raise ValueError("rodisk_max_parallel_calls must be at least 1")
@@ -1144,16 +1144,11 @@ class AbstractLocalizer(abc.ABC):
     def rodisk_parallel_calls(self):
         """
         Shell lines setting CANINE_RODISK_CALLS: how many attach/detach calls to
-        make at once. Each is a gcloud process, so one per CPU the job has, but at
-        least 4 (or rodisk_max_parallel_calls, if less), up to
-        rodisk_max_parallel_calls.
+        make at once, rodisk_max_parallel_calls, whatever the job's size: the
+        jobs with the most disks to attach, like a MarkDuplicates gathering
+        every BWA shard, may have only 2 CPUs.
         """
-        return [
-          "CANINE_RODISK_CALLS=${SLURM_CPUS_PER_TASK:-1}",
-          "[ $CANINE_RODISK_CALLS -ge 4 ] || CANINE_RODISK_CALLS=4",
-          "[ $CANINE_RODISK_CALLS -le {cap} ] || CANINE_RODISK_CALLS={cap}".format(
-            cap = self.rodisk_max_parallel_calls),
-        ]
+        return ["CANINE_RODISK_CALLS={}".format(self.rodisk_max_parallel_calls)]
 
     def rodisk_attach(self):
         """
@@ -2786,8 +2781,9 @@ class AbstractLocalizer(abc.ABC):
         if len(canine_rodisks):
             localization_tasks += [
               "[ -f .rodisk_lock_pids ] && rm .rodisk_lock_pids || :",
-              'echo "INFO: Attaching ${CANINE_N_RODISKS} read-only disk(s) ..." >&2',
+              'echo "INFO: $(date -u +%T) Attaching ${CANINE_N_RODISKS} read-only disk(s) ..." >&2',
             ] + self.rodisk_attach() + [
+              'echo "INFO: $(date -u +%T) Attach calls done; mounting ..." >&2',
               # then wait for each disk's device, and mount it
               "for i in `seq ${CANINE_N_RODISKS}`; do",
               "CANINE_RODISK=CANINE_RODISK_${i}",
@@ -2840,9 +2836,10 @@ class AbstractLocalizer(abc.ABC):
               # if other processes are still using it
               "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.rodisk_lock_pids",
 
-              'echo "INFO: Successfully attached read-only disk ${CANINE_RODISK}." >&2',
+              'echo "INFO: $(date -u +%T) Successfully attached read-only disk ${CANINE_RODISK}." >&2',
 
               "done",
+              'echo "INFO: $(date -u +%T) Mounted ${CANINE_N_RODISKS} read-only disk(s)." >&2',
             ]
 
         #
@@ -3090,6 +3087,7 @@ class AbstractLocalizer(abc.ABC):
                 # unmount each, then detach the unmounted ones together
                 '(cd /',
                 'CANINE_RODISKS_TO_DETACH=()',
+                'echo "INFO: $(date -u +%T) Unmounting ${CANINE_N_RODISKS} read-only disk(s) ..." >&2',
                 'for i in $(seq ${CANINE_N_RODISKS}); do',
                 '  CANINE_RODISK=CANINE_RODISK_${i}',
                 '  CANINE_RODISK=${!CANINE_RODISK}',
@@ -3102,7 +3100,9 @@ class AbstractLocalizer(abc.ABC):
                 '    echo "Read-only disk ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
                 '  fi',
                 'done',
+                'echo "INFO: $(date -u +%T) Detaching ${#CANINE_RODISKS_TO_DETACH[@]} read-only disk(s) ..." >&2',
             ] + self.rodisk_detach() + [
+                'echo "INFO: $(date -u +%T) Detach calls done." >&2',
                 ')',
 
                 # Bucket mounts are node-lifetime and are never unmounted here
