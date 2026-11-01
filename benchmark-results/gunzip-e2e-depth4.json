@@ -1,0 +1,67 @@
+{
+  "routeb": {
+    "token_source": "metadata server",
+    "outcome": {
+      "phases": {
+        "relay": 5.9,
+        "compose": 0.1,
+        "gunzip": 39.9
+      },
+      "decompressed_from": 852013000,
+      "decompressed_to": 1644444450,
+      "decode_read_seconds": 0.273,
+      "decode_inflate_seconds": 10.87,
+      "decode_write_seconds": 28.688,
+      "decode_blocks": 102,
+      "decode_readahead": 4,
+      "decode_ceiling": 1.39,
+      "decode_pipe2_ceiling": 1.39,
+      "fell_back": null,
+      "bookkeeping_seconds": 0.1,
+      "bookkeeping_calls": 13,
+      "bookkeeping_mean": 0.005,
+      "bookkeeping_pct_workers": 0.1,
+      "read_seconds": 34.929,
+      "write_seconds": 25.512,
+      "loop_other_seconds": 0.002,
+      "io_blocks": 102,
+      "read_pct_of_loop": 58,
+      "overlap_ceiling": 1.73,
+      "commit_seconds": 0.1,
+      "commit_batches": 1,
+      "commit_chunks": 13,
+      "commit_mean_batch": 13.0,
+      "commit_pct_wall": 1.4,
+      "mean_streams": 10.2,
+      "workers": 13,
+      "connections": 16,
+      "returncode": 0,
+      "seconds": 72.12,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 265560064,
+      "nic_bytes": 2592425173,
+      "disk_bytes": 360448,
+      "peak_nic_bytes_per_s": 193795797.23672846,
+      "peak_disk_bytes_per_s": 130862.01305591488,
+      "stderr_tail": [
+        "[k9pdl] k9pdl-phase gunzip 39.9s, 21.4 MB/s",
+        "[k9pdl] decompressed 852013000 bytes into 1644444450 bytes",
+        "[k9pdl] complete: 852013000 bytes composed from 13 parts (verified)"
+      ]
+    },
+    "gunzip": {
+      "ran": true,
+      "compressed_bytes": 852013000,
+      "decompressed_bytes": 1644444450,
+      "seconds": 39.9,
+      "read_seconds": 0.273,
+      "inflate_seconds": 10.87,
+      "write_seconds": 28.688,
+      "blocks": 102,
+      "readahead": 4,
+      "ceiling": 1.39,
+      "pipe2_ceiling": 1.39
+    }
+  }
+}

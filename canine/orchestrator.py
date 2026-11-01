@@ -1,4 +1,5 @@
 import copy
+import json
 import typing
 import os
 import time
@@ -78,6 +79,11 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
     echo '======================' >&2
     {{pipeline_script}}
     export CANINE_JOB_RC=$?
+    # a tool can exit 0 after gcsfuse failed one of its reads; see bucketmount_check.py
+    if [ $CANINE_JOB_RC == 0 ] && [ -f $CANINE_JOB_INPUTS/.bucketmount_logs ]; then
+      python3 $CANINE_ROOT/bucketmount_check.py $CANINE_JOB_INPUTS >&2
+      [ $? == 3 ] && export CANINE_JOB_RC=74 || : # EX_IOERR
+    fi
     if [ $CANINE_JOB_RC == 0 ]; then
       echo '====================================' >&2
       echo '==== JOB COMPLETED SUCCESSFULLY ====' >&2
@@ -129,6 +135,21 @@ echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=_pkg_version("canine"))
 
+def _numeric_sacct_columns(acct):
+    """
+    sacct's counts as nullable integers, and PlannedCPURAW (where queried) as a float.
+    A row can come back with a count missing: at the end of a CTSP run a plain int cast
+    raised "cannot convert float NaN to integer" and the whole cost summary was lost.
+    Such a row keeps <NA>, which resolve_job_resources() treats as unknown.
+    """
+    for column in ("CPUTimeRAW", "ReqCPUS", "NCPUS"):
+        if column in acct.columns:
+            acct[column] = pd.to_numeric(acct[column], errors = "coerce").astype("Int64")
+    if "PlannedCPURAW" in acct.columns:
+        acct["PlannedCPURAW"] = pd.to_numeric(acct["PlannedCPURAW"], errors = "coerce")
+    return acct
+
+
 def _job_indices_to_array_str(indices: typing.List[int]) -> str:
     """Convert a sorted list of job indices into a compact SLURM array range string.
 
@@ -179,6 +200,30 @@ def stringify(obj: typing.Any, safe: bool = True) -> typing.Any:
 class StringifyTypeError(TypeError):
     pass
 
+# sacct's placeholders for a job that hasn't started/finished yet -- real,
+# not hypothetical, since the whole batch's sacct data gets grouped on every
+# poll of wait_for_jobs_to_finish, not just once a job is confirmed done.
+_SACCT_TIME_PLACEHOLDERS = {"Unknown": "", "-": ""}
+
+
+def _attempt_sort_key(start_col):
+    """
+    Sort key for ordering a job's preemption/requeue attempts chronologically
+    by Start. Deliberately NOT Submit: Submit is the original job submission
+    time and stays constant across every requeue of the same JobID (a
+    requeue doesn't get a new Submit), so sorting on it doesn't reliably
+    produce chronological order -- pandas' sort isn't guaranteed stable for
+    tied keys, so picking iloc[-1] afterward wasn't actually guaranteed to
+    land on the chronologically last attempt, even though it often would by
+    chance. Start genuinely varies per attempt, so it doesn't have this
+    problem. Maps sacct's "Unknown"/"-" placeholders to "" so an attempt that
+    hasn't started yet sorts *before* every real ISO timestamp string, rather
+    than after (plain lexicographic comparison would otherwise put "Unknown"
+    last, since "U" > any digit).
+    """
+    return start_col.replace(_SACCT_TIME_PLACEHOLDERS)
+
+
 class Orchestrator(object):
     """
     Main class
@@ -224,54 +269,75 @@ class Orchestrator(object):
 
         jobs_dir = localizer.environment("local")["CANINE_JOBS"]
         acct = {}
-        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": pd.NaT, "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1}
+        # fields added for cost estimation (Start/End/Elapsed/AllocTRES/Account/
+        # attempts) default to placeholders when reading .sacct files written before
+        # this schema existed, or when no accounting info is available at all --
+        # canine.cost degrades visibly (missing_capacity_data/is_provisional) rather
+        # than guessing when it sees these.
+        new_field_placeholders = { "Start" : pd.NaT, "End" : pd.NaT, "Elapsed" : "-", "AllocTRES" : "-", "Account" : "-", "attempts" : [] }
+        # scalar-only fields, suitable for pd.DataFrame(dict, index=[0]) construction --
+        # "attempts" is list-valued and would break that constructor's row-broadcasting
+        # (a length-0 list doesn't broadcast to a length-1 index), so it's assigned
+        # separately wherever placeholder_fields is used to build a placeholder row.
+        placeholder_fields = { "State" : np.nan, "ExitCode": "-", "CPUTimeRAW" : -1, "Submit": pd.NaT, "NodeList" : "-", "Partition" : "-","ReqCPUS" : -1, "NCPUS" : -1, "ReqMem" : "-", "n_preempted" : -1,
+          **{k: v for k, v in new_field_placeholders.items() if k != "attempts"}}
+
+        def placeholder_row():
+            row = pd.DataFrame(placeholder_fields, index = [0])
+            row["attempts"] = [[]]
+            return row
+
+        FULL_COLUMNS = ["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem",
+                        "Start", "End", "Elapsed", "AllocTRES", "Account", "n_preempted", "attempts"]
+        # keyed by how many tab-separated fields are actually present on disk --
+        # NOT a try/except cascade: pd.read_csv silently pads/misaligns columns
+        # rather than raising when `names=` is longer than the data, so detecting
+        # the format from a downstream .astype() failure (the previous approach)
+        # would silently accept misaligned garbage instead of falling through to
+        # the right column set.
+        FORMAT_COLUMNS_BY_WIDTH = {
+          16 : FULL_COLUMNS,
+          10 : ["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"],
+          5  : ["State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"],
+        }
 
         with localizer.transport_context() as tr:
             for j, v in job_spec.items():
                 sacct_path = os.path.join(jobs_dir, j, ".sacct")
                 jid = str(batch_id) + "_" + j
                 if tr.exists(sacct_path):
-                    with tr.open(sacct_path, "r") as f:
-                        try:
-                            acct[jid] = pd.read_csv(
-                              f,
-                              header = None,
-                              sep = "\t",
-                              names = [
-                                "State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"
-                              ]
-                            ).astype({
-                              'CPUTimeRAW': int,
-                              "Submit" : "datetime64[ns]",
-                              "ReqCPUS" : int,
-                              "NCPUS" : int,
-                            })
-                        except:
-                            a = pd.read_csv(
-                              f,
-                              header = None,
-                              sep = "\t",
-                              names = [
-                                "State", "ExitCode", "CPUTimeRAW", "Submit", "n_preempted"
-                              ]
-                            ).astype({
-                              'CPUTimeRAW': int,
-                              "Submit" : "datetime64[ns]",
-                            })
-                            a["NodeList"] = "-"
-                            a["Partition"] = "-"
-                            a["ReqCPUS"] = -1
-                            a["NCPUS"] = -1
-                            a["ReqMem"] = "-"
-                            acct[jid] = a[["State", "ExitCode", "CPUTimeRAW", "Submit","NodeList","Partition","ReqCPUS","NCPUS","ReqMem", "n_preempted"]]
+                    try:
+                        with tr.open(sacct_path, "r") as f:
+                            raw = pd.read_csv(f, header = None, sep = "\t")
+                        columns = FORMAT_COLUMNS_BY_WIDTH[raw.shape[1]]
+                        raw.columns = columns
+                        raw = raw.astype({
+                          'CPUTimeRAW': int,
+                          "Submit" : "datetime64[ns]",
+                          **({"ReqCPUS": int, "NCPUS": int} if "ReqCPUS" in columns else {}),
+                        })
+                        if "attempts" in columns:
+                            raw["attempts"] = raw["attempts"].apply(json.loads)
+                        for field, default in { "NodeList": "-", "Partition": "-", "ReqCPUS": -1, "NCPUS": -1, "ReqMem": "-" }.items():
+                            if field not in columns:
+                                raw[field] = default
+                        for field, placeholder in new_field_placeholders.items():
+                            if field not in columns:
+                                raw[field] = [placeholder] * len(raw) if field == "attempts" else placeholder
+                        acct[jid] = raw[FULL_COLUMNS]
+                    # unrecognized column count, or genuinely malformed/corrupt file --
+                    # treat the same as "sacct never got written" below rather than
+                    # guessing at a format.
+                    except Exception:
+                        acct[jid] = placeholder_row()
 
                     # sacct info is blank (write error?)
                     if acct[jid].empty:
-                        acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
+                        acct[jid] = placeholder_row()
 
                 # sacct never got written
                 else:
-                    acct[jid] = pd.DataFrame(placeholder_fields, index = [0])
+                    acct[jid] = placeholder_row()
 
                 # if job_spec[j] is None, this indicates a noop (job was avoided)
                 # override state to completed, regardless of what got loaded from disk
@@ -279,6 +345,62 @@ class Orchestrator(object):
                     acct[jid]["State"] = "COMPLETED"
 
         return pd.concat(acct).droplevel(1).rename_axis("JobID")
+
+    @staticmethod
+    def query_sacct_for_nodes(backend, node_names, start, end):
+        """
+        Query sacct for every job -- any account, any user -- that ran on any of
+        the given nodes during [start, end]. Unlike wait_for_jobs_to_finish(),
+        which is scoped to one canine batch's own jobs (and thus blind to other
+        jobs/tenants sharing the same node), this is used to reconstruct how much
+        of a node's capacity was actually occupied during a window, for cost/
+        undersubscription estimation.
+
+        node_names: iterable of node hostnames. Returns an empty DataFrame,
+          without querying, if empty.
+        start, end: datetime-like (anything pd.Timestamp() accepts).
+        """
+        node_names = list(node_names)
+        if not node_names:
+            return pd.DataFrame()
+
+        def _fmt(t):
+            return pd.Timestamp(t).strftime("%Y-%m-%dT%H:%M:%S")
+
+        acct = backend.sacct(
+          "D",
+          allusers = True,
+          nodelist = ",".join(node_names),
+          starttime = _fmt(start),
+          endtime = _fmt(end),
+          format = "JobId%50,State,ExitCode,CPUTimeRAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem,Start,End,Elapsed,AllocTRES,Account"
+        )
+
+        if len(acct) == 0:
+            return acct
+
+        # drop SLURM's own per-job ".batch" substep accounting rows (they
+        # duplicate the parent job's resource usage under a distinct JobID
+        # suffix). Deliberately NOT also requiring "_" in the JobID the way
+        # wait_for_jobs_to_finish() does -- that filter assumes every job is one
+        # of wolF/canine's own array-job shards, which doesn't hold here since
+        # this query can see other tools'/accounts' jobs sharing the same node.
+        # Start/End are left as raw sacct strings (may be "Unknown" for jobs
+        # still running/pending), same reasoning as wait_for_jobs_to_finish().
+        #
+        # The counts are nullable: a row can come back with no ReqCPUS (seen at the
+        # end of a CTSP run, where the plain int cast raised "cannot convert float
+        # NaN to integer" and the whole cost summary was lost). Such a row stays,
+        # with <NA>, and resolve_job_resources() treats it as unknown.
+        acct = acct.loc[~acct.index.str.endswith("batch")].astype({"Submit" : "datetime64[ns]"})
+        return _numeric_sacct_columns(acct).copy()
+
+    def _batch_in_queue(self, batch_id):
+        """True if squeue still has any job of the batch; False if not, or if it fails."""
+        try:
+            return len(self.backend.squeue(jobs = batch_id)) > 0
+        except Exception:
+            return False
 
     def __init__(self, config: typing.Union[
       str,
@@ -537,11 +659,17 @@ class Orchestrator(object):
 
     def wait_for_jobs_to_finish(self, batch_id, localizer = None, track_uptime = False):
         def grouper(g):
-            g = g.sort_values("Submit")
+            g = g.sort_values("Start", key = _attempt_sort_key)
             final = g.iloc[-1].copy()
             final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
             final.at["Submit"] = g.loc[:, "Submit"].iloc[0]
             final["n_preempted"] = len(g) - 1
+            # per-attempt breakdown: the fields above collapse every preemption/
+            # requeue attempt into a single row (last attempt's NodeList, summed
+            # CPUTimeRAW), which loses which specific node(s)/time window(s) this
+            # job actually occupied -- needed to prorate cost per node, not just
+            # know total CPU-seconds consumed.
+            final["attempts"] = g[["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem"]].to_dict("records")
 
             return final
 
@@ -564,22 +692,44 @@ class Orchestrator(object):
             backoff_factor = 1
             while True:
                 time.sleep(30*backoff_factor)
-                acct = self.backend.sacct(
-                  "D",
-                  job = batch_id,
-                  format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem"
-                  ).astype({'CPUTimeRAW': int, "PlannedCPURAW" : float, "Submit" : "datetime64[ns]", "ReqCPUS" : int, "NCPUS" : int})
+                # A failed sacct is no answer, like an empty one, so it takes the same
+                # backoff. It used to propagate at once: on a CTSP controller sacct
+                # briefly could not reach slurmdbd ("Resource temporarily
+                # unavailable"), wolF fell back to reading the jobs' state from disk,
+                # declared two running downloads "catastrophically lost", and retried
+                # the task while they were still running.
+                try:
+                    acct = _numeric_sacct_columns(self.backend.sacct(
+                      "D",
+                      job = batch_id,
+                      format = "JobId%50,State,ExitCode,CPUTimeRAW,PlannedCPURAW,Submit,NodeList%50,Partition%50,ReqCPUS,NCPUS,ReqMem,Start,End,Elapsed,AllocTRES,Account"
+                      ).astype({"Submit" : "datetime64[ns]"}))
+                except CalledProcessError as e:
+                    canine_logging.warning("sacct failed ({}); retrying".format(
+                      " ".join(str(e.stderr or "").split())[:300]))
+                    acct = pd.DataFrame()
+                # Start/End/Elapsed are deliberately NOT cast to datetime here: sacct
+                # reports "Unknown" for jobs that haven't started/finished yet, and this
+                # query includes still-in-progress jobs from the same batch on every
+                # poll. Left as raw sacct strings; parsed downstream (in canine.cost)
+                # once a job has actually reached a terminal state.
                 # sometimes sacct can lag when the cluster is under load and return nothing; retry with exponential backoff
                 if len(acct) > 0:
                     break
-                # corresponds to a five minute backoff
                 elif backoff_factor >= 31:
+                    # Out of patience with the accounting database, but the scheduler
+                    # answers separately: while it still has jobs of this batch, they
+                    # are not lost, so keep waiting rather than give up on them.
+                    if self._batch_in_queue(batch_id):
+                        canine_logging.warning("Still no job accounting information for batch {}, but its jobs are in the queue; still waiting".format(batch_id))
+                        backoff_factor = 1
+                        continue
                     raise Exception("Timeout exceeded waiting to query job accounting information; cluster is likely under extreme load!")
                 else:
                     backoff_factor *= 1.1
             acct = acct.loc[~(acct.index.str.endswith("batch") | ~acct.index.str.contains("_"))].copy()
             acct.loc[acct["PlannedCPURAW"].isna(), "PlannedCPURAW"] = 0
-            acct.loc[:, "CPUTimeRAW"] += acct.loc[:, "PlannedCPURAW"].astype(int)
+            acct.loc[:, "CPUTimeRAW"] = acct.loc[:, "CPUTimeRAW"].fillna(0) + acct.loc[:, "PlannedCPURAW"].astype(int)
             acct = acct.drop(columns = ["PlannedCPURAW"])
             acct = acct.groupby(acct.index).apply(grouper)
 
@@ -598,7 +748,13 @@ class Orchestrator(object):
                     if save_acct and self.job_spec[job] is not None:
                         with localizer.transport_context() as transport:
                             with transport.open(os.path.join(jobs_dir, job, ".sacct"), 'w') as w:
-                                acct.loc[[jid]].to_csv(w, sep = "\t", header = False, index = False)
+                                # "attempts" holds a list of per-attempt dicts, which
+                                # to_csv would otherwise stringify via repr(); JSON-encode
+                                # it explicitly so load_acct_from_disk() can parse it back
+                                # unambiguously.
+                                row = acct.loc[[jid]].copy()
+                                row["attempts"] = row["attempts"].apply(json.dumps)
+                                row.to_csv(w, sep = "\t", header = False, index = False)
 
             # track node uptime
             # this is an expensive operation, so only track if requested
@@ -637,9 +793,25 @@ class Orchestrator(object):
             # dict with blanks
             missing_outputs = job_spec.keys() - outputs.keys()
             if missing_outputs:
-                canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
-                  len(missing_outputs), len(job_spec)
-                ))
+                # A job stopped by the entrypoint for exceeding CANINE_PREEMPT_LIMIT
+                # (exit 123) never reaches delocalization either, but it isn't lost:
+                # say so, rather than leave the real cause to the next log line.
+                array_ids = { job_id : i for i, job_id in enumerate(job_spec) }
+                def exit_code(job_id):
+                    try:
+                        return str(acct['ExitCode'][str(batch_id) + '_' + str(array_ids[job_id])]).split(":")[0]
+                    except Exception:
+                        return ""
+                over_limit = sorted(j for j in missing_outputs if exit_code(j) == "123")
+                lost = len(missing_outputs) - len(over_limit)
+                if over_limit:
+                    canine_logging.error("{}/{} job(s) stopped after reaching the preemption limit (exit 123), before producing outputs: {}".format(
+                      len(over_limit), len(job_spec), ", ".join(over_limit)
+                    ))
+                if lost:
+                    canine_logging.error("{}/{} job(s) were catastrophically lost (no stdout/stderr available)".format(
+                      lost, len(job_spec)
+                    ))
                 outputs = { **outputs, **{ k : {} for k in missing_outputs } }
 
             batch_id = str(batch_id) # in case it's set to special value -2
@@ -732,10 +904,33 @@ class Orchestrator(object):
 
         return batch_id
 
-    def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)
+    def resolve_localizations_on_controller(self, localizer: AbstractLocalizer) -> int:
+        """
+        Drop from the batch every job whose bucket localization the localizer could
+        settle on the controller (AbstractLocalizer.resolve_on_controller), marking it
+        None the way job avoidance does, so it is never submitted. Returns how many.
+
+        Call after localize_inputs_and_script, and only for a task whose job does
+        nothing but localize (wolF's LocalizeToBucket): a dropped job's script never
+        runs.
+        """
+        settled = 0
+        for jobId, spec in self.job_spec.items():
+            if spec is not None and localizer.resolve_on_controller(jobId):
+                self.job_spec[jobId] = None
+                settled += 1
+        if settled:
+            canine_logging.info1("{} of {} localization job(s) needed no worker node".format(
+                                 settled, len(self.job_spec)))
+        return settled
+
+    def job_avoid(self, localizer: AbstractLocalizer, overwrite: bool = False, warn_overwrite: bool = True) -> int: #TODO: add params for type of avoidance (force, only if failed, etc.)
         """
         Detects jobs which have previously been run in this staging directory.
         Succeeded jobs are skipped. Failed jobs are reset and rerun
+        warn_overwrite: warn when overwrite clears previous jobs. A caller that
+          avoids jobs its own way (wolF's LocalizeToBucket checks its bucket)
+          passes False, since its jobs may not rerun.
         """
         old_job_spec = copy.deepcopy(self.job_spec)
         n_avoided = 0
@@ -743,7 +938,11 @@ class Orchestrator(object):
         with localizer.transport_context() as transport:
             # remove all output if specified
             if overwrite:
-                canine_logging.warning("Job avoidance disabled for this task; overwriting output.")
+                (canine_logging.warning if warn_overwrite else canine_logging.info1)(
+                  "Job avoidance disabled for this task; clearing its previous jobs and rerunning them."
+                  if warn_overwrite else
+                  "Clearing staging directory {}; its previous jobs are not reused.".format(localizer.staging_dir)
+                )
                 if transport.isdir(localizer.staging_dir):
                     transport.rmtree(localizer.staging_dir)
                     transport.makedirs(localizer.staging_dir)
@@ -765,12 +964,21 @@ class Orchestrator(object):
                     # if everything succeeded, with matching outputs, we're done
                     # TODO
 
-                    # check for failed shards 
+                    # A scratch-disk job's workspace is on its disk, so jobs/<id>/workspace
+                    # never exists on NFS, and such a job used to be avoidable only while
+                    # its disk survived -- which the lab's cost-monitoring app deletes about
+                    # a day after last use, so a later rerun redid the work. If every
+                    # output it declares is copied back to NFS (files_to_copy_to_outputs),
+                    # those copies are a complete record of it: avoid it on them instead.
+                    scratch_outputs_on_nfs = bool(getattr(localizer, "use_scratch_disk", False)) and \
+                      set(self.raw_outputs) - {"stdout", "stderr"} <= set(getattr(localizer, "files_to_copy_to_outputs", None) or ())
+
+                    # check for failed shards
                     for i in js_df.index:
                         # if workspace directory is missing, consider shard failed
                         # this is to disable job avoidance for jobs that write to scratch
                         # directories, which do not generate a workspace directory.
-                        if not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
+                        if not scratch_outputs_on_nfs and not transport.isdir(os.path.join(jobs_dir, i, "workspace")):
                             js_df.at[i, "failed"] = True
 
                         # otherwise, make sure all three exit code are OK
@@ -794,8 +1002,25 @@ class Orchestrator(object):
                           sep = "\t"
                         )
 
-                        if o_df.set_index("output").loc[:, "pattern"].to_dict() == self.raw_outputs:
+                        # the manifest records patterns as the job saw them, with
+                        # $CANINE_JOB_ROOT (stdout/stderr's default) expanded
+                        job_root = os.path.join(localizer.environment("remote")["CANINE_JOBS"], i)
+                        declared = {
+                          k : v.replace("${CANINE_JOB_ROOT}", job_root).replace("$CANINE_JOB_ROOT", job_root)
+                          for k, v in self.raw_outputs.items()
+                        }
+                        if o_df.set_index("output").loc[:, "pattern"].to_dict() == declared:
                             js_df.at[i, "output_ok"] = True
+
+                        # ...and for a scratch-disk job, only if its copies are really there.
+                        # Its delocalizer cannot be rerun without the disk, so one with
+                        # anything missing is rerun in full rather than re-delocalized.
+                        if scratch_outputs_on_nfs:
+                            copies = o_df.loc[~o_df["output"].isin(["stdout", "stderr"]), "path"]
+                            if not (js_df.at[i, "output_ok"] and all(
+                              transport.exists(os.path.join(output_dir, p)) for p in copies)):
+                                js_df.at[i, "output_ok"] = False
+                                js_df.at[i, "failed"] = True
 
                     # shards that both succeeded and have matching outputs can be noop'd
                     # in the job spec
