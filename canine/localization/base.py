@@ -45,6 +45,18 @@ Localization = namedtuple("Localization", ['type', 'path'])
 # _scratch_disk_provenance_lines). Dot-named, so output globs don't match it.
 SCRATCH_DISK_PROVENANCE = ".canine_provenance"
 
+# Read-ahead for the disks canine attaches, in 512-byte sectors (16 MiB). A
+# persistent disk answers each request in milliseconds, so a sequential reader
+# is limited by how many requests are in flight: at the kernel's default of
+# 128 KiB a pd-standard disk read a 100 GB file at 68 MB/s, at 16 MiB at 453 MB/s.
+# The setting belongs to the device, so it is made each time a disk is mounted.
+# It only affects speed, so failing to set it doesn't fail the job.
+DISK_READ_AHEAD_SECTORS = 32768
+
+def read_ahead_line(device):
+    """The shell line that sets a device's read-ahead (see DISK_READ_AHEAD_SECTORS)."""
+    return "sudo blockdev --setra {} {} || true".format(DISK_READ_AHEAD_SECTORS, device)
+
 # Scripts staged into CANINE_ROOT so the compute node can run them. They ride the shared
 # staging directory rather than the worker image: baking them in would need a fleet-wide
 # rebuild and would version-skew against the installed canine.
@@ -1387,6 +1399,7 @@ class AbstractLocalizer(abc.ABC):
             'if [[ $(sudo blkid -o value -s TYPE /dev/disk/by-id/google-${GCP_DISK_NAME}) != "ext4" ]]; then',
             'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-${GCP_DISK_NAME}',
             'fi',
+            read_ahead_line('/dev/disk/by-id/google-"${GCP_DISK_NAME}"'),
 
             ## mount
             'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
@@ -2571,6 +2584,7 @@ class AbstractLocalizer(abc.ABC):
                 ),
                 'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
                 'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
+                read_ahead_line('/dev/disk/by-id/google-{}'.format(device_name)),
 
                 'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
                     device_name,
@@ -2820,6 +2834,7 @@ class AbstractLocalizer(abc.ABC):
                 "sleep 10; ((++tries))",
               "done",
 
+              read_ahead_line("/dev/disk/by-id/google-${CANINE_RODISK}"),
               # mount within Slurm worker container
               "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} || true",
               "fi",
