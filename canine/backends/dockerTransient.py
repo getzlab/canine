@@ -142,7 +142,7 @@ class DockerTransientImageSlurmBackend(TransientImageSlurmBackend):  # {{{
 
         #
         # check if image exists; pull it if not
-        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.6'
+        image_ref = f'gcr.io/{self.config["image_project"]}/slurm_gcp_docker:v0.18.7'
         try:
             image = self.dkr.images.get(image_ref)
         except docker.errors.ImageNotFound:

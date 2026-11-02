@@ -150,6 +150,19 @@ def _numeric_sacct_columns(acct):
     return acct
 
 
+# The Slurm GRES that counts each node's attachable persistent disks. GCE allows
+# 128 per VM, the boot disk among them, and Slurm doesn't otherwise know how many
+# a node already has, so jobs that attach many (e.g. reading every BWA shard's
+# scratch disk) could land on one node together and fail to attach. A cluster
+# that defines it (slurm_gcp_docker, from v0.18.7) gets each job's request
+# added; on one that doesn't, nothing is requested, as a job requesting an
+# undefined GRES could never run.
+DISK_GRES = "pdisk"
+
+def _with_gres(existing: typing.Optional[str], name: str, count: int) -> str:
+    """A --gres value: the existing one, if any, with name:count added."""
+    return "{}:{}".format(name, count) if not existing else "{},{}:{}".format(existing, name, count)
+
 def _job_indices_to_array_str(indices: typing.List[int]) -> str:
     """Convert a sorted list of job indices into a compact SLURM array range string.
 
@@ -577,7 +590,8 @@ class Orchestrator(object):
                 #
                 # submit job
                 canine_logging.info1("Submitting batch job")
-                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'))
+                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'),
+                                                 extra_sbatch_args = self.disk_gres_args(localizer))
                 if batch_id != -2:
                     canine_logging.print("Batch id:", batch_id)
 
@@ -861,6 +875,32 @@ class Orchestrator(object):
                 with transport.open(dest, 'wb') as w:
                     pandas_write_hdf5_buffered(df, buf = w, key = "results")
         return df
+
+    def cluster_counts_disks(self) -> bool:
+        """Whether the cluster defines DISK_GRES (asked once per Orchestrator)."""
+        if not hasattr(self, "_cluster_counts_disks"):
+            try:
+                rc, stdout, stderr = self.backend.invoke("scontrol show config")
+                config = stdout.read().decode() if rc == 0 else ""
+            except Exception:
+                config = ""
+            types = [l.split("=", 1)[1] for l in config.splitlines() if l.split("=", 1)[0].strip() == "GresTypes"]
+            self._cluster_counts_disks = bool(types) and DISK_GRES in [t.strip() for t in types[0].split(",")]
+        return self._cluster_counts_disks
+
+    def disk_gres_args(self, localizer, job_spec = None) -> typing.Dict[str, str]:
+        """
+        extra_sbatch_args requesting the persistent disks the batch's jobs
+        attach, if the cluster counts them (see DISK_GRES). One request covers
+        the job array, so it's the most any job being run attaches.
+        """
+        if job_spec is None:
+            job_spec = self.job_spec
+        attached = getattr(localizer, "attached_disks", {})
+        most = max([attached.get(k, 0) for k, v in job_spec.items() if v is not None] or [0])
+        if most == 0 or not self.cluster_counts_disks():
+            return {}
+        return { "gres" : _with_gres(self.resources.get("gres"), DISK_GRES, most) }
 
     def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}, job_spec = None) -> int:
         if job_spec is None:

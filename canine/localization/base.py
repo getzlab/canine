@@ -448,6 +448,10 @@ class AbstractLocalizer(abc.ABC):
         # other tasks
         # jobId : { input : [RODISK URLs] }
         self.rodisk_paths = {}
+        # {jobId: how many persistent disks the job attaches}: its own scratch
+        # disk, and other jobs' scratch disks read-only. Orchestrator requests
+        # them from Slurm (see DISK_GRES).
+        self.attached_disks = {}
 
         # jobId : (bucket_prefix, region, upload plan), kept from job_setup_teardown so
         # a job can be settled on the controller without re-planning it
@@ -2788,6 +2792,11 @@ class AbstractLocalizer(abc.ABC):
         for k in array_exports.keys():
             dest = self.reserve_path('jobs', jobId)
             exports += ['export {0}="{1}/{0}_array.txt"'.format(k, dest.remotepath)]
+
+        # A finished scratch disk is among the read-only disks; an unfinished one
+        # is attached read-write, which counts as well.
+        self.attached_disks[jobId] = len(canine_rodisks) + \
+          int(self.use_scratch_disk and not scratch_disk_already_exists)
 
         #
         # Mount RO disks if any
