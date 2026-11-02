@@ -56,7 +56,7 @@ def write_daemon(tmpdir, kind, **kw):
         return f.read()
 
 
-def run_daemon(daemon_src, df_values):
+def run_daemon(daemon_src, df_values, disk_gb=None, fs_gb=None):
     """
     Run the daemon against a stubbed environment.
 
@@ -64,6 +64,10 @@ def run_daemon(daemon_src, df_values):
     daemon calls df twice per iteration (total, then free), so the stub advances every
     two calls. When the values run out the stub signals completion and the daemon
     exits, so this terminates without needing `timeout` (absent on macOS).
+
+    `disk_gb`/`fs_gb` are the disk's size and its filesystem's (blockdev and
+    dumpe2fs, through sudo); unset, they print nothing, as if unreadable. A resize
+    grows the disk, and resize2fs grows the filesystem to it.
 
     Returns (resize_sizes_gb, stderr_lines).
     """
@@ -75,6 +79,10 @@ def run_daemon(daemon_src, df_values):
             f.write("\n".join(df_values) + "\n")
         with open(os.path.join(work, "calls"), "w") as f:
             f.write("0\n")
+        for name, gb in (("disk_gb", disk_gb), ("fs_gb", fs_gb)):
+            if gb is not None:
+                with open(os.path.join(work, name), "w") as f:
+                    f.write("{}\n".format(gb))
 
         stubs = {
             "df": (
@@ -92,12 +100,21 @@ def run_daemon(daemon_src, df_values):
                 '#!/bin/bash\n'
                 'W="$(dirname "$0")/.."\n'
                 'while [ $# -gt 0 ]; do\n'
-                '  [ "$1" = "--size" ] && echo "$2" >> "$W/resizes"\n'
+                '  [ "$1" = "--size" ] && { echo "$2" >> "$W/resizes"; [ -f "$W/disk_gb" ] && echo "$2" > "$W/disk_gb"; }\n'
                 '  shift\n'
                 'done\n'
                 'exit 0\n'
             ),
-            "sudo": "#!/bin/bash\nexit 0\n",
+            "sudo": (
+                '#!/bin/bash\n'
+                'W="$(dirname "$0")/.."\n'
+                'case "$1" in\n'
+                '  blockdev) [ -f "$W/disk_gb" ] && echo $(( $(cat "$W/disk_gb") * 1073741824 ));;\n'
+                '  dumpe2fs) [ -f "$W/fs_gb" ] && printf "Block count:              %d\\nBlock size:               4096\\n" $(( $(cat "$W/fs_gb") * 262144 ));;\n'
+                '  resize2fs) [ -f "$W/disk_gb" ] && cp "$W/disk_gb" "$W/fs_gb";;\n'
+                'esac\n'
+                'exit 0\n'
+            ),
         }
         for name, body in stubs.items():
             p = os.path.join(binv, name)
@@ -282,3 +299,66 @@ def test_daemon_tolerates_unmounted_disk(tmp_path):
     # df reporting a zero-size filesystem must not divide by zero or resize
     resizes, _ = run_daemon(daemon, ["0:0", "102400:51200"])
     assert resizes == []
+
+
+# ---------------------------------------------------------------------------
+# a disk larger than its filesystem
+# ---------------------------------------------------------------------------
+
+def test_grows_the_filesystem_when_an_earlier_resize_was_interrupted(tmp_path):
+    """
+    Seen live (2026-11-02): a node was preempted after GCE grew a scratch disk to
+    16 GB but before resize2fs. On the rerun the filesystem was still 10 GB, the
+    daemon asked GCE for 10 -> 16 GB, GCE rejected it (not larger than the disk) on
+    every poll, resize2fs never ran, and the job ran out of space. The filesystem is
+    grown to the disk first, with no GCE call.
+    """
+    daemon = write_daemon(tmp_path, "scratch", **SCRATCH_KW)
+    resizes, log = run_daemon(daemon, ["9964:1026", "16384:7462"], disk_gb=16, fs_gb=10)
+    assert resizes == []
+    assert any("filesystem grown from 10GB to the disk size, 16GB" in l for l in log)
+
+
+def test_then_grows_the_disk_from_its_own_size(tmp_path):
+    """Still short of space once the filesystem fills the disk: the disk grows, from 16 GB."""
+    daemon = write_daemon(tmp_path, "scratch", **SCRATCH_KW)
+    resizes, log = run_daemon(daemon, ["9964:1026", "16384:1024"], disk_gb=16, fs_gb=10)
+    assert resizes == [16 * 160 // 100]
+    assert sum("filesystem grown" in l for l in log) == 1
+
+
+def test_steps_are_sized_from_the_disk_not_its_filesystem(tmp_path):
+    """
+    A 1000 GB disk's filesystem reports about 984 GB. Sized from that, a small
+    enough step could fall short of the disk's size, which GCE rejects.
+    """
+    daemon = write_daemon(tmp_path, "localization", **LOCALIZATION_KW)
+    resizes, log = run_daemon(daemon, ["1007616:102400"], disk_gb=1000, fs_gb=1000)
+    assert resizes == [1100]   # 1000 GB + the 100 GB step cap
+    assert not any("filesystem grown" in l for l in log)
+
+
+def test_an_unreadable_filesystem_size_still_grows_the_disk(tmp_path):
+    """If dumpe2fs prints nothing, the disk is grown as before."""
+    daemon = write_daemon(tmp_path, "scratch", **SCRATCH_KW)
+    resizes, log = run_daemon(daemon, ["16384:1024"], disk_gb=16)
+    assert resizes == [16 * 160 // 100]
+    assert not any("filesystem grown" in l for l in log)
+
+
+def test_mounting_grows_the_filesystem_to_the_disk():
+    """
+    The disk setup grows the filesystem right after mounting too, so a rerun
+    starts with the space an earlier attempt's resize gave it. Asserted against the
+    module source, as building the setup needs live GCP disk clients.
+    """
+    base_py = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "localization", "base.py",
+    )
+    with open(base_py) as f:
+        src = f.read()
+    mount = src.index("'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-\"${GCP_DISK_NAME}\"")
+    grow = src.index("'sudo resize2fs /dev/disk/by-id/google-\"${GCP_DISK_NAME}\" || :'")
+    lock = src.index("'flock -os \"$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME\" sleep infinity")
+    assert mount < grow < lock

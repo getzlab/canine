@@ -1126,14 +1126,29 @@ class AbstractLocalizer(abc.ABC):
           '  PREV_FREE_MB=\$FREE_MB',
           '  if [[ \$NEED_RESIZE -eq 1 ]]; then',
           '    TOTAL_GB=\$(( (TOTAL_MB + 1023) / 1024 ))',
-          '    NEW_GB=\$(( TOTAL_GB * GROW_PCT / 100 ))',
+          # Steps are sized from the disk, not its filesystem, which reports less
+          # than the disk's size, and less still if a resize grew the disk but was
+          # interrupted (e.g. by preemption) before resize2fs. GCE rejects a size
+          # that isn't larger than the disk's, so sizing from the filesystem could
+          # then never grow it; growing the filesystem to the disk comes first.
+          '    DEV=/dev/disk/by-id/google-${GCP_DISK_NAME}',
+          '    DISK_B=\$(sudo blockdev --getsize64 \$DEV 2> /dev/null)',
+          '    DISK_GB=\$(( \${DISK_B:-0} / 1073741824 ))',
+          '    if [[ \$DISK_GB -le 0 ]]; then DISK_GB=\$TOTAL_GB; fi',
+          '    FS_GB=\$(sudo dumpe2fs -h \$DEV 2> /dev/null | awk -F: \'/^Block count/ { c = \$2 } /^Block size/ { s = \$2 } END { if (c && s) print int(c * s / 1073741824) }\')',
+          '    if [[ -n \$FS_GB && \$DISK_GB -gt \$FS_GB ]] && sudo resize2fs \$DEV; then',
+          '      echo "' + disk_kind + ' disk $GCP_DISK_NAME: \$REASON (\${FREE_MB}MB free of \${TOTAL_MB}MB); filesystem grown from \${FS_GB}GB to the disk size, \${DISK_GB}GB" >&2',
+          '      PREV_FREE_MB=-1',
+          '      continue',
+          '    fi',
+          '    NEW_GB=\$(( DISK_GB * GROW_PCT / 100 ))',
           '    if [[ \$RATE_MB_S -gt 0 && \$HEADROOM_SEC -gt 0 ]]; then',
-          '      RATE_GB=\$(( TOTAL_GB + (RATE_MB_S * HEADROOM_SEC + 1023) / 1024 ))',
+          '      RATE_GB=\$(( DISK_GB + (RATE_MB_S * HEADROOM_SEC + 1023) / 1024 ))',
           '      if [[ \$RATE_GB -gt \$NEW_GB ]]; then NEW_GB=\$RATE_GB; fi',
           '    fi',
-          '    if [[ \$MIN_GROW_GB -gt 0 && \$((NEW_GB - TOTAL_GB)) -lt \$MIN_GROW_GB ]]; then NEW_GB=\$((TOTAL_GB + MIN_GROW_GB)); fi',
-          '    if [[ \$MAX_GROW_GB -gt 0 && \$((NEW_GB - TOTAL_GB)) -gt \$MAX_GROW_GB ]]; then NEW_GB=\$((TOTAL_GB + MAX_GROW_GB)); fi',
-          '    echo "' + disk_kind + ' disk $GCP_DISK_NAME: \$REASON (\${FREE_MB}MB free of \${TOTAL_MB}MB); resizing \${TOTAL_GB}GB -> \${NEW_GB}GB" >&2',
+          '    if [[ \$MIN_GROW_GB -gt 0 && \$((NEW_GB - DISK_GB)) -lt \$MIN_GROW_GB ]]; then NEW_GB=\$((DISK_GB + MIN_GROW_GB)); fi',
+          '    if [[ \$MAX_GROW_GB -gt 0 && \$((NEW_GB - DISK_GB)) -gt \$MAX_GROW_GB ]]; then NEW_GB=\$((DISK_GB + MAX_GROW_GB)); fi',
+          '    echo "' + disk_kind + ' disk $GCP_DISK_NAME: \$REASON (\${FREE_MB}MB free of \${TOTAL_MB}MB); resizing \${DISK_GB}GB -> \${NEW_GB}GB" >&2',
           '    if gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$NEW_GB; then',
           '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
           '    else',
@@ -1414,6 +1429,9 @@ class AbstractLocalizer(abc.ABC):
             'sudo chown $(id -u):$(id -g) "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'sudo chmod 774 "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'fi',
+            ## grow the filesystem to the disk, if an earlier attempt's resize grew
+            ## the disk but was interrupted before resize2fs (a no-op otherwise)
+            'sudo resize2fs /dev/disk/by-id/google-"${GCP_DISK_NAME}" || :',
 
             ## lock the disk
             # will be unlocked during teardown script (or if script crashes). this
