@@ -2,7 +2,7 @@
 A job's read-only disks are attached together, then each is mounted; in
 teardown each is unmounted, then they're detached together. One call at a time,
 attaching and detaching took about 6.5 s per disk, so MarkDuplicates over 120
-BWA shard disks spent most of its half hour on gcloud calls (2026-10-30).
+BWA scratch disks spent most of its half hour on gcloud calls (2026-10-30).
 
 These run the generated bash against a stand-in gcloud that records each call,
 takes a second per call, and exits with a code chosen per disk.
