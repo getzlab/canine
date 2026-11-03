@@ -1078,6 +1078,12 @@ class AbstractLocalizer(abc.ABC):
         persists as a RODISK for downstream tasks, so overshoot is a permanent storage
         cost and it is better to resize repeatedly than to over-provision once.
 
+        It also records the most space it has seen used on the disk, in MB, in
+        `$CANINE_JOB_ROOT/.<disk_kind>_disk_peak_used_mb`: what the job needed,
+        to size the disk from the start next time. A requeued job carries on from
+        the recorded value, so it covers every attempt on the disk. Sampled each
+        poll, so a peak shorter than a poll can be missed.
+
         The heredoc is deliberately unquoted (`<<EOF`) so that GCP_DISK_NAME and
         GCP_TSNT_DISKS_DIR are baked in at file-write time: they are plain shell
         assignments rather than exports (see the localization_script preamble above),
@@ -1094,6 +1100,9 @@ class AbstractLocalizer(abc.ABC):
           'MIN_GROW_GB={}'.format(min_grow_gb),
           'MAX_GROW_GB={}'.format(max_grow_gb),
           'PREV_FREE_MB=-1',
+          'PEAK_FILE=$CANINE_JOB_ROOT/.' + disk_kind + '_disk_peak_used_mb',
+          'PEAK_MB=\$(cat \$PEAK_FILE 2> /dev/null)',
+          '[[ \$PEAK_MB =~ ^[0-9]+\$ ]] || PEAK_MB=0',
           'while true; do',
           '  sleep \$POLL',
           '  if ! mountpoint "\$DISK_DIR" &> /dev/null; then',
@@ -1104,6 +1113,10 @@ class AbstractLocalizer(abc.ABC):
           '  TOTAL_MB=\$(df -B1M "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
           '  FREE_MB=\$(df -B1M "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
           '  if [[ -z \$TOTAL_MB || \$TOTAL_MB -le 0 ]]; then continue; fi',
+          '  if [[ \$((TOTAL_MB - FREE_MB)) -gt \$PEAK_MB ]]; then',
+          '    PEAK_MB=\$((TOTAL_MB - FREE_MB))',
+          '    echo \$PEAK_MB > \$PEAK_FILE.tmp && mv \$PEAK_FILE.tmp \$PEAK_FILE',
+          '  fi',
           '  NEED_RESIZE=0; REASON=; RATE_MB_S=0',
           '  if [[ \$((100*FREE_MB/TOTAL_MB)) -lt \$MIN_FREE_PCT ]]; then',
           '    NEED_RESIZE=1; REASON="free space below \${MIN_FREE_PCT}%"',

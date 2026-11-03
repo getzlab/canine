@@ -362,3 +362,45 @@ def test_mounting_grows_the_filesystem_to_the_disk():
     grow = src.index("'sudo resize2fs /dev/disk/by-id/google-\"${GCP_DISK_NAME}\" || :'")
     lock = src.index("'flock -os \"$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME\" sleep infinity")
     assert mount < grow < lock
+
+
+# ---------------------------------------------------------------------------
+# peak usage record
+# ---------------------------------------------------------------------------
+
+def peak(tmp_path, kind):
+    with open(os.path.join(str(tmp_path), ".{}_disk_peak_used_mb".format(kind))) as f:
+        return f.read().strip()
+
+
+@pytest.mark.parametrize("kind,kw", [("scratch", SCRATCH_KW), ("localization", LOCALIZATION_KW)])
+def test_the_most_space_used_is_recorded(tmp_path, kind, kw):
+    """Used is total less free: 2240, then 5240 MB, then 1240 MB; the most is kept."""
+    daemon = write_daemon(tmp_path, kind, **kw)
+    run_daemon(daemon, ["10240:8000", "10240:5000", "10240:9000"])
+    assert peak(tmp_path, kind) == "5240"
+
+
+def test_a_requeued_job_carries_on_from_the_recorded_peak(tmp_path):
+    """An earlier attempt on the same disk used more: its peak stands."""
+    with open(os.path.join(str(tmp_path), ".scratch_disk_peak_used_mb"), "w") as f:
+        f.write("9000\n")
+    daemon = write_daemon(tmp_path, "scratch", **SCRATCH_KW)
+    run_daemon(daemon, ["10240:8000", "10240:5000"])
+    assert peak(tmp_path, "scratch") == "9000"
+
+
+def test_an_unreadable_record_starts_over(tmp_path):
+    """A record that isn't a number (e.g. cut short) is taken as no record."""
+    with open(os.path.join(str(tmp_path), ".scratch_disk_peak_used_mb"), "w") as f:
+        f.write("90x\n")
+    daemon = write_daemon(tmp_path, "scratch", **SCRATCH_KW)
+    run_daemon(daemon, ["10240:8000"])
+    assert peak(tmp_path, "scratch") == "2240"
+
+
+def test_the_record_is_written_whole(tmp_path):
+    """Written to a temporary file, then moved into place, so a reader never sees half."""
+    daemon = write_daemon(tmp_path, "scratch", **SCRATCH_KW)
+    assert "echo $PEAK_MB > $PEAK_FILE.tmp && mv $PEAK_FILE.tmp $PEAK_FILE" in daemon
+    assert "PEAK_FILE={}/.scratch_disk_peak_used_mb".format(tmp_path) in daemon   # baked in
