@@ -55,7 +55,8 @@ export CANINE_JOBS="{{CANINE_JOBS}}"
 echo -n '---- STARTING JOB SETUP ... ' >&2
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 echo 'COMPLETE ----' >&2
-if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0))) -ge $CANINE_PREEMPT_LIMIT ]; then
+# restarts that weren't preemptions: requeues after a recoverable localization failure or a job failure
+if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0)-$([ -f $CANINE_JOB_ROOT/.job_failure_count ] && cat $CANINE_JOB_ROOT/.job_failure_count || echo -n 0))) -ge $CANINE_PREEMPT_LIMIT ]; then
   # localization must have completed successfully and job must not have exited with a failure
   if [[ ( -e $CANINE_JOB_ROOT/.localizer_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0) && \
         (( -e $CANINE_JOB_ROOT/.job_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0 ) || \
@@ -98,12 +99,15 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
       TEARDOWN_RC=$?
       [ $TEARDOWN_RC == 0 ] && echo '++++ CLEANUP COMPLETE ++++' >&2 || echo '!+++ CLEANUP FAILURE +++!' >&2
-      [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
+      # failures, not restarts, are counted against the limit: restarts include
+      # preemptions, which have their own (CANINE_PREEMPT_LIMIT)
+      CANINE_JOB_FAILURES=$(cat $CANINE_JOB_ROOT/.job_failure_count)
+      [[ $CANINE_JOB_FAILURES -gt $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
       if [[ $CANINE_JOB_RC -eq 137 ]]; then
         echo "INFO: job ran out of memory; will not attempt to requeue." >&2
         break
       fi
-      echo "INFO: Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
+      echo "INFO: Retrying job (attempt $CANINE_JOB_FAILURES/$CANINE_RETRY_LIMIT)" >&2
       [ -f $CANINE_JOB_ROOT/stdout ] && mv $CANINE_JOB_ROOT/stdout $CANINE_JOB_ROOT/stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       [ -f $CANINE_JOB_ROOT/stderr ] && mv $CANINE_JOB_ROOT/stderr $CANINE_JOB_ROOT/stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       scontrol requeue $SLURM_JOB_ID
