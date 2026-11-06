@@ -52,6 +52,9 @@ export CANINE_ROOT="{{CANINE_ROOT}}"
 export CANINE_COMMON="{{CANINE_COMMON}}"
 export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
+# This job, to requeue: <array>_<task> for a job array's task. The array's last
+# task has the array's own ID as its SLURM_JOB_ID, which would requeue them all.
+[ -n "$SLURM_ARRAY_JOB_ID" ] && CANINE_SLURM_JOB=$SLURM_ARRAY_JOB_ID"_"$SLURM_ARRAY_TASK_ID || CANINE_SLURM_JOB=$SLURM_JOB_ID
 echo -n '---- STARTING JOB SETUP ... ' >&2
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 echo 'COMPLETE ----' >&2
@@ -110,7 +113,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo "INFO: Retrying job (attempt $CANINE_JOB_FAILURES/$CANINE_RETRY_LIMIT)" >&2
       [ -f $CANINE_JOB_ROOT/stdout ] && mv $CANINE_JOB_ROOT/stdout $CANINE_JOB_ROOT/stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       [ -f $CANINE_JOB_ROOT/stderr ] && mv $CANINE_JOB_ROOT/stderr $CANINE_JOB_ROOT/stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
-      scontrol requeue $SLURM_JOB_ID
+      scontrol requeue $CANINE_SLURM_JOB
     fi
   done
   echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
@@ -118,7 +121,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
 elif [ $LOCALIZER_JOB_RC -eq 5 ]; then # localization failed due to recoverable reason (e.g. quota); requeue the job
   echo "WARNING: localization will be retried" >&2
   echo $(($([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.localization_failure_count
-  scontrol requeue $SLURM_JOB_ID
+  scontrol requeue $CANINE_SLURM_JOB
 elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization and job can be skipped (to facilitate avoidance of scratch disk tasks)
   echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2
   export CANINE_JOB_RC=0
