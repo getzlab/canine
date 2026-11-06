@@ -1,0 +1,72 @@
+{
+  "routeb": {
+    "token_source": "metadata server",
+    "outcome": {
+      "phases": {
+        "relay": 75.5,
+        "compose": 1.6,
+        "verify": 75.0,
+        "gunzip": 194.0
+      },
+      "decompressed_from": 8520130000,
+      "decompressed_to": 16444444500,
+      "decode_read_seconds": 0.289,
+      "decode_inflate_seconds": 115.256,
+      "decode_write_seconds": 77.318,
+      "decode_blocks": 1016,
+      "decode_readahead": 4,
+      "decode_upload_width": 4,
+      "decode_slices": 491,
+      "decode_ceiling": 1.67,
+      "decode_pipe2_ceiling": 1.67,
+      "fell_back": null,
+      "bookkeeping_seconds": 4.1,
+      "bookkeeping_calls": 127,
+      "bookkeeping_mean": 0.032,
+      "bookkeeping_pct_workers": 0.3,
+      "read_seconds": 914.027,
+      "write_seconds": 213.565,
+      "loop_other_seconds": 0.029,
+      "io_blocks": 1016,
+      "read_pct_of_loop": 81,
+      "overlap_ceiling": 1.23,
+      "commit_seconds": 1.5,
+      "commit_batches": 18,
+      "commit_chunks": 127,
+      "commit_mean_batch": 7.1,
+      "commit_pct_wall": 2.0,
+      "mean_streams": 14.94,
+      "workers": 16,
+      "connections": 16,
+      "returncode": 0,
+      "seconds": 356.3,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 525721600,
+      "nic_bytes": 26047184624,
+      "disk_bytes": 780554240,
+      "peak_nic_bytes_per_s": 134716941.54197615,
+      "peak_disk_bytes_per_s": 124930208.70555526,
+      "stderr_tail": [
+        "[k9pdl] k9pdl-phase gunzip 194.0s, 43.9 MB/s",
+        "[k9pdl] decompressed 8520130000 bytes into 16444444500 bytes",
+        "[k9pdl] complete: 8520130000 bytes composed from 127 parts (verified)"
+      ]
+    },
+    "gunzip": {
+      "ran": true,
+      "compressed_bytes": 8520130000,
+      "decompressed_bytes": 16444444500,
+      "seconds": 194.0,
+      "read_seconds": 0.289,
+      "inflate_seconds": 115.256,
+      "write_seconds": 77.318,
+      "blocks": 1016,
+      "readahead": 4,
+      "upload_width": 4,
+      "slices": 491,
+      "ceiling": 1.67,
+      "pipe2_ceiling": 1.67
+    }
+  }
+}

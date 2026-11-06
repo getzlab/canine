@@ -7,11 +7,11 @@ import re
 import shlex
 import glob
 import subprocess
-from .base import PathType, Localization
+from .base import PathType, Localization, STAGED_SCRIPTS, BASH, on_shared_mount
 from .local import BatchedLocalizer
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
-from ..utils import get_default_gcp_project
+from ..utils import get_default_gcp_project, canine_logging
 import pandas as pd
 
 
@@ -61,7 +61,10 @@ class NFSLocalizer(BatchedLocalizer):
         # it's a remote URL; get localization command and execute
         if src.localization_mode == "url":
             cmd = src.localization_command(dest.localpath)
-            subprocess.check_call(cmd, shell = True)
+            # bash explicitly: the emitted command is authored as bash and uses
+            # constructs like [[ ]] and process substitution, which shell=True's
+            # default /bin/sh rejects (dash on the controller image)
+            subprocess.check_call(cmd, shell = True, executable = BASH)
 
         # it's a local file
         elif os.path.exists(src.path):
@@ -71,10 +74,9 @@ class NFSLocalizer(BatchedLocalizer):
                 if not os.path.isdir(os.path.dirname(dest.localpath)):
                     os.makedirs(os.path.dirname(dest.localpath))
 
-                #
-                # check if self.mount_path, self.staging_dir, and src all exist on the same NFS share
-                # symlink if yes, copy if no
-                if self.same_volume(src):
+                # symlink a file on the NFS share, which workers can follow; copy
+                # any other local path, which is on the controller alone
+                if on_shared_mount(src):
                     os.symlink(src, dest.localpath)
                 else:
                     if os.path.isfile(src):
@@ -97,8 +99,9 @@ class NFSLocalizer(BatchedLocalizer):
         if overrides is None:
             overrides = {}
 
-        # for inputs that are absolute paths residing on the same NFS share,
-        # and are not Canine outputs, treat them as string literals
+        # for inputs that are absolute paths on the NFS share, and are not Canine
+        # outputs, treat them as string literals: workers read them where they are.
+        # Any other local path is on the controller alone, so it is localized.
 
         # XXX: this can be potentially slow, since it has to iterate over every
         #      single input. It would make more sense to do this before the adapter
@@ -110,7 +113,7 @@ class NFSLocalizer(BatchedLocalizer):
 
             for k, v in input_dict.items():
                 if k not in overrides and isinstance(v, str):
-                    if re.match(r"^/", v) is not None and self.same_volume(v) and \
+                    if re.match(r"^/", v) is not None and on_shared_mount(v) and \
                       re.match(r".*/outputs/\d+/.*", v) is None:
                         overrides[k] = None
                         warnings.warn(
@@ -163,23 +166,9 @@ class NFSLocalizer(BatchedLocalizer):
                     with open(export_path.localpath, 'w') as w:
                         w.write("\n".join(v) + "\n")
 
-            # copy delocalization script
-            shutil.copyfile(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    'delocalization.py'
-                ),
-                os.path.join(self.environment('local')['CANINE_ROOT'], 'delocalization.py')
-            )
-
-            # copy debug script
-            shutil.copyfile(
-                os.path.join(
-                    os.path.dirname(__file__),
-                    'debug.sh'
-                ),
-                os.path.join(self.environment('local')['CANINE_ROOT'], 'debug.sh')
-            )
+            # Stage the scripts the compute node runs. See copy_staged_scripts for why
+            # the executable bit needs restoring by hand here.
+            self.copy_staged_scripts(self.environment('local')['CANINE_ROOT'])
 
             return self.finalize_staging_dir(inputs)
 

@@ -102,7 +102,13 @@ class TestIntegration(unittest.TestCase):
                 staging_dir = localizer.localize(inputs, output_patterns, {'gs-stream': 'stream', 'gs-download': 'delayed'})
                 with localizer.transport_context() as transport:
                     self.assertTrue(transport.isdir(staging_dir))
-                    self.assertTrue(transport.isfile(os.path.join(staging_dir, 'delocalization.py')))
+                    # every script the compute node runs must be staged; a missing
+                    # parallel_download.py would silently fall back to single-stream
+                    for script in ('delocalization.py', 'debug.sh', 'parallel_download.py'):
+                        self.assertTrue(
+                            transport.isfile(os.path.join(staging_dir, script)),
+                            '{} was not staged into CANINE_ROOT'.format(script)
+                        )
 
                     self.assertTrue(transport.isdir(os.path.join(staging_dir, 'common')))
                     self.assertTrue(transport.isfile(os.path.join(staging_dir, 'common', 'testfile')))
