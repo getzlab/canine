@@ -57,6 +57,11 @@ def read_ahead_line(device):
     """The shell line that sets a device's read-ahead (see DISK_READ_AHEAD_SECTORS)."""
     return "sudo blockdev --setra {} {} || true".format(DISK_READ_AHEAD_SECTORS, device)
 
+# How long a scratch disk's mount may take. A disk resumed after a preemption is
+# mounted with its ext4 journal still to replay; on a hard-clipping shard's
+# 133 GB disk (2026-11-06) that took longer than the 30 s allowed before.
+SCRATCH_DISK_MOUNT_TIMEOUT_S = 900
+
 # Scripts staged into CANINE_ROOT so the compute node can run them. They ride the shared
 # staging directory rather than the worker image: baking them in would need a fleet-wide
 # rebuild and would version-skew against the installed canine.
@@ -1438,7 +1443,12 @@ class AbstractLocalizer(abc.ABC):
             'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
             'fi',
             'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
-            'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            # a disk resumed from a node that stopped without unmounting it (a
+            # preemption) has its ext4 journal replayed as it mounts, which can
+            # take longer than a minute; at 30 s the timeout gave up while the
+            # kernel went on to mount it, and the job failed (exit 124). A mount
+            # that finishes after the timeout still counts.
+            'sudo timeout -k 30 {} mount -o discard,defaults /dev/disk/by-id/google-"${{GCP_DISK_NAME}}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" || mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"'.format(SCRATCH_DISK_MOUNT_TIMEOUT_S),
             'sudo chown $(id -u):$(id -g) "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'sudo chmod 774 "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'fi',

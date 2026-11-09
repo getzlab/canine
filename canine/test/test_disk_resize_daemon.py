@@ -358,7 +358,7 @@ def test_mounting_grows_the_filesystem_to_the_disk():
     )
     with open(base_py) as f:
         src = f.read()
-    mount = src.index("'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-\"${GCP_DISK_NAME}\"")
+    mount = src.index("'sudo timeout -k 30 {} mount -o discard,defaults /dev/disk/by-id/google-\"${{GCP_DISK_NAME}}\"")
     grow = src.index("'sudo resize2fs /dev/disk/by-id/google-\"${GCP_DISK_NAME}\" || :'")
     lock = src.index("'flock -os \"$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME\" sleep infinity")
     assert mount < grow < lock

@@ -34,5 +34,5 @@ def test_a_scratch_disk_records_it_once_mounted():
 
     record = base.AbstractLocalizer._scratch_disk_provenance_lines('"$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"')
     assert all(line in script for line in record)
-    mount = next(i for i, line in enumerate(script) if line.startswith("sudo timeout -k 30 30 mount"))
+    mount = next(i for i, line in enumerate(script) if line.startswith("sudo timeout -k 30 900 mount"))
     assert script.index(record[0]) > mount

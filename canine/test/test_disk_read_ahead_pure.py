@@ -49,7 +49,7 @@ def test_a_scratch_disk_gets_it_before_it_is_mounted():
         _, script, _, _ = localizer.create_persistent_disk(disk_name = "abc")
 
     read_ahead = script.index(base.read_ahead_line('/dev/disk/by-id/google-"${GCP_DISK_NAME}"'))
-    mount = next(i for i, line in enumerate(script) if line.startswith("sudo timeout -k 30 30 mount"))
+    mount = next(i for i, line in enumerate(script) if line.startswith("sudo timeout -k 30 900 mount"))
     assert read_ahead < mount
     # outside the mount's if, so a disk already mounted by an earlier attempt gets it too
     assert script[mount - 1].startswith("if ! mountpoint") and read_ahead < mount - 1
