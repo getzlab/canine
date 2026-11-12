@@ -3258,9 +3258,10 @@ class AbstractLocalizer(abc.ABC):
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
             ] + (
                 # move_to_bucket: the bucket delocalization moves the outputs to,
-                # created only for a job that succeeded
+                # created only for a job that succeeded. Not indented: its
+                # lifecycle heredoc's terminator must start the line.
                 ['if [[ -z $CANINE_DEBUG_MODE && $CANINE_JOB_RC == 0 ]]; then'] +
-                ['  ' + l for l in self.move_bucket_script(move_bucket)] +
+                self.move_bucket_script(move_bucket) +
                 ['fi'] if move_bucket else []
             ) + [
                 # 'mv ../stderr ../stdout .',

@@ -194,6 +194,7 @@ def job_teardown(finished, move_to_bucket = True):
     loc = BatchedLocalizer(MagicMock(), use_scratch_disk = True, scratch_disk_name = "canine-scratch-abc",
                            move_to_bucket = move_to_bucket)
     loc.clean_on_exit = False
+    loc.staging_dir = "/mnt/nfs/staging"
     loc.backend.config = {"compute_zone": "us-central1-a"}
     loc.inputs = {"0": {}}
     loc.input_array_flag = {"0": {}}
@@ -218,7 +219,7 @@ class TestAJobSkippedOnItsFinishedDisk:
         assert teardown.index("Detach calls done") < delete
         # only if this job's delocalization moved its outputs
         check = teardown[teardown.rindex("if [ -f ", 0, delete):delete].splitlines()[0]
-        assert check.endswith("/outputs/0/{}' ]; then".format(base.MOVED_MARKER))
+        assert "/outputs/0/{}".format(base.MOVED_MARKER) in check and check.endswith(" ]; then")
 
     def test_a_new_disk_has_only_its_own_teardown(self):
         teardown = job_teardown(finished = False)
@@ -227,6 +228,31 @@ class TestAJobSkippedOnItsFinishedDisk:
 
     def test_not_without_move_to_bucket(self):
         assert "disks delete" not in job_teardown(finished = True, move_to_bucket = False)
+
+
+class TestTheTeardownScript:
+    """The whole teardown parses: a heredoc's terminator indented by a block ends the script early."""
+
+    @pytest.mark.parametrize("finished", [True, False])
+    def test_bash_parses_it(self, finished):
+        r = subprocess.run(["bash", "-n"], input = job_teardown(finished), text = True, capture_output = True)
+        assert r.returncode == 0, r.stderr
+
+    def test_creates_the_bucket_with_its_lifecycle_rule(self, tmp_path):
+        # the bucket-creation block alone, run with a gcloud that records its calls
+        lines = job_teardown(finished = False).splitlines()
+        start = lines.index('if [[ -z $CANINE_DEBUG_MODE && $CANINE_JOB_RC == 0 ]]; then')
+        block = lines[start:lines.index("fi", lines.index('rm -f "$CANINE_BUCKET_LC"', start)) + 1]
+        script = "\n".join([
+          'gcloud() {',
+          '  if [ "$3" != create ]; then [ -e made ]; return; fi',
+          '  for a; do case $a in --lifecycle-file=*) cat "${a#*=}" > lifecycle;; esac; done; touch made',
+          '}',
+          "CANINE_JOB_RC=0",
+        ] + block)
+        r = subprocess.run(["bash", "-c", script], cwd = tmp_path, text = True, capture_output = True)
+        assert r.returncode == 0, r.stderr
+        assert '"daysSinceCustomTime":7' in (tmp_path / "lifecycle").read_text()
 
 
 class MovingLocalizer(Localizer):
