@@ -11,6 +11,7 @@ from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer, file_handlers
+from .localization.base import MOVED_MARKER
 from .utils import check_call, pandas_write_hdf5_buffered, canine_logging
 import yaml
 import numpy as np
@@ -1017,8 +1018,12 @@ class Orchestrator(object):
                     # a day after last use, so a later rerun redid the work. If every
                     # output it declares is copied back to NFS (files_to_copy_to_outputs),
                     # those copies are a complete record of it: avoid it on them instead.
-                    scratch_outputs_on_nfs = bool(getattr(localizer, "use_scratch_disk", False)) and \
-                      set(self.raw_outputs) - {"stdout", "stderr"} <= set(getattr(localizer, "files_to_copy_to_outputs", None) or ())
+                    # Likewise if its outputs are moved to a bucket (move_to_bucket),
+                    # which deletes its disk: avoid it while they're still there.
+                    moves_outputs = bool(getattr(localizer, "use_scratch_disk", False)) and \
+                      bool(getattr(localizer, "move_to_bucket", False))
+                    scratch_outputs_on_nfs = bool(getattr(localizer, "use_scratch_disk", False)) and (moves_outputs or \
+                      set(self.raw_outputs) - {"stdout", "stderr"} <= set(getattr(localizer, "files_to_copy_to_outputs", None) or ()))
 
                     # check for failed shards
                     for i in js_df.index:
@@ -1063,9 +1068,18 @@ class Orchestrator(object):
                         # Its delocalizer cannot be rerun without the disk, so one with
                         # anything missing is rerun in full rather than re-delocalized.
                         if scratch_outputs_on_nfs:
-                            copies = o_df.loc[~o_df["output"].isin(["stdout", "stderr"]), "path"]
+                            copied = set(getattr(localizer, "files_to_copy_to_outputs", None) or ())
+                            copies = o_df.loc[o_df["output"].isin(copied), "path"]
+                            # a moved output's symlink points into a bucket mount, which
+                            # isn't on the controller: its object is checked instead. One
+                            # that wasn't moved (a copy failed) is on the disk, which was
+                            # kept; then there's no marker, and the job reruns, resuming
+                            # from its disk.
+                            moved = moves_outputs and \
+                              (~o_df["output"].isin(copied | {"stdout", "stderr"}) & (o_df["path"] != "//not_found")).any()
                             if not (js_df.at[i, "output_ok"] and all(
-                              transport.exists(os.path.join(output_dir, p)) for p in copies)):
+                              transport.exists(os.path.join(output_dir, p)) for p in copies) and
+                              (not moved or localizer.moved_outputs_present(os.path.join(output_dir, i, MOVED_MARKER), transport))):
                                 js_df.at[i, "output_ok"] = False
                                 js_df.at[i, "failed"] = True
 

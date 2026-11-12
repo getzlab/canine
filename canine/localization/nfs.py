@@ -7,7 +7,7 @@ import re
 import shlex
 import glob
 import subprocess
-from .base import PathType, Localization, STAGED_SCRIPTS, BASH, on_shared_mount
+from .base import PathType, Localization, STAGED_SCRIPTS, BASH, on_shared_mount, scratch_output_url
 from .local import BatchedLocalizer
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport
@@ -197,10 +197,10 @@ class NFSLocalizer(BatchedLocalizer):
                     output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
 
                     # if we're using a scratch disk, outputs should be RODISK
-                    # objects for downstream tasks to mount. read symlinks to
-                    # RODISK URLs
+                    # objects for downstream tasks to mount, or bucket mounts if
+                    # they were moved to a bucket. read symlinks to their URLs
                     if self.use_scratch_disk and outputname not in self.files_to_copy_to_outputs:
-                        output_files[jobId][outputname] = ["rodisk://" + re.match(r".*(canine-scratch.*)", os.readlink(x))[1] for x in output_files[jobId][outputname]]
+                        output_files[jobId][outputname] = [scratch_output_url(os.readlink(x)) for x in output_files[jobId][outputname]]
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
         return output_files

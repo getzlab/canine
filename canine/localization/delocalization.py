@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import shlex
 import sys
+import time
 
 """
 This is not actually part of the canine package
@@ -78,7 +79,78 @@ def compute_crc32c(path, fast = False):
 
     return hash_alg.hexdigest().decode().upper()
 
-def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
+MOVED_MARKER = ".moved_to_bucket"   # as base.MOVED_MARKER
+
+def gcloud_cp(args, tries = 3):
+    """
+    gcloud storage cp, tried again after 10 s if it fails. Several sources in
+    one call are copied in parallel, and a large file is uploaded in parallel
+    parts, composed into one object (parallel composite uploads, which gcloud
+    leaves off by default; the object keeps a crc32c, which gcloud checks).
+    """
+    env = dict(os.environ, CLOUDSDK_STORAGE_PARALLEL_COMPOSITE_UPLOAD_ENABLED = "True")
+    for i in range(tries):
+        if subprocess.run(["gcloud", "storage", "cp"] + args, env = env).returncode == 0:
+            return True
+        if i < tries - 1:
+            time.sleep(10)
+    return False
+
+def move_to_bucket(jobdir, jobId, outputs, bucket, mount_dir):
+    """
+    Moves a job's outputs (name, dest, target) off its scratch disk into
+    gs://<bucket>/<jobId>/<target's path from the workspace>, and points each
+    one's symlink in the output directory at the bucket's mount,
+    <mount_dir>/<jobId>/<path>, which canine returns as a bucketmount:// URL. A
+    directory is copied whole. Records every object it copied in
+    gs://<bucket>/<jobId>/.wolf_moved and in the output directory's
+    MOVED_MARKER, whose presence lets teardown delete the disk. All or nothing:
+    if any copy fails, no symlink changes and no marker is written, so the
+    outputs stay on the disk, which is kept.
+
+    The outputs go in one gcloud call, so they're uploaded in parallel; one per
+    directory they're in, if a pattern reaches below the workspace. Each object
+    gets a customTime, which the bucket's lifecycle rule counts from. -n copies
+    only what isn't already there, so a rerun after a partial move skips what
+    made it; GCS writes an object whole or not at all.
+    """
+    custom_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    prefix = "gs://{}/{}".format(bucket, jobId)
+
+    # each file or directory once, though two outputs' patterns may match it
+    by_parent = {}
+    for _, _, target in outputs:
+        rel = os.path.relpath(target)
+        by_parent.setdefault(os.path.dirname(rel), set()).add(rel)
+
+    urls = []
+    for parent, rels in sorted(by_parent.items()):
+        if not gcloud_cp(["-r", "-n", "--custom-time=" + custom_time] + sorted(rels) +
+                         ["/".join([prefix] + ([parent] if parent else [])) + "/"]):
+            print("ERROR: could not move outputs to {}; they stay on the scratch disk, which is kept".format(prefix), file = sys.stderr)
+            return False
+        for rel in sorted(rels):
+            if os.path.isdir(rel):
+                urls += ["/".join([prefix, os.path.relpath(os.path.join(d, f))]) for d, _, fs in os.walk(rel) for f in fs]
+            else:
+                urls.append("/".join([prefix, rel]))
+
+    record = os.path.join(jobdir, MOVED_MARKER)
+    with open(record + ".part", "w") as f:
+        f.write("".join(u + "\n" for u in urls))
+    if not gcloud_cp(["--custom-time=" + custom_time, record + ".part", prefix + "/.wolf_moved"]):
+        print("ERROR: could not record the moved outputs in {}; they stay on the scratch disk, which is kept".format(prefix), file = sys.stderr)
+        os.remove(record + ".part")
+        return False
+
+    for _, dest, target in outputs:
+        os.remove(dest)
+        os.symlink(os.path.join(mount_dir, jobId, os.path.relpath(target)), dest)
+    os.rename(record + ".part", record)
+    print("INFO: moved {} output file(s) to {}".format(len(urls), prefix), file = sys.stderr)
+    return True
+
+def main(output_dir, jobId, patterns, copy, scratch, finished_scratch, move_bucket = None, move_mount = None):
     jobdir = os.path.join(output_dir, str(jobId))
     if not os.path.isdir(jobdir):
         os.makedirs(jobdir)
@@ -122,7 +194,7 @@ def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
                 ))
 
                 # append to array of files that will be hashed
-                matched_files.append([dest, target])
+                matched_files.append([name, dest, target])
 
                 n_matched += 1
 
@@ -143,7 +215,7 @@ def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
         print('Computing CRC32C checksums ...', file = sys.stderr, flush = True, end = "")
         pool = multiprocessing.Pool(8)
         crc_results = []
-        for dest, f in matched_files:
+        for _, dest, f in matched_files:
             crc_path = os.path.join(os.path.dirname(dest), "." + os.path.basename(dest) + ".crc32c")
             # if we are delocalizing from a finished scratch disk, do not bother
             # recomputing checksum for this file if it already exists
@@ -158,6 +230,13 @@ def main(output_dir, jobId, patterns, copy, scratch, finished_scratch):
                 crc32c_file.write(crc + "\n")
         pool.terminate()
         print(' done', file = sys.stderr, flush = True)
+
+        # move_to_bucket: every output still on the scratch disk (not stdout or
+        # stderr, and not copied to the output directory)
+        if move_bucket is not None:
+            move_to_bucket(jobdir, jobId,
+              [m for m in matched_files if m[0] not in {"stdout", "stderr"} and m[0] not in copy],
+              move_bucket, move_mount)
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser('canine-delocalizer')
@@ -192,5 +271,15 @@ if __name__ == '__main__':
         action='store_true',
         help="Scratch disk was finished; delocalizer is only running to (re)generate output directory. Will skip computing CRC32 hashes if they were precomputed to save time."
     )
+    parser.add_argument(
+        '--move-bucket',
+        help="If the job succeeded, move its outputs on the scratch disk to this bucket (move_to_bucket)",
+        default=None
+    )
+    parser.add_argument(
+        '--move-mount',
+        help="Where workers mount --move-bucket; moved outputs' symlinks point into it",
+        default=None
+    )
     args = parser.parse_args()
-    main(args.dest, args.jobId, args.pattern, set(args.copy), args.scratch, args.finished_scratch)
+    main(args.dest, args.jobId, args.pattern, set(args.copy), args.scratch, args.finished_scratch, args.move_bucket, args.move_mount)

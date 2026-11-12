@@ -517,6 +517,8 @@ Pass from wolF via `LocalizeToBucket(files=..., <kwarg>=...)`, or workflow-wide 
 | `scratch_disk_job_avoid` | `True` |
 | `protect_disk` | `False` — adds label `protect:yes`, blocking automatic deletion |
 | `files_to_copy_to_outputs` | `{}` — output keys copied from the scratch disk back to NFS. If it covers every output the task declares, a finished job is avoided on those NFS copies, with no need for its disk, which the lab's cost-monitoring app deletes about a day after last use |
+| `move_to_bucket` | `False` — move a successful job's other outputs to a bucket, delete its disk, and return them as `bucketmount://` URLs; a job whose outputs were moved is avoided while they're in the bucket. See `MOVE_TO_BUCKET.md` |
+| `move_to_bucket_expiry_days` | `7` — lifecycle expiry of the moved outputs' bucket |
 | `persistent_disk_type` | `"standard"` |
 
 **Read-only disks (a job's `rodisk://` inputs, such as upstream scratch disks):**
