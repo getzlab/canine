@@ -96,6 +96,15 @@ class TestMovingOutputs:
         assert (jobdir / base.MOVED_MARKER).read_text().splitlines() == expected
         assert (fake_gcloud / "gcs" / "wolf-1-r-h" / "3" / ".wolf_moved").read_text().splitlines() == expected
 
+    def test_logs_the_uploads_size_and_speed(self, fake_gcloud, monkeypatch, capsys):
+        workspace, jobdir, outputs = job(fake_gcloud)
+        os.truncate(workspace / "S.bam", 8 * 10**6)
+        clock = iter([100.0, 104.0])
+        monkeypatch.setattr(delocalization.time, "monotonic", lambda: next(clock))
+        os.chdir(workspace)
+        assert delocalization.move_to_bucket(str(jobdir), "3", outputs, "b", "/mnt/bucketmounts/b")
+        assert "INFO: moved 3 output file(s), 8 MB in 4 s (2.0 MB/s), to gs://b/3" in capsys.readouterr().err
+
     def test_a_failed_copy_leaves_the_outputs_on_the_disk(self, fake_gcloud, monkeypatch):
         monkeypatch.setenv("FAKE_GCLOUD_FAIL", "1")
         ok, jobdir = self.move(fake_gcloud)

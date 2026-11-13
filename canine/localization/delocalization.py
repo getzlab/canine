@@ -96,6 +96,12 @@ def gcloud_cp(args, tries = 3):
             time.sleep(10)
     return False
 
+def tree_size(path):
+    """The bytes in a file, or in every file under a directory."""
+    if not os.path.isdir(path):
+        return os.path.getsize(path)
+    return sum(os.path.getsize(os.path.join(d, f)) for d, _, fs in os.walk(path) for f in fs)
+
 def move_to_bucket(jobdir, jobId, outputs, bucket, mount_dir):
     """
     Moves a job's outputs (name, dest, target) off its scratch disk into
@@ -116,6 +122,7 @@ def move_to_bucket(jobdir, jobId, outputs, bucket, mount_dir):
     """
     custom_time = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     prefix = "gs://{}/{}".format(bucket, jobId)
+    start = time.monotonic()
 
     # each file or directory once, though two outputs' patterns may match it
     by_parent = {}
@@ -147,7 +154,11 @@ def move_to_bucket(jobdir, jobId, outputs, bucket, mount_dir):
         os.remove(dest)
         os.symlink(os.path.join(mount_dir, jobId, os.path.relpath(target)), dest)
     os.rename(record + ".part", record)
-    print("INFO: moved {} output file(s) to {}".format(len(urls), prefix), file = sys.stderr)
+    # the upload's size and time, to see how fast a job's disk and node upload
+    seconds = time.monotonic() - start
+    mb = sum(tree_size(rel) for rels in by_parent.values() for rel in rels) / 1e6
+    print("INFO: moved {} output file(s), {:.0f} MB in {:.0f} s ({:.1f} MB/s), to {}".format(
+      len(urls), mb, seconds, mb / max(seconds, 1e-3), prefix), file = sys.stderr)
     return True
 
 def main(output_dir, jobId, patterns, copy, scratch, finished_scratch, move_bucket = None, move_mount = None):
