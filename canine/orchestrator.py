@@ -701,7 +701,7 @@ class Orchestrator(object):
 
     OOM_REQUEUE_FACTOR = 1.5
 
-    def requeue_out_of_memory(self, jid, req_mem):
+    def requeue_out_of_memory(self, jid, req_mem, partition = None, cpus = None):
         """
         Requeues a job that ran out of memory, at once, with OOM_REQUEUE_FACTOR
         times the memory it had (req_mem, as sacct gives it): held, its memory
@@ -713,6 +713,13 @@ class Orchestrator(object):
         (checked on the cluster, 2026-11-13). Returns the memory in MB it runs
         again with (its own, if it couldn't be raised), or None if it couldn't
         be requeued, leaving the job as it was.
+
+        Slurm refuses a new job no node of its partition can run, but not a
+        held job raised past them: released, it stays pending
+        (BadConstraints) for good. So the raised memory is first tried as a
+        new job would be (sbatch --test-only, with the job's partition and
+        CPUs); if no node could run it, the job isn't requeued, and the
+        caller's retry is refused at submission as before.
         """
         m = re.match(r"^(\d+(?:\.\d+)?)([KMGT]?)", str(req_mem))
         if m is None:
@@ -720,6 +727,14 @@ class Orchestrator(object):
             return None
         mb = float(m[1]) * {"K" : 1 / 1024, "" : 1, "M" : 1, "G" : 1024, "T" : 1024 ** 2}[m[2]]
         new_mb = int(ceil(mb * self.OOM_REQUEUE_FACTOR))
+        test = "sbatch --test-only{}{} --mem={}M --wrap true".format(
+          " -p {}".format(partition) if isinstance(partition, str) and partition else "",
+          " -c {}".format(int(cpus)) if cpus is not None and not pd.isna(cpus) else "",
+          new_mb)
+        rc, _, _ = self.backend.invoke(test)
+        if rc != 0:
+            canine_logging.warning("Job {} ran out of memory, but no node of its partition has {} MB; not requeued".format(jid, new_mb))
+            return None
         rc, _, _ = self.backend.invoke("scontrol requeuehold {}".format(jid))
         if rc != 0:
             canine_logging.warning("Job {} ran out of memory, but couldn't be requeued".format(jid))
@@ -821,7 +836,7 @@ class Orchestrator(object):
                         if oom_requeued_end.get(jid) == acct['End'][jid]:
                             continue # already requeued; sacct hasn't caught up
                         if oom_requeues.get(jid, 0) < getattr(self, "oom_requeue", 0):
-                            mb = self.requeue_out_of_memory(jid, acct['ReqMem'][jid])
+                            mb = self.requeue_out_of_memory(jid, acct['ReqMem'][jid], acct['Partition'][jid], acct['ReqCPUS'][jid])
                             if mb is not None:
                                 oom_requeues[jid] = oom_requeues.get(jid, 0) + 1
                                 oom_requeued_end[jid] = acct['End'][jid]

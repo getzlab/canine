@@ -447,7 +447,8 @@ class TestRequeuingOutOfMemory:
         pending = _completed_row("999_2", State = "PENDING", ReqMem = "2625M", Start = "Unknown", End = "Unknown")
         done = _completed_row("999_2", ReqMem = "2625M", End = "2026-01-01T02:00:00")
         completed, acct, calls = self.run(self._orch([[self.OOM], [stale], [pending], [done]]))
-        assert calls == ["scontrol requeuehold 999_2", "scontrol update JobId=999_2 MinMemoryNode=2625", "scontrol release 999_2"]
+        assert calls == ["sbatch --test-only -p main -c 1 --mem=2625M --wrap true",
+                         "scontrol requeuehold 999_2", "scontrol update JobId=999_2 MinMemoryNode=2625", "scontrol release 999_2"]
         assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "COMPLETED"
 
     def test_only_oom_requeue_times(self):
@@ -465,17 +466,23 @@ class TestRequeuingOutOfMemory:
         assert completed == [("2", "999_2")] and calls == []
 
     def test_a_failed_requeue_leaves_it_out_of_memory(self):
-        completed, _, calls = self.run(self._orch([[self.OOM]], invoke_rcs = [1]))
-        assert calls == ["scontrol requeuehold 999_2"]
+        completed, _, calls = self.run(self._orch([[self.OOM]], invoke_rcs = [0, 1]))
+        assert calls[-1] == "scontrol requeuehold 999_2"
         assert completed == [("2", "999_2")]
 
     def test_a_failed_memory_raise_still_releases_it_and_waits(self):
         """Released, it runs again as it was, and is waited for."""
         done = _completed_row("999_2", End = "2026-01-01T02:00:00")
-        orch = self._orch([[self.OOM], [done]], invoke_rcs = [0, 1, 0])
+        orch = self._orch([[self.OOM], [done]], invoke_rcs = [0, 0, 1, 0])
         completed, acct, calls = self.run(orch)
         assert calls[-1] == "scontrol release 999_2"
         assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "COMPLETED"
+
+    def test_not_past_every_node_of_its_partition(self):
+        """Slurm would keep a held job raised past them pending for good, so it's left out of memory."""
+        completed, acct, calls = self.run(self._orch([[self.OOM]], invoke_rcs = [1]))
+        assert calls == ["sbatch --test-only -p main -c 1 --mem=2625M --wrap true"]
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "OUT_OF_MEMORY"
 
     @pytest.mark.parametrize("req_mem, mb", [("1750M", 2625), ("4G", 6144), ("2.5G", 3840), ("512K", 1)])
     def test_memory_units(self, req_mem, mb):
