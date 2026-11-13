@@ -71,6 +71,7 @@ if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.localization_fa
   fi
 fi
 rm -f $CANINE_JOB_ROOT/.*exit_code || :
+CANINE_CLEANUP_RC=
 echo '~~~~ STARTING JOB LOCALIZATION ~~~~' >&2
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh >&2
 export LOCALIZER_JOB_RC=$?
@@ -79,6 +80,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   echo -n 0 > $CANINE_JOB_ROOT/.localizer_exit_code
   cd $CANINE_JOB_WORKSPACE
   while true; do
+    CANINE_CLEANUP_RC=
     echo '======================' >&2
     echo '==== STARTING JOB ====' >&2
     echo '======================' >&2
@@ -102,6 +104,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo '++++ STARTING JOB CLEANUP ++++' >&2
       $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
       TEARDOWN_RC=$?
+      CANINE_CLEANUP_RC=$TEARDOWN_RC
       [ $TEARDOWN_RC == 0 ] && echo '++++ CLEANUP COMPLETE ++++' >&2 || echo '!+++ CLEANUP FAILURE +++!' >&2
       # failures, not restarts, are counted against the limit: restarts include
       # preemptions, which have their own (CANINE_PREEMPT_LIMIT)
@@ -134,11 +137,18 @@ else
   echo -n $LOCALIZER_JOB_RC > $CANINE_JOB_ROOT/.localizer_exit_code
   export CANINE_JOB_RC=$LOCALIZER_JOB_RC
 fi
-echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
-cd $CANINE_JOB_ROOT
-$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
-DELOC_RC=$?
-[ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
+# a failed job that isn't requeued has already run the teardown, as its
+# cleanup; a second run would fail, detaching a scratch disk already detached
+if [ -n "$CANINE_CLEANUP_RC" ]; then
+  echo "INFO: the job's cleanup already ran its teardown" >&2
+  DELOC_RC=$CANINE_CLEANUP_RC
+else
+  echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
+  cd $CANINE_JOB_ROOT
+  $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
+  DELOC_RC=$?
+  [ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
+fi
 echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=_pkg_version("canine"))

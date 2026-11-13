@@ -22,12 +22,13 @@ RETRY_LIMIT = 3
 
 
 def run_entrypoint(tmp_path, job_rc, restarts, failures = 0, localization_failures = 0, last_attempt_ok = False,
-                   localizer_rc = 0, slurm_ids = None):
+                   localizer_rc = 0, slurm_ids = None, teardown_rc = 0):
     """
     Run one attempt of a job whose script exits job_rc, as its restarts-th restart,
     with failures and localization_failures recorded by earlier attempts, and the
     last attempt's localization and job recorded as succeeded if last_attempt_ok;
-    its localization exits localizer_rc. slurm_ids are the job's Slurm IDs, by
+    its localization exits localizer_rc, and its teardown teardown_rc, each run
+    adding a line to tmp_path/teardowns. slurm_ids are the job's Slurm IDs, by
     default task 0 of array 7 (job 8). A requeue ends the attempt, as Slurm's
     does. Returns (requeued, stderr, the failure count after).
     """
@@ -50,7 +51,7 @@ def run_entrypoint(tmp_path, job_rc, restarts, failures = 0, localization_failur
         "export CANINE_JOB_INPUTS={}".format(tmp_path / "ws"), ""]))
     scripts = {
         root / "localization.sh": "exit {}".format(localizer_rc),
-        root / "teardown.sh": "exit 0",
+        root / "teardown.sh": "echo run >> {}; exit {}".format(tmp_path / "teardowns", teardown_rc),
         tmp_path / "script.sh": "exit {}".format(job_rc),
         # a requeue stops the running attempt
         tmp_path / "bin" / "scontrol": 'echo "$@" >> {}; kill -KILL $PPID'.format(tmp_path / "requeues"),
@@ -103,6 +104,54 @@ class TestFailedJobRetries:
         requeued, err, failures = run_entrypoint(tmp_path, 0, restarts = 2)
         assert not requeued and failures == 0
         assert "JOB COMPLETED SUCCESSFULLY" in err
+
+
+class TestTheTeardownRunsOnce:
+    """
+    A failed job runs its teardown as cleanup. One that isn't requeued then
+    went on to run it again, as its delocalization, and the second run failed
+    detaching the scratch disk the first had detached: hard-clipping shards
+    out of memory (2026-11-12) recorded "is not attached to instance" and a
+    failed teardown.
+    """
+
+    @staticmethod
+    def teardowns(tmp_path):
+        path = tmp_path / "teardowns"
+        return len(path.read_text().splitlines()) if path.exists() else 0
+
+    @staticmethod
+    def teardown_exit_code(tmp_path):
+        return (tmp_path / "jobs" / "0" / ".teardown_exit_code").read_text()
+
+    def test_out_of_memory(self, tmp_path):
+        _, err, _ = run_entrypoint(tmp_path, 137, restarts = 0)
+        assert self.teardowns(tmp_path) == 1
+        assert self.teardown_exit_code(tmp_path) == "0"
+        assert "cleanup already ran its teardown" in err
+
+    def test_past_the_retry_limit(self, tmp_path):
+        run_entrypoint(tmp_path, 3, restarts = 3, failures = 3)
+        assert self.teardowns(tmp_path) == 1
+
+    def test_a_failed_cleanup_is_recorded(self, tmp_path):
+        run_entrypoint(tmp_path, 137, restarts = 0, teardown_rc = 1)
+        assert self.teardown_exit_code(tmp_path) == "1"
+
+    def test_a_retried_failure(self, tmp_path):
+        """Its cleanup, then the requeue ends the attempt."""
+        run_entrypoint(tmp_path, 3, restarts = 0)
+        assert self.teardowns(tmp_path) == 1
+
+    def test_success(self, tmp_path):
+        _, err, _ = run_entrypoint(tmp_path, 0, restarts = 0)
+        assert self.teardowns(tmp_path) == 1
+        assert "DELOCALIZATION COMPLETE" in err
+
+    def test_a_failed_localization(self, tmp_path):
+        _, err, _ = run_entrypoint(tmp_path, 0, restarts = 0, localizer_rc = 1)
+        assert self.teardowns(tmp_path) == 1
+        assert "STARTING JOB DELOCALIZATION" in err
 
 
 class TestARequeueIsOfThisJobOnly:
