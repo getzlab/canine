@@ -413,3 +413,77 @@ class TestQuerySacctForNodes:
         backend.sacct.return_value = pd.DataFrame()
         result = Orchestrator.query_sacct_for_nodes(backend, ["worker1"], "2026-01-01", "2026-01-02")
         assert result.empty
+
+
+class TestRequeuingOutOfMemory:
+    """
+    A job out of memory is requeued at once with 1.5x its memory (held,
+    raised, released), oom_requeue times, rather than waiting for the rest of
+    its batch before wolF retries it. sacct shows the attempt that ran out of
+    memory as the job's last for a while after the requeue (seen on the
+    cluster, 2026-11-13), so that attempt isn't requeued twice.
+    """
+
+    OOM = _completed_row("999_2", State="OUT_OF_MEMORY", ExitCode="0:125", ReqMem="1750M", End="2026-01-01T01:00:00")
+
+    def _orch(self, polls, oom_requeue = 2, invoke_rcs = None):
+        orch = object.__new__(Orchestrator)
+        orch.backend = MagicMock()
+        orch.backend.sacct.side_effect = [make_raw_sacct_df(p) for p in polls]
+        rcs = iter(invoke_rcs or [])
+        orch.backend.invoke.side_effect = lambda cmd: (next(rcs, 0), None, None)
+        orch.job_spec = {"2": {"some": "spec"}}
+        orch.oom_requeue = oom_requeue
+        return orch
+
+    @staticmethod
+    def run(orch):
+        with patch("canine.orchestrator.time.sleep"):
+            completed, _, acct = orch.wait_for_jobs_to_finish(999, localizer = None)
+        return completed, acct, [c.args[0] for c in orch.backend.invoke.call_args_list]
+
+    def test_is_requeued_with_more_memory_and_waited_for(self):
+        stale = dict(self.OOM)
+        pending = _completed_row("999_2", State = "PENDING", ReqMem = "2625M", Start = "Unknown", End = "Unknown")
+        done = _completed_row("999_2", ReqMem = "2625M", End = "2026-01-01T02:00:00")
+        completed, acct, calls = self.run(self._orch([[self.OOM], [stale], [pending], [done]]))
+        assert calls == ["scontrol requeuehold 999_2", "scontrol update JobId=999_2 MinMemoryNode=2625", "scontrol release 999_2"]
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "COMPLETED"
+
+    def test_only_oom_requeue_times(self):
+        again = _completed_row("999_2", State = "OUT_OF_MEMORY", ReqMem = "2625M", End = "2026-01-01T02:00:00")
+        last = _completed_row("999_2", State = "OUT_OF_MEMORY", ReqMem = "3938M", End = "2026-01-01T03:00:00")
+        completed, acct, calls = self.run(self._orch([[self.OOM], [again], [last]]))
+        assert [c for c in calls if "update" in c] == ["scontrol update JobId=999_2 MinMemoryNode=2625",
+                                                       "scontrol update JobId=999_2 MinMemoryNode=3938"]
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "OUT_OF_MEMORY"
+
+    def test_not_by_default(self):
+        orch = self._orch([[self.OOM]])
+        del orch.oom_requeue                       # as an Orchestrator without the option
+        completed, _, calls = self.run(orch)
+        assert completed == [("2", "999_2")] and calls == []
+
+    def test_a_failed_requeue_leaves_it_out_of_memory(self):
+        completed, _, calls = self.run(self._orch([[self.OOM]], invoke_rcs = [1]))
+        assert calls == ["scontrol requeuehold 999_2"]
+        assert completed == [("2", "999_2")]
+
+    def test_a_failed_memory_raise_still_releases_it_and_waits(self):
+        """Released, it runs again as it was, and is waited for."""
+        done = _completed_row("999_2", End = "2026-01-01T02:00:00")
+        orch = self._orch([[self.OOM], [done]], invoke_rcs = [0, 1, 0])
+        completed, acct, calls = self.run(orch)
+        assert calls[-1] == "scontrol release 999_2"
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "COMPLETED"
+
+    @pytest.mark.parametrize("req_mem, mb", [("1750M", 2625), ("4G", 6144), ("2.5G", 3840), ("512K", 1)])
+    def test_memory_units(self, req_mem, mb):
+        orch = self._orch([])
+        orch.backend.invoke.side_effect = lambda cmd: (0, None, None)
+        assert orch.requeue_out_of_memory("999_2", req_mem) == mb
+
+    def test_the_option_must_be_a_count(self):
+        for bad, err in [("2", TypeError), (-1, ValueError)]:
+            with pytest.raises(err, match = "oom_requeue"):
+                Orchestrator.__init__(object.__new__(Orchestrator), {"script": ["true"], "inputs": {}, "oom_requeue": bad})

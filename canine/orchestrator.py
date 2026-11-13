@@ -2,7 +2,9 @@ import copy
 import json
 import typing
 import os
+import re
 import time
+from math import ceil
 import sys
 import warnings
 import traceback
@@ -476,6 +478,14 @@ class Orchestrator(object):
                 raise ValueError("Retry count must be >= 0")
         self.retry_limit = stringify(config['retry']) if 'retry' in config else 0
 
+        # out-of-memory requeues (see requeue_out_of_memory)
+        if "oom_requeue" in config:
+            if type(config["oom_requeue"]) != int:
+                raise TypeError("oom_requeue must be an int")
+            if config["oom_requeue"] < 0:
+                raise ValueError("oom_requeue must be >= 0")
+        self.oom_requeue = config.get("oom_requeue", 0)
+
         # avoidance
         if "avoid" in config:
             if type(config["avoid"]) != bool:
@@ -689,6 +699,38 @@ class Orchestrator(object):
 
         return entrypoint_path
 
+    OOM_REQUEUE_FACTOR = 1.5
+
+    def requeue_out_of_memory(self, jid, req_mem):
+        """
+        Requeues a job that ran out of memory, at once, with OOM_REQUEUE_FACTOR
+        times the memory it had (req_mem, as sacct gives it): held, its memory
+        raised, released. Otherwise it would wait for every other job of the
+        batch before the caller (wolF) could retry it with more: a hard-clip
+        shard out of memory an hour in waited 6 h for the slowest shard
+        (2026-11-12). The job resumes as after a preemption, from whatever it
+        kept on its scratch disk. Slurm lets a user do this to their own job
+        (checked on the cluster, 2026-11-13). Returns the memory in MB it runs
+        again with (its own, if it couldn't be raised), or None if it couldn't
+        be requeued, leaving the job as it was.
+        """
+        m = re.match(r"^(\d+(?:\.\d+)?)([KMGT]?)", str(req_mem))
+        if m is None:
+            canine_logging.warning("Job {} ran out of memory, but its memory ({}) couldn't be read; not requeued".format(jid, req_mem))
+            return None
+        mb = float(m[1]) * {"K" : 1 / 1024, "" : 1, "M" : 1, "G" : 1024, "T" : 1024 ** 2}[m[2]]
+        new_mb = int(ceil(mb * self.OOM_REQUEUE_FACTOR))
+        rc, _, _ = self.backend.invoke("scontrol requeuehold {}".format(jid))
+        if rc != 0:
+            canine_logging.warning("Job {} ran out of memory, but couldn't be requeued".format(jid))
+            return None
+        rc, _, _ = self.backend.invoke("scontrol update JobId={} MinMemoryNode={}".format(jid, new_mb))
+        self.backend.invoke("scontrol release {}".format(jid))
+        if rc != 0:
+            canine_logging.warning("Job {} ran out of memory; requeued, but its memory couldn't be raised".format(jid))
+            return int(ceil(mb))
+        return new_mb
+
     def wait_for_jobs_to_finish(self, batch_id, localizer = None, track_uptime = False):
         def grouper(g):
             g = g.sort_values("Start", key = _attempt_sort_key)
@@ -708,6 +750,11 @@ class Orchestrator(object):
         acct = None
         completed_jobs = []
         uptime = {}
+        # jobs requeued out of memory: how many times, and when the attempt
+        # each requeue answered ended, since sacct shows that attempt as the
+        # job's last for a while after the requeue
+        oom_requeues = {}
+        oom_requeued_end = {}
 
         waiting_jobs = {
             '{}_{}'.format(batch_id, k)
@@ -766,8 +813,21 @@ class Orchestrator(object):
             acct = acct.groupby(acct.index).apply(grouper)
 
             for jid in [*waiting_jobs]:
-                if jid in acct.index: 
+                if jid in acct.index:
                     job = jid.split('_')[1]
+
+                    # out of memory: requeued at once with more, oom_requeue times
+                    if str(acct['State'][jid]).startswith("OUT_OF_ME") and self.job_spec[job] is not None:
+                        if oom_requeued_end.get(jid) == acct['End'][jid]:
+                            continue # already requeued; sacct hasn't caught up
+                        if oom_requeues.get(jid, 0) < getattr(self, "oom_requeue", 0):
+                            mb = self.requeue_out_of_memory(jid, acct['ReqMem'][jid])
+                            if mb is not None:
+                                oom_requeues[jid] = oom_requeues.get(jid, 0) + 1
+                                oom_requeued_end[jid] = acct['End'][jid]
+                                canine_logging.warning("Job {} ran out of memory; requeued with {} MB ({}/{})".format(
+                                  jid, mb, oom_requeues[jid], self.oom_requeue))
+                                continue
 
                     # job has completed
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL', 'REQUEUED'} or self.job_spec[job] is None:
