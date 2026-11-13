@@ -1,0 +1,53 @@
+{
+  "routeb": {
+    "token_source": "metadata server",
+    "outcome": {
+      "phases": {
+        "relay": 2.5,
+        "compose": 0.1,
+        "gunzip": 0.3
+      },
+      "decompressed_from": null,
+      "decompressed_to": null,
+      "fell_back": null,
+      "bookkeeping_seconds": 0.0,
+      "bookkeeping_calls": 3,
+      "bookkeeping_mean": 0.0,
+      "bookkeeping_pct_workers": 0.0,
+      "read_seconds": 1.22,
+      "write_seconds": 3.698,
+      "loop_other_seconds": 0.0,
+      "io_blocks": 21,
+      "read_pct_of_loop": 25,
+      "overlap_ceiling": 1.33,
+      "commit_seconds": 0.1,
+      "commit_batches": 1,
+      "commit_chunks": 3,
+      "commit_mean_batch": 3.0,
+      "commit_pct_wall": 4.9,
+      "mean_streams": 2.0,
+      "workers": 3,
+      "connections": 16,
+      "returncode": 0,
+      "seconds": 8.51,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 115347456,
+      "nic_bytes": 356297656,
+      "disk_bytes": 77824,
+      "peak_nic_bytes_per_s": 76835527.3907127,
+      "peak_disk_bytes_per_s": 38856.26370108189,
+      "stderr_tail": [
+        "[k9pdl] keep-check.gz is named for b'\\x1f\\x8b' content but decoding did not produce it; the content-encoding metadata is set on a singly-compressed object, so the stored bytes are kept as-is",
+        "[k9pdl] k9pdl-phase gunzip 0.3s, 574.7 MB/s",
+        "[k9pdl] complete: 170401724 bytes composed from 3 parts (verified)"
+      ]
+    },
+    "gunzip": {
+      "ran": false,
+      "compressed_bytes": null,
+      "decompressed_bytes": null,
+      "seconds": 0.3
+    }
+  }
+}

@@ -1,0 +1,72 @@
+{
+  "routeb": {
+    "token_source": "metadata server",
+    "outcome": {
+      "phases": {
+        "relay": 6.5,
+        "compose": 0.2,
+        "verify": 4.8,
+        "gunzip": 21.3
+      },
+      "decompressed_from": 852013000,
+      "decompressed_to": 1644444450,
+      "decode_read_seconds": 0.226,
+      "decode_inflate_seconds": 11.321,
+      "decode_write_seconds": 9.683,
+      "decode_blocks": 102,
+      "decode_readahead": 4,
+      "decode_upload_width": 4,
+      "decode_slices": 50,
+      "decode_ceiling": 1.88,
+      "decode_pipe2_ceiling": 1.84,
+      "fell_back": null,
+      "bookkeeping_seconds": 0.1,
+      "bookkeeping_calls": 13,
+      "bookkeeping_mean": 0.004,
+      "bookkeeping_pct_workers": 0.1,
+      "read_seconds": 40.5,
+      "write_seconds": 25.885,
+      "loop_other_seconds": 0.002,
+      "io_blocks": 102,
+      "read_pct_of_loop": 61,
+      "overlap_ceiling": 1.64,
+      "commit_seconds": 0.1,
+      "commit_batches": 1,
+      "commit_chunks": 13,
+      "commit_mean_batch": 13.0,
+      "commit_pct_wall": 1.2,
+      "mean_streams": 10.25,
+      "workers": 13,
+      "connections": 16,
+      "returncode": 0,
+      "seconds": 36.31,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 381886464,
+      "nic_bytes": 2588605475,
+      "disk_bytes": 2191360,
+      "peak_nic_bytes_per_s": 188211595.27794155,
+      "peak_disk_bytes_per_s": 637878.1905836113,
+      "stderr_tail": [
+        "[k9pdl] k9pdl-phase gunzip 21.3s, 40.0 MB/s",
+        "[k9pdl] decompressed 852013000 bytes into 1644444450 bytes",
+        "[k9pdl] complete: 852013000 bytes composed from 13 parts (verified)"
+      ]
+    },
+    "gunzip": {
+      "ran": true,
+      "compressed_bytes": 852013000,
+      "decompressed_bytes": 1644444450,
+      "seconds": 21.3,
+      "read_seconds": 0.226,
+      "inflate_seconds": 11.321,
+      "write_seconds": 9.683,
+      "blocks": 102,
+      "readahead": 4,
+      "upload_width": 4,
+      "slices": 50,
+      "ceiling": 1.88,
+      "pipe2_ceiling": 1.84
+    }
+  }
+}

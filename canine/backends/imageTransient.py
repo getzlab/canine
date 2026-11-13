@@ -7,7 +7,10 @@ import os
 import sys
 
 from .local import LocalSlurmBackend
-from ..utils import get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, canine_logging
+from ..utils import (
+    get_default_gcp_zone, get_default_gcp_project, gcp_hourly_cost, canine_logging,
+    get_or_create_workflow_bucket, get_or_create_rapid_cache
+)
 
 import googleapiclient.discovery as gd
 import googleapiclient.errors
@@ -83,6 +86,9 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         project: typing.Optional[str] = None,
         user: typing.Optional[str] = None, slurm_conf_path: typing.Optional[str] = None,
         action_on_stop: str = "stop",
+        workflow_name: typing.Optional[str] = None,
+        rapid_cache: bool = False,
+        rapid_cache_ttl: str = "1d",
         **kwargs
     ):
         #
@@ -115,8 +121,6 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
 
         if compute_zone is None:
             compute_zone = get_default_gcp_zone()
-            if compute_zone is None:
-                raise ValueError("No GCP zone was provided and a project could not be auto-detected")
 
         # make config dict
         self.config = {
@@ -142,7 +146,10 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
             "project" : project if project else get_default_gcp_project(),
             "user" : user if user else "root",
             "slurm_conf_path" : slurm_conf_path,
-            "action_on_stop" : action_on_stop
+            "action_on_stop" : action_on_stop,
+            "workflow_name" : workflow_name,
+            "rapid_cache" : rapid_cache,
+            "rapid_cache_ttl" : rapid_cache_ttl
         }
 
         if self.config['project'] is None:
@@ -162,6 +169,35 @@ class TransientImageSlurmBackend(LocalSlurmBackend): # {{{
         try:
             # start Slurm controller (and associated programs)
             self.init_slurm()
+
+            # get-or-create the bucket backing bucket-mounted localization
+            # (RODISK replacement); a genuine creation failure aborts
+            # startup here, before any node/job work begins
+            self.config["storage_bucket"] = get_or_create_workflow_bucket(
+                self.config["compute_zone"], self.config["project"], self.config["workflow_name"]
+            )
+
+            # Rapid Cache is opt-in per workflow (rapid_cache=True), because it
+            # is not free and not always a win: cache storage bills per GiB-hour
+            # at roughly 4x standard storage, while the transfer it would save
+            # is $0 for a same-region read, so an in-region workload pays purely
+            # for read latency. Worth it for inputs read by many shards, wasteful
+            # for read-once work.
+            #
+            # Best-effort when enabled: it affects read speed, not correctness,
+            # so a failure is logged and startup continues rather than aborting.
+            if self.config["rapid_cache"]:
+                try:
+                    get_or_create_rapid_cache(
+                        self.config["storage_bucket"], self.config["compute_zone"],
+                        ttl = self.config["rapid_cache_ttl"]
+                    )
+                except Exception as e:
+                    canine_logging.warning(
+                        "Could not provision Rapid Cache for bucket {}; continuing without cache acceleration: {}".format(
+                            self.config["storage_bucket"], e
+                        )
+                    )
 
             # start nodes
             self.init_nodes()

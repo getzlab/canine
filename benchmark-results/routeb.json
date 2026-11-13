@@ -1,0 +1,44 @@
+{
+  "routeb": {
+    "token_source": "metadata server",
+    "outcome": {
+      "phases": {
+        "relay": 301.4,
+        "compose": 8.8
+      },
+      "fell_back": null,
+      "bookkeeping_seconds": 0.4,
+      "bookkeeping_calls": 192,
+      "bookkeeping_mean": 0.002,
+      "bookkeeping_pct_workers": 0.0,
+      "read_seconds": 41.583,
+      "write_seconds": 2289.527,
+      "loop_other_seconds": 0.364,
+      "io_blocks": 49152,
+      "read_pct_of_loop": 2,
+      "overlap_ceiling": 1.02,
+      "commit_seconds": 14.6,
+      "commit_batches": 192,
+      "commit_chunks": 192,
+      "commit_mean_batch": 1.0,
+      "commit_pct_wall": 4.9,
+      "mean_streams": 7.74,
+      "workers": 8,
+      "connections": 8,
+      "returncode": 0,
+      "seconds": 826.62,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 69091328,
+      "nic_bytes": 26404041815,
+      "disk_bytes": 1134592,
+      "peak_nic_bytes_per_s": 55651628.02148825,
+      "peak_disk_bytes_per_s": 147229.84480361533,
+      "stderr_tail": [
+        "[k9pdl] k9pdl-phase relay 301.4s, 42.8 MB/s",
+        "[k9pdl] k9pdl-phase compose 8.8s",
+        "[k9pdl] complete: 12884901888 bytes composed from 192 parts (verified)"
+      ]
+    }
+  }
+}
