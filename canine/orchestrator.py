@@ -257,6 +257,22 @@ def _attempt_sort_key(start_col):
     return start_col.replace(_SACCT_TIME_PLACEHOLDERS)
 
 
+def general_partition(partition):
+    """
+    The partition with every node type of a one-type partition's kind, as
+    slurm_gcp_docker names them: "main" for a preemptible type's (named for the
+    type, e.g. n1-highcpu-16), "nonpreemptible" for a non-preemptible one's
+    (n1-highcpu-16-nonp). None for any other partition, a GPU type's included.
+    A job too big for its node type can run there, on whichever type its node
+    weights pick.
+    """
+    if not isinstance(partition, str) or partition in {"", "main", "nonpreemptible", "all", "gpu"}:
+        return None
+    if re.search(r"-nonp-\d", partition):
+        return None
+    return "nonpreemptible" if partition.endswith("-nonp") else "main"
+
+
 class Orchestrator(object):
     """
     Main class
@@ -718,8 +734,10 @@ class Orchestrator(object):
         held job raised past them: released, it stays pending
         (BadConstraints) for good. So the raised memory is first tried as a
         new job would be (sbatch --test-only, with the job's partition and
-        CPUs); if no node could run it, the job isn't requeued, and the
-        caller's retry is refused at submission as before.
+        CPUs); if no node could run it, the job moves to the partition of every
+        node type of its kind (general_partition), if one there could. Otherwise
+        it isn't requeued, and the caller's retry is refused at submission as
+        before.
         """
         m = re.match(r"^(\d+(?:\.\d+)?)([KMGT]?)", str(req_mem))
         if m is None:
@@ -727,19 +745,28 @@ class Orchestrator(object):
             return None
         mb = float(m[1]) * {"K" : 1 / 1024, "" : 1, "M" : 1, "G" : 1024, "T" : 1024 ** 2}[m[2]]
         new_mb = int(ceil(mb * self.OOM_REQUEUE_FACTOR))
-        test = "sbatch --test-only{}{} --mem={}M --wrap true".format(
-          " -p {}".format(partition) if isinstance(partition, str) and partition else "",
-          " -c {}".format(int(cpus)) if cpus is not None and not pd.isna(cpus) else "",
-          new_mb)
-        rc, _, _ = self.backend.invoke(test)
-        if rc != 0:
-            canine_logging.warning("Job {} ran out of memory, but no node of its partition has {} MB; not requeued".format(jid, new_mb))
-            return None
+        def fits(p):
+            rc, _, _ = self.backend.invoke("sbatch --test-only{}{} --mem={}M --wrap true".format(
+              " -p {}".format(p) if isinstance(p, str) and p else "",
+              " -c {}".format(int(cpus)) if cpus is not None and not pd.isna(cpus) else "",
+              new_mb))
+            return rc == 0
+        # a job too big for its partition's node type moves to the partition
+        # of every type of its kind
+        new_partition = None
+        if not fits(partition):
+            new_partition = general_partition(partition)
+            if new_partition is None or not fits(new_partition):
+                canine_logging.warning("Job {} ran out of memory, but no node of its partition has {} MB; not requeued".format(jid, new_mb))
+                return None
         rc, _, _ = self.backend.invoke("scontrol requeuehold {}".format(jid))
         if rc != 0:
             canine_logging.warning("Job {} ran out of memory, but couldn't be requeued".format(jid))
             return None
-        rc, _, _ = self.backend.invoke("scontrol update JobId={} MinMemoryNode={}".format(jid, new_mb))
+        rc, _, _ = self.backend.invoke("scontrol update JobId={} MinMemoryNode={}{}".format(
+          jid, new_mb, " Partition={}".format(new_partition) if new_partition else ""))
+        if rc == 0 and new_partition:
+            canine_logging.warning("Job {} needs more memory than its partition {} has; moved to {}".format(jid, partition, new_partition))
         self.backend.invoke("scontrol release {}".format(jid))
         if rc != 0:
             canine_logging.warning("Job {} ran out of memory; requeued, but its memory couldn't be raised".format(jid))

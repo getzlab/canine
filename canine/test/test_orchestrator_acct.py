@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from canine.orchestrator import Orchestrator
+from canine.orchestrator import Orchestrator, general_partition
 
 
 class FakeTransport:
@@ -511,6 +511,37 @@ class TestRequeuingOutOfMemory:
         completed, acct, calls = self.run(self._orch([[self.OOM]], invoke_rcs = [1]))
         assert calls == ["sbatch --test-only -p main -c 1 --mem=2625M --wrap true"]
         assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "OUT_OF_MEMORY"
+
+    def test_past_its_node_type_it_moves_to_the_general_partition(self):
+        """A job pinned to one node type moves to every type of its kind when its type is too small."""
+        oom = dict(self.OOM, Partition = "n1-highcpu-16")
+        done = _completed_row("999_2", ReqMem = "2625M", End = "2026-01-01T02:00:00")
+        completed, acct, calls = self.run(self._orch([[oom], [done]], invoke_rcs = [1, 0]))
+        assert calls == ["sbatch --test-only -p n1-highcpu-16 -c 1 --mem=2625M --wrap true",
+                         "sbatch --test-only -p main -c 1 --mem=2625M --wrap true",
+                         "scontrol requeuehold 999_2",
+                         "scontrol update JobId=999_2 MinMemoryNode=2625 Partition=main",
+                         "scontrol release 999_2"]
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "COMPLETED"
+
+    def test_it_stays_in_its_partition_while_that_fits(self):
+        orch = self._orch([])
+        assert orch.requeue_out_of_memory("999_2", "32G", "n1-highmem-16-nonp", 2) == 49152
+        assert [c.args[0] for c in orch.backend.invoke.call_args_list][2] == "scontrol update JobId=999_2 MinMemoryNode=49152"
+
+    def test_not_past_every_node_of_its_kind(self):
+        orch = self._orch([], invoke_rcs = [1, 1])
+        assert orch.requeue_out_of_memory("999_2", "32G", "n1-highmem-16-nonp", 2) is None
+        assert [c.args[0] for c in orch.backend.invoke.call_args_list] == [
+          "sbatch --test-only -p n1-highmem-16-nonp -c 2 --mem=49152M --wrap true",
+          "sbatch --test-only -p nonpreemptible -c 2 --mem=49152M --wrap true"]
+
+    @pytest.mark.parametrize("partition, general", [
+      ("n1-highcpu-16", "main"), ("n1-highmem-16-nonp", "nonpreemptible"), ("main", None),
+      ("nonpreemptible", None), ("all", None), ("gpu", None), ("n1-highmem-16-nonp-1-nvidia-tesla-t4", None),
+      ("", None), (None, None), (float("nan"), None)])
+    def test_general_partition(self, partition, general):
+        assert general_partition(partition) == general
 
     @pytest.mark.parametrize("req_mem, mb", [("1750M", 2625), ("4G", 6144), ("2.5G", 3840), ("512K", 1)])
     def test_memory_units(self, req_mem, mb):
