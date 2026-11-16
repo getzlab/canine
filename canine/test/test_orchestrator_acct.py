@@ -207,7 +207,35 @@ class TestWaitForJobsToFinishGrouper:
         assert row["attempts"] == [{
           "NodeList": "worker3", "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:01:00",
           "AllocTRES": "cpu=1,mem=1G,node=1", "CPUTimeRAW": 50, "NCPUS": 1, "ReqMem": "1G",
+          "State": "COMPLETED", "ExitCode": "0:0",
         }]
+
+    def test_attempts_say_why_each_ended(self):
+        # n_preempted counts every requeue; each attempt's State and ExitCode
+        # tell a preemption from running out of memory or a retried failure
+        def attempt(state, exit_code, start, mem):
+            return { "_index": "999_4", "State": state, "ExitCode": exit_code, "CPUTimeRAW": 10, "PlannedCPURAW": 0,
+              "Submit": "2026-01-01 00:00:00", "NodeList": "worker", "Partition": "main", "ReqCPUS": 1, "NCPUS": 1, "ReqMem": mem,
+              "Start": start, "End": start, "Elapsed": "00:00:10", "AllocTRES": "cpu=1,mem=1G,node=1", "Account": "abcd" }
+        raw = make_raw_sacct_df([
+          attempt("PREEMPTED", "0:0", "2026-01-01T00:00:05", "1000M"),
+          attempt("OUT_OF_MEMORY", "0:125", "2026-01-01T00:01:05", "1000M"),
+          attempt("REQUEUED", "1:0", "2026-01-01T00:02:05", "1500M"),
+          attempt("COMPLETED", "0:0", "2026-01-01T00:03:05", "1500M"),
+        ])
+
+        orch = object.__new__(Orchestrator)
+        orch.backend = MagicMock()
+        orch.backend.sacct.return_value = raw
+        orch.job_spec = {"4": {"some": "spec"}}
+
+        with patch("canine.orchestrator.time.sleep"):
+            _, _, acct = orch.wait_for_jobs_to_finish(999, localizer=None)
+
+        row = acct.loc["999_4"]
+        assert row["n_preempted"] == 3
+        assert [(a["State"], a["ExitCode"]) for a in row["attempts"]] == [
+          ("PREEMPTED", "0:0"), ("OUT_OF_MEMORY", "0:125"), ("REQUEUED", "1:0"), ("COMPLETED", "0:0")]
 
     def test_constant_submit_across_attempts_still_orders_by_start(self):
         # Real SLURM behavior for preemption/requeue: Submit is the ORIGINAL

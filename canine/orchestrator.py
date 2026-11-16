@@ -757,8 +757,10 @@ class Orchestrator(object):
             # requeue attempt into a single row (last attempt's NodeList, summed
             # CPUTimeRAW), which loses which specific node(s)/time window(s) this
             # job actually occupied -- needed to prorate cost per node, not just
-            # know total CPU-seconds consumed.
-            final["attempts"] = g[["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem"]].to_dict("records")
+            # know total CPU-seconds consumed. Each attempt's State and ExitCode
+            # say why it ended: n_preempted counts every requeue, whatever its
+            # cause (preemption, running out of memory, a retried failure).
+            final["attempts"] = g[["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem", "State", "ExitCode"]].to_dict("records")
 
             return final
 
