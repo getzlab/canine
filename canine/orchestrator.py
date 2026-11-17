@@ -2,7 +2,9 @@ import copy
 import json
 import typing
 import os
+import re
 import time
+from math import ceil
 import sys
 import warnings
 import traceback
@@ -11,6 +13,7 @@ from subprocess import CalledProcessError
 from .adapters import AbstractAdapter, ManualAdapter, FirecloudAdapter
 from .backends import AbstractSlurmBackend, LocalSlurmBackend, RemoteSlurmBackend, DummySlurmBackend, TransientGCPSlurmBackend, TransientImageSlurmBackend, DockerTransientImageSlurmBackend, LocalDockerSlurmBackend
 from .localization import AbstractLocalizer, BatchedLocalizer, LocalLocalizer, RemoteLocalizer, NFSLocalizer, file_handlers
+from .localization.base import MOVED_MARKER
 from .utils import check_call, pandas_write_hdf5_buffered, canine_logging
 import yaml
 import numpy as np
@@ -52,10 +55,14 @@ export CANINE_ROOT="{{CANINE_ROOT}}"
 export CANINE_COMMON="{{CANINE_COMMON}}"
 export CANINE_OUTPUT="{{CANINE_OUTPUT}}"
 export CANINE_JOBS="{{CANINE_JOBS}}"
+# This job, to requeue: <array>_<task> for a job array's task. The array's last
+# task has the array's own ID as its SLURM_JOB_ID, which would requeue them all.
+[ -n "$SLURM_ARRAY_JOB_ID" ] && CANINE_SLURM_JOB=$SLURM_ARRAY_JOB_ID"_"$SLURM_ARRAY_TASK_ID || CANINE_SLURM_JOB=$SLURM_JOB_ID
 echo -n '---- STARTING JOB SETUP ... ' >&2
 source $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/setup.sh
 echo 'COMPLETE ----' >&2
-if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0))) -ge $CANINE_PREEMPT_LIMIT ]; then
+# restarts that weren't preemptions: requeues after a recoverable localization failure or a job failure
+if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0)-$([ -f $CANINE_JOB_ROOT/.job_failure_count ] && cat $CANINE_JOB_ROOT/.job_failure_count || echo -n 0))) -ge $CANINE_PREEMPT_LIMIT ]; then
   # localization must have completed successfully and job must not have exited with a failure
   if [[ ( -e $CANINE_JOB_ROOT/.localizer_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0) && \
         (( -e $CANINE_JOB_ROOT/.job_exit_code && $(cat $CANINE_JOB_ROOT/.job_exit_code) -eq 0 ) || \
@@ -66,6 +73,7 @@ if [ $((${{{{SLURM_RESTART_COUNT:-0}}}}-$([ -f $CANINE_JOB_ROOT/.localization_fa
   fi
 fi
 rm -f $CANINE_JOB_ROOT/.*exit_code || :
+CANINE_CLEANUP_RC=
 echo '~~~~ STARTING JOB LOCALIZATION ~~~~' >&2
 $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/localization.sh >&2
 export LOCALIZER_JOB_RC=$?
@@ -74,6 +82,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
   echo -n 0 > $CANINE_JOB_ROOT/.localizer_exit_code
   cd $CANINE_JOB_WORKSPACE
   while true; do
+    CANINE_CLEANUP_RC=
     echo '======================' >&2
     echo '==== STARTING JOB ====' >&2
     echo '======================' >&2
@@ -97,16 +106,20 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
       echo '++++ STARTING JOB CLEANUP ++++' >&2
       $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
       TEARDOWN_RC=$?
+      CANINE_CLEANUP_RC=$TEARDOWN_RC
       [ $TEARDOWN_RC == 0 ] && echo '++++ CLEANUP COMPLETE ++++' >&2 || echo '!+++ CLEANUP FAILURE +++!' >&2
-      [[ ${{{{SLURM_RESTART_COUNT:-0}}}} -ge $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
+      # failures, not restarts, are counted against the limit: restarts include
+      # preemptions, which have their own (CANINE_PREEMPT_LIMIT)
+      CANINE_JOB_FAILURES=$(cat $CANINE_JOB_ROOT/.job_failure_count)
+      [[ $CANINE_JOB_FAILURES -gt $CANINE_RETRY_LIMIT ]] && {{{{ echo "ERROR: Retry limit of $CANINE_RETRY_LIMIT retries exceeded" >&2; break; }}}} || :
       if [[ $CANINE_JOB_RC -eq 137 ]]; then
         echo "INFO: job ran out of memory; will not attempt to requeue." >&2
         break
       fi
-      echo "INFO: Retrying job (attempt $((${{{{SLURM_RESTART_COUNT:-0}}}}+1))/$CANINE_RETRY_LIMIT)" >&2
+      echo "INFO: Retrying job (attempt $CANINE_JOB_FAILURES/$CANINE_RETRY_LIMIT)" >&2
       [ -f $CANINE_JOB_ROOT/stdout ] && mv $CANINE_JOB_ROOT/stdout $CANINE_JOB_ROOT/stdout_${{{{SLURM_RESTART_COUNT:-0}}}} || :
       [ -f $CANINE_JOB_ROOT/stderr ] && mv $CANINE_JOB_ROOT/stderr $CANINE_JOB_ROOT/stderr_${{{{SLURM_RESTART_COUNT:-0}}}} || :
-      scontrol requeue $SLURM_JOB_ID
+      scontrol requeue $CANINE_SLURM_JOB
     fi
   done
   echo -n $CANINE_JOB_RC > $CANINE_JOB_ROOT/.job_exit_code
@@ -114,7 +127,7 @@ if [ $LOCALIZER_JOB_RC -eq 0 ]; then
 elif [ $LOCALIZER_JOB_RC -eq 5 ]; then # localization failed due to recoverable reason (e.g. quota); requeue the job
   echo "WARNING: localization will be retried" >&2
   echo $(($([ -f $CANINE_JOB_ROOT/.localization_failure_count ] && cat $CANINE_JOB_ROOT/.localization_failure_count || echo -n 0)+1)) > $CANINE_JOB_ROOT/.localization_failure_count
-  scontrol requeue $SLURM_JOB_ID
+  scontrol requeue $CANINE_SLURM_JOB
 elif [ $LOCALIZER_JOB_RC -eq 15 ]; then # localization and job can be skipped (to facilitate avoidance of scratch disk tasks)
   echo '~~~~ LOCALIZATION SKIPPED ~~~~' >&2
   export CANINE_JOB_RC=0
@@ -126,11 +139,18 @@ else
   echo -n $LOCALIZER_JOB_RC > $CANINE_JOB_ROOT/.localizer_exit_code
   export CANINE_JOB_RC=$LOCALIZER_JOB_RC
 fi
-echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
-cd $CANINE_JOB_ROOT
-$CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
-DELOC_RC=$?
-[ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
+# a failed job that isn't requeued has already run the teardown, as its
+# cleanup; a second run would fail, detaching a scratch disk already detached
+if [ -n "$CANINE_CLEANUP_RC" ]; then
+  echo "INFO: the job's cleanup already ran its teardown" >&2
+  DELOC_RC=$CANINE_CLEANUP_RC
+else
+  echo '++++ STARTING JOB DELOCALIZATION ++++' >&2
+  cd $CANINE_JOB_ROOT
+  $CANINE_JOBS/$SLURM_ARRAY_TASK_ID/teardown.sh >&2
+  DELOC_RC=$?
+  [ $DELOC_RC == 0 ] && echo '++++ DELOCALIZATION COMPLETE ++++' >&2 || echo '!+++ DELOCALIZATION FAILURE +++!' >&2
+fi
 echo -n $DELOC_RC > $CANINE_JOB_ROOT/.teardown_exit_code
 exit $CANINE_JOB_RC
 """.format(version=_pkg_version("canine"))
@@ -149,6 +169,19 @@ def _numeric_sacct_columns(acct):
         acct["PlannedCPURAW"] = pd.to_numeric(acct["PlannedCPURAW"], errors = "coerce")
     return acct
 
+
+# The Slurm GRES that counts each node's attachable persistent disks. GCE allows
+# 128 per VM, the boot disk among them, and Slurm doesn't otherwise know how many
+# a node already has, so jobs that attach many (e.g. reading every BWA shard's
+# scratch disk) could land on one node together and fail to attach. A cluster
+# that defines it (slurm_gcp_docker, from v0.18.7) gets each job's request
+# added; on one that doesn't, nothing is requested, as a job requesting an
+# undefined GRES could never run.
+DISK_GRES = "pdisk"
+
+def _with_gres(existing: typing.Optional[str], name: str, count: int) -> str:
+    """A --gres value: the existing one, if any, with name:count added."""
+    return "{}:{}".format(name, count) if not existing else "{},{}:{}".format(existing, name, count)
 
 def _job_indices_to_array_str(indices: typing.List[int]) -> str:
     """Convert a sorted list of job indices into a compact SLURM array range string.
@@ -222,6 +255,22 @@ def _attempt_sort_key(start_col):
     last, since "U" > any digit).
     """
     return start_col.replace(_SACCT_TIME_PLACEHOLDERS)
+
+
+def general_partition(partition):
+    """
+    The partition with every node type of a one-type partition's kind, as
+    slurm_gcp_docker names them: "main" for a preemptible type's (named for the
+    type, e.g. n1-highcpu-16), "nonpreemptible" for a non-preemptible one's
+    (n1-highcpu-16-nonp). None for any other partition, a GPU type's included.
+    A job too big for its node type can run there, on whichever type its node
+    weights pick.
+    """
+    if not isinstance(partition, str) or partition in {"", "main", "nonpreemptible", "all", "gpu"}:
+        return None
+    if re.search(r"-nonp-\d", partition):
+        return None
+    return "nonpreemptible" if partition.endswith("-nonp") else "main"
 
 
 class Orchestrator(object):
@@ -445,6 +494,14 @@ class Orchestrator(object):
                 raise ValueError("Retry count must be >= 0")
         self.retry_limit = stringify(config['retry']) if 'retry' in config else 0
 
+        # out-of-memory requeues (see requeue_out_of_memory)
+        if "oom_requeue" in config:
+            if type(config["oom_requeue"]) != int:
+                raise TypeError("oom_requeue must be an int")
+            if config["oom_requeue"] < 0:
+                raise ValueError("oom_requeue must be >= 0")
+        self.oom_requeue = config.get("oom_requeue", 0)
+
         # avoidance
         if "avoid" in config:
             if type(config["avoid"]) != bool:
@@ -577,7 +634,8 @@ class Orchestrator(object):
                 #
                 # submit job
                 canine_logging.info1("Submitting batch job")
-                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'))
+                batch_id = self.submit_batch_job(entrypoint_path, localizer.environment('remote'),
+                                                 extra_sbatch_args = self.disk_gres_args(localizer))
                 if batch_id != -2:
                     canine_logging.print("Batch id:", batch_id)
 
@@ -657,6 +715,64 @@ class Orchestrator(object):
 
         return entrypoint_path
 
+    OOM_REQUEUE_FACTOR = 1.5
+
+    def requeue_out_of_memory(self, jid, req_mem, partition = None, cpus = None):
+        """
+        Requeues a job that ran out of memory, at once, with OOM_REQUEUE_FACTOR
+        times the memory it had (req_mem, as sacct gives it): held, its memory
+        raised, released. Otherwise it would wait for every other job of the
+        batch before the caller (wolF) could retry it with more: a hard-clip
+        shard out of memory an hour in waited 6 h for the slowest shard
+        (2026-11-12). The job resumes as after a preemption, from whatever it
+        kept on its scratch disk. Slurm lets a user do this to their own job
+        (checked on the cluster, 2026-11-13). Returns the memory in MB it runs
+        again with (its own, if it couldn't be raised), or None if it couldn't
+        be requeued, leaving the job as it was.
+
+        Slurm refuses a new job no node of its partition can run, but not a
+        held job raised past them: released, it stays pending
+        (BadConstraints) for good. So the raised memory is first tried as a
+        new job would be (sbatch --test-only, with the job's partition and
+        CPUs); if no node could run it, the job moves to the partition of every
+        node type of its kind (general_partition), if one there could. Otherwise
+        it isn't requeued, and the caller's retry is refused at submission as
+        before.
+        """
+        m = re.match(r"^(\d+(?:\.\d+)?)([KMGT]?)", str(req_mem))
+        if m is None:
+            canine_logging.warning("Job {} ran out of memory, but its memory ({}) couldn't be read; not requeued".format(jid, req_mem))
+            return None
+        mb = float(m[1]) * {"K" : 1 / 1024, "" : 1, "M" : 1, "G" : 1024, "T" : 1024 ** 2}[m[2]]
+        new_mb = int(ceil(mb * self.OOM_REQUEUE_FACTOR))
+        def fits(p):
+            rc, _, _ = self.backend.invoke("sbatch --test-only{}{} --mem={}M --wrap true".format(
+              " -p {}".format(p) if isinstance(p, str) and p else "",
+              " -c {}".format(int(cpus)) if cpus is not None and not pd.isna(cpus) else "",
+              new_mb))
+            return rc == 0
+        # a job too big for its partition's node type moves to the partition
+        # of every type of its kind
+        new_partition = None
+        if not fits(partition):
+            new_partition = general_partition(partition)
+            if new_partition is None or not fits(new_partition):
+                canine_logging.warning("Job {} ran out of memory, but no node of its partition has {} MB; not requeued".format(jid, new_mb))
+                return None
+        rc, _, _ = self.backend.invoke("scontrol requeuehold {}".format(jid))
+        if rc != 0:
+            canine_logging.warning("Job {} ran out of memory, but couldn't be requeued".format(jid))
+            return None
+        rc, _, _ = self.backend.invoke("scontrol update JobId={} MinMemoryNode={}{}".format(
+          jid, new_mb, " Partition={}".format(new_partition) if new_partition else ""))
+        if rc == 0 and new_partition:
+            canine_logging.warning("Job {} needs more memory than its partition {} has; moved to {}".format(jid, partition, new_partition))
+        self.backend.invoke("scontrol release {}".format(jid))
+        if rc != 0:
+            canine_logging.warning("Job {} ran out of memory; requeued, but its memory couldn't be raised".format(jid))
+            return int(ceil(mb))
+        return new_mb
+
     def wait_for_jobs_to_finish(self, batch_id, localizer = None, track_uptime = False):
         def grouper(g):
             g = g.sort_values("Start", key = _attempt_sort_key)
@@ -668,14 +784,21 @@ class Orchestrator(object):
             # requeue attempt into a single row (last attempt's NodeList, summed
             # CPUTimeRAW), which loses which specific node(s)/time window(s) this
             # job actually occupied -- needed to prorate cost per node, not just
-            # know total CPU-seconds consumed.
-            final["attempts"] = g[["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem"]].to_dict("records")
+            # know total CPU-seconds consumed. Each attempt's State and ExitCode
+            # say why it ended: n_preempted counts every requeue, whatever its
+            # cause (preemption, running out of memory, a retried failure).
+            final["attempts"] = g[["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem", "State", "ExitCode"]].to_dict("records")
 
             return final
 
         acct = None
         completed_jobs = []
         uptime = {}
+        # jobs requeued out of memory: how many times, and when the attempt
+        # each requeue answered ended, since sacct shows that attempt as the
+        # job's last for a while after the requeue
+        oom_requeues = {}
+        oom_requeued_end = {}
 
         waiting_jobs = {
             '{}_{}'.format(batch_id, k)
@@ -734,8 +857,21 @@ class Orchestrator(object):
             acct = acct.groupby(acct.index).apply(grouper)
 
             for jid in [*waiting_jobs]:
-                if jid in acct.index: 
+                if jid in acct.index:
                     job = jid.split('_')[1]
+
+                    # out of memory: requeued at once with more, oom_requeue times
+                    if str(acct['State'][jid]).startswith("OUT_OF_ME") and self.job_spec[job] is not None:
+                        if oom_requeued_end.get(jid) == acct['End'][jid]:
+                            continue # already requeued; sacct hasn't caught up
+                        if oom_requeues.get(jid, 0) < getattr(self, "oom_requeue", 0):
+                            mb = self.requeue_out_of_memory(jid, acct['ReqMem'][jid], acct['Partition'][jid], acct['ReqCPUS'][jid])
+                            if mb is not None:
+                                oom_requeues[jid] = oom_requeues.get(jid, 0) + 1
+                                oom_requeued_end[jid] = acct['End'][jid]
+                                canine_logging.warning("Job {} ran out of memory; requeued with {} MB ({}/{})".format(
+                                  jid, mb, oom_requeues[jid], self.oom_requeue))
+                                continue
 
                     # job has completed
                     if acct['State'][jid] not in {'RUNNING', 'PENDING', 'NODE_FAIL', 'REQUEUED'} or self.job_spec[job] is None:
@@ -862,6 +998,32 @@ class Orchestrator(object):
                     pandas_write_hdf5_buffered(df, buf = w, key = "results")
         return df
 
+    def cluster_counts_disks(self) -> bool:
+        """Whether the cluster defines DISK_GRES (asked once per Orchestrator)."""
+        if not hasattr(self, "_cluster_counts_disks"):
+            try:
+                rc, stdout, stderr = self.backend.invoke("scontrol show config")
+                config = stdout.read().decode() if rc == 0 else ""
+            except Exception:
+                config = ""
+            types = [l.split("=", 1)[1] for l in config.splitlines() if l.split("=", 1)[0].strip() == "GresTypes"]
+            self._cluster_counts_disks = bool(types) and DISK_GRES in [t.strip() for t in types[0].split(",")]
+        return self._cluster_counts_disks
+
+    def disk_gres_args(self, localizer, job_spec = None) -> typing.Dict[str, str]:
+        """
+        extra_sbatch_args requesting the persistent disks the batch's jobs
+        attach, if the cluster counts them (see DISK_GRES). One request covers
+        the job array, so it's the most any job being run attaches.
+        """
+        if job_spec is None:
+            job_spec = self.job_spec
+        attached = getattr(localizer, "attached_disks", {})
+        most = max([attached.get(k, 0) for k, v in job_spec.items() if v is not None] or [0])
+        if most == 0 or not self.cluster_counts_disks():
+            return {}
+        return { "gres" : _with_gres(self.resources.get("gres"), DISK_GRES, most) }
+
     def submit_batch_job(self, entrypoint_path, compute_env, extra_sbatch_args = {}, job_spec = None) -> int:
         if job_spec is None:
             job_spec = self.job_spec
@@ -970,8 +1132,12 @@ class Orchestrator(object):
                     # a day after last use, so a later rerun redid the work. If every
                     # output it declares is copied back to NFS (files_to_copy_to_outputs),
                     # those copies are a complete record of it: avoid it on them instead.
-                    scratch_outputs_on_nfs = bool(getattr(localizer, "use_scratch_disk", False)) and \
-                      set(self.raw_outputs) - {"stdout", "stderr"} <= set(getattr(localizer, "files_to_copy_to_outputs", None) or ())
+                    # Likewise if its outputs are moved to a bucket (move_to_bucket),
+                    # which deletes its disk: avoid it while they're still there.
+                    moves_outputs = bool(getattr(localizer, "use_scratch_disk", False)) and \
+                      bool(getattr(localizer, "move_to_bucket", False))
+                    scratch_outputs_on_nfs = bool(getattr(localizer, "use_scratch_disk", False)) and (moves_outputs or \
+                      set(self.raw_outputs) - {"stdout", "stderr"} <= set(getattr(localizer, "files_to_copy_to_outputs", None) or ()))
 
                     # check for failed shards
                     for i in js_df.index:
@@ -1016,9 +1182,18 @@ class Orchestrator(object):
                         # Its delocalizer cannot be rerun without the disk, so one with
                         # anything missing is rerun in full rather than re-delocalized.
                         if scratch_outputs_on_nfs:
-                            copies = o_df.loc[~o_df["output"].isin(["stdout", "stderr"]), "path"]
+                            copied = set(getattr(localizer, "files_to_copy_to_outputs", None) or ())
+                            copies = o_df.loc[o_df["output"].isin(copied), "path"]
+                            # a moved output's symlink points into a bucket mount, which
+                            # isn't on the controller: its object is checked instead. One
+                            # that wasn't moved (a copy failed) is on the disk, which was
+                            # kept; then there's no marker, and the job reruns, resuming
+                            # from its disk.
+                            moved = moves_outputs and \
+                              (~o_df["output"].isin(copied | {"stdout", "stderr"}) & (o_df["path"] != "//not_found")).any()
                             if not (js_df.at[i, "output_ok"] and all(
-                              transport.exists(os.path.join(output_dir, p)) for p in copies)):
+                              transport.exists(os.path.join(output_dir, p)) for p in copies) and
+                              (not moved or localizer.moved_outputs_present(os.path.join(output_dir, i, MOVED_MARKER), transport))):
                                 js_df.at[i, "output_ok"] = False
                                 js_df.at[i, "failed"] = True
 

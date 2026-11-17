@@ -20,14 +20,43 @@ BASH = shutil.which("bash")
 pytestmark = pytest.mark.skipif(BASH is None, reason="bash not available")
 
 
-def run_check(tmp_path, links, mount_name="wolf-1-us-central1-abc"):
+def fake_gcloud(tmp_path, in_bucket=None, error=None):
+    """
+    A stand-in for `gcloud storage ls <url>` on PATH. It records each URL it's
+    asked about in <tmp_path>/gcloud_calls, and answers from in_bucket: a set
+    of object URLs the bucket has (None: it has everything). error makes every
+    lookup fail with that message instead, as a permission or network failure
+    would.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    calls = tmp_path / "gcloud_calls"
+    lines = ["#!/bin/bash", 'url="${@: -1}"', 'echo "$url" >> "{}"'.format(calls)]
+    if error is not None:
+        lines += ['echo "{}" >&2'.format(error), "exit 1"]
+    elif in_bucket is not None:
+        lines += ['case "$url" in'] + ['  "{}") echo "$url"; exit 0;;'.format(u) for u in in_bucket] + [
+                  "esac",
+                  'echo "ERROR: (gcloud.storage.ls) One or more URLs matched no objects." >&2',
+                  "exit 1"]
+    else:
+        lines += ['echo "$url"']
+    (bin_dir / "gcloud").write_text("\n".join(lines) + "\n")
+    os.chmod(str(bin_dir / "gcloud"), 0o755)
+    return bin_dir, calls
+
+
+def run_check(tmp_path, links, mount_name="wolf-1-us-central1-abc", in_bucket=None, gcloud_error=None):
     """
     Lay out an inputs dir and a fake mount, then run the generated check.
 
     links: {symlink name: target path relative to the mount dir, or None to
             point somewhere outside the mount entirely}
-    Files are created under the mount only when `present` says so.
+    Files are created under the mount only when `present` says so. in_bucket
+    and gcloud_error set what the bucket itself says (see fake_gcloud): by
+    default it has every object, i.e. a missing file is the mount's fault.
     """
+    bin_dir, _ = fake_gcloud(tmp_path, in_bucket, gcloud_error)
     inputs = tmp_path / "inputs"
     mount = tmp_path / "mnt" / mount_name
     inputs.mkdir(parents=True)
@@ -48,6 +77,7 @@ def run_check(tmp_path, links, mount_name="wolf-1-us-central1-abc"):
     loc = BatchedLocalizer(MagicMock())
     script = "\n".join([
         "set -e",
+        'export PATH="{}:$PATH"'.format(bin_dir),
         'CANINE_JOB_INPUTS="{}"'.format(inputs),
         'CANINE_BUCKETMOUNT="{}"'.format(mount_name),
         'CANINE_BUCKETMOUNT_DIR="{}"'.format(mount),
@@ -63,10 +93,40 @@ class TestReachabilityCheck:
             "index.bai": ("filename/index.bai", True),
         })
         assert proc.returncode == 0, proc.stderr.decode()
+        assert not (tmp_path / "gcloud_calls").exists(), "a resolving link needs no bucket lookup"
 
     def test_exits_5_on_a_broken_link_into_the_mount(self, tmp_path):
-        """The mounted-but-empty case: link points into the mount, target absent."""
-        proc = run_check(tmp_path, {"reads.bam": ("filename/reads.bam", False)})
+        """
+        The mounted-but-empty case: link points into the mount, target absent,
+        but the bucket has the object -- the mount is at fault, so retry elsewhere.
+        """
+        proc = run_check(tmp_path, {"reads.bam": ("filename/reads.bam", False)},
+                         in_bucket={"gs://wolf-1-us-central1-abc/filename/reads.bam"})
+        assert proc.returncode == 5
+        assert "does not resolve inside bucket mount" in proc.stderr.decode()
+
+    def test_fails_when_the_object_is_gone_from_the_bucket(self, tmp_path):
+        """
+        Seen on a live cluster, 2026-10-30: another workflow's DeleteLocalizedFiles
+        removed a BAM this job was waiting to read. Exit 5 isn't counted against the
+        preemption limit, and no node can resolve the link, so the job requeued 24
+        times in an hour. It must fail instead.
+        """
+        proc = run_check(tmp_path, {"reads.bam": ("filename/reads.bam", False)}, in_bucket=set())
+        assert proc.returncode == 1
+        err = proc.stderr.decode()
+        assert "gs://wolf-1-us-central1-abc/filename/reads.bam is not in the bucket" in err
+        assert "reads.bam" in err
+
+    def test_asks_the_bucket_for_the_links_own_object(self, tmp_path):
+        """The whole bucket is mounted, so the link's path under the mount is the object's name."""
+        run_check(tmp_path, {"reads.bam": ("bam/sub/reads.bam", False)}, in_bucket=set())
+        assert (tmp_path / "gcloud_calls").read_text().split() == ["gs://wolf-1-us-central1-abc/bam/sub/reads.bam"]
+
+    def test_a_failed_lookup_is_still_retried(self, tmp_path):
+        """A lookup that fails for any other reason (permission, network) says nothing about the object."""
+        proc = run_check(tmp_path, {"reads.bam": ("filename/reads.bam", False)},
+                         gcloud_error="ERROR: (gcloud.storage.ls) HTTPError 403: permission denied")
         assert proc.returncode == 5
         assert "does not resolve inside bucket mount" in proc.stderr.decode()
 
@@ -137,6 +197,49 @@ class TestReachabilityCheck:
         ] + loc.bucketmount_reachability_check())
         proc = subprocess.run([BASH], input=script.encode(), capture_output=True)
         assert proc.returncode == 0, proc.stderr.decode()
+
+
+class TestASkippedJobIsNotChecked:
+    """
+    A job whose scratch disk is already finished ends localization with exit 15 and
+    is skipped: it reads none of its inputs. So a bucket-mounted input that's gone
+    from its bucket mustn't fail it before it gets there. That's the normal case on
+    a rerun with persistent_disk_dry_run, used when every task that reads the
+    localized files has completed -- or at least every task that reads the large
+    ones, since downstream tasks may still use reference disks that are kept -- so
+    they aren't localized again. Its URLs can then name objects that are no longer
+    in the bucket.
+    """
+
+    @staticmethod
+    def _localization_script(finished, scratch_disk_job_avoid=True):
+        from unittest.mock import patch
+        from canine.localization.file_handlers import HandleBucketMountURL
+        loc = BatchedLocalizer(MagicMock(), use_scratch_disk=True, scratch_disk_name="canine-scratch-abc",
+                               scratch_disk_job_avoid=scratch_disk_job_avoid)
+        loc.clean_on_exit = False
+        loc.inputs = {"0": {"bam": [HandleBucketMountURL("bucketmount://wolf-1-us-central1-abc/bam/x.bam")]}}
+        loc.input_array_flag = {"0": {"bam": False}}
+        disk = (("/mnt/rwdisks/canine-scratch-abc-0", [], [], "rodisk://canine-scratch-abc-0") if finished
+                else ("/mnt/rwdisks/canine-scratch-abc-0", ["echo create"], ["echo teardown"], None))
+        with patch.object(loc, "create_persistent_disk", return_value=disk):
+            return loc.job_setup_teardown("0", {"stdout": "../stdout", "stderr": "../stderr"}, MagicMock())[1]
+
+    def test_a_job_on_a_finished_disk_skips_without_the_check(self):
+        script = self._localization_script(finished=True)
+        assert "exit 15" in script
+        assert "does not resolve inside bucket mount" not in script
+
+    def test_a_job_on_a_new_disk_is_checked(self):
+        script = self._localization_script(finished=False)
+        assert "exit 15" not in script
+        assert "does not resolve inside bucket mount" in script
+
+    def test_a_job_that_wont_be_skipped_is_checked(self):
+        """With scratch_disk_job_avoid off, a finished disk is mounted but the job still runs."""
+        script = self._localization_script(finished=True, scratch_disk_job_avoid=False)
+        assert "exit 15" not in script
+        assert "does not resolve inside bucket mount" in script
 
 
 class TestMountLeases:

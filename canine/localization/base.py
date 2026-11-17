@@ -3,6 +3,7 @@ import os
 import sys
 import typing
 import glob
+import hashlib
 import shlex
 import tempfile
 import random
@@ -21,7 +22,7 @@ from collections import namedtuple
 from contextlib import ExitStack, contextmanager
 from . import file_handlers
 from ..backends import AbstractSlurmBackend, AbstractTransport, LocalSlurmBackend
-from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging, localization_bucket_name, get_project_number, _zone_to_region
+from ..utils import get_default_gcp_project, get_default_gcp_zone, check_call, canine_logging, localization_bucket_name, get_project_number, _zone_to_region, gcloud_storage_client
 from hound.client import _getblob_bucket
 import pandas as pd
 import google.cloud.compute_v1, google.api_core.exceptions
@@ -40,6 +41,27 @@ def gcloud_disk_client():
 PROJECT = get_default_gcp_project()
 
 Localization = namedtuple("Localization", ['type', 'path'])
+
+# A file at the root of each scratch disk naming the job that wrote it (see
+# _scratch_disk_provenance_lines). Dot-named, so output globs don't match it.
+SCRATCH_DISK_PROVENANCE = ".canine_provenance"
+
+# Read-ahead for the disks canine attaches, in 512-byte sectors (16 MiB). A
+# persistent disk answers each request in milliseconds, so a sequential reader
+# is limited by how many requests are in flight: at the kernel's default of
+# 128 KiB a pd-standard disk read a 100 GB file at 68 MB/s, at 16 MiB at 453 MB/s.
+# The setting belongs to the device, so it is made each time a disk is mounted.
+# It only affects speed, so failing to set it doesn't fail the job.
+DISK_READ_AHEAD_SECTORS = 32768
+
+def read_ahead_line(device):
+    """The shell line that sets a device's read-ahead (see DISK_READ_AHEAD_SECTORS)."""
+    return "sudo blockdev --setra {} {} || true".format(DISK_READ_AHEAD_SECTORS, device)
+
+# How long a scratch disk's mount may take. A disk resumed after a preemption is
+# mounted with its ext4 journal still to replay; on a hard-clipping shard's
+# 133 GB disk (2026-11-06) that took longer than the 30 s allowed before.
+SCRATCH_DISK_MOUNT_TIMEOUT_S = 900
 
 # Scripts staged into CANINE_ROOT so the compute node can run them. They ride the shared
 # staging directory rather than the worker image: baking them in would need a fleet-wide
@@ -200,6 +222,25 @@ def retried_copy(copy):
 # and project-level storage roles still apply, so nodes and users see no difference.
 BUCKET_CREATE_FLAGS = "--soft-delete-duration=0 --public-access-prevention --uniform-bucket-level-access"
 
+# Written by delocalization.py in a job's output directory once it has moved the
+# job's outputs to a bucket (move_to_bucket): the gs:// URL of every moved
+# object, one per line. Its presence is what lets teardown delete the disk.
+MOVED_MARKER = ".moved_to_bucket"
+
+# Where a worker mounts a bucket read-only: /mnt/bucketmounts/<bucket>
+BUCKET_MOUNT_ROOT = "/mnt/bucketmounts"
+
+def scratch_output_url(link_target):
+    """
+    The URL a scratch-disk job's output is returned as, from where its symlink
+    in the job's output directory points: bucketmount://<bucket>/<path> for an
+    output move_to_bucket moved into a bucket, otherwise rodisk://<disk>/<path>
+    on the job's scratch disk.
+    """
+    if link_target.startswith(BUCKET_MOUNT_ROOT + "/"):
+        return "bucketmount://" + link_target[len(BUCKET_MOUNT_ROOT) + 1:]
+    return "rodisk://" + re.match(r".*(canine-scratch.*)", link_target)[1]
+
 # types: stream, download, ro_disk, None
 # indicates what kind of action needs to be taken during job startup
 PathType = namedtuple(
@@ -250,6 +291,8 @@ class AbstractLocalizer(abc.ABC):
         use_scratch_disk = False, scratch_disk_size: int = 10, scratch_disk_type: str = "standard", scratch_disk_job_avoid=True, scratch_disk_name = None,
         protect_disk = False,
         files_to_copy_to_outputs = {},
+        move_to_bucket = False,
+        move_to_bucket_expiry_days: int = 7,
         persistent_disk_dry_run = False,
         cleanup_job_workdir = False,
         parallel_download = True,
@@ -261,6 +304,7 @@ class AbstractLocalizer(abc.ABC):
         localization_expiry_days: int = 1,
         bucketmount_heartbeat_seconds: int = 3600,
         resolve_on_controller: bool = True,
+        rodisk_max_parallel_calls: int = 16,
         **kwargs
     ):
         """
@@ -284,6 +328,19 @@ class AbstractLocalizer(abc.ABC):
           from being automatically deleted
         files_to_copy_to_outputs: if using a scratch disk, copy these output keys
           to the NFS from the scratch disk
+        move_to_bucket: if using a scratch disk, move the job's outputs to a
+          bucket when it succeeds, and delete the disk. They are returned as
+          bucketmount:// URLs instead of rodisk:// ones, which downstream tasks
+          read through a bucket mount, as they read localized inputs. Outputs in
+          files_to_copy_to_outputs still go to the NFS instead. A job that fails
+          keeps its disk and its rodisk:// outputs, so a retry resumes from it.
+          A rerun avoids the job while its moved outputs are still in the
+          bucket. See MOVE_TO_BUCKET.md.
+        move_to_bucket_expiry_days: days since last touch after which a moved
+          output is deleted by its bucket's lifecycle rule. Default 7. Moved
+          outputs are the only copy, so this is longer than
+          localization_expiry_days; consumers refresh the clock while they hold
+          the mount, and DeleteDisk frees them as soon as nothing needs them.
         persistent_disk_dry_run: don't actually create a persistent disk; just
           return the paths to the files on the disk that would be created
         cleanup_job_workdir: remove files in the job working directory that aren't
@@ -349,7 +406,16 @@ class AbstractLocalizer(abc.ABC):
           resolve_on_controller(). Default True. The environment
           variable CANINE_DISABLE_CONTROLLER_LOCALIZATION, set on the controller,
           turns it off without a code change.
+
+        rodisk_max_parallel_calls: the most gcloud calls a job makes at once to
+          attach or detach its read-only disks, whatever the job's size.
+          Default 16. Each call uses a few seconds of CPU, but even a 2-CPU job
+          finishes sooner making 16 at once than 4; lower it if a cluster hits
+          the Compute API's rate limits.
         """
+        if rodisk_max_parallel_calls < 1:
+            raise ValueError("rodisk_max_parallel_calls must be at least 1")
+        self.rodisk_max_parallel_calls = rodisk_max_parallel_calls
         self.file_handler_defaults = self.build_file_handler_defaults(
             parallel_download, download_connections, download_min_chunk, check_hash,
             allow_requester_pays
@@ -396,6 +462,11 @@ class AbstractLocalizer(abc.ABC):
 
         self.files_to_copy_to_outputs = files_to_copy_to_outputs
 
+        if move_to_bucket and not use_scratch_disk:
+            raise ValueError("move_to_bucket moves a job's outputs off its scratch disk, so it needs use_scratch_disk")
+        self.move_to_bucket = bool(move_to_bucket)
+        self.move_to_bucket_expiry_days = move_to_bucket_expiry_days
+
         self.persistent_disk_dry_run = persistent_disk_dry_run
 
         self.cleanup_job_workdir = cleanup_job_workdir
@@ -422,6 +493,10 @@ class AbstractLocalizer(abc.ABC):
         # other tasks
         # jobId : { input : [RODISK URLs] }
         self.rodisk_paths = {}
+        # {jobId: how many persistent disks the job attaches}: its own scratch
+        # disk, and other jobs' scratch disks read-only. Orchestrator requests
+        # them from Slurm (see DISK_GRES).
+        self.attached_disks = {}
 
         # jobId : { "input" / "scratch" : [GCE disk names] },
         # filled in by job_setup_teardown()
@@ -788,10 +863,10 @@ class AbstractLocalizer(abc.ABC):
                     output_files[jobId][outputname] = glob.glob(os.path.join(dirpath, patterns[outputname]))
 
                     # if we're using a scratch disk, outputs should be RODISK
-                    # objects for downstream tasks to mount. read symlinks to
-                    # RODISK URLs
+                    # objects for downstream tasks to mount, or bucket mounts if
+                    # they were moved to a bucket. read symlinks to their URLs
                     if self.use_scratch_disk and outputname not in self.files_to_copy_to_outputs:
-                        output_files[jobId][outputname] = ["rodisk://" + re.match(r".*(canine-scratch.*)", os.readlink(x))[1] for x in output_files[jobId][outputname]]
+                        output_files[jobId][outputname] = [scratch_output_url(os.readlink(x)) for x in output_files[jobId][outputname]]
                 elif outputname in {'stdout', 'stderr'} and os.path.isfile(dirpath):
                     output_files[jobId][outputname] = [dirpath]
         return output_files
@@ -1057,6 +1132,12 @@ class AbstractLocalizer(abc.ABC):
         persists as a RODISK for downstream tasks, so overshoot is a permanent storage
         cost and it is better to resize repeatedly than to over-provision once.
 
+        It also records the most space it has seen used on the disk, in MB, in
+        `$CANINE_JOB_ROOT/.<disk_kind>_disk_peak_used_mb`: what the job needed,
+        to size the disk from the start next time. A requeued job carries on from
+        the recorded value, so it covers every attempt on the disk. Sampled each
+        poll, so a peak shorter than a poll can be missed.
+
         The heredoc is deliberately unquoted (`<<EOF`) so that GCP_DISK_NAME and
         GCP_TSNT_DISKS_DIR are baked in at file-write time: they are plain shell
         assignments rather than exports (see the localization_script preamble above),
@@ -1073,6 +1154,9 @@ class AbstractLocalizer(abc.ABC):
           'MIN_GROW_GB={}'.format(min_grow_gb),
           'MAX_GROW_GB={}'.format(max_grow_gb),
           'PREV_FREE_MB=-1',
+          'PEAK_FILE=$CANINE_JOB_ROOT/.' + disk_kind + '_disk_peak_used_mb',
+          'PEAK_MB=\$(cat \$PEAK_FILE 2> /dev/null)',
+          '[[ \$PEAK_MB =~ ^[0-9]+\$ ]] || PEAK_MB=0',
           'while true; do',
           '  sleep \$POLL',
           '  if ! mountpoint "\$DISK_DIR" &> /dev/null; then',
@@ -1083,6 +1167,10 @@ class AbstractLocalizer(abc.ABC):
           '  TOTAL_MB=\$(df -B1M "\$DISK_DIR" | awk \'NR == 2 { print int(\$3 + \$4) }\')',
           '  FREE_MB=\$(df -B1M "\$DISK_DIR" | awk \'NR == 2 { print int(\$4) }\')',
           '  if [[ -z \$TOTAL_MB || \$TOTAL_MB -le 0 ]]; then continue; fi',
+          '  if [[ \$((TOTAL_MB - FREE_MB)) -gt \$PEAK_MB ]]; then',
+          '    PEAK_MB=\$((TOTAL_MB - FREE_MB))',
+          '    echo \$PEAK_MB > \$PEAK_FILE.tmp && mv \$PEAK_FILE.tmp \$PEAK_FILE',
+          '  fi',
           '  NEED_RESIZE=0; REASON=; RATE_MB_S=0',
           '  if [[ \$((100*FREE_MB/TOTAL_MB)) -lt \$MIN_FREE_PCT ]]; then',
           '    NEED_RESIZE=1; REASON="free space below \${MIN_FREE_PCT}%"',
@@ -1105,14 +1193,29 @@ class AbstractLocalizer(abc.ABC):
           '  PREV_FREE_MB=\$FREE_MB',
           '  if [[ \$NEED_RESIZE -eq 1 ]]; then',
           '    TOTAL_GB=\$(( (TOTAL_MB + 1023) / 1024 ))',
-          '    NEW_GB=\$(( TOTAL_GB * GROW_PCT / 100 ))',
+          # Steps are sized from the disk, not its filesystem, which reports less
+          # than the disk's size, and less still if a resize grew the disk but was
+          # interrupted (e.g. by preemption) before resize2fs. GCE rejects a size
+          # that isn't larger than the disk's, so sizing from the filesystem could
+          # then never grow it; growing the filesystem to the disk comes first.
+          '    DEV=/dev/disk/by-id/google-${GCP_DISK_NAME}',
+          '    DISK_B=\$(sudo blockdev --getsize64 \$DEV 2> /dev/null)',
+          '    DISK_GB=\$(( \${DISK_B:-0} / 1073741824 ))',
+          '    if [[ \$DISK_GB -le 0 ]]; then DISK_GB=\$TOTAL_GB; fi',
+          '    FS_GB=\$(sudo dumpe2fs -h \$DEV 2> /dev/null | awk -F: \'/^Block count/ { c = \$2 } /^Block size/ { s = \$2 } END { if (c && s) print int(c * s / 1073741824) }\')',
+          '    if [[ -n \$FS_GB && \$DISK_GB -gt \$FS_GB ]] && sudo resize2fs \$DEV; then',
+          '      echo "' + disk_kind + ' disk $GCP_DISK_NAME: \$REASON (\${FREE_MB}MB free of \${TOTAL_MB}MB); filesystem grown from \${FS_GB}GB to the disk size, \${DISK_GB}GB" >&2',
+          '      PREV_FREE_MB=-1',
+          '      continue',
+          '    fi',
+          '    NEW_GB=\$(( DISK_GB * GROW_PCT / 100 ))',
           '    if [[ \$RATE_MB_S -gt 0 && \$HEADROOM_SEC -gt 0 ]]; then',
-          '      RATE_GB=\$(( TOTAL_GB + (RATE_MB_S * HEADROOM_SEC + 1023) / 1024 ))',
+          '      RATE_GB=\$(( DISK_GB + (RATE_MB_S * HEADROOM_SEC + 1023) / 1024 ))',
           '      if [[ \$RATE_GB -gt \$NEW_GB ]]; then NEW_GB=\$RATE_GB; fi',
           '    fi',
-          '    if [[ \$MIN_GROW_GB -gt 0 && \$((NEW_GB - TOTAL_GB)) -lt \$MIN_GROW_GB ]]; then NEW_GB=\$((TOTAL_GB + MIN_GROW_GB)); fi',
-          '    if [[ \$MAX_GROW_GB -gt 0 && \$((NEW_GB - TOTAL_GB)) -gt \$MAX_GROW_GB ]]; then NEW_GB=\$((TOTAL_GB + MAX_GROW_GB)); fi',
-          '    echo "' + disk_kind + ' disk $GCP_DISK_NAME: \$REASON (\${FREE_MB}MB free of \${TOTAL_MB}MB); resizing \${TOTAL_GB}GB -> \${NEW_GB}GB" >&2',
+          '    if [[ \$MIN_GROW_GB -gt 0 && \$((NEW_GB - DISK_GB)) -lt \$MIN_GROW_GB ]]; then NEW_GB=\$((DISK_GB + MIN_GROW_GB)); fi',
+          '    if [[ \$MAX_GROW_GB -gt 0 && \$((NEW_GB - DISK_GB)) -gt \$MAX_GROW_GB ]]; then NEW_GB=\$((DISK_GB + MAX_GROW_GB)); fi',
+          '    echo "' + disk_kind + ' disk $GCP_DISK_NAME: \$REASON (\${FREE_MB}MB free of \${TOTAL_MB}MB); resizing \${DISK_GB}GB -> \${NEW_GB}GB" >&2',
           '    if gcloud_exp_backoff compute disks resize $GCP_DISK_NAME --quiet --zone $CANINE_NODE_ZONE --size \$NEW_GB; then',
           '      sudo resize2fs /dev/disk/by-id/google-${GCP_DISK_NAME}',
           '    else',
@@ -1127,16 +1230,84 @@ class AbstractLocalizer(abc.ABC):
           'set -e',
         ]
 
+    # A job's read-only disks are attached, and detached, by concurrent gcloud
+    # calls. GCE works through one VM's attach/detach calls roughly in turn, but
+    # concurrent calls still finish sooner: 120 disks on one VM (2026-10-30) took
+    # about 780 s to attach one call at a time, 373 s 4 at once, 252 s 8 at
+    # once and 165 s 16 at once (detach: 272, 182 and 120 s). A call waits its
+    # turn, so a single call can take far longer than it does alone (up to 53 s
+    # seen); RODISK_CALL_TIMEOUT allows for that, and still catches a hung call.
+    RODISK_CALL_TIMEOUT = 120
+
+    def rodisk_parallel_calls(self):
+        """
+        Shell lines setting CANINE_RODISK_CALLS: how many attach/detach calls to
+        make at once, rodisk_max_parallel_calls, whatever the job's size: the
+        jobs with the most disks to attach, like a MarkDuplicates gathering
+        every BWA shard, may have only 2 CPUs.
+        """
+        return ["CANINE_RODISK_CALLS={}".format(self.rodisk_max_parallel_calls)]
+
+    def rodisk_attach(self):
+        """
+        Shell lines that attach every read-only disk (CANINE_RODISK_1..N) not
+        already attached, CANINE_RODISK_CALLS at a time. Each disk's gcloud
+        output goes to ${CANINE_RODISK_DIAG_DIR}/<disk>, for the mount loop's
+        error messages. As when they were attached one at a time:
+        - another job may be attaching the same disk, so a failed attach isn't
+          an error here; the mount loop fails if the device never appears;
+        - but quota exhaustion (gcloud exit 5) or a hung attach (timeout's 124)
+          requeues the job (exit 5).
+        """
+        return self.rodisk_parallel_calls() + [
+          "CANINE_RODISK_DIAG_DIR=$(mktemp -d)",
+          "for i in $(seq ${CANINE_N_RODISKS}); do",
+          "  CANINE_RODISK=CANINE_RODISK_${i}",
+          "  [[ -e /dev/disk/by-id/google-${!CANINE_RODISK} ]] || echo ${!CANINE_RODISK}",
+          "done | xargs -r -P $CANINE_RODISK_CALLS -I {{}} bash -c 'timeout -k 30 {t} gcloud compute instances attach-disk \"$0\" --zone \"$1\" --disk \"$2\" --device-name \"$2\" --mode ro >> \"$3/$2\" 2>&1; ec=$?; [[ $ec == 5 || $ec == 124 ]] && exit 1 || exit 0' \"$CANINE_NODE_NAME\" \"$CANINE_NODE_ZONE\" {{}} \"$CANINE_RODISK_DIAG_DIR\" || {{ echo 'ERROR: attaching read-only disks hit a quota limit or timed out; retrying.' >&2; exit 5; }}".format(
+            t = self.RODISK_CALL_TIMEOUT),
+        ]
+
+    def rodisk_detach(self):
+        """
+        Shell lines that detach the read-only disks named in the
+        CANINE_RODISKS_TO_DETACH array, CANINE_RODISK_CALLS at a time. A failed
+        detach is logged with gcloud's output, and isn't fatal.
+        """
+        return self.rodisk_parallel_calls() + [
+          'if [ ${#CANINE_RODISKS_TO_DETACH[@]} -gt 0 ]; then',
+          '  printf "%s\\n" "${{CANINE_RODISKS_TO_DETACH[@]}}" | xargs -P $CANINE_RODISK_CALLS -I {{}} bash -c \'out=$(timeout -k 30 {t} gcloud compute instances detach-disk "$0" --zone "$1" --disk "$2" 2>&1) && echo "Unmounted $2" >&2 || echo "Error detaching disk $2 (exit $?): $out" >&2\' "$CANINE_NODE_NAME" "$CANINE_NODE_ZONE" {{}}'.format(
+            t = self.RODISK_CALL_TIMEOUT),
+          'fi',
+        ]
+
+    @staticmethod
+    def _scratch_disk_provenance_lines(disk_dir):
+        """
+        Shell lines that record, at the root of a scratch disk (disk_dir, a
+        shell expression), the root of the job writing to it: its task's
+        directory and shard, <task dir>/jobs/<shard>. Whatever later reads the
+        disk, e.g. to copy its files elsewhere, can tell where they came from.
+        """
+        return [
+          'echo "$CANINE_JOB_ROOT" > {}/{}'.format(disk_dir, SCRATCH_DISK_PROVENANCE),
+        ]
+
     def create_persistent_disk(self,
       file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
       disk_name: str = None,
       disk_size: int = 0,
-      dry_run = False
+      dry_run = False,
+      moved_marker = None
     ):
         """
         Generates the commands to (i) create and (ii) destroy a persistent disk.
         If a dict of inputs -> [FileTypes] is provided, disk will be named
         according to the FileType hashes, and sized according to the filesizes.
+        moved_marker: for a scratch disk under move_to_bucket, the file
+        delocalization.py writes once it has moved the job's outputs off the
+        disk; if it's there when the job succeeded, the disk is deleted rather
+        than labelled finished.
         """
         is_scratch_disk = len(file_paths_arrays) == 0
         #
@@ -1319,22 +1490,31 @@ class AbstractLocalizer(abc.ABC):
             'if [[ $(sudo blkid -o value -s TYPE /dev/disk/by-id/google-${GCP_DISK_NAME}) != "ext4" ]]; then',
             'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-${GCP_DISK_NAME}',
             'fi',
+            read_ahead_line('/dev/disk/by-id/google-"${GCP_DISK_NAME}"'),
 
             ## mount
             'if [[ ! -d "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" ]]; then',
             'sudo mkdir -p "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
             'fi',
             'if ! mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"; then',
-            'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-"${GCP_DISK_NAME}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"',
+            # a disk resumed from a node that stopped without unmounting it (a
+            # preemption) has its ext4 journal replayed as it mounts, which can
+            # take longer than a minute; at 30 s the timeout gave up while the
+            # kernel went on to mount it, and the job failed (exit 124). A mount
+            # that finishes after the timeout still counts.
+            'sudo timeout -k 30 {} mount -o discard,defaults /dev/disk/by-id/google-"${{GCP_DISK_NAME}}" "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" || mountpoint -q "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"'.format(SCRATCH_DISK_MOUNT_TIMEOUT_S),
             'sudo chown $(id -u):$(id -g) "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'sudo chmod 774 "${GCP_TSNT_DISKS_DIR}/${GCP_DISK_NAME}"',
             'fi',
+            ## grow the filesystem to the disk, if an earlier attempt's resize grew
+            ## the disk but was interrupted before resize2fs (a no-op otherwise)
+            'sudo resize2fs /dev/disk/by-id/google-"${GCP_DISK_NAME}" || :',
 
             ## lock the disk
             # will be unlocked during teardown script (or if script crashes). this
             # is a way of other processes surveying if this is a hanging disk.
             'flock -os "$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME" sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.scratchdisk_lock_pids',
-        ]
+        ] + (self._scratch_disk_provenance_lines('"$GCP_TSNT_DISKS_DIR/$GCP_DISK_NAME"') if is_scratch_disk else [])
 
         # Disks dynamically resize as they get full.
         #
@@ -1390,7 +1570,6 @@ class AbstractLocalizer(abc.ABC):
 
           ## detach disk
           'gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
-          # TODO: add command to optionally delete disk
 
           ## kill disk resizing daemon, if running
           # NB: absolute path. The daemon writes $CANINE_JOB_ROOT/.diskresizedaemon_pid,
@@ -1403,18 +1582,45 @@ class AbstractLocalizer(abc.ABC):
 
         # scratch disks get labeled "finalized" if the task ran OK.
         if is_scratch_disk:
-            teardown_script += [
-              'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}; fi'.format(
-                disk_name = disk_name,
-                protect_string = (",protect=yes" if self.protect_disk else "")
-              )
-            ]
+            label = 'gcloud compute disks add-labels "{disk_name}" --zone "$CANINE_NODE_ZONE" --labels finished=yes{protect_string}'.format(
+              disk_name = disk_name,
+              protect_string = (",protect=yes" if self.protect_disk else "")
+            )
+            if moved_marker is None:
+                teardown_script += [
+                  'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then {}; fi'.format(label)
+                ]
+            # move_to_bucket: if they weren't moved (a copy failed), the
+            # outputs are still on the disk, which is kept and labelled as
+            # without move_to_bucket
+            else:
+                teardown_script += self.moved_disk_teardown(disk_name, moved_marker, otherwise = label)
 
             # we also need to leave the job workspace directory before anything else
             # in the scratch disk teardown script to allow the disk to unmount
             teardown_script = ["cd $CANINE_JOB_ROOT"] + teardown_script
 
         return disk_mountpoint, localization_script, teardown_script, rodisk_paths
+
+    def moved_disk_teardown(self, disk_name, moved_marker, otherwise = None):
+        """
+        Teardown commands for a scratch disk under move_to_bucket, once it is
+        detached: if the job succeeded and delocalization.py moved its outputs
+        (moved_marker is there), nothing needs the disk, so it's deleted;
+        otherwise `otherwise` runs, if given. A failed delete only warns: the
+        disk may still be attached read-only to another node, by a job reading
+        it, and GCE refuses to delete an attached disk. It's then left for the
+        lab's cleanup.
+        """
+        return [
+          'if [[ ! -z $CANINE_JOB_RC && $CANINE_JOB_RC -eq 0 ]]; then',
+          '  if [ -f {} ]; then'.format(shlex.quote(moved_marker)),
+          '    echo "Outputs moved to a bucket; deleting scratch disk {}" >&2'.format(disk_name),
+          '    gcloud compute disks delete "{}" --zone "$CANINE_NODE_ZONE" --quiet || echo "WARNING: could not delete scratch disk {}; it may still be attached to another node" >&2'.format(disk_name, disk_name),
+        ] + (['  else', '    ' + otherwise] if otherwise else []) + [
+          '  fi',
+          'fi',
+        ]
 
     def backend_zone(self):
         """
@@ -1429,6 +1635,67 @@ class AbstractLocalizer(abc.ABC):
           or self.backend.config.get("compute_zone")
           or get_default_gcp_zone()
         )
+
+    def move_bucket_name(self):
+        """
+        The bucket move_to_bucket moves this task's outputs to: one for all of
+        the task's shards, not one per shard, since a scatter of hundreds of
+        shards would otherwise create hundreds of buckets, against GCS's
+        bucket-creation rate limit. Its hash is taken from scratch_disk_name,
+        the name all the task's shards share (each shard's disk is that name
+        plus "-<job ID>", see job_setup_teardown); that name comes from the
+        task's script, image and inputs, so a rerun of the same task finds the
+        same bucket. Each shard's outputs are under its job ID in it (see
+        delocalization.py).
+        """
+        return localization_bucket_name(
+          get_project_number(self.project),
+          _zone_to_region(self.backend_zone()),
+          hashlib.sha256(("move_to_bucket:" + self.scratch_disk_name).encode()).hexdigest()
+        )
+
+    def move_bucket_script(self, bucket):
+        """
+        Commands, run on the worker before delocalization when the job
+        succeeded, that create move_to_bucket's bucket if it doesn't exist, as
+        a localization bucket is created (BUCKET_CREATE_FLAGS: private, no soft
+        delete), with move_to_bucket_expiry_days in its lifecycle rule. Every
+        shard of a task races to create it; a 409 is a sibling creating it at
+        the same moment, so this waits for it to become readable. If it never
+        does, delocalization.py's copies fail and the outputs stay on the disk.
+        """
+        burl = shlex.quote("gs://" + bucket)
+        return self._lifecycle_file_lines(self.move_to_bucket_expiry_days) + [
+          'if ! gcloud storage buckets describe {burl} > /dev/null 2>&1; then'.format(burl = burl),
+          '  gcloud storage buckets create {burl} --location={region} {flags} --lifecycle-file="$CANINE_BUCKET_LC" > /dev/null 2>&1 || :'.format(
+            burl = burl, region = shlex.quote(_zone_to_region(self.backend_zone())), flags = BUCKET_CREATE_FLAGS),
+          '  CANINE_BUCKET_TRIES=0',
+          '  until gcloud storage buckets describe {burl} > /dev/null 2>&1; do'.format(burl = burl),
+          '    if [ $CANINE_BUCKET_TRIES -gt 30 ]; then echo "ERROR: bucket {b} for the moved outputs never became readable" >&2; break; fi'.format(b = bucket),
+          '    sleep 2; CANINE_BUCKET_TRIES=$((CANINE_BUCKET_TRIES+1))',
+          '  done',
+          'fi',
+          'rm -f "$CANINE_BUCKET_LC"',
+        ]
+
+    def moved_outputs_present(self, marker_path, transport):
+        """
+        Whether a job's moved outputs are all still in their bucket: the
+        objects listed in its .moved_to_bucket marker, which delocalization.py
+        writes once every output is moved. False without the marker (the job
+        didn't move its outputs) or with any object gone (deleted, or expired
+        under the bucket's lifecycle rule). Reads object metadata only.
+        """
+        if not transport.isfile(marker_path):
+            return False
+        with transport.open(marker_path, "r") as f:
+            urls = [l.strip() for l in f if l.strip()]
+        client = gcloud_storage_client()
+        for url in urls:
+            m = re.match(r"gs://([^/]+)/(.+)", url)
+            if m is None or not client.bucket(m[1]).blob(m[2]).exists():
+                return False
+        return True
 
     def create_bucket_mount(self,
       file_paths_arrays: typing.Dict[str, typing.List[file_handlers.FileType]] = {},
@@ -1591,15 +1858,20 @@ class AbstractLocalizer(abc.ABC):
                     ]
         return "gs://{}".format(bucket), False, bucketmount_paths, expanded
 
-    def _lifecycle_file_lines(self):
-        """Commands writing the bucket's lifecycle rule to the file "$CANINE_BUCKET_LC"."""
+    def _lifecycle_file_lines(self, expiry_days = None):
+        """
+        Commands writing the bucket's lifecycle rule to the file "$CANINE_BUCKET_LC":
+        objects expire expiry_days after their customTime, localization_expiry_days
+        unless given.
+        """
+        days = self.localization_expiry_days if expiry_days is None else expiry_days
         return [
           'CANINE_BUCKET_LC=$(mktemp)',
           # the lifecycle rule must be applied at creation: a second call to set
           # it might never happen if this job dies in between
           "cat > \"$CANINE_BUCKET_LC\" <<'CANINE_LIFECYCLE_EOF'",
           '{{"rule":[{{"action":{{"type":"Delete"}},"condition":{{"daysSinceCustomTime":{days}}}}}]}}'.format(
-            days = int(self.localization_expiry_days)),
+            days = int(days)),
           'CANINE_LIFECYCLE_EOF',
         ]
 
@@ -2322,14 +2594,27 @@ class AbstractLocalizer(abc.ABC):
         loop skips remounting an existing mountpoint) and its metadata cache is
         stale.
 
-        Exits 5 rather than 1: both causes are node-local or transient, so the
-        shard is worth retrying elsewhere rather than failing the workflow.
+        Those causes are node-local or transient, so the shard exits 5 and is
+        retried elsewhere. But a link also fails to resolve when its object is
+        gone from the bucket itself, e.g. deleted by another workflow's
+        DeleteLocalizedFiles while this job waited. No node can fix that, and
+        exit 5 isn't counted against the preemption limit, so the shard would
+        requeue forever. So the bucket is asked directly: an object it doesn't
+        have exits 1, failing the shard; one it has, or a lookup that itself
+        fails, exits 5 as before. The whole bucket is mounted, so a link's path
+        under the mount is its object's name in the bucket.
         Expects CANINE_JOB_INPUTS, CANINE_BUCKETMOUNT and CANINE_BUCKETMOUNT_DIR
         to be set -- i.e. this belongs inside the per-bucket mount loop.
         """
         return [
           'for CANINE_BM_LINK in $(find ${CANINE_JOB_INPUTS} -maxdepth 1 -type l 2> /dev/null); do',
-          '  if [[ "$(readlink "$CANINE_BM_LINK")" == ${CANINE_BUCKETMOUNT_DIR}/* && ! -e "$CANINE_BM_LINK" ]]; then',
+          '  CANINE_BM_TARGET=$(readlink "$CANINE_BM_LINK")',
+          '  if [[ "$CANINE_BM_TARGET" == ${CANINE_BUCKETMOUNT_DIR}/* && ! -e "$CANINE_BM_LINK" ]]; then',
+          '    CANINE_BM_OBJECT="gs://${CANINE_BUCKETMOUNT}/${CANINE_BM_TARGET#${CANINE_BUCKETMOUNT_DIR}/}"',
+          '    if ! CANINE_BM_LS_ERR=$(gcloud storage ls "$CANINE_BM_OBJECT" 2>&1 > /dev/null) && [[ "$CANINE_BM_LS_ERR" == *"matched no objects"* ]]; then',
+          '      echo "ERROR: $CANINE_BM_LINK: $CANINE_BM_OBJECT is not in the bucket (deleted, or never written); no node can resolve it" >&2',
+          '      exit 1',
+          '    fi',
           '    echo "ERROR: $CANINE_BM_LINK does not resolve inside bucket mount ${CANINE_BUCKETMOUNT}; retrying on another node" >&2',
           '    exit 5',
           '  fi',
@@ -2439,7 +2724,8 @@ class AbstractLocalizer(abc.ABC):
             scratch_disk_teardown_script, \
             finished_scratch_disk_url = self.create_persistent_disk(
               disk_name = self.scratch_disk_name + "-" + jobId, # one scratch disk per shard
-              disk_size = self.scratch_disk_size
+              disk_size = self.scratch_disk_size,
+              moved_marker = os.path.join(self.environment('remote')['CANINE_OUTPUT'], jobId, MOVED_MARKER) if self.move_to_bucket else None
             )
 
             localization_tasks += scratch_disk_creation_script
@@ -2454,8 +2740,12 @@ class AbstractLocalizer(abc.ABC):
                 exports += ["export CANINE_RODISK_{}={}".format(len(canine_rodisks), finished_scratch_disk_url[9:])] # strip 'rodisk://' prefix
                 exports += ["export CANINE_RODISK_DIR_{}={}".format(len(canine_rodisks), scratch_disk_prefix)]
 
-                # we also need to bypass running the script if scratch_disk_job_avoid 
+                # we also need to bypass running the script if scratch_disk_job_avoid
                 # is True. this will happen later
+
+        # the job's output is already on its finished scratch disk, so
+        # localization ends with exit 15 and the job is skipped
+        skips_job = self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid
 
         local_download_size = self.local_download_size.get(jobId, 0)
         disk_name = None
@@ -2491,6 +2781,7 @@ class AbstractLocalizer(abc.ABC):
                 ),
                 'gcloud compute instances set-disk-auto-delete $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk {}'.format(disk_name),
                 'sudo mkfs.ext4 -m 0 -E lazy_itable_init=0,lazy_journal_init=0,discard /dev/disk/by-id/google-{}'.format(device_name),
+                read_ahead_line('/dev/disk/by-id/google-{}'.format(device_name)),
 
                 'sudo timeout -k 30 30 mount -o discard,defaults /dev/disk/by-id/google-{} $CANINE_LOCAL_DISK_DIR'.format(
                     device_name,
@@ -2623,7 +2914,7 @@ class AbstractLocalizer(abc.ABC):
                     file = dgrp[2]
 
                     bucketmount_key = bkt
-                    mount_dir = "/mnt/bucketmounts/{}".format(bucketmount_key)
+                    mount_dir = "{}/{}".format(BUCKET_MOUNT_ROOT, bucketmount_key)
 
                     if bucketmount_key not in canine_bucketmounts:
                         canine_bucketmounts.append(bucketmount_key)
@@ -2695,37 +2986,33 @@ class AbstractLocalizer(abc.ABC):
             dest = self.reserve_path('jobs', jobId)
             exports += ['export {0}="{1}/{0}_array.txt"'.format(k, dest.remotepath)]
 
+        # A finished scratch disk is among the read-only disks; an unfinished one
+        # is attached read-write, which counts as well.
+        self.attached_disks[jobId] = len(canine_rodisks) + \
+          int(self.use_scratch_disk and not scratch_disk_already_exists)
+
         #
         # Mount RO disks if any
         exports += ["export CANINE_N_RODISKS={}".format(len(canine_rodisks))]
         if len(canine_rodisks):
             localization_tasks += [
               "[ -f .rodisk_lock_pids ] && rm .rodisk_lock_pids || :",
+              'echo "INFO: $(date -u +%T) Attaching ${CANINE_N_RODISKS} read-only disk(s) ..." >&2',
+            ] + self.rodisk_attach() + [
+              'echo "INFO: $(date -u +%T) Attach calls done; mounting ..." >&2',
+              # then wait for each disk's device, and mount it
               "for i in `seq ${CANINE_N_RODISKS}`; do",
               "CANINE_RODISK=CANINE_RODISK_${i}",
               "CANINE_RODISK=${!CANINE_RODISK}",
               "CANINE_RODISK_DIR=CANINE_RODISK_DIR_${i}",
               "CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}",
 
-              'echo "INFO: Attaching read-only disk ${CANINE_RODISK} ..." >&2',
-
               "if [[ ! -d ${CANINE_RODISK_DIR} ]]; then",
               "sudo mkdir -p ${CANINE_RODISK_DIR}",
               "fi",
 
-              # create tempfile to hold diagnostic information
-              "DIAG_FILE=$(mktemp)",
-
-              # attach the disk if it's not already
-              "if [[ ! -e /dev/disk/by-id/google-${CANINE_RODISK} ]]; then",
-              # we can run into a race condition here if other tasks are
-              # attempting to mount the same disk simultaneously, so we
-              # force a 0 exit, unless gcloud returned exit code 5 (quota exceeded),
-              # which we explicitly propagate to cause localization to be retried.
-              # mounting the disk can also hang (exit 124), in which case we
-              # also cause localization to be retried by returning exit 5
-              "timeout -k 30 30 gcloud compute instances attach-disk ${CANINE_NODE_NAME} --zone ${CANINE_NODE_ZONE} --disk ${CANINE_RODISK} --device-name ${CANINE_RODISK} --mode ro &>> $DIAG_FILE || { ec=$?; [[ $ec == 5 || $ec == 124 ]] && exit 5 || true; }",
-              "fi",
+              # this disk's attach output, if it needed attaching
+              "DIAG_FILE=${CANINE_RODISK_DIAG_DIR}/${CANINE_RODISK}",
 
               # mount the disk if it's not already
               # as before, we can run into a race condition here, so we again
@@ -2749,6 +3036,7 @@ class AbstractLocalizer(abc.ABC):
                 "sleep 10; ((++tries))",
               "done",
 
+              read_ahead_line("/dev/disk/by-id/google-${CANINE_RODISK}"),
               # mount within Slurm worker container
               "sudo timeout -k 30 30 mount -o noload,ro,defaults /dev/disk/by-id/google-${CANINE_RODISK} ${CANINE_RODISK_DIR} || true",
               "fi",
@@ -2765,9 +3053,10 @@ class AbstractLocalizer(abc.ABC):
               # if other processes are still using it
               "flock -os ${CANINE_RODISK_DIR} sleep infinity & echo $! >> ${CANINE_JOB_INPUTS}/.rodisk_lock_pids",
 
-              'echo "INFO: Successfully attached read-only disk ${CANINE_RODISK}." >&2',
+              'echo "INFO: $(date -u +%T) Successfully attached read-only disk ${CANINE_RODISK}." >&2',
 
               "done",
+              'echo "INFO: $(date -u +%T) Mounted ${CANINE_N_RODISKS} read-only disk(s)." >&2',
             ]
 
         #
@@ -2922,7 +3211,8 @@ class AbstractLocalizer(abc.ABC):
               ") 200>${CANINE_BUCKETMOUNT_MOUNTLOCK} || exit 1",
               "fi",
 
-            ] + self.bucketmount_reachability_check() + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + self.bucketmount_log_mark() + [
+            # a skipped job doesn't read its inputs, so one that's gone mustn't fail it
+            ] + (self.bucketmount_reachability_check() if not skips_job else []) + self.bucketmount_lease_register() + self.bucketmount_heartbeat_start() + self.bucketmount_log_mark() + [
 
               'echo "INFO: Successfully mounted bucket ${CANINE_BUCKETMOUNT}." >&2',
 
@@ -2966,11 +3256,12 @@ class AbstractLocalizer(abc.ABC):
             "alias gcloud=gcloud_exp_backoff #DEBUG_OMIT"
           ] + localization_tasks +
           ( # skip running task script if finished scratch disk already exists via special localizer exit code
-            ["exit 15 #DEBUG_OMIT"] if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else []
+            ["exit 15 #DEBUG_OMIT"] if skips_job else []
           )
         ) + "\nset +e\n"
 
         # generate teardown script
+        move_bucket = self.move_bucket_name() if self.move_to_bucket else None
         teardown_script = '\n'.join(
             line.rstrip()
             for line in [
@@ -2979,9 +3270,17 @@ class AbstractLocalizer(abc.ABC):
                 'shopt -s expand_aliases #DEBUG_OMIT',
                 'alias gcloud=gcloud_exp_backoff #DEBUG_OMIT',
                 'if [[ -d $CANINE_JOB_WORKSPACE ]]; then cd $CANINE_JOB_WORKSPACE; fi',
+            ] + (
+                # move_to_bucket: the bucket delocalization moves the outputs to,
+                # created only for a job that succeeded. Not indented: its
+                # lifecycle heredoc's terminator must start the line.
+                ['if [[ -z $CANINE_DEBUG_MODE && $CANINE_JOB_RC == 0 ]]; then'] +
+                self.move_bucket_script(move_bucket) +
+                ['fi'] if move_bucket else []
+            ) + [
                 # 'mv ../stderr ../stdout .',
                 # do not run delocalization script if we're in debug mode
-                'if [[ -z $CANINE_DEBUG_MODE ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag}; fi; fi'.format(
+                'if [[ -z $CANINE_DEBUG_MODE ]]; then if which python3 2>/dev/null >/dev/null; then python3 {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag} {moveflags}; else python {script_path} {output_root} {shard} {patterns} {copyflags} {scratchflag} {finishedflag} {moveflags}; fi; fi'.format(
                     script_path = os.path.join(compute_env['CANINE_ROOT'], 'delocalization.py'),
                     output_root = compute_env['CANINE_OUTPUT'],
                     shard = jobId,
@@ -2995,6 +3294,7 @@ class AbstractLocalizer(abc.ABC):
                     ),
                     scratchflag = "--scratch" if self.use_scratch_disk else "",
                     finishedflag = "--finished_scratch" if self.use_scratch_disk and scratch_disk_already_exists and self.scratch_disk_job_avoid else "",
+                    moveflags = "--move-bucket {} --move-mount {}".format(move_bucket, BUCKET_MOUNT_ROOT + "/" + move_bucket) if move_bucket else "",
                 ),
 
                 # remove stream dir
@@ -3011,7 +3311,10 @@ class AbstractLocalizer(abc.ABC):
                 '  done < ${CANINE_JOB_INPUTS}/.rodisk_lock_pids',
                 '  rm -f ${CANINE_JOB_INPUTS}/.rodisk_lock_pids',
                 'fi',
+                # unmount each, then detach the unmounted ones together
                 '(cd /',
+                'CANINE_RODISKS_TO_DETACH=()',
+                'echo "INFO: $(date -u +%T) Unmounting ${CANINE_N_RODISKS} read-only disk(s) ..." >&2',
                 'for i in $(seq ${CANINE_N_RODISKS}); do',
                 '  CANINE_RODISK=CANINE_RODISK_${i}',
                 '  CANINE_RODISK=${!CANINE_RODISK}',
@@ -3019,17 +3322,29 @@ class AbstractLocalizer(abc.ABC):
                 '  CANINE_RODISK_DIR=${!CANINE_RODISK_DIR}',
                 '  echo "Unmounting read-only disk ${CANINE_RODISK}" >&2',
                 '  if flock -n ${CANINE_RODISK_DIR} true && mountpoint -q ${CANINE_RODISK_DIR} && sudo umount ${CANINE_RODISK_DIR}; then',
-                '    timeout -k 30 30 gcloud compute instances detach-disk $CANINE_NODE_NAME --zone $CANINE_NODE_ZONE --disk $CANINE_RODISK && echo "Unmounted ${CANINE_RODISK}" >&2 || echo "Error detaching disk ${CANINE_RODISK}" >&2',
+                '    CANINE_RODISKS_TO_DETACH+=(${CANINE_RODISK})',
                 '  else',
                 '    echo "Read-only disk ${CANINE_RODISK} is busy and will not be unmounted during teardown. It is likely in use by another job." >&2',
                 '  fi',
-                'done)',
+                'done',
+                'echo "INFO: $(date -u +%T) Detaching ${#CANINE_RODISKS_TO_DETACH[@]} read-only disk(s) ..." >&2',
+            ] + self.rodisk_detach() + [
+                'echo "INFO: $(date -u +%T) Detach calls done." >&2',
+                ')',
 
                 # Bucket mounts are node-lifetime and are never unmounted here
                 # (see the mount loop). Only this job's own bookkeeping is undone:
                 # stop refreshing customTime, then drop its mount leases.
             ] + self.bucketmount_heartbeat_stop() + self.bucketmount_lease_release() + self.bucketmount_log_report(compute_env['CANINE_ROOT']) + [
-            ] + ( scratch_disk_teardown_script if self.use_scratch_disk else [] )
+            ] + ( scratch_disk_teardown_script if self.use_scratch_disk else [] ) + (
+                # a job skipped on its finished scratch disk mounts it read-only,
+                # like any read-only disk, and has no scratch-disk teardown; under
+                # move_to_bucket its delocalization moves the outputs off it, so
+                # once it's detached above, nothing needs it
+                self.moved_disk_teardown(finished_scratch_disk_url[len("rodisk://"):],
+                  os.path.join(compute_env['CANINE_OUTPUT'], jobId, MOVED_MARKER))
+                if self.move_to_bucket and skips_job else []
+            )
         )
 
         # every GCE disk this job's scripts create or mount, for billing-grounded

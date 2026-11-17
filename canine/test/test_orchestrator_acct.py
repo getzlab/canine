@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
-from canine.orchestrator import Orchestrator
+from canine.orchestrator import Orchestrator, general_partition
 
 
 class FakeTransport:
@@ -207,7 +207,35 @@ class TestWaitForJobsToFinishGrouper:
         assert row["attempts"] == [{
           "NodeList": "worker3", "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:01:00",
           "AllocTRES": "cpu=1,mem=1G,node=1", "CPUTimeRAW": 50, "NCPUS": 1, "ReqMem": "1G",
+          "State": "COMPLETED", "ExitCode": "0:0",
         }]
+
+    def test_attempts_say_why_each_ended(self):
+        # n_preempted counts every requeue; each attempt's State and ExitCode
+        # tell a preemption from running out of memory or a retried failure
+        def attempt(state, exit_code, start, mem):
+            return { "_index": "999_4", "State": state, "ExitCode": exit_code, "CPUTimeRAW": 10, "PlannedCPURAW": 0,
+              "Submit": "2026-01-01 00:00:00", "NodeList": "worker", "Partition": "main", "ReqCPUS": 1, "NCPUS": 1, "ReqMem": mem,
+              "Start": start, "End": start, "Elapsed": "00:00:10", "AllocTRES": "cpu=1,mem=1G,node=1", "Account": "abcd" }
+        raw = make_raw_sacct_df([
+          attempt("PREEMPTED", "0:0", "2026-01-01T00:00:05", "1000M"),
+          attempt("OUT_OF_MEMORY", "0:125", "2026-01-01T00:01:05", "1000M"),
+          attempt("REQUEUED", "1:0", "2026-01-01T00:02:05", "1500M"),
+          attempt("COMPLETED", "0:0", "2026-01-01T00:03:05", "1500M"),
+        ])
+
+        orch = object.__new__(Orchestrator)
+        orch.backend = MagicMock()
+        orch.backend.sacct.return_value = raw
+        orch.job_spec = {"4": {"some": "spec"}}
+
+        with patch("canine.orchestrator.time.sleep"):
+            _, _, acct = orch.wait_for_jobs_to_finish(999, localizer=None)
+
+        row = acct.loc["999_4"]
+        assert row["n_preempted"] == 3
+        assert [(a["State"], a["ExitCode"]) for a in row["attempts"]] == [
+          ("PREEMPTED", "0:0"), ("OUT_OF_MEMORY", "0:125"), ("REQUEUED", "1:0"), ("COMPLETED", "0:0")]
 
     def test_constant_submit_across_attempts_still_orders_by_start(self):
         # Real SLURM behavior for preemption/requeue: Submit is the ORIGINAL
@@ -413,3 +441,115 @@ class TestQuerySacctForNodes:
         backend.sacct.return_value = pd.DataFrame()
         result = Orchestrator.query_sacct_for_nodes(backend, ["worker1"], "2026-01-01", "2026-01-02")
         assert result.empty
+
+
+class TestRequeuingOutOfMemory:
+    """
+    A job out of memory is requeued at once with 1.5x its memory (held,
+    raised, released), oom_requeue times, rather than waiting for the rest of
+    its batch before wolF retries it. sacct shows the attempt that ran out of
+    memory as the job's last for a while after the requeue (seen on the
+    cluster, 2026-11-13), so that attempt isn't requeued twice.
+    """
+
+    OOM = _completed_row("999_2", State="OUT_OF_MEMORY", ExitCode="0:125", ReqMem="1750M", End="2026-01-01T01:00:00")
+
+    def _orch(self, polls, oom_requeue = 2, invoke_rcs = None):
+        orch = object.__new__(Orchestrator)
+        orch.backend = MagicMock()
+        orch.backend.sacct.side_effect = [make_raw_sacct_df(p) for p in polls]
+        rcs = iter(invoke_rcs or [])
+        orch.backend.invoke.side_effect = lambda cmd: (next(rcs, 0), None, None)
+        orch.job_spec = {"2": {"some": "spec"}}
+        orch.oom_requeue = oom_requeue
+        return orch
+
+    @staticmethod
+    def run(orch):
+        with patch("canine.orchestrator.time.sleep"):
+            completed, _, acct = orch.wait_for_jobs_to_finish(999, localizer = None)
+        return completed, acct, [c.args[0] for c in orch.backend.invoke.call_args_list]
+
+    def test_is_requeued_with_more_memory_and_waited_for(self):
+        stale = dict(self.OOM)
+        pending = _completed_row("999_2", State = "PENDING", ReqMem = "2625M", Start = "Unknown", End = "Unknown")
+        done = _completed_row("999_2", ReqMem = "2625M", End = "2026-01-01T02:00:00")
+        completed, acct, calls = self.run(self._orch([[self.OOM], [stale], [pending], [done]]))
+        assert calls == ["sbatch --test-only -p main -c 1 --mem=2625M --wrap true",
+                         "scontrol requeuehold 999_2", "scontrol update JobId=999_2 MinMemoryNode=2625", "scontrol release 999_2"]
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "COMPLETED"
+
+    def test_only_oom_requeue_times(self):
+        again = _completed_row("999_2", State = "OUT_OF_MEMORY", ReqMem = "2625M", End = "2026-01-01T02:00:00")
+        last = _completed_row("999_2", State = "OUT_OF_MEMORY", ReqMem = "3938M", End = "2026-01-01T03:00:00")
+        completed, acct, calls = self.run(self._orch([[self.OOM], [again], [last]]))
+        assert [c for c in calls if "update" in c] == ["scontrol update JobId=999_2 MinMemoryNode=2625",
+                                                       "scontrol update JobId=999_2 MinMemoryNode=3938"]
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "OUT_OF_MEMORY"
+
+    def test_not_by_default(self):
+        orch = self._orch([[self.OOM]])
+        del orch.oom_requeue                       # as an Orchestrator without the option
+        completed, _, calls = self.run(orch)
+        assert completed == [("2", "999_2")] and calls == []
+
+    def test_a_failed_requeue_leaves_it_out_of_memory(self):
+        completed, _, calls = self.run(self._orch([[self.OOM]], invoke_rcs = [0, 1]))
+        assert calls[-1] == "scontrol requeuehold 999_2"
+        assert completed == [("2", "999_2")]
+
+    def test_a_failed_memory_raise_still_releases_it_and_waits(self):
+        """Released, it runs again as it was, and is waited for."""
+        done = _completed_row("999_2", End = "2026-01-01T02:00:00")
+        orch = self._orch([[self.OOM], [done]], invoke_rcs = [0, 0, 1, 0])
+        completed, acct, calls = self.run(orch)
+        assert calls[-1] == "scontrol release 999_2"
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "COMPLETED"
+
+    def test_not_past_every_node_of_its_partition(self):
+        """Slurm would keep a held job raised past them pending for good, so it's left out of memory."""
+        completed, acct, calls = self.run(self._orch([[self.OOM]], invoke_rcs = [1]))
+        assert calls == ["sbatch --test-only -p main -c 1 --mem=2625M --wrap true"]
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "OUT_OF_MEMORY"
+
+    def test_past_its_node_type_it_moves_to_the_general_partition(self):
+        """A job pinned to one node type moves to every type of its kind when its type is too small."""
+        oom = dict(self.OOM, Partition = "n1-highcpu-16")
+        done = _completed_row("999_2", ReqMem = "2625M", End = "2026-01-01T02:00:00")
+        completed, acct, calls = self.run(self._orch([[oom], [done]], invoke_rcs = [1, 0]))
+        assert calls == ["sbatch --test-only -p n1-highcpu-16 -c 1 --mem=2625M --wrap true",
+                         "sbatch --test-only -p main -c 1 --mem=2625M --wrap true",
+                         "scontrol requeuehold 999_2",
+                         "scontrol update JobId=999_2 MinMemoryNode=2625 Partition=main",
+                         "scontrol release 999_2"]
+        assert completed == [("2", "999_2")] and acct.loc["999_2", "State"] == "COMPLETED"
+
+    def test_it_stays_in_its_partition_while_that_fits(self):
+        orch = self._orch([])
+        assert orch.requeue_out_of_memory("999_2", "32G", "n1-highmem-16-nonp", 2) == 49152
+        assert [c.args[0] for c in orch.backend.invoke.call_args_list][2] == "scontrol update JobId=999_2 MinMemoryNode=49152"
+
+    def test_not_past_every_node_of_its_kind(self):
+        orch = self._orch([], invoke_rcs = [1, 1])
+        assert orch.requeue_out_of_memory("999_2", "32G", "n1-highmem-16-nonp", 2) is None
+        assert [c.args[0] for c in orch.backend.invoke.call_args_list] == [
+          "sbatch --test-only -p n1-highmem-16-nonp -c 2 --mem=49152M --wrap true",
+          "sbatch --test-only -p nonpreemptible -c 2 --mem=49152M --wrap true"]
+
+    @pytest.mark.parametrize("partition, general", [
+      ("n1-highcpu-16", "main"), ("n1-highmem-16-nonp", "nonpreemptible"), ("main", None),
+      ("nonpreemptible", None), ("all", None), ("gpu", None), ("n1-highmem-16-nonp-1-nvidia-tesla-t4", None),
+      ("", None), (None, None), (float("nan"), None)])
+    def test_general_partition(self, partition, general):
+        assert general_partition(partition) == general
+
+    @pytest.mark.parametrize("req_mem, mb", [("1750M", 2625), ("4G", 6144), ("2.5G", 3840), ("512K", 1)])
+    def test_memory_units(self, req_mem, mb):
+        orch = self._orch([])
+        orch.backend.invoke.side_effect = lambda cmd: (0, None, None)
+        assert orch.requeue_out_of_memory("999_2", req_mem) == mb
+
+    def test_the_option_must_be_a_count(self):
+        for bad, err in [("2", TypeError), (-1, ValueError)]:
+            with pytest.raises(err, match = "oom_requeue"):
+                Orchestrator.__init__(object.__new__(Orchestrator), {"script": ["true"], "inputs": {}, "oom_requeue": bad})

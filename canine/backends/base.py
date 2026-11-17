@@ -406,7 +406,7 @@ class AbstractSlurmBackend(abc.ABC):
             stderr_str = stderr.read().decode()
             stderr.seek(0)
             if stderr is not None and "Requested node configuration is not available" in stderr_str:
-                canine_logging.error(f"Requested CPU/memory resources exceed maximum cluster capacity. Please request fewer resources, or add a suitable node to /mnt/nfs/clust_conf/slurm/nodetypes.json")
+                canine_logging.error(f"Requested CPU/memory resources exceed maximum cluster capacity, or the job attaches more persistent disks than a node can (127 besides its boot disk; see DISK_GRES in canine/orchestrator.py). Please request fewer resources, or add a suitable node to /mnt/nfs/clust_conf/slurm/nodetypes.json")
                 raise ResourceWarning
             # all other errors are handled generically
             check_call(command, status, stdout, stderr)

@@ -517,7 +517,15 @@ Pass from wolF via `LocalizeToBucket(files=..., <kwarg>=...)`, or workflow-wide 
 | `scratch_disk_job_avoid` | `True` |
 | `protect_disk` | `False` — adds label `protect:yes`, blocking automatic deletion |
 | `files_to_copy_to_outputs` | `{}` — output keys copied from the scratch disk back to NFS. If it covers every output the task declares, a finished job is avoided on those NFS copies, with no need for its disk, which the lab's cost-monitoring app deletes about a day after last use |
+| `move_to_bucket` | `False` — move a successful job's other outputs to a bucket, delete its disk, and return them as `bucketmount://` URLs; a job whose outputs were moved is avoided while they're in the bucket. See `MOVE_TO_BUCKET.md` |
+| `move_to_bucket_expiry_days` | `7` — lifecycle expiry of the moved outputs' bucket |
 | `persistent_disk_type` | `"standard"` |
+
+**Read-only disks (a job's `rodisk://` inputs, such as upstream scratch disks):**
+
+| Option | Default | Effect |
+|---|---|---|
+| `rodisk_max_parallel_calls` | `16` | The most `gcloud` calls a job makes at once to attach, or detach, its read-only disks, whatever the job's size. GCE works through one VM's calls roughly in turn, but concurrent calls still finish sooner: from a machine with CPU to spare, 120 disks took about 780 s to attach one at a time, 373 s 4 at once, 252 s 8 at once and 165 s 16 at once (detach 272, 182, 120 s). Each `gcloud` call also uses about 2.4 s of CPU, so a small job is partly CPU-bound: 16 attaches at once took 49 s with 2 CPUs and 24 s with 8. Even so, a 2-CPU MarkDuplicates over 120 disks spent 6:27 attaching and 5:32 detaching at 16, against 9:07 and 6:47 at 4 and about 19 and 8 minutes one at a time. Lower it if a cluster hits the Compute API's rate limits. A call waits its turn, so each is allowed 120 s (`RODISK_CALL_TIMEOUT`); up to 53 s was seen. The job's stderr times each step: `Attaching`, `Attach calls done`, `Mounted`, `Unmounting`, `Detaching`, `Detach calls done`. |
 
 ### 5b. Backend options that affect localization
 
