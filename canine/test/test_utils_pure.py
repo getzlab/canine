@@ -23,7 +23,9 @@ from canine.utils import (
     check_call,
     localization_bucket_name,
     LOCALIZATION_BUCKET_HASH_LEN,
+    get_or_create_workflow_bucket,
 )
+import google.api_core.exceptions
 
 
 @pytest.fixture(autouse=True)
@@ -357,6 +359,120 @@ class TestLocalizationBucketName:
         name = localization_bucket_name(PN, "US-CENTRAL1", MD5)
         assert name == name.lower()
         assert re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', name)
+
+
+# ---------------------------------------------------------------------------
+# get_or_create_workflow_bucket
+# ---------------------------------------------------------------------------
+
+CUSTOM_TIME_RULE = {"action": {"type": "Delete"}, "condition": {"daysSinceCustomTime": 5}}
+OTHER_RULE = {"action": {"type": "SetStorageClass", "storageClass": "NEARLINE"}, "condition": {"age": 30}}
+
+
+class FakeGcsBucket:
+    """A bucket in a fake GCS: the server's lifecycle rules and metageneration."""
+
+    def __init__(self, rules=()):
+        self.rules, self.metageneration = list(rules), 1
+
+
+class FakeBucketHandle:
+    """A client's copy of a bucket, read when it is loaded, like google.cloud.storage.Bucket."""
+
+    def __init__(self, server, refuse_patches=()):
+        self.server, self.refuse = server, list(refuse_patches)
+        self.patches = 0
+        self.reload()
+
+    def reload(self):
+        self.lifecycle_rules, self.metageneration = list(self.server.rules), self.server.metageneration
+
+    def add_lifecycle_delete_rule(self, days_since_custom_time):
+        self.lifecycle_rules.append({"action": {"type": "Delete"},
+                                     "condition": {"daysSinceCustomTime": days_since_custom_time}})
+
+    def patch(self, if_metageneration_match=None):
+        self.patches += 1
+        if self.refuse:
+            refusal = self.refuse.pop(0)
+            if refusal:
+                refusal(self.server)
+                raise google.api_core.exceptions.Conflict("concurrent update")
+        if if_metageneration_match != self.server.metageneration:
+            raise google.api_core.exceptions.PreconditionFailed("metageneration changed")
+        self.server.rules, self.server.metageneration = list(self.lifecycle_rules), self.server.metageneration + 1
+
+
+def _client_with(handle):
+    client = MagicMock()
+    client.lookup_bucket.return_value = handle
+    client.get_bucket.return_value = handle
+    client.create_bucket.return_value = handle
+    return patch("canine.utils.gcloud_storage_client", return_value=client), client
+
+
+class TestGetOrCreateWorkflowBucket:
+
+    def run(self, handle):
+        p, client = _client_with(handle)
+        with p, patch("canine.utils.time.sleep"):
+            name = get_or_create_workflow_bucket("us-central1-a", "proj", "check")
+        return name, client
+
+    def test_an_existing_bucket_with_the_rule_is_not_patched(self):
+        """The rule is read from the bucket's loaded metadata, so a run that finds it doesn't patch."""
+        handle = FakeBucketHandle(FakeGcsBucket([OTHER_RULE, CUSTOM_TIME_RULE]))
+        name, client = self.run(handle)
+        assert name == "canine-proj-check"
+        assert handle.patches == 0
+        client.create_bucket.assert_not_called()
+
+    def test_adds_the_rule_keeping_the_buckets_others(self):
+        server = FakeGcsBucket([OTHER_RULE])
+        handle = FakeBucketHandle(server)
+        self.run(handle)
+        assert server.rules == [OTHER_RULE, CUSTOM_TIME_RULE]
+
+    def test_a_concurrent_patch_that_added_the_rule_ends_it(self):
+        """Two runs patching at once: GCS refuses one, which rereads and finds the other's rule."""
+        server = FakeGcsBucket()
+        handle = FakeBucketHandle(server, refuse_patches=[lambda s: setattr(s, "rules", [CUSTOM_TIME_RULE])])
+        self.run(handle)
+        assert handle.patches == 1
+        assert server.rules == [CUSTOM_TIME_RULE]
+
+    def test_a_bucket_changed_since_read_is_reread_not_overwritten(self):
+        """Another run added a rule after this one read the bucket: the stale patch is refused (412)."""
+        server = FakeGcsBucket()
+        handle = FakeBucketHandle(server)
+        server.rules, server.metageneration = [OTHER_RULE], 2
+        self.run(handle)
+        assert server.rules == [OTHER_RULE, CUSTOM_TIME_RULE]
+        assert handle.patches == 2
+
+    def test_gives_up_after_repeated_conflicts(self):
+        handle = FakeBucketHandle(FakeGcsBucket(), refuse_patches=[lambda s: None] * 5)
+        with pytest.raises(google.api_core.exceptions.Conflict):
+            self.run(handle)
+        assert handle.patches == 5
+
+    def test_creates_a_missing_bucket_in_the_zones_region(self):
+        handle = FakeBucketHandle(FakeGcsBucket())
+        p, client = _client_with(handle)
+        client.lookup_bucket.return_value = None
+        with p:
+            get_or_create_workflow_bucket("us-central1-a", "proj", "check")
+        client.create_bucket.assert_called_once_with("canine-proj-check", project="proj", location="us-central1")
+
+    def test_a_bucket_created_concurrently_is_loaded(self):
+        handle = FakeBucketHandle(FakeGcsBucket([CUSTOM_TIME_RULE]))
+        p, client = _client_with(handle)
+        client.lookup_bucket.return_value = None
+        client.create_bucket.side_effect = google.api_core.exceptions.Conflict("exists")
+        with p:
+            get_or_create_workflow_bucket("us-central1-a", "proj", "check")
+        client.get_bucket.assert_called_once_with("canine-proj-check")
+        assert handle.patches == 0
 
 
 # ---------------------------------------------------------------------------

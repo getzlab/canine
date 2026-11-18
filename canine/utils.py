@@ -308,23 +308,37 @@ def get_or_create_workflow_bucket(zone: str, project: str, workflow_name: typing
     sanitized = _sanitize_bucket_name_component(workflow_name or "default")[:name_budget]
     bucket_name = prefix + sanitized
 
-    bucket = client.bucket(bucket_name)
-    if not bucket.exists():
+    # lookup_bucket loads the bucket's metadata (exists() doesn't), so the
+    # lifecycle check below sees the bucket's actual rules
+    bucket = client.lookup_bucket(bucket_name)
+    if bucket is None:
         try:
             bucket = client.create_bucket(bucket_name, project=project, location=_zone_to_region(zone))
         except google.api_core.exceptions.Conflict:
             # bucket was created concurrently by another run of the same
             # workflow; this is the expected reuse case, not an error
-            bucket = client.bucket(bucket_name)
-            bucket.reload()
+            bucket = client.get_bucket(bucket_name)
 
-    has_lifecycle_rule = any(
-        rule.get("action", {}).get("type") == "Delete" and "daysSinceCustomTime" in rule.get("condition", {})
-        for rule in bucket.lifecycle_rules
-    )
-    if not has_lifecycle_rule:
+    # Runs starting together can both find the rule missing. GCS refuses all but
+    # one concurrent patch (409), and the metageneration match refuses a patch
+    # of a bucket changed since it was read (412), so another run's rules are
+    # never overwritten; either way, reread the bucket and check again.
+    attempts = 5
+    for attempt in range(attempts):
+        if any(
+            rule.get("action", {}).get("type") == "Delete" and "daysSinceCustomTime" in rule.get("condition", {})
+            for rule in bucket.lifecycle_rules
+        ):
+            break
         bucket.add_lifecycle_delete_rule(days_since_custom_time=5)
-        bucket.patch()
+        try:
+            bucket.patch(if_metageneration_match=bucket.metageneration)
+            break
+        except (google.api_core.exceptions.Conflict, google.api_core.exceptions.PreconditionFailed):
+            if attempt == attempts - 1:
+                raise
+            time.sleep(1 + attempt)
+            bucket.reload()
 
     return bucket_name
 
