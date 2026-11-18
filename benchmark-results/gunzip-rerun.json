@@ -1,0 +1,49 @@
+{
+  "routeb": {
+    "token_source": "metadata server",
+    "outcome": {
+      "phases": {},
+      "decompressed_from": null,
+      "decompressed_to": null,
+      "fell_back": null,
+      "bookkeeping_seconds": null,
+      "bookkeeping_calls": null,
+      "bookkeeping_mean": null,
+      "bookkeeping_pct_workers": null,
+      "read_seconds": null,
+      "write_seconds": null,
+      "loop_other_seconds": null,
+      "io_blocks": null,
+      "read_pct_of_loop": null,
+      "overlap_ceiling": null,
+      "commit_seconds": null,
+      "commit_batches": null,
+      "commit_chunks": null,
+      "commit_mean_batch": null,
+      "commit_pct_wall": null,
+      "mean_streams": null,
+      "workers": null,
+      "connections": 16,
+      "returncode": 0,
+      "seconds": 1.25,
+      "killed": false,
+      "killed_at_bytes": null,
+      "peak_rss": 32067584,
+      "nic_bytes": 13147,
+      "disk_bytes": 0,
+      "peak_nic_bytes_per_s": null,
+      "peak_disk_bytes_per_s": null,
+      "stderr_tail": [
+        "[k9pdl] k9pdl-auth no ADC credentials file found (GOOGLE_APPLICATION_CREDENTIALS, $CLOUDSDK_CONFIG, ~/.config/gcloud)",
+        "[k9pdl] k9pdl-auth using gcloud account",
+        "[k9pdl] already complete per .gunzip-check.tsv.k9pdl.done"
+      ]
+    },
+    "gunzip": {
+      "ran": false,
+      "compressed_bytes": null,
+      "decompressed_bytes": null,
+      "seconds": null
+    }
+  }
+}

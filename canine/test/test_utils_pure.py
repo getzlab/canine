@@ -3,17 +3,29 @@ Pure unit tests for canine.utils — no SLURM cluster, no GCP credentials requir
 The legacy test_utils.py has randomized ArgumentHelper round-trip tests; this file
 adds deterministic, scenario-specific coverage including pricing and hashing.
 """
+import ast
+import inspect
 import io
+import re
 import subprocess
+import warnings
+from unittest.mock import MagicMock, patch
+
 import pytest
+import requests
 from canine.utils import (
     ArgumentHelper,
+    get_default_gcp_zone,
     _get_mtype_cost,
     gcp_hourly_cost,
     base32,
     sha1_base32,
     check_call,
+    localization_bucket_name,
+    LOCALIZATION_BUCKET_HASH_LEN,
+    get_or_create_workflow_bucket,
 )
+import google.api_core.exceptions
 
 
 @pytest.fixture(autouse=True)
@@ -290,3 +302,289 @@ class TestCheckCall:
     def test_none_streams_no_crash(self):
         with pytest.raises(subprocess.CalledProcessError):
             check_call("cmd", 1, stdout=None, stderr=None)
+
+
+# ---------------------------------------------------------------------------
+# localization_bucket_name
+# ---------------------------------------------------------------------------
+
+MD5 = "0123456789abcdef0123456789abcdef"  # 32 hex chars, as hash_set() returns
+PN = "406002258908"                       # 12 digits, as real project numbers are
+
+
+class TestLocalizationBucketName:
+
+    def test_shape(self):
+        assert localization_bucket_name(PN, "us-central1", MD5) == \
+          "wolf-406002258908-us-central1-" + MD5[:21]
+
+    def test_stable_for_identical_inputs(self):
+        assert localization_bucket_name(PN, "us-central1", MD5) == \
+               localization_bucket_name(PN, "us-central1", MD5)
+
+    def test_differs_across_regions(self):
+        """Buckets are regional: the same content in two regions needs two names."""
+        assert localization_bucket_name(PN, "us-central1", MD5) != \
+               localization_bucket_name(PN, "us-east1", MD5)
+
+    def test_differs_across_content(self):
+        other = "f" * 32
+        assert localization_bucket_name(PN, "us-central1", MD5) != \
+               localization_bucket_name(PN, "us-central1", other)
+
+    @pytest.mark.parametrize("region", [
+        "us-east1", "us-central1", "europe-west1", "asia-southeast1",
+        "southamerica-east1", "australia-southeast1", "northamerica-northeast1",
+    ])
+    def test_fits_63_chars_in_every_region(self, region):
+        """northamerica-northeast1 (23 chars) is the boundary case: exactly 63."""
+        name = localization_bucket_name(PN, region, MD5)
+        assert len(name) <= 63, "{} -> {} chars".format(region, len(name))
+
+    def test_longest_region_is_exactly_at_the_boundary(self):
+        name = localization_bucket_name(PN, "northamerica-northeast1", MD5)
+        assert len(name) == 63
+
+    def test_hash_truncated_not_full_md5(self):
+        name = localization_bucket_name(PN, "us-central1", MD5)
+        assert name.endswith(MD5[:LOCALIZATION_BUCKET_HASH_LEN])
+        assert MD5 not in name  # the full 32-char hash would overflow
+
+    def test_rejects_oversized_name(self):
+        """A longer future project number must fail loudly, not reach GCS."""
+        with pytest.raises(ValueError):
+            localization_bucket_name("9" * 40, "northamerica-northeast1", MD5)
+
+    def test_lowercase_and_legal_charset(self):
+        name = localization_bucket_name(PN, "US-CENTRAL1", MD5)
+        assert name == name.lower()
+        assert re.match(r'^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$', name)
+
+
+# ---------------------------------------------------------------------------
+# get_or_create_workflow_bucket
+# ---------------------------------------------------------------------------
+
+CUSTOM_TIME_RULE = {"action": {"type": "Delete"}, "condition": {"daysSinceCustomTime": 5}}
+OTHER_RULE = {"action": {"type": "SetStorageClass", "storageClass": "NEARLINE"}, "condition": {"age": 30}}
+
+
+class FakeGcsBucket:
+    """A bucket in a fake GCS: the server's lifecycle rules and metageneration."""
+
+    def __init__(self, rules=()):
+        self.rules, self.metageneration = list(rules), 1
+
+
+class FakeBucketHandle:
+    """A client's copy of a bucket, read when it is loaded, like google.cloud.storage.Bucket."""
+
+    def __init__(self, server, refuse_patches=()):
+        self.server, self.refuse = server, list(refuse_patches)
+        self.patches = 0
+        self.reload()
+
+    def reload(self):
+        self.lifecycle_rules, self.metageneration = list(self.server.rules), self.server.metageneration
+
+    def add_lifecycle_delete_rule(self, days_since_custom_time):
+        self.lifecycle_rules.append({"action": {"type": "Delete"},
+                                     "condition": {"daysSinceCustomTime": days_since_custom_time}})
+
+    def patch(self, if_metageneration_match=None):
+        self.patches += 1
+        if self.refuse:
+            refusal = self.refuse.pop(0)
+            if refusal:
+                refusal(self.server)
+                raise google.api_core.exceptions.Conflict("concurrent update")
+        if if_metageneration_match != self.server.metageneration:
+            raise google.api_core.exceptions.PreconditionFailed("metageneration changed")
+        self.server.rules, self.server.metageneration = list(self.lifecycle_rules), self.server.metageneration + 1
+
+
+def _client_with(handle):
+    client = MagicMock()
+    client.lookup_bucket.return_value = handle
+    client.get_bucket.return_value = handle
+    client.create_bucket.return_value = handle
+    return patch("canine.utils.gcloud_storage_client", return_value=client), client
+
+
+class TestGetOrCreateWorkflowBucket:
+
+    def run(self, handle):
+        p, client = _client_with(handle)
+        with p, patch("canine.utils.time.sleep"):
+            name = get_or_create_workflow_bucket("us-central1-a", "proj", "check")
+        return name, client
+
+    def test_an_existing_bucket_with_the_rule_is_not_patched(self):
+        """The rule is read from the bucket's loaded metadata, so a run that finds it doesn't patch."""
+        handle = FakeBucketHandle(FakeGcsBucket([OTHER_RULE, CUSTOM_TIME_RULE]))
+        name, client = self.run(handle)
+        assert name == "canine-proj-check"
+        assert handle.patches == 0
+        client.create_bucket.assert_not_called()
+
+    def test_adds_the_rule_keeping_the_buckets_others(self):
+        server = FakeGcsBucket([OTHER_RULE])
+        handle = FakeBucketHandle(server)
+        self.run(handle)
+        assert server.rules == [OTHER_RULE, CUSTOM_TIME_RULE]
+
+    def test_a_concurrent_patch_that_added_the_rule_ends_it(self):
+        """Two runs patching at once: GCS refuses one, which rereads and finds the other's rule."""
+        server = FakeGcsBucket()
+        handle = FakeBucketHandle(server, refuse_patches=[lambda s: setattr(s, "rules", [CUSTOM_TIME_RULE])])
+        self.run(handle)
+        assert handle.patches == 1
+        assert server.rules == [CUSTOM_TIME_RULE]
+
+    def test_a_bucket_changed_since_read_is_reread_not_overwritten(self):
+        """Another run added a rule after this one read the bucket: the stale patch is refused (412)."""
+        server = FakeGcsBucket()
+        handle = FakeBucketHandle(server)
+        server.rules, server.metageneration = [OTHER_RULE], 2
+        self.run(handle)
+        assert server.rules == [OTHER_RULE, CUSTOM_TIME_RULE]
+        assert handle.patches == 2
+
+    def test_gives_up_after_repeated_conflicts(self):
+        handle = FakeBucketHandle(FakeGcsBucket(), refuse_patches=[lambda s: None] * 5)
+        with pytest.raises(google.api_core.exceptions.Conflict):
+            self.run(handle)
+        assert handle.patches == 5
+
+    def test_creates_a_missing_bucket_in_the_zones_region(self):
+        handle = FakeBucketHandle(FakeGcsBucket())
+        p, client = _client_with(handle)
+        client.lookup_bucket.return_value = None
+        with p:
+            get_or_create_workflow_bucket("us-central1-a", "proj", "check")
+        client.create_bucket.assert_called_once_with("canine-proj-check", project="proj", location="us-central1")
+
+    def test_a_bucket_created_concurrently_is_loaded(self):
+        handle = FakeBucketHandle(FakeGcsBucket([CUSTOM_TIME_RULE]))
+        p, client = _client_with(handle)
+        client.lookup_bucket.return_value = None
+        client.create_bucket.side_effect = google.api_core.exceptions.Conflict("exists")
+        with p:
+            get_or_create_workflow_bucket("us-central1-a", "proj", "check")
+        client.get_bucket.assert_called_once_with("canine-proj-check")
+        assert handle.patches == 0
+
+
+# ---------------------------------------------------------------------------
+# get_default_gcp_zone
+# ---------------------------------------------------------------------------
+
+def _unreachable_metadata():
+    return patch("canine.utils.requests.get",
+                 side_effect=requests.exceptions.ConnectionError())
+
+
+def _metadata_says(zone_path, status=200):
+    resp = MagicMock()
+    resp.status_code = status
+    resp.text = zone_path
+    return patch("canine.utils.requests.get", return_value=resp)
+
+
+def _gcloud_says(stdout, returncode=0):
+    return patch("canine.utils.subprocess.run",
+                 return_value=MagicMock(returncode=returncode, stdout=stdout))
+
+
+class TestGetDefaultGcpZone:
+    """
+    A zone this function makes up is worse than no zone at all: it silently
+    places the Anywhere Cache and localization buckets away from the cluster,
+    which costs money and logs nothing. So the last resort is an exception.
+    """
+
+    @pytest.fixture(autouse=True)
+    def clear_zone_cache(self):
+        get_default_gcp_zone.cache_clear()
+        yield
+        get_default_gcp_zone.cache_clear()
+
+    def test_metadata_server_wins(self):
+        with _metadata_says("projects/406002258908/zones/us-central1-c"):
+            assert get_default_gcp_zone() == "us-central1-c"
+
+    def test_metadata_response_is_reduced_to_the_bare_zone(self):
+        """The endpoint returns a full resource path; only the last segment is a zone."""
+        with _metadata_says("projects/406002258908/zones/europe-west4-a"):
+            assert "/" not in get_default_gcp_zone()
+
+    def test_falls_through_to_gcloud_config(self):
+        with _unreachable_metadata(), _gcloud_says(b"us-east1-b\n"):
+            assert get_default_gcp_zone() == "us-east1-b"
+
+    def test_raises_when_both_sources_are_exhausted(self):
+        with _unreachable_metadata(), _gcloud_says(b"(unset)\n"):
+            with pytest.raises(ValueError) as e:
+                get_default_gcp_zone()
+        assert "compute/zone" in str(e.value), "the error must say how to fix it"
+
+    def test_raises_when_gcloud_itself_fails(self):
+        with _unreachable_metadata(), _gcloud_says(b"ERROR: not authenticated", returncode=1):
+            with pytest.raises(ValueError):
+                get_default_gcp_zone()
+
+    def test_non_200_from_metadata_is_not_treated_as_a_zone(self):
+        with _metadata_says("nope", status=404), _gcloud_says(b"(unset)\n"):
+            with pytest.raises(ValueError):
+                get_default_gcp_zone()
+
+    def test_error_does_not_name_a_zone_as_if_it_were_usable(self):
+        """The removed fallback looked like a working answer; that was the danger."""
+        with _unreachable_metadata(), _gcloud_says(b"(unset)\n"):
+            with pytest.raises(ValueError) as e:
+                get_default_gcp_zone()
+        assert "us-central1-a" not in str(e.value)
+
+    def test_success_is_cached(self):
+        with _metadata_says("projects/1/zones/us-central1-c") as m:
+            get_default_gcp_zone()
+            get_default_gcp_zone()
+        assert m.call_count == 1
+
+    def test_failure_is_not_cached(self):
+        """
+        lru_cache does not memoize exceptions, so a process that starts before
+        the zone is configured recovers without a restart.
+        """
+        with _unreachable_metadata(), _gcloud_says(b"(unset)\n"):
+            with pytest.raises(ValueError):
+                get_default_gcp_zone()
+        with _metadata_says("projects/1/zones/us-central1-c"):
+            assert get_default_gcp_zone() == "us-central1-c"
+
+
+class TestNoZoneLookupAtImportTime:
+
+    def test_localization_base_has_no_module_level_zone(self):
+        from canine.localization import base
+        assert not hasattr(base, "ZONE")
+
+    def test_no_module_scope_call_anywhere_in_localization_base(self):
+        """
+        CI regression guard. Now that this function raises, a single module-scope
+        call makes `import canine` fail outright on any machine that is not on
+        GCE and has no compute/zone set -- GitHub Actions included, which is
+        where the whole suite runs.
+        """
+        from canine.localization import base
+        with warnings.catch_warnings():
+            # base.py has pre-existing invalid escapes in its embedded bash;
+            # re-parsing it here would otherwise re-emit them as suite noise
+            warnings.simplefilter("ignore", SyntaxWarning)
+            tree = ast.parse(inspect.getsource(base))
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue  # calls inside a def are lazy by definition
+            for sub in ast.walk(node):
+                if isinstance(sub, ast.Call) and getattr(sub.func, "id", None) == "get_default_gcp_zone":
+                    pytest.fail("module-scope zone lookup at base.py line {}".format(sub.lineno))

@@ -10,7 +10,8 @@ import subprocess
 from multiprocessing import cpu_count
 from contextlib import contextmanager
 from canine.backends.dummy import DummySlurmBackend
-from canine.orchestrator import Orchestrator, version
+from canine import __version__ as version
+from canine.orchestrator import Orchestrator
 from timeout_decorator import timeout as with_timeout
 import pandas as pd
 import yaml
@@ -315,7 +316,7 @@ class TestIntegration(unittest.TestCase):
                 'examples',
                 'example_pipeline.yaml'
             )) as r:
-                pipeline = yaml.load(r)
+                pipeline = yaml.load(r, Loader=yaml.loader.SafeLoader)
 
             o = Orchestrator({
                 **pipeline,
@@ -353,7 +354,7 @@ class TestIntegration(unittest.TestCase):
                 'examples',
                 'gpu.yaml'
             )) as r:
-                pipeline = yaml.load(r)
+                pipeline = yaml.load(r, Loader=yaml.loader.SafeLoader)
 
             o = Orchestrator({
                 **pipeline,
