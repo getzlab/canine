@@ -245,8 +245,10 @@ def group_sacct_by_job(raw_acct_df):
         if "CPUTimeRAW" in g.columns:
             final.at["CPUTimeRAW"] = g["CPUTimeRAW"].sum()
         final.at["Submit"] = g["Submit"].iloc[0]
+        # counts every requeue, whatever its cause (preemption, running out of
+        # memory, a retried failure); each attempt's State/ExitCode says which
         final["n_preempted"] = len(g) - 1
-        attempt_cols = [c for c in ["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem"] if c in g.columns]
+        attempt_cols = [c for c in ["NodeList", "Start", "End", "AllocTRES", "CPUTimeRAW", "NCPUS", "ReqMem", "State", "ExitCode"] if c in g.columns]
         final["attempts"] = g[attempt_cols].to_dict("records")
         return final
 

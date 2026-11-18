@@ -1111,7 +1111,22 @@ class TestGroupSacctByJob:
         row = result.loc["1_1"]
         assert row["n_preempted"] == 0
         assert row["CPUTimeRAW"] == 100
-        assert row["attempts"] == [{"NodeList": "worker1", "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:01:00", "AllocTRES": "cpu=1,mem=1G", "CPUTimeRAW": 100}]
+        assert row["attempts"] == [{"NodeList": "worker1", "Start": "2026-01-01T00:00:05", "End": "2026-01-01T00:01:00", "AllocTRES": "cpu=1,mem=1G", "CPUTimeRAW": 100, "State": "COMPLETED"}]
+
+    def test_attempts_record_state_and_exit_code(self):
+        # Same per-attempt fields as Orchestrator.wait_for_jobs_to_finish's
+        # grouper(), so a preemption can be told from an out-of-memory requeue
+        raw = pd.DataFrame({
+          "State": ["OUT_OF_MEMORY", "COMPLETED"], "ExitCode": ["0:125", "0:0"], "CPUTimeRAW": [100, 200],
+          "Submit": ["2026-01-01 00:00:00", "2026-01-01 00:00:00"],
+          "NodeList": ["worker1", "worker2"],
+          "Start": ["2026-01-01T00:00:05", "2026-01-01T00:05:05"],
+          "End": ["2026-01-01T00:02:00", "2026-01-01T00:08:00"],
+          "AllocTRES": ["cpu=2,mem=2G", "cpu=2,mem=3G"],
+        }, index=["1_1", "1_1"])
+        row = cost.group_sacct_by_job(raw).loc["1_1"]
+        assert [(a["State"], a["ExitCode"]) for a in row["attempts"]] == [("OUT_OF_MEMORY", "0:125"), ("COMPLETED", "0:0")]
+        assert row["n_preempted"] == 1  # counts the requeue, whatever its cause
 
     def test_multi_attempt_job_collapses_and_sums(self):
         raw = pd.DataFrame({
